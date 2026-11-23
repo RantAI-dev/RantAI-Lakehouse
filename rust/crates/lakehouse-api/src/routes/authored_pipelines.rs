@@ -3457,7 +3457,10 @@ mod tests {
                 transforms: Vec::new(),
                 fbic_enabled: false,
                 target_zone: "silver".to_owned(),
-                target_table: "tgt".to_owned(),
+                // BLD-20: derive the output table from the pipeline name so
+                // fixtures that author several pipelines in one test do not
+                // trip the store's one-writer-per-output-table guard.
+                target_table: format!("{name}_tgt"),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,
@@ -3861,7 +3864,10 @@ mod tests {
                 transforms: Vec::new(),
                 fbic_enabled: false,
                 target_zone: "silver".to_owned(),
-                target_table: "tgt".to_owned(),
+                // BLD-20: derive the output table from the pipeline name so
+                // fixtures that author several pipelines in one test do not
+                // trip the store's one-writer-per-output-table guard.
+                target_table: format!("{name}_tgt"),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,
@@ -4996,7 +5002,10 @@ mod tests {
                 transforms: Vec::new(),
                 fbic_enabled: false,
                 target_zone: "silver".to_owned(),
-                target_table: "tgt".to_owned(),
+                // BLD-20: derive the output table from the pipeline name so
+                // fixtures that author several pipelines in one test do not
+                // trip the store's one-writer-per-output-table guard.
+                target_table: format!("{name}_tgt"),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,
@@ -5196,7 +5205,10 @@ mod tests {
                 transforms: Vec::new(),
                 fbic_enabled: false,
                 target_zone: "silver".to_owned(),
-                target_table: "tgt".to_owned(),
+                // BLD-20: derive the output table from the pipeline name so
+                // fixtures that author several pipelines in one test do not
+                // trip the store's one-writer-per-output-table guard.
+                target_table: format!("{name}_tgt"),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,
@@ -5338,7 +5350,10 @@ mod tests {
                 transforms: Vec::new(),
                 fbic_enabled: false,
                 target_zone: "silver".to_owned(),
-                target_table: "tgt".to_owned(),
+                // BLD-20: derive the output table from the pipeline name so
+                // fixtures that author several pipelines in one test do not
+                // trip the store's one-writer-per-output-table guard.
+                target_table: format!("{name}_tgt"),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,

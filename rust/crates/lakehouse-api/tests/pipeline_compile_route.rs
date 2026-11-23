@@ -215,6 +215,11 @@ async fn seed_pipeline_reading(
         }],
         FixtureStep::Steps(steps) => steps,
     };
+    // A unique name: one test seeds two pipelines, and the name is the
+    // table's natural key. BLD-20 makes the output table a natural key too,
+    // so derive it from the same unique name rather than pinning both
+    // pipelines to `silver.orders_clean`.
+    let name = format!("compile-probe-{}", Uuid::new_v4());
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
@@ -224,15 +229,13 @@ async fn seed_pipeline_reading(
                 table: reads.1.to_owned(),
             }],
             steps,
-            // A unique name: one test seeds two pipelines, and the name is
-            // the table's natural key.
-            name: format!("compile-probe-{}", Uuid::new_v4()),
+            name: name.clone(),
 
             kind: "batch".to_owned(),
             source_zone: reads.0.to_owned(),
             source_table: reads.1.to_owned(),
             target_zone: "silver".to_owned(),
-            target_table: "orders_clean".to_owned(),
+            target_table: format!("{name}_out"),
             schedule: "0 3 * * *".to_owned(),
             description: None,
             incremental_column: None,

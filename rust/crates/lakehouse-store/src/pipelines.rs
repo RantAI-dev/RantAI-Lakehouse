@@ -1280,6 +1280,95 @@ fn split_zone_table(location: &str) -> (String, String) {
     )
 }
 
+// ── BLD-20: one pipeline per output table ────────────────────────────────
+//
+// Two pipelines that name the same output table overwrite each other's data
+// and both claim it. The rule is global (no `tenant_id` filter), matching
+// `pipeline_definition_name_unique`: a physical output table is one resource
+// no matter who authored the writer, and a caller learns only that the key is
+// taken, never whose pipeline holds it. Deletes are hard deletes (there is no
+// soft-delete column), so a deleted pipeline's output table is free as soon
+// as its transaction commits. Nothing here is a migration: the check is a
+// transaction-scoped advisory lock plus a `SELECT`, kept in this store so
+// every save path (create, update, restore, generate, clone-by-create) shares
+// one guard.
+
+/// The normalized key for an output table: both halves trimmed and
+/// lowercased, so `("Silver", " Orders ")` and `("silver", "orders")` are the
+/// same physical table. Used both as the advisory-lock key and as the name in
+/// the 409, so the sentence a caller sees names exactly what was claimed.
+#[must_use]
+fn normalize_output_table(target_zone: &str, target_table: &str) -> String {
+    format!(
+        "{}.{}",
+        target_zone.trim().to_lowercase(),
+        target_table.trim().to_lowercase()
+    )
+}
+
+/// The refusal for a taken output table: a 409 carrying this crate's own
+/// sentence, never an upstream error's text (AGENTS.md principle 4). Kept as
+/// its own function so create, update and restore say byte-identical words.
+#[must_use]
+fn output_table_conflict(key: &str) -> StoreError {
+    StoreError::FieldConflict(format!(
+        "another pipeline already writes the output table \"{key}\" — pick a different target zone or table"
+    ))
+}
+
+/// Refuse the save when another live pipeline already claims this output
+/// table. MUST be called inside the caller's transaction, before the
+/// `INSERT`/`UPDATE`, so the check and the write are one atomic unit.
+///
+/// Two layers make it race-free without a schema change:
+///
+/// 1. `pg_advisory_xact_lock(hashtextextended($1, 0))` serializes every save
+///    normalizing to the SAME key. The lock is transaction-scoped — released
+///    only at the caller's commit/rollback — so a concurrent save waits here
+///    and then runs its `SELECT` against the first save's committed row (or
+///    sees none if the first rolled back). Without it, two saves could both
+///    see "free" and both commit, reintroducing the overwrite.
+/// 2. The `SELECT` excludes `exclude_id`, so a pipeline updating itself with
+///    its OWN existing `(target_zone, target_table)` never conflicts with
+///    itself. Create passes `None` (every row is "another"); update and
+///    restore pass `Some(id)`.
+///
+/// Stored targets are compared through the same normalization as
+/// [`normalize_output_table`]: `split_part(target, '.', 1)` is the zone and
+/// the remainder after the first `.` is the table (matching
+/// [`split_zone_table`]), both `LOWER(TRIM(...))`d. No tenant filter, per the
+/// global scope above.
+async fn assert_output_table_unclaimed(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    exclude_id: Option<&str>,
+    target_zone: &str,
+    target_table: &str,
+) -> Result<(), StoreError> {
+    let key = normalize_output_table(target_zone, target_table);
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&key)
+        .execute(&mut **tx)
+        .await?;
+    let taken: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM pipeline_definition \
+             WHERE ($1::text IS NULL OR id <> $1) \
+               AND LOWER(TRIM(split_part(target, '.', 1))) = LOWER(TRIM($2)) \
+               AND LOWER(TRIM(substring(target FROM position('.' IN target) + 1))) = \
+                   LOWER(TRIM($3)) \
+         )",
+    )
+    .bind(exclude_id)
+    .bind(target_zone)
+    .bind(target_table)
+    .fetch_one(&mut **tx)
+    .await?;
+    if taken {
+        return Err(output_table_conflict(&key));
+    }
+    Ok(())
+}
+
 /// A slug-based id in the same shape `mock/pipelines.ts`'s `slugId` used
 /// (`"pl-<slug>-<base36 millis>"`), so ids created by this store don't
 /// collide with a Dagster job name (which is never prefixed `pl-`) or with
@@ -1432,8 +1521,10 @@ const DEFAULT_OWNER: &str = "Current user";
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::Conflict`] (409) if the name is taken, or
-/// [`StoreError::Database`] on any other failure.
+/// Returns [`StoreError::Conflict`] (409) if the name is taken,
+/// [`StoreError::FieldConflict`] (409) if another pipeline already writes
+/// this `(target_zone, target_table)` (BLD-20), or [`StoreError::Database`]
+/// on any other failure.
 pub async fn create_pipeline(
     pool: &PgPool,
     input: &CreatePipelineInput,
@@ -1490,6 +1581,11 @@ schedule, description, incremental_column, fbic_enabled, transforms, \
          RETURNING {FULL_PIPELINE_COLUMNS}"
     );
     let mut tx = pool.begin().await?;
+    // BLD-20: claim the output table in this same transaction, before the
+    // INSERT. The advisory lock serializes concurrent claims of this key and
+    // the SELECT refuses a second live writer (409 FieldConflict). `None`
+    // excludes no row: every existing pipeline is "another" at create time.
+    assert_output_table_unclaimed(&mut tx, None, &input.target_zone, &input.target_table).await?;
     // safe: only the constant `FULL_PIPELINE_COLUMNS` is formatted in; values are bound.
     let row: FullPipelineRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&id)
@@ -1686,8 +1782,11 @@ impl<'de> serde::Deserialize<'de> for ConnectorChange {
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::Database`] on any failure. `Ok(None)` when no
-/// pipeline with `id` exists.
+/// Returns [`StoreError::FieldConflict`] (409) when the new
+/// `(target_zone, target_table)` is already written by another pipeline
+/// (BLD-20), [`StoreError::Database`] on any other failure. `Ok(None)` when
+/// no pipeline with `id` exists. Keeping this pipeline's OWN output table
+/// never conflicts.
 pub async fn update_pipeline(
     pool: &PgPool,
     id: &str,
@@ -1707,8 +1806,10 @@ pub async fn update_pipeline(
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::Database`] on any failure. `Ok(None)` when no
-/// pipeline with `id` exists.
+/// Returns [`StoreError::FieldConflict`] (409) when the snapshot's
+/// `(target_zone, target_table)` is now written by another pipeline (BLD-20),
+/// [`StoreError::Database`] on any other failure. `Ok(None)` when no pipeline
+/// with `id` exists.
 pub async fn restore_pipeline(
     pool: &PgPool,
     id: &str,
@@ -1779,6 +1880,13 @@ owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
         ConnectorChange::Set(connector_id) => (true, Some(connector_id.clone())),
     };
     let mut tx = pool.begin().await?;
+    // BLD-20: claim the output table in this same transaction, before the
+    // UPDATE. Excluding `id` lets a pipeline keep its OWN output table on an
+    // unrelated edit (and on a version restore) while still refusing to
+    // steal another pipeline's — including when restore replays a snapshot
+    // that names a table now owned by someone else.
+    assert_output_table_unclaimed(&mut tx, Some(id), &input.target_zone, &input.target_table)
+        .await?;
     // safe: only the constant `FULL_PIPELINE_COLUMNS` is formatted in; values are bound.
     let row: Option<FullPipelineRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
