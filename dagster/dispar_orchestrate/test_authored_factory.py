@@ -697,6 +697,118 @@ class OpForPipelineTest(unittest.TestCase):
         mocked_exec.assert_not_called()
 
 
+class ServingGoldZoneTest(unittest.TestCase):
+    """BLD-19: Gold marts live in the ClickHouse `serving` database — it is
+    the only Gold database `routes::catalog` lists and the one
+    `routes::lineage` names `table:serving.<name>` with `layer: gold`. A
+    definition stored before that rule can still say `gold`; both spellings
+    must write `serving.<target_table>`, never create an orphan `gold`
+    database, and emit a `serving.<target_table>` asset materialization.
+
+    No network and no ClickHouse: the same seams `OpForPipelineTest` uses
+    (`_ch_exec`, `_ch_query_json`, `ClickHouseTarget.from_env`,
+    `_compile_passthrough`), plus the op context's `log_event` is replaced so
+    the materialization the op logs can be inspected.
+    """
+
+    @staticmethod
+    def _run(target_zone: str, **definition_overrides: object):
+        pipeline = _ready_pipeline(targetZone=target_zone, **definition_overrides)
+        run_fn = authored_factory._op_for_pipeline(pipeline)
+        counts = iter([[{"n": "0"}], [{"n": "3"}]])
+        exec_calls: list[str] = []
+        events: list[Any] = []
+        context = build_op_context()
+        with mock.patch.object(
+            authored_factory, "_ch_exec", side_effect=lambda t, s: exec_calls.append(s)
+        ), mock.patch.object(
+            authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts)
+        ), mock.patch.object(
+            authored_factory.ClickHouseTarget,
+            "from_env",
+            return_value=ClickHouseTarget("http://ch", "default", ""),
+        ), _compile_passthrough(), mock.patch.object(
+            context, "log_event", side_effect=events.append
+        ):
+            result = run_fn(context)
+        return run_fn, exec_calls, events, result, pipeline
+
+    def test_only_gold_is_aliased_to_serving(self) -> None:
+        self.assertEqual(authored_factory._canonical_clickhouse_zone("gold"), "serving")
+        self.assertEqual(authored_factory._canonical_clickhouse_zone("serving"), "serving")
+        self.assertEqual(authored_factory._canonical_clickhouse_zone("silver"), "silver")
+        self.assertEqual(authored_factory._canonical_clickhouse_zone("bronze"), "bronze")
+        self.assertEqual(authored_factory._canonical_clickhouse_zone("lake"), "lake")
+
+    def test_a_serving_target_writes_and_materializes_serving(self) -> None:
+        run_fn, exec_calls, events, result, _ = self._run("serving")
+        self.assertEqual(result["rows"], 3)
+        self.assertIn("CREATE DATABASE IF NOT EXISTS serving", exec_calls)
+        self.assertTrue(
+            any("INSERT INTO serving.`__staging_orders_clean`" in s for s in exec_calls)
+        )
+        self.assertTrue(any("EXCHANGE TABLES serving.`orders_clean`" in s for s in exec_calls))
+        self.assertEqual(run_fn.tags["writes"], "ClickHouse serving.orders_clean")
+        self.assertEqual(len(events), 1, "exactly one asset materialization per run")
+        self.assertEqual(events[0].asset_key.path, ["serving", "orders_clean"])
+        self.assertEqual(events[0].metadata["rows"].value, 3)
+
+    def test_a_legacy_gold_target_writes_and_materializes_serving(self) -> None:
+        run_fn, exec_calls, events, result, pipeline = self._run("gold")
+        self.assertEqual(result["rows"], 3)
+        self.assertIn("CREATE DATABASE IF NOT EXISTS serving", exec_calls)
+        self.assertTrue(
+            any("INSERT INTO serving.`__staging_orders_clean`" in s for s in exec_calls)
+        )
+        self.assertTrue(any("EXCHANGE TABLES serving.`orders_clean`" in s for s in exec_calls))
+        # The whole point: no statement may name the orphan Gold database.
+        self.assertFalse(
+            any("gold." in s or "DATABASE IF NOT EXISTS gold" in s for s in exec_calls),
+            f"a legacy gold target leaked into ClickHouse SQL: {exec_calls}",
+        )
+        self.assertEqual(run_fn.tags["writes"], "ClickHouse serving.orders_clean")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].asset_key.path, ["serving", "orders_clean"])
+        self.assertEqual(events[0].metadata["rows"].value, 3)
+        # Normalisation is a read-time decision: the stored row is untouched.
+        self.assertEqual(pipeline["definition"]["targetZone"], "gold")
+
+    def test_a_legacy_gold_source_zone_is_named_serving_in_source_metadata(self) -> None:
+        run_fn, _, _, _, _ = self._run("serving", sourceZone="gold")
+        self.assertEqual(run_fn.tags["reads"], "ClickHouse serving.orders")
+
+    def test_a_legacy_gold_input_zone_is_named_serving_in_source_metadata(self) -> None:
+        run_fn, _, _, _, _ = self._run(
+            "serving",
+            sourceZone="gold",
+            inputs=[{"name": "orders", "zone": "gold", "table": "orders"}],
+        )
+        self.assertEqual(run_fn.tags["reads"], "ClickHouse serving.orders")
+
+    def test_the_write_helpers_normalize_a_legacy_gold_zone_on_their_own(self) -> None:
+        """Defence in depth: `_write_clickhouse_table` and its
+        `_ensure_target_table` callee normalise the zone themselves, so a
+        direct call with a legacy `gold` still never issues
+        `CREATE DATABASE IF NOT EXISTS gold`."""
+        calls: list[str] = []
+        counts = iter([[{"n": "0"}], [{"n": "2"}]])
+        with mock.patch.object(
+            authored_factory, "_ch_exec", side_effect=lambda t, s: calls.append(s)
+        ), mock.patch.object(
+            authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts)
+        ):
+            rows = authored_factory._write_clickhouse_table(
+                ClickHouseTarget("http://ch", "default", ""),
+                "gold",
+                "mart",
+                "SELECT 1",
+                False,
+            )
+        self.assertEqual(rows, 2)
+        self.assertIn("CREATE DATABASE IF NOT EXISTS serving", calls)
+        self.assertFalse(any("gold." in s for s in calls), f"orphan Gold SQL: {calls}")
+
+
 class RunnableFetchTest(unittest.TestCase):
     def test_the_factory_reads_the_runnable_route_and_keeps_paused_pipelines(self) -> None:
         resp = mock.Mock(status_code=200)

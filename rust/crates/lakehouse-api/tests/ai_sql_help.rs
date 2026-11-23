@@ -631,6 +631,15 @@ const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
 // sentences), placed at the end of the Ask suffix, and the Build prompt's
 // bytes are unchanged. (Before: `bdb95459...f810`.) The AI team reviews the
 // sentence (Assistant parity).
+//
+// Checked for `BLD-19` (PR #707 review fix, ci-required failure on da2a7c9):
+// `create_pipeline`'s tool description now names `serving` instead of `gold`,
+// but that description lives in the registry schema, which travels in the
+// request's `tools` array — not in these system-prompt bytes. The prompt's
+// own Pipelines line (`prompt.rs`) names the tool only ("authors one as a
+// draft") and carries no zone words, so this pin does not move; the zone
+// wording is pinned by `tests/fixtures/tool_schemas.json` instead. The
+// offered-tool list above is untouched — no tool was added or removed.
 const SYSTEM_SHA256_WITHOUT_ALLOWLIST: &str =
     "f77c95e5d54877e61a80a4ef1dee442a31e92a5ecda832d3f803148f762ae1ed";
 
