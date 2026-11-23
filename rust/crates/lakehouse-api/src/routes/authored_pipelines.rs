@@ -2567,6 +2567,48 @@ pub async fn delete(
 /// definition-mutating route, because the rebuilt job may differ
 /// from the one currently running.
 ///
+/// F2.8 (PR #59 review), restore side: the tenant-scoped validation walk
+/// `update` also runs — Dagster's job names best effort (an unreachable
+/// orchestrator narrows `depends_on` to authored ids only), the caller's
+/// scope, the other authored chains, then the shared `validate_pipeline_input`
+/// over the snapshot's transforms, `max_retries` and `depends_on`. A
+/// cross-tenant `pl-` id reads as "unknown" (F2.2).
+///
+/// # Errors
+///
+/// [`ApiRejection`] (400) from the shared validator, and whatever the
+/// Dagster list or the chain query surface — both classified by their
+/// own layers first.
+async fn validate_snapshot_pipeline_input(
+    state: &AppState,
+    pool: &PgPool,
+    principal: &Principal,
+    headers: &HeaderMap,
+    id: &str,
+    transforms: &[String],
+    max_retries: i16,
+    depends_on: &[String],
+) -> Result<(), ApiRejection> {
+    let dagster_jobs = match state.dagster.list_jobs().await {
+        Ok(j) => j,
+        Err(err) => {
+            tracing::warn!(%err, "restore_version: dagster unreachable, depends_on accepts authored upstreams only");
+            Vec::new()
+        }
+    };
+    let scope = crate::routes::authored_pipelines::resolve_caller_scope(principal, headers)?;
+    let others_rows = collect_authored_depends_on_with_tenants(pool, Some(id)).await?;
+    let others = in_scope_depends_on_rows(&others_rows, scope);
+    validate_pipeline_input(
+        id,
+        transforms,
+        Some(max_retries),
+        Some(depends_on),
+        &others,
+        &dagster_jobs,
+    )
+}
+
 /// # Errors
 ///
 /// 404 for a non-`pl-` id or for an unknown `(id, version)` pair;
@@ -2623,34 +2665,33 @@ pub async fn restore_version(
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
     // PR review (BLD-7, SHOULD-FIX 1): a restore keeps the row's current
     // connector (`ConnectorChange::Keep` below) but replays the snapshot's
-    // source, which may predate the connector. Hold it to the same rule.
-    if let Some(kept) = current.connector_id.as_deref() {
-        if restored_inputs.len() != 1 {
-            return Err(ApiError::BadRequest(
-                "a pipeline with a connector has exactly one input".to_owned(),
-            )
-            .into());
-        }
-        validate_connector_source(pool, kept, &first.zone, &first.table).await?;
-    }
-    let dagster_jobs = match state.dagster.list_jobs().await {
-        Ok(j) => j,
-        Err(err) => {
-            tracing::warn!(%err, "restore_version: dagster unreachable, depends_on accepts authored upstreams only");
-            Vec::new()
-        }
-    };
-    let scope = crate::routes::authored_pipelines::resolve_caller_scope(&principal, &headers)?;
-    let others_rows = collect_authored_depends_on_with_tenants(pool, Some(&id)).await?;
-    let others = in_scope_depends_on_rows(&others_rows, scope);
-    validate_pipeline_input(
+    // source, which may predate the connector — the same rule, through the
+    // same helper `create` and `update` use. `Keep` never re-checks the
+    // tenant: it was checked when the connector was set.
+    check_connector_for_definition(
+        pool,
+        &ConnectorChange::Keep,
+        current.connector_id.as_deref(),
+        current.tenant_id,
+        &restored_inputs,
+    )
+    .await?;
+    // F2.8 (PR #59 review): the shared validator runs the transform grammar,
+    // the `max_retries` range, and the snapshot's dependency walk, scoped to
+    // the caller's tenant through [`validate_snapshot_pipeline_input`] — the
+    // restore side of the walk `update` runs, so a cross-tenant `pl-` id
+    // reads as "unknown" (F2.2).
+    validate_snapshot_pipeline_input(
+        &state,
+        pool,
+        &principal,
+        &headers,
         &id,
         &snapshot.transforms,
-        Some(snapshot.max_retries),
-        Some(&snapshot.depends_on),
-        &others,
-        &dagster_jobs,
-    )?;
+        snapshot.max_retries,
+        &snapshot.depends_on,
+    )
+    .await?;
     // BLD-1 part 1 / D10 (`SEC-71`): a version that reads differently from
     // the current definition, restored by someone other than the current
     // author, makes that person the author -- the same rule an edit follows.
