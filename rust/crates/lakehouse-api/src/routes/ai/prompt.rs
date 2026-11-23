@@ -71,17 +71,18 @@ RULES
 /// and not part of [`SYSTEM_BASE`], so a deployment with the switch off
 /// keeps the prompt it was measured with, byte for byte.
 ///
-/// The rules turn an unclear word into one of three answers: use the one
-/// reading there is and say which, ask once with options, or say the data
-/// does not cover it (the coverage rule in [`SYSTEM_BASE`] already says
-/// that last one).
+/// The rules cover using a reading the DATA MAP or the person's words settle,
+/// asking once with options when nothing settles it, and answering a question
+/// that is not about data as it is. A reply that uses a reading opens by
+/// naming it. The rules name no table, column or value (`AI-17`).
 pub(super) const ASK_BACK_RULES: &str = "
 
 UNCLEAR WORDS
-- If the DATA MAP or THIS USER'S WORDS settles what a word means, use that reading and say in your reply which reading you took.
-- If a word fits two or more tables, columns or values and nothing settles it, call ask_user once. Make the options names taken from the DATA MAP. Run no query in that turn.
-- Ask only once. If your previous message was a question, take the most likely reading, say which one you took, and answer.
-- If the question is not about data, answer it as it is. Do not ask.";
+- A reading the DATA MAP or THIS USER'S WORDS settles is the one to use.
+- A word fitting two or more tables, columns or values, with nothing settling it, gets one ask_user call with options from the DATA MAP and no query that turn.
+- Ask only once. After the person answers, use the reading they chose; without an answer, take the most likely one.
+- Open every reply that uses a reading with one short sentence naming it.
+- A question not about data is answered as it is, with no ask.";
 
 /// The two sentences the console sends with the SQL help. `prepare_chat`
 /// matches the Explain one to take the tool out of its turn (plan 17); the
@@ -1134,6 +1135,35 @@ pub(super) fn group_of(name: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ask_back_rules_pin_the_chosen_reading_and_the_opening_sentence_and_name_no_dataset() {
+        assert!(
+            ASK_BACK_RULES.contains("the reading they chose"),
+            "{ASK_BACK_RULES}"
+        );
+        assert!(
+            ASK_BACK_RULES
+                .contains("Open every reply that uses a reading with one short sentence naming it"),
+            "{ASK_BACK_RULES}"
+        );
+        // A word of one dataset would tie these rules to one deployment.
+        let lower = ASK_BACK_RULES.to_lowercase();
+        for word in ["wisman", "pariwisata", "mart_", "outlet", "distributor"] {
+            assert!(!lower.contains(word), "`{word}` in {ASK_BACK_RULES}");
+        }
+    }
+
+    /// The Build prompt has a character ceiling (`ai_prompt_size`), so a later
+    /// edit of these rules must not grow the block past what the owner saw.
+    #[test]
+    fn the_ask_back_rules_stay_within_570_characters() {
+        let chars = ASK_BACK_RULES.chars().count();
+        assert!(
+            chars <= 570,
+            "{chars} characters, the ceiling is 570: {ASK_BACK_RULES}"
+        );
+    }
 
     #[test]
     fn the_count_rules_are_five_lines_and_name_no_dataset() {

@@ -631,8 +631,14 @@ const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
 // sentences), placed at the end of the Ask suffix, and the Build prompt's
 // bytes are unchanged. (Before: `bdb95459...f810`.) The AI team reviews the
 // sentence (Assistant parity).
+// Updated by hand for `AI-17`: the ask-back block (`ASK_BACK_RULES`, which
+// this chat's prompt includes because `ask_user` is offered and `AI_ASK_BACK`
+// defaults on) was rewritten so a reply that uses a reading opens with one
+// short sentence naming it, and trimmed to fit the viewer ceiling with the
+// ceilings unchanged. The new hash is the old bytes with the rewritten block
+// in place of the old four bullets. (Before: `f77c95e5...762ae1ed`.)
 const SYSTEM_SHA256_WITHOUT_ALLOWLIST: &str =
-    "f77c95e5d54877e61a80a4ef1dee442a31e92a5ecda832d3f803148f762ae1ed";
+    "61ee27897923e5f8bdbd74f359bd2086f65e23948a685f742b819e71e113d159";
 
 fn sha256_hex(text: &str) -> String {
     use std::fmt::Write as _;

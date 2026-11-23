@@ -1653,7 +1653,13 @@ fn draft_policy_schema() -> Value {
             "subjects": { "type": "string", "description": "who or what the policy applies to" },
             "resources": { "type": "string", "description": "which data the policy covers" },
             "effect": { "type": "string", "description": "e.g. \"Permit with obligation\", \"Require approval\"" },
-            "conditions": { "type": "string" },
+            "conditions": { "type": "object", "description": "what it enforces: needs a mask or a rowFilter; without conditions the draft enforces nothing",
+                "properties": {
+                    "roles": { "type": "array", "items": { "type": "string" }, "description": "role names it applies to" },
+                    "table": { "type": "string", "description": "table it governs, e.g. \"serving.mart_x\"" },
+                    "mask": { "type": "array", "items": { "type": "string" }, "description": "columns to mask" },
+                    "rowFilter": { "type": "string", "description": "SQL condition rows must meet" } },
+                "required": ["roles", "table"] },
             "owner": { "type": "string" } },
             "required": ["name", "kind", "subjects", "resources", "effect"] } } })
 }

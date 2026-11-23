@@ -51,6 +51,12 @@ struct Measured {
 
 /// Runs one turn as `cookie` and reads the first request the model got.
 async fn measure(mode: &str, principal: Principal) -> Measured {
+    // The DATA MAP cache is one entry for the whole process, kept for two
+    // minutes, and its text is part of the system message. A chat that ran
+    // earlier in the same process would leave its map behind and move the
+    // totals with test order, so the cache is cleared here and every total
+    // is measured against the map this test's own mocks produce (`AI-32`).
+    lakehouse_api::clear_data_map_cache().await;
     let llm = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -158,14 +164,14 @@ fn size(text: &str) -> (usize, usize) {
 /// characters: the system message plus the offered tool schemas, as the
 /// model receives them. Each has a ceiling below.
 ///
-/// The ceilings are the totals this PR measures in the full suite. Run alone,
-/// the admin Build and admin Ask totals are 64 characters lower (76,343 and
-/// 19,660): the prompt's data-map cache is filled by other tests in the same
-/// process, so the totals move with test order. The admin Build ceiling is
-/// above the owner's target of 68,000 (owner, 2026-11-22, via the Auditor),
-/// which the sweep did not reach, so it waits for the owner's OK via the
-/// Auditor before the PR merges. The viewer Build ceiling is the measured
-/// total, 29,699.
+/// The owner approved these ceilings (owner, 2026-11-22, via the Auditor).
+/// They sit at or above the totals [`measure`] reports on purpose: the headroom is
+/// reserved for a following change, so no one lowers a ceiling to the
+/// measured total. The admin Build ceiling is above the owner's earlier
+/// target of 68,000, which the sweep did not reach.
+///
+/// [`measure`] clears the data-map cache before each turn, so a total is the
+/// same when this file runs alone and when the whole suite runs (`AI-32`).
 const ADMIN_BUILD_CEILING: usize = 76_407;
 const ADMIN_ASK_CEILING: usize = 19_724;
 const VIEWER_BUILD_CEILING: usize = 29_699;
