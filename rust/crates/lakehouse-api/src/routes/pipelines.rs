@@ -3214,7 +3214,15 @@ pub async fn create(
     // so the new pipeline is on the list the create form returns to. It
     // used to be inserted unassigned, which no tenant-scoped read shows.
     let tenant_id = crate::tenant_scope::resolve(&principal, &headers)?;
-    let body: CreatePipelineBody = parse_body(&body)?;
+    let mut body: CreatePipelineBody = parse_body(&body)?;
+    // BLD-19: a legacy `gold` target is written as `serving` — the Gold
+    // database `routes::catalog` lists and `routes::lineage` names. This is
+    // the one door the console, an older script and the assistant's
+    // `create_pipeline` tool all come through, so no caller can persist an
+    // orphan `gold` target. Input zones are normalised by `definition_form`
+    // below; `bronze` is left alone for the refusal that follows.
+    body.target_zone =
+        crate::routes::authored_pipelines::canonical_clickhouse_zone(&body.target_zone).to_owned();
     // BLD-3 / D4: refuse a `bronze` target before anything is written.
     // Same validator (and same message) as `authored_pipelines::update`
     // and `authored_pipelines::restore_version` run; the assistant's
@@ -3481,12 +3489,17 @@ pub async fn generate(
     // Same tenant rule as `create`: the draft lands in the caller's tenant.
     let tenant_id = crate::tenant_scope::resolve(&principal, &headers)?;
     let body: GeneratePipelineBody = parse_body(&body)?;
+    // BLD-19: the draft's source and target are the same zone, so both
+    // spellings must name `serving` for a Gold draft — the catalog only
+    // lists `silver` and `serving`.
+    let database =
+        crate::routes::authored_pipelines::canonical_clickhouse_zone(&body.database).to_owned();
     // The draft used to be a name and nothing else: every generated
     // pipeline arrived reading `source_table` → `target_table`, kind
     // "incremental", schedule "On demand", whatever had been asked for.
     // The model now proposes the shape too, and every field it does not
     // give falls back to something derived rather than invented.
-    let draft = llm_pipeline_draft(&state, &body.instruction, &body.database).await;
+    let draft = llm_pipeline_draft(&state, &body.instruction, &database).await;
     let fallback_name = derive_pipeline_name(&body.instruction);
     let name = draft
         .as_ref()
@@ -3519,7 +3532,7 @@ pub async fn generate(
         steps: Vec::new(),
         name,
         kind,
-        source_zone: body.database.clone(),
+        source_zone: database.clone(),
         source_table,
         // The draft LLM call proposes an incremental column/transforms too
         // (see `PipelineDraft` below); nothing asks it for FBIC, so that
@@ -3531,7 +3544,7 @@ pub async fn generate(
             .map(|d| d.transforms.clone())
             .unwrap_or_default(),
         fbic_enabled: false,
-        target_zone: body.database,
+        target_zone: database,
         target_table,
         schedule,
         owner: Some("Agentic Builder".to_owned()),
@@ -8220,6 +8233,97 @@ mod tests {
                 row.is_none(),
                 "an invalid transform must write nothing to pipeline_definition"
             );
+        }
+
+        /// BLD-19: `serving` is the Gold zone the catalog lists, so a
+        /// pipeline created with that target is stored verbatim. The stored
+        /// `pipeline_definition.target` is what Dagster reads to pick the
+        /// `ClickHouse` database, so this is the value that matters.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_stores_a_serving_target_as_serving(pool: sqlx::PgPool) {
+            lakehouse_store::uploads::claim_table(
+                &pool,
+                super::SEED_TENANT.parse().unwrap(),
+                "orders",
+                "upload-bld19-serving",
+            )
+            .await
+            .expect("claim the bronze source table");
+            let name = format!("create-serving-test-{}", uuid::Uuid::new_v4());
+            let body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "name": name,
+                    "kind": "batch",
+                    "sourceZone": "bronze",
+                    "sourceTable": "orders",
+                    "transforms": [],
+                    "targetZone": "serving",
+                    "targetTable": "mart_bld19_serving",
+                    "schedule": "manual",
+                }))
+                .expect("serialize"),
+            );
+            let (_, ApiJson(created)) = create(
+                State(state_for(&pool)),
+                Extension(super::fixture_member_principal()),
+                HeaderMap::new(),
+                body,
+            )
+            .await
+            .expect("a serving target is accepted");
+            assert_eq!(created.target, "serving.mart_bld19_serving");
+            let row: (String,) =
+                sqlx::query_as("SELECT target FROM pipeline_definition WHERE id = $1")
+                    .bind(&created.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("query the stored target");
+            assert_eq!(row.0, "serving.mart_bld19_serving");
+        }
+
+        /// BLD-19: an older client (or script) still sending `gold` gets
+        /// its pipeline stored as `serving` — never as an orphan `gold`
+        /// database that the catalog and lineage do not list.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_normalizes_a_legacy_gold_target_to_serving(pool: sqlx::PgPool) {
+            lakehouse_store::uploads::claim_table(
+                &pool,
+                super::SEED_TENANT.parse().unwrap(),
+                "orders",
+                "upload-bld19-gold",
+            )
+            .await
+            .expect("claim the bronze source table");
+            let name = format!("create-gold-test-{}", uuid::Uuid::new_v4());
+            let body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "name": name,
+                    "kind": "batch",
+                    "sourceZone": "bronze",
+                    "sourceTable": "orders",
+                    "transforms": [],
+                    "targetZone": "gold",
+                    "targetTable": "mart_bld19_gold",
+                    "schedule": "manual",
+                }))
+                .expect("serialize"),
+            );
+            let (_, ApiJson(created)) = create(
+                State(state_for(&pool)),
+                Extension(super::fixture_member_principal()),
+                HeaderMap::new(),
+                body,
+            )
+            .await
+            .expect("a legacy gold target must be accepted as serving");
+            assert_eq!(created.target, "serving.mart_bld19_gold");
+            let row: (String,) =
+                sqlx::query_as("SELECT target FROM pipeline_definition WHERE id = $1")
+                    .bind(&created.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("query the stored target");
+            assert_eq!(row.0, "serving.mart_bld19_gold");
         }
     }
     /// WS4 item D4 — `POST /api/pipelines/{id}/status`'s

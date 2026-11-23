@@ -84,6 +84,11 @@ use crate::routes::pipelines::record_pipeline_audit;
 use crate::state::AppState;
 use crate::upstream_error;
 
+// BLD-19: one canonical spelling of the Gold database at every API write
+// boundary and in the compiler. Re-exported here because create/update and
+// restore all enter this module to validate their target zone.
+pub use crate::pipeline_compile::canonical_clickhouse_zone;
+
 /// Ticks read per request: enough to see a day of a 15-minute schedule.
 const MAX_TICKS: u32 = 50;
 
@@ -459,9 +464,15 @@ pub const BRONZE_TARGET_REFUSED: &str =
 /// orchestrator's op applies, so a stored pipeline that predates this
 /// refusal (or that arrives from a client the assistant never
 /// validated) fails loudly at run time instead of writing somewhere
-/// meaningless. `silver`, `gold`, `serving`, `lake`, and anything else the
-/// store's column accepts is left alone here: narrowing the set is the
-/// catalog's job, not this route's.
+/// meaningless. `silver`, `serving`, `lake`, and anything else the store's
+/// column accepts is left alone here: narrowing the set is the catalog's
+/// job, not this route's.
+///
+/// BLD-19: the legacy `gold` spelling is NOT a fourth writable zone. Every
+/// caller runs [`canonical_clickhouse_zone`] before this check, so a client
+/// or a stored version that says `gold` is validated and written as
+/// `serving` — the `ClickHouse` database the catalog lists and lineage
+/// names. `bronze` is deliberately left to this check, not normalised.
 ///
 /// # Errors
 ///
@@ -1093,6 +1104,11 @@ pub const LEGACY_FORM_CANNOT_EDIT: &str = "This pipeline has inputs and steps th
 /// used as given. A body that sends both is a 400, because "which one wins"
 /// is not a question a caller should have to guess.
 ///
+/// BLD-19: input zones are normalised here, before the compiler sees them,
+/// so a legacy `gold.foo` input compiles to and is stored as
+/// `serving.foo` — the name the catalog and lineage use. A `bronze` input
+/// is untouched: that zone has its own read path in the compiler.
+///
 /// # Errors
 ///
 /// [`ApiRejection`] (400) when the body sends both forms, or neither.
@@ -1109,8 +1125,10 @@ pub(crate) fn definition_form(
         return Err(ApiError::BadRequest(BOTH_FORMS.to_owned()).into());
     }
     if has_new {
+        let mut inputs = inputs.unwrap_or_default();
+        canonicalize_input_zones(&mut inputs);
         return Ok(DefinitionForm {
-            inputs: inputs.unwrap_or_default(),
+            inputs,
             steps: steps.unwrap_or_default(),
             legacy_transforms: None,
         });
@@ -1127,12 +1145,37 @@ pub(crate) fn definition_form(
             ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
         })?;
     }
+    let zone = canonical_clickhouse_zone(zone);
     let (inputs, steps) = pipelines::legacy_definition(zone, table, transforms);
     Ok(DefinitionForm {
         inputs,
         steps,
         legacy_transforms: Some(transforms.to_vec()),
     })
+}
+
+/// BLD-19: the one place input zones are normalised for every body form.
+/// A restore of a stored definition (which never goes through
+/// [`definition_form`]) calls this too, so an old `gold` input cannot reach
+/// the compiler or the orchestrator under that spelling.
+pub(crate) fn canonicalize_input_zones(inputs: &mut [lakehouse_store::pipelines::PipelineInput]) {
+    for input in inputs {
+        input.zone = canonical_clickhouse_zone(&input.zone).to_owned();
+    }
+}
+
+/// BLD-19: the inputs and steps a version snapshot replays, with Gold input
+/// zones normalised at the same boundary as every other write path. Kept out
+/// of `restore_version` so that route stays within the line budget.
+fn canonical_snapshot_definition(
+    snapshot: &lakehouse_store::pipelines::PipelineDefinitionSnapshot,
+) -> (
+    Vec<lakehouse_store::pipelines::PipelineInput>,
+    Vec<lakehouse_store::pipelines::PipelineStep>,
+) {
+    let (mut inputs, steps) = pipelines::snapshot_definition(snapshot);
+    canonicalize_input_zones(&mut inputs);
+    (inputs, steps)
 }
 
 /// The editable row an `update` writes, from the body it read and the shape
@@ -1211,7 +1254,11 @@ fn legacy_form_over_stored(
     Ok(DefinitionForm {
         inputs: vec![lakehouse_store::pipelines::PipelineInput {
             name: input_name.clone(),
-            zone: zone.to_owned(),
+            // BLD-19: this path rebuilds the input from the RAW body zone,
+            // bypassing `definition_form`'s normalisation. A legacy `gold`
+            // source must still be stored as `serving`, the Gold database
+            // the catalog and lineage name.
+            zone: canonical_clickhouse_zone(zone).to_owned(),
             table: table.to_owned(),
         }],
         steps: if transforms.is_empty() {
@@ -2266,7 +2313,12 @@ pub async fn update(
     // fact that the orchestrator rebuilds a job) without it.
     crate::routes::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id)
         .await?;
-    let body: UpdateBody = crate::routes::pipelines::parse_body(&body)?;
+    let mut body: UpdateBody = crate::routes::pipelines::parse_body(&body)?;
+    // BLD-19: a legacy `gold` target is stored (and compiled) as `serving`
+    // instead of making the orchestrator create an orphan `gold` database.
+    // Done before the Bronze refusal so the one zone that must stay refused
+    // is the only one this helper leaves alone.
+    body.target_zone = canonical_clickhouse_zone(&body.target_zone).to_owned();
     // BLD-3 / D4: a `bronze` target is refused with the same message
     // `create` and `restore_version` use, before the store is touched.
     //
@@ -2532,9 +2584,13 @@ pub async fn restore_version(
     crate::routes::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id)
         .await?;
     let pool = crate::routes::pipelines::pool(&state)?;
-    let snapshot = pipelines::get_definition_version(pool, &id, version)
+    let mut snapshot = pipelines::get_definition_version(pool, &id, version)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} version {version} not found")))?;
+    // BLD-19: a version snapshot can also predate the Gold-is-serving rule.
+    // Replaying `gold` verbatim would write a target no catalog or lineage
+    // query lists, so normalise it before the Bronze check and the write.
+    snapshot.target_zone = canonical_clickhouse_zone(&snapshot.target_zone).to_owned();
     // BLD-3 / D4: a stored snapshot can predate the Bronze-target refusal,
     // so a restore is refused on the same rule `update` and `create`
     // apply — replaying such a version would write the Bronze target
@@ -2553,7 +2609,7 @@ pub async fn restore_version(
     // BLD-1 part 1 / D13: the inputs and steps this version held. A snapshot
     // written before the shape existed is turned into it by D3's rule, so a
     // restore of an old version reproduces what that version's pipeline was.
-    let (restored_inputs, restored_steps) = pipelines::snapshot_definition(&snapshot);
+    let (restored_inputs, restored_steps) = canonical_snapshot_definition(&snapshot);
     let first = first_of(&restored_inputs)?;
     // DATA-19 / D2 + BLD-4 / D2: the snapshot is replayed whole, so its
     // `depends_on` is checked against its own source zone on every restore
@@ -4058,6 +4114,76 @@ mod tests {
         );
     }
 
+    /// BLD-19: Gold is `serving` in the catalog and in lineage; a legacy
+    /// `gold` spelling is the same zone, never a database of its own.
+    /// `bronze` is NOT normalised — it is the one target the refusal above
+    /// owns, and folding it into another zone would hide the refusal.
+    #[test]
+    fn canonical_clickhouse_zone_maps_only_gold_to_serving() {
+        assert_eq!(super::canonical_clickhouse_zone("gold"), "serving");
+        assert_eq!(super::canonical_clickhouse_zone("serving"), "serving");
+        assert_eq!(super::canonical_clickhouse_zone("silver"), "silver");
+        assert_eq!(super::canonical_clickhouse_zone("bronze"), "bronze");
+        assert_eq!(super::canonical_clickhouse_zone("lake"), "lake");
+    }
+
+    /// BLD-19: both body forms normalise their input zones, so the
+    /// definition the store saves (and the compiler reads) never carries
+    /// an orphan `gold.foo` reference.
+    #[test]
+    fn definition_form_normalizes_legacy_gold_input_zones() {
+        let inputs = vec![lakehouse_store::pipelines::PipelineInput {
+            name: "orders".to_owned(),
+            zone: "gold".to_owned(),
+            table: "orders".to_owned(),
+        }];
+        let form = definition_form(Some(inputs), None, None, None, None)
+            .expect("the new body form with an input");
+        assert_eq!(form.inputs[0].zone, "serving");
+
+        let legacy = definition_form(
+            None,
+            None,
+            Some("gold"),
+            Some("orders"),
+            Some(&["dedupe(id)".to_owned()]),
+        )
+        .expect("the legacy body form with a source zone");
+        assert_eq!(legacy.inputs[0].zone, "serving");
+    }
+
+    /// BLD-19: the legacy-form-over-stored path rebuilds the input from the
+    /// raw body source zone, so it needs its own normalisation — otherwise an
+    /// edit that spells Gold `gold` would store an orphan `gold` input even
+    /// though `definition_form` rejected that spelling.
+    #[test]
+    fn legacy_form_over_stored_normalizes_a_legacy_gold_source_zone() {
+        use lakehouse_store::pipelines::PipelineStep;
+
+        let stored = lakehouse_store::pipelines::AuthoredDefinition {
+            inputs: vec![lakehouse_store::pipelines::PipelineInput {
+                name: "orders".to_owned(),
+                zone: "silver".to_owned(),
+                table: "orders".to_owned(),
+            }],
+            steps: Vec::<PipelineStep>::new(),
+            source_zone: "silver".to_owned(),
+            source_table: "orders".to_owned(),
+            incremental_column: None,
+            transforms: Vec::new(),
+            fbic_enabled: false,
+            target_zone: "serving".to_owned(),
+            target_table: "out".to_owned(),
+            connector_id: None,
+            max_retries: 2,
+        };
+        let form = definition_form(None, None, Some("gold"), Some("orders"), None)
+            .expect("a legacy body form");
+        let over = legacy_form_over_stored(&form, &stored, Some("gold"), Some("orders"))
+            .expect("the legacy form can edit a legacy stored definition");
+        assert_eq!(over.inputs[0].zone, "serving");
+    }
+
     /// DATA-19 / D2: the pure rule behind the `file_ingest_job` refusal,
     /// and the wording every refusal carries. Three facts, all of them
     /// load-bearing:
@@ -4390,6 +4516,63 @@ mod tests {
                 versions.0, 1,
                 "the refused restore must not have written a `restored` version row"
             );
+        }
+
+        /// BLD-19: a legacy `gold` target is not a writable zone of its
+        /// own — the API saves it as `serving`, so the orchestrator never
+        /// creates an orphan `gold` `ClickHouse` database. Both the route's
+        /// answer and the stored row (what Dagster reads) are checked.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn update_rewrites_a_legacy_gold_target_to_serving(pool: sqlx::PgPool) {
+            let created = pipelines::create_pipeline(
+                &pool,
+                &pipeline_input("pl-gold-update", "silver"),
+                None,
+            )
+            .await
+            .expect("seed the row the update rewrites");
+            let body = Bytes::from_static(
+                br#"{"kind":"batch","sourceZone":"silver","sourceTable":"s","targetZone":"gold","targetTable":"t","schedule":"manual","transforms":[]}"#,
+            );
+            let ApiJson(updated) = update(
+                State(state_for(&pool)),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
+                Path(created.id.clone()),
+                body,
+            )
+            .await
+            .expect("a legacy gold target must be accepted as serving");
+            assert_eq!(updated["target"], "serving.t", "the route's answer");
+            let stored = pipelines::get_pipeline(&pool, &created.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row still exists");
+            assert_eq!(stored.target, "serving.t", "the value Dagster will read");
+        }
+
+        /// BLD-19: a stored version predating the Gold-is-serving rule is
+        /// replayed as `serving`, not as an orphan `gold.<table>`.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn restore_rewrites_a_legacy_gold_target_to_serving(pool: sqlx::PgPool) {
+            let created =
+                pipelines::create_pipeline(&pool, &pipeline_input("pl-gold-restore", "gold"), None)
+                    .await
+                    .expect("seed the pre-rule row the restore replays");
+            let ApiJson(restored) = restore_version(
+                State(state_for(&pool)),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
+                Path((created.id.clone(), 1)),
+            )
+            .await
+            .expect("a stored gold target must restore as serving");
+            assert_eq!(restored["target"], "serving.t");
+            let stored = pipelines::get_pipeline(&pool, &created.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row still exists");
+            assert_eq!(stored.target, "serving.t");
         }
     }
 
