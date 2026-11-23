@@ -32,6 +32,12 @@ export type DashboardLook = {
   dark: boolean
   /** Classes for the dashboard container. */
   className: string
+  /**
+   * Theme class a pop-up portalled out of this surface must copy (`WEB-10`).
+   * Only a surface fixed to light has one; every other surface inherits the
+   * console's theme, which is also where its portal lands.
+   */
+  surfaceThemeClass: string | undefined
   /** Inline style for the container: the font. */
   style: React.CSSProperties | undefined
 }
@@ -57,5 +63,8 @@ export function dashboardLook(
   const className = theme === "dark" ? `dark ${scope}` : theme === "light" ? `theme-light ${scope}` : ""
   const font = board?.font
   const family = font && FONT_FAMILIES[font] && (!allowedFonts || allowedFonts.includes(font)) ? FONT_FAMILIES[font] : undefined
-  return { dark, className, style: family ? { fontFamily: family } : undefined }
+  // WEB-10: the light class is the one CSS token definition; a portal outside
+  // this subtree only sees it if the popup itself carries it.
+  const surfaceThemeClass = theme === "light" ? "theme-light" : undefined
+  return { dark, className, surfaceThemeClass, style: family ? { fontFamily: family } : undefined }
 }
