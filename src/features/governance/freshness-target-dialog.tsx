@@ -85,7 +85,9 @@ export function FreshnessTargetDialog({
   async function removeTarget() {
     // `run` resolves to `null` only on failure.
     if ((await remove.run(tableName)) === null) {
-      notifyError("Failed to remove the freshness target", remove.error)
+      // WEB-6: `remove.error` in this closure is stale (null on the first
+      // failure); `getError()` is the error of the invocation just awaited.
+      notifyError("Failed to remove the freshness target", remove.getError())
       return
     }
     notifySuccess("Freshness target removed")
