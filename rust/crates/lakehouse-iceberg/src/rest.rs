@@ -30,8 +30,12 @@
 //! deferred to a later task.
 
 use std::collections::HashMap;
+use std::future::Future;
 
-use iceberg::spec::Summary;
+use iceberg::spec::{
+    DataContentType, ManifestContentType, ManifestEntry, ManifestEntryRef, ManifestFile, Summary,
+};
+use iceberg::table::Table;
 use iceberg::{ErrorKind, NamespaceIdent, TableIdent};
 use thiserror::Error;
 
@@ -175,6 +179,116 @@ fn author_of(summary: &Summary) -> Option<String> {
 
 fn parse_u64(summary: &Summary, key: &str) -> Option<u64> {
     summary.additional_properties.get(key)?.parse().ok()
+}
+
+/// A live data file smaller than this is counted as a "small file" (OPS-21).
+///
+/// The number is a READ threshold, not a target: 32 MiB is deliberately
+/// well below Trino's default `EXECUTE optimize` target file size (128 MiB),
+/// so a file counted here is one a compaction pass would clearly merge. No
+/// in-repo writer defines a target file size (`git grep target_file_size`
+/// found none), so this value is owned here rather than guessed from a
+/// writer's config. The companion count that decides whether to WARN lives
+/// in `lakehouse-api::routes::lakehouse` (`NEEDS_COMPACTION_FILE_COUNT`),
+/// tied to the G3 measurement of 20 small files/partition (ADR 0009).
+pub const SMALL_FILE_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Counts live data files below `threshold_bytes` from manifest entries.
+///
+/// A manifest keeps rows with status `DELETED` as tombstones and can also
+/// track delete files; neither is a data file still present in the table, so
+/// both are excluded. The comparison is strict (`<`): a file exactly at the
+/// threshold is not below it. Pure over `entries` so the rule is testable
+/// without an object store.
+pub fn count_small_files_in_entries<'a>(
+    entries: impl Iterator<Item = &'a ManifestEntry>,
+    threshold_bytes: u64,
+) -> u64 {
+    entries
+        .filter(|entry| {
+            entry.is_alive()
+                && entry.content_type() == DataContentType::Data
+                && entry.file_size_in_bytes() < threshold_bytes
+        })
+        .fold(0_u64, |n, _| n + 1)
+}
+
+/// Counts small files across a snapshot's manifests through an injected
+/// reader. `None` means a manifest could not be read or parsed — the caller
+/// must emit `null`, never a `0` that would read as a successful measurement.
+/// Injecting the reader makes that failure path testable without S3.
+pub(crate) async fn count_small_files_from_manifests<T, F, Fut>(
+    manifest_files: &[T],
+    threshold_bytes: u64,
+    mut read: F,
+) -> Option<u64>
+where
+    F: FnMut(&T) -> Fut,
+    Fut: Future<Output = Option<Vec<ManifestEntryRef>>>,
+{
+    let mut count = 0_u64;
+    for manifest_file in manifest_files {
+        let entries = read(manifest_file).await?;
+        count += count_small_files_in_entries(
+            entries.iter().map(std::ops::Deref::deref),
+            threshold_bytes,
+        );
+    }
+    Some(count)
+}
+
+/// Measures the current snapshot's small files from its manifest list and
+/// manifests. `Some(0)` for a table with no current snapshot (there are no
+/// files to count); `None` when the manifest list or any manifest could not
+/// be read — metadata from the catalog alone cannot answer this question.
+async fn small_file_count_in_current_snapshot(table: &Table, threshold_bytes: u64) -> Option<u64> {
+    let Some(snapshot) = table.metadata().current_snapshot() else {
+        return Some(0);
+    };
+    // A snapshot with no manifest list is not an empty snapshot — it is one
+    // whose file list this client cannot read, so it stays unmeasured.
+    if snapshot.manifest_list().is_empty() {
+        return None;
+    }
+    let manifest_list = table.manifest_list_reader(snapshot).load().await.ok()?;
+    let files: Vec<ManifestFile> = manifest_list
+        .entries()
+        .iter()
+        .filter(|f| f.content == ManifestContentType::Data)
+        .cloned()
+        .collect();
+    count_small_files_from_manifests(&files, threshold_bytes, |manifest_file| {
+        let file_io = table.file_io().clone();
+        let manifest_file = manifest_file.clone();
+        async move {
+            manifest_file
+                .load_manifest(&file_io)
+                .await
+                .ok()
+                .map(|m| m.entries().to_vec())
+        }
+    })
+    .await
+}
+
+/// Measures one table's small-file count through the catalog's own client
+/// (vended credentials, same as every other read here). Manifest failures
+/// are reported as `None`, not as errors: the table detail still loads.
+///
+/// # Errors
+/// Returns [`RestError::NotFound`] / [`RestError::Catalog`] only for the
+/// catalog `load_table` call. Manifest reads degrade to `None`.
+pub async fn load_small_file_count(
+    client: &IcebergClient,
+    ident: &TableIdent,
+    threshold_bytes: u64,
+) -> Result<Option<u64>, RestError> {
+    let table = client
+        .as_catalog()
+        .load_table(ident)
+        .await
+        .map_err(|err| map_catalog_error(err, ErrorKind::TableNotFound))?;
+    Ok(small_file_count_in_current_snapshot(&table, threshold_bytes).await)
 }
 
 /// One table row for a namespace listing.
@@ -336,22 +450,17 @@ pub struct TableDetail {
     pub metadata_log_count: usize,
     /// Totals from the current snapshot's summary.
     pub stats: TableStats,
+    /// Measured count of live data files below [`SMALL_FILE_THRESHOLD_BYTES`]
+    /// in the current snapshot's manifests. `Some(0)` for a table with no
+    /// snapshot; `None` when the manifests could not be read (OPS-21) —
+    /// never a fabricated zero.
+    pub small_file_count: Option<u64>,
 }
 
-/// Loads full detail for one table.
-///
-/// # Errors
-/// Returns [`RestError::NotFound`] if the table does not exist,
-/// [`RestError::Catalog`] for any other catalog failure.
-pub async fn load_table_detail(
-    client: &IcebergClient,
-    ident: &TableIdent,
-) -> Result<TableDetail, RestError> {
-    let table = client
-        .as_catalog()
-        .load_table(ident)
-        .await
-        .map_err(|err| map_catalog_error(err, ErrorKind::TableNotFound))?;
+/// Builds the detail body from an already-loaded table. Kept separate from
+/// the catalog call so the manifest-aware loader can reuse the exact same
+/// mapping with one `load_table` round trip.
+fn table_detail_from_table(table: &Table) -> TableDetail {
     let metadata = table.metadata();
     let current_schema_id = metadata.current_schema_id();
     let mut schema_versions: Vec<SchemaVersionDetail> = metadata
@@ -371,7 +480,7 @@ pub async fn load_table_detail(
         })
         .collect();
     schema_versions.sort_by_key(|v| v.schema_id);
-    Ok(TableDetail {
+    TableDetail {
         schema: field_details(metadata.current_schema()),
         partition_fields: metadata
             .default_partition_spec()
@@ -413,14 +522,57 @@ pub async fn load_table_detail(
             .current_snapshot()
             .map(|s| stats_from_summary(s.summary()))
             .unwrap_or_default(),
-    })
+        // Filled in by `load_table_detail_with_small_files`; the plain
+        // loader does not read manifests and reports it as unmeasured.
+        small_file_count: None,
+    }
+}
+
+/// Loads full detail for one table, without reading its manifests.
+///
+/// # Errors
+/// Returns [`RestError::NotFound`] if the table does not exist,
+/// [`RestError::Catalog`] for any other catalog failure.
+pub async fn load_table_detail(
+    client: &IcebergClient,
+    ident: &TableIdent,
+) -> Result<TableDetail, RestError> {
+    let table = client
+        .as_catalog()
+        .load_table(ident)
+        .await
+        .map_err(|err| map_catalog_error(err, ErrorKind::TableNotFound))?;
+    Ok(table_detail_from_table(&table))
+}
+
+/// Loads full detail AND measures the current snapshot's small files in the
+/// same catalog round trip. A manifest read failure leaves
+/// [`TableDetail::small_file_count`] as `None` (never a fabricated `0`) and
+/// does not fail the table detail itself.
+///
+/// # Errors
+/// Returns [`RestError::NotFound`] if the table does not exist,
+/// [`RestError::Catalog`] for any other catalog failure.
+pub async fn load_table_detail_with_small_files(
+    client: &IcebergClient,
+    ident: &TableIdent,
+    threshold_bytes: u64,
+) -> Result<TableDetail, RestError> {
+    let table = client
+        .as_catalog()
+        .load_table(ident)
+        .await
+        .map_err(|err| map_catalog_error(err, ErrorKind::TableNotFound))?;
+    let mut detail = table_detail_from_table(&table);
+    detail.small_file_count = small_file_count_in_current_snapshot(&table, threshold_bytes).await;
+    Ok(detail)
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use iceberg::spec::Operation;
+    use iceberg::spec::{ManifestStatus, Operation};
     use std::collections::HashMap;
 
     use super::*;
@@ -495,6 +647,105 @@ mod tests {
 
         let non_numeric = summary_with(&[("added-records", "not-a-number")]);
         assert_eq!(parse_u64(&non_numeric, "added-records"), None);
+    }
+
+    // ── OPS-21: measured small files from manifest entries ───────────────
+    //
+    // These exercise the exact counting rule the table-detail and the
+    // System-status warning read. Nothing here touches S3 or a catalog.
+
+    fn entry(status: ManifestStatus, content: DataContentType, size: u64) -> ManifestEntry {
+        let data_file = iceberg::spec::DataFileBuilder::default()
+            .content(content)
+            .file_path(format!("data/{size}.parquet"))
+            .file_format(iceberg::spec::DataFileFormat::Parquet)
+            .record_count(1)
+            .file_size_in_bytes(size)
+            .build()
+            .expect("a valid data file");
+        ManifestEntry {
+            status,
+            snapshot_id: None,
+            sequence_number: None,
+            file_sequence_number: None,
+            data_file,
+        }
+    }
+
+    #[test]
+    fn small_file_count_counts_only_live_data_files_below_the_threshold() {
+        let entries = [
+            entry(ManifestStatus::Added, DataContentType::Data, 1),
+            entry(
+                ManifestStatus::Existing,
+                DataContentType::Data,
+                SMALL_FILE_THRESHOLD_BYTES - 1,
+            ),
+        ];
+
+        assert_eq!(
+            count_small_files_in_entries(entries.iter(), SMALL_FILE_THRESHOLD_BYTES),
+            2
+        );
+    }
+
+    #[test]
+    fn small_file_count_ignores_deleted_files_delete_files_and_files_at_the_threshold() {
+        let entries = [
+            entry(ManifestStatus::Deleted, DataContentType::Data, 1),
+            entry(ManifestStatus::Added, DataContentType::PositionDeletes, 1),
+            entry(ManifestStatus::Added, DataContentType::EqualityDeletes, 1),
+            entry(
+                ManifestStatus::Existing,
+                DataContentType::Data,
+                SMALL_FILE_THRESHOLD_BYTES,
+            ),
+            entry(
+                ManifestStatus::Existing,
+                DataContentType::Data,
+                SMALL_FILE_THRESHOLD_BYTES + 1,
+            ),
+            entry(ManifestStatus::Added, DataContentType::Data, 1024),
+        ];
+
+        assert_eq!(
+            count_small_files_in_entries(entries.iter(), SMALL_FILE_THRESHOLD_BYTES),
+            1,
+            "exactly one live data file is below the threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_snapshot_counts_zero_small_files_without_reading_a_manifest() {
+        let no_manifests: [u8; 0] = [];
+        let count = count_small_files_from_manifests(
+            &no_manifests,
+            SMALL_FILE_THRESHOLD_BYTES,
+            |_| async {
+                // Never called: there are no manifests to read.
+                Some(Vec::new())
+            },
+        )
+        .await;
+
+        assert_eq!(count, Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_failed_manifest_read_is_none_never_a_fabricated_zero() {
+        let count = count_small_files_from_manifests(
+            &["missing.avro"],
+            SMALL_FILE_THRESHOLD_BYTES,
+            |_| async {
+                None // the object store could not read or parse the manifest
+            },
+        )
+        .await;
+
+        assert_eq!(
+            count, None,
+            "an unreadable manifest must not read as a measured zero"
+        );
     }
 
     mod wiremock_tests {
