@@ -1193,7 +1193,9 @@ fn legacy_form_over_stored(
 /// The first of a definition's inputs — the one a connector or a per-table
 /// upstream watches (D12). The compiler refuses a definition with none; this
 /// is the route's own guard for the same case before it reaches the compiler.
-fn first_of(
+/// BLD-13: `pub(crate)` so the `ready` transition reuses this exact guard on
+/// a stored definition rather than growing a second copy of it.
+pub(crate) fn first_of(
     inputs: &[lakehouse_store::pipelines::PipelineInput],
 ) -> Result<lakehouse_store::pipelines::PipelineInput, ApiRejection> {
     inputs.first().cloned().ok_or_else(|| {
