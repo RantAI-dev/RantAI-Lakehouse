@@ -278,7 +278,9 @@ jobs:
       - name: Check every compose image is pinned by digest (REL-2)
         run: python3 ops/lint/check_image_digests.py
 
-      # The unit tests of that check and of the gates' registry and result
+      # The unit tests of that check, of the REL-17 pin-resolution checker
+      # (its live registry calls belong to the scheduled image-pins workflow,
+      # not to this required PR check), and of the gates' registry and result
       # table module (no network, no containers; seconds).
       #
       # `ops/bench` too (DATA-24 T2): the catalog-search bench's own tests
