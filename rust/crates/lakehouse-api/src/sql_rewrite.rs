@@ -108,13 +108,17 @@ fn all_queries(stmt: &sqlparser::ast::Statement) -> Vec<Query> {
 ///
 /// A bare, unqualified table name is excluded here whenever it matches
 /// a CTE alias declared ANYWHERE in `sql` (not lexically scoped to the
-/// exact position) — safe because every table this module's caller
-/// ever governs is authored fully qualified (`policy_engine::
-/// PolicyCondition::table`, e.g. `"serving.mart_x"`), so a bare 1-part
-/// name can never collide with a governed table's canonical key
-/// regardless of CTE scoping precision; excluding it too eagerly only
-/// ever affects this function's own "is this a CTE" cosmetics, never
-/// which tables get substituted.
+/// exact position), compared AS WRITTEN — exact case, never case-folded.
+/// `ClickHouse` matches a `WITH` name by exact case (BLD-1 part 1 D6a /
+/// review R2-B1), so `WITH T AS (SELECT 1) SELECT * FROM t` reads a REAL
+/// table `t` in the connection's database, not the CTE. Folding both
+/// sides (the old behaviour, SEC-73) silently dropped that `t` from this
+/// result — and therefore from the tenant gate, which reads this same
+/// collector through [`gate_targets`]. Governing policy keys are authored
+/// fully qualified (`policy_engine::PolicyCondition::table`, e.g.
+/// `"serving.mart_x"`), so a bare 1-part name is never a governed key
+/// itself; it must nonetheless reach the gate, which is why the
+/// comparison here is exact.
 pub fn referenced_tables(sql: &str, dialect: &dyn Dialect) -> Option<Vec<String>> {
     let statements = Parser::parse_sql(dialect, sql).ok()?;
     Some(referenced_tables_of(&statements).into_iter().collect())
@@ -128,11 +132,17 @@ fn referenced_tables_of(statements: &[Statement]) -> HashSet<String> {
     for stmt in statements {
         queries.extend(all_queries(stmt));
     }
+    // SEC-73: keep the names AS WRITTEN. ClickHouse matches a `WITH` name
+    // by exact case, so a bare reference that differs only in case is a
+    // real table in the connection's database, not the CTE — it must not
+    // be dropped from the gate's targets or the rewrite's substitution
+    // set. `object_name_parts` lowercases for canonical table keys and is
+    // deliberately not used here.
     let ctes: HashSet<String> = queries
         .iter()
         .flat_map(|q| q.with.iter())
         .flat_map(|with| with.cte_tables.iter())
-        .map(|cte| cte.alias.name.value.to_ascii_lowercase())
+        .map(|cte| cte.alias.name.value.clone())
         .collect();
     let mut out = HashSet::new();
     for query in &queries {
@@ -518,10 +528,26 @@ fn top_level_table_with_joins(query: &Query) -> Vec<&sqlparser::ast::TableWithJo
     from_set_expr(&query.body)
 }
 
+/// The lone identifier of a single-part `ObjectName`, AS WRITTEN — exact
+/// case, no quote-style stripping beyond what `sqlparser` already does.
+/// `None` for a qualified name (which is never a CTE reference).
+///
+/// SEC-73: this is deliberately NOT [`object_name_parts`], which lowercases
+/// every part so canonical table keys (`"bronze.orders"`) bind on both
+/// `ClickHouse` and `Trino`. CTE names are different: `ClickHouse` matches
+/// them by exact case, so the CTE-exclusion check must use the raw spelling.
+fn single_part_as_written(name: &ObjectName) -> Option<&str> {
+    let [ObjectNamePart::Identifier(ident)] = name.0.as_slice() else {
+        return None;
+    };
+    Some(&ident.value)
+}
+
 /// Records `factor`'s own canonical table name into `out`, when it is
 /// an ordinary `TableFactor::Table` naming a real table (not a
 /// table-function call — `args.is_some()` — which WS7 item B5 classifies
-/// and refuses separately, and not a bare name matching a CTE alias).
+/// and refuses separately, and not a bare name matching a CTE alias
+/// exactly, case included — SEC-73).
 /// Does NOT recurse into `TableFactor::Derived`'s subquery or
 /// `TableFactor::NestedJoin`'s inner joins beyond one level of
 /// unwrapping — both are reachable through [`all_queries`]/this same
@@ -538,10 +564,15 @@ fn collect_table_factor_name(
             if args.is_some() {
                 return;
             }
-            let parts = object_name_parts(name);
-            if parts.len() == 1 && ctes.contains(&parts[0]) {
+            // SEC-73: compare the bare name AS WRITTEN against the CTE
+            // names (also collected as written). `object_name_parts`
+            // lowercases every part for canonical table keys — using it
+            // here used to make `WITH T AS (...) FROM t` look like a CTE
+            // reference when ClickHouse reads a real table `t`.
+            if single_part_as_written(name).is_some_and(|part| ctes.contains(part)) {
                 return; // a CTE reference, not a real table
             }
+            let parts = object_name_parts(name);
             out.insert(canonicalize(&parts));
         }
         TableFactor::NestedJoin {
@@ -690,6 +721,92 @@ mod table_resolution {
         assert_eq!(tables, vec!["silver.orders_enriched".to_owned()]);
     }
 
+    /// SEC-73: `ClickHouse` matches a `WITH` name by exact case (BLD-1 part 1
+    /// D6a / review R2-B1), so a bare reference that differs only in case
+    /// is a REAL table in the connection's database. It must be reported,
+    /// gated and rewritten rather than silently dropped as a CTE.
+    #[test]
+    fn a_bare_name_differing_from_a_cte_only_in_case_is_a_real_table() {
+        for dialect in [
+            &sqlparser::dialect::ClickHouseDialect {} as &dyn sqlparser::dialect::Dialect,
+            &sqlparser::dialect::GenericDialect {},
+            &super::TrinoDialect::default(),
+        ] {
+            // `t` is not `T`: a real table, not the CTE.
+            assert_eq!(
+                referenced_tables("WITH T AS (SELECT 1) SELECT * FROM t", dialect),
+                Some(vec!["t".to_owned()]),
+                "a differently-cased bare name must not be dropped"
+            );
+            // Same case in both places: still the CTE, still excluded.
+            assert_eq!(
+                referenced_tables("WITH T AS (SELECT 1) SELECT * FROM T", dialect),
+                Some(Vec::new())
+            );
+            assert_eq!(
+                referenced_tables("WITH t AS (SELECT 1) SELECT * FROM t", dialect),
+                Some(Vec::new())
+            );
+            // The ordinary, lower-case CTE over a real table is unchanged.
+            assert_eq!(
+                referenced_tables(
+                    "WITH recent AS (SELECT id FROM silver.orders_enriched) SELECT * FROM recent",
+                    dialect
+                ),
+                Some(vec!["silver.orders_enriched".to_owned()])
+            );
+        }
+    }
+
+    /// SEC-73: the exact-case check uses the name AS WRITTEN, including
+    /// quoting, and only ever applies to a single-part (unqualified) name.
+    #[test]
+    fn cte_matching_is_exact_case_for_quoted_names_and_not_for_qualified_names() {
+        let dialect = ClickHouseDialect {};
+        // A quoted `T` is still the exact name "T" to ClickHouse, so `t`
+        // is a different, real table.
+        assert_eq!(
+            referenced_tables("WITH `T` AS (SELECT 1) SELECT * FROM t", &dialect),
+            Some(vec!["t".to_owned()])
+        );
+        // `` `T` `` matches the CTE's own exact-case name.
+        assert_eq!(
+            referenced_tables("WITH `T` AS (SELECT 1) SELECT * FROM `T`", &dialect),
+            Some(Vec::new())
+        );
+        // A qualified name is never a CTE reference, whatever its case.
+        assert_eq!(
+            referenced_tables("WITH T AS (SELECT 1) SELECT * FROM x.t", &dialect),
+            Some(vec!["x.t".to_owned()])
+        );
+        // Canonical table keys stay lower-cased; only the CTE-exclusion
+        // comparison uses the raw spelling.
+        assert_eq!(
+            referenced_tables("WITH t AS (SELECT 1) SELECT * FROM x.T", &dialect),
+            Some(vec!["x.t".to_owned()])
+        );
+    }
+
+    /// SEC-73: a differently-cased reference is a real table at any depth —
+    /// a derived table, a CTE body, a nested CTE's body, or a `UNION` branch.
+    #[test]
+    fn a_mixed_case_cte_does_not_hide_a_real_table_at_any_depth() {
+        let dialect = ClickHouseDialect {};
+        for sql in [
+            "WITH T AS (SELECT 1) SELECT * FROM (SELECT * FROM t) s",
+            "WITH T AS (SELECT 1), U AS (SELECT * FROM t) SELECT * FROM T",
+            "WITH T AS (WITH U AS (SELECT 1) SELECT * FROM t) SELECT * FROM T",
+            "WITH T AS (SELECT 1) SELECT * FROM t UNION ALL SELECT * FROM T",
+            "WITH T AS (SELECT 1) SELECT (SELECT max(id) FROM t) AS m FROM T",
+        ] {
+            assert_eq!(
+                referenced_tables(sql, &dialect),
+                Some(vec!["t".to_owned()]),
+                "sql={sql}"
+            );
+        }
+    }
+
     #[test]
     fn finds_tables_inside_from_where_and_select_subqueries() {
         let sql = "SELECT (SELECT max(id) FROM silver.a) AS m FROM silver.b \
@@ -825,6 +942,28 @@ mod gate_targets {
                     "WITH orders AS (SELECT 1) SELECT * FROM orders",
                     dialect.as_ref()
                 ),
+                Some(GateTargets::Tables(vec![]))
+            );
+        }
+    }
+
+    /// SEC-73: the gate shares the collector, so a bare name that differs
+    /// from a `WITH` name only in case is still a gate target — otherwise a
+    /// restricted principal could read `t` in the connection's database
+    /// with no gate and no mask.
+    #[test]
+    fn a_mixed_case_cte_does_not_hide_a_bare_table_from_the_gate() {
+        for dialect in dialects() {
+            assert_eq!(
+                super::gate_targets("WITH T AS (SELECT 1) SELECT * FROM t", dialect.as_ref()),
+                Some(GateTargets::Tables(vec!["t".to_owned()]))
+            );
+            assert_eq!(
+                super::gate_targets("WITH T AS (SELECT 1) SELECT * FROM T", dialect.as_ref()),
+                Some(GateTargets::Tables(vec![]))
+            );
+            assert_eq!(
+                super::gate_targets("WITH t AS (SELECT 1) SELECT * FROM t", dialect.as_ref()),
                 Some(GateTargets::Tables(vec![]))
             );
         }
@@ -1412,9 +1551,9 @@ pub const ALLOWED_ROW_FILTER_FORMS: &[&str] =
 /// `SELECT`-list subquery — whose canonicalized name has an entry in
 /// `obligations`, replaces that node with a derived table masking/
 /// filtering it. A canonicalized name absent from `obligations`
-/// (including a CTE's own alias, never looked up — see
-/// [`referenced_tables`]'s own doc comment for why that is safe) is
-/// left completely untouched.
+/// (including a CTE's own alias, matched by exact case and so never
+/// looked up — see [`referenced_tables`]'s own doc comment, SEC-73, for
+/// why that is safe) is left completely untouched.
 ///
 /// `engine` says which engine's SQL the derived table is written in
 /// (`DATA-21` D1): the same obligations, the engine's own identifiers
@@ -1557,11 +1696,12 @@ fn substitute_in_query(
 ) -> Result<(), RewriteError> {
     if let Some(with) = &mut query.with {
         for cte in &mut with.cte_tables {
-            // Substituted inside the CTE's own body — a later
-            // reference to the CTE's name never looks up `obligations`
-            // at all (bare names never match a dotted governed-table
-            // key; see `referenced_tables`'s own doc comment), so no
-            // separate CTE-name bookkeeping is needed here either.
+            // Substituted inside the CTE's own body — a later reference
+            // to the CTE's own exact-case name never looks up
+            // `obligations` at all (bare names never match a dotted
+            // governed-table key; see `referenced_tables`'s doc comment,
+            // SEC-73), so no separate CTE-name bookkeeping is needed
+            // here either.
             substitute_in_query(
                 &mut cte.query,
                 dialect,
