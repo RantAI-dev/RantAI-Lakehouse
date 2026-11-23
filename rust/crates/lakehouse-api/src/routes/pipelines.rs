@@ -3229,6 +3229,11 @@ pub async fn create(
     // `create_pipeline` tool lands here too, so it is refused with the
     // same wording its schema enum no longer offers.
     crate::routes::authored_pipelines::validate_target_zone(&body.target_zone)?;
+    // BLD-21: the output table is held to the same name rule the compiler
+    // applies to inputs and steps, before the store is touched. The
+    // assistant's `create_pipeline` tool lands here too, so it gets the
+    // same 400 and the same message as a console save.
+    crate::routes::authored_pipelines::validate_target_table(&body.target_table)?;
     // BLD-1 part 1 / D3: whichever of the two body forms this is, one
     // function turns it into D1's shape. A body that sends both is refused
     // here, before anything else reads them.
@@ -3415,8 +3420,14 @@ pub struct GeneratePipelineBody {
 /// words, non-alnum stripped, lowercased) — used both as the final
 /// fallback when the LLM is unavailable/returns nothing usable, and to
 /// sanitize whatever name the LLM does propose.
+///
+/// BLD-21: the fallback `target_table` is `<name>_out`, so the derived name
+/// must itself satisfy `crate::pipeline_compile::valid_name` with room for
+/// that suffix. A prompt beginning with a digit or made of four long words
+/// would otherwise author a pipeline the engine refuses on its next run —
+/// a valid prompt must still produce a saveable pipeline.
 fn derive_pipeline_name(text: &str) -> String {
-    let name: String = text
+    let mut name: String = text
         .split_whitespace()
         .take(4)
         .collect::<Vec<_>>()
@@ -3426,9 +3437,23 @@ fn derive_pipeline_name(text: &str) -> String {
         .collect::<String>()
         .to_lowercase();
     if name.is_empty() {
-        "agentic_pipeline".to_owned()
-    } else {
+        return "agentic_pipeline".to_owned();
+    }
+    // Strip the reserved `__` prefix and a leading digit, then leave room
+    // for `_out` within `MAX_NAME_CHARS`. The guard below is the defence in
+    // depth: an unexpected shape falls back to a name known to be valid.
+    name = name.trim_start_matches("__").to_owned();
+    if name.starts_with(|c: char| c.is_ascii_digit()) {
+        name.insert(0, 'p');
+    }
+    let name: String = name
+        .chars()
+        .take(crate::pipeline_compile::MAX_NAME_CHARS - 4)
+        .collect();
+    if crate::pipeline_compile::valid_name(&name) {
         name
+    } else {
+        "agentic_pipeline".to_owned()
     }
 }
 
@@ -3495,6 +3520,11 @@ pub async fn generate(
         .as_ref()
         .and_then(|d| d.target_table.clone())
         .unwrap_or_else(|| format!("{fallback_name}_out"));
+    // BLD-21: a model may propose any string for `targetTable`, so the same
+    // guard a person's save goes through runs here too. The derived
+    // fallback is already a valid name (see `derive_pipeline_name`), so a
+    // valid prompt is never refused for a name this route made up.
+    crate::routes::authored_pipelines::validate_target_table(&target_table)?;
     let schedule = draft
         .as_ref()
         .and_then(|d| d.schedule.clone())
@@ -5056,6 +5086,84 @@ mod tests {
             err.0.to_string(),
             crate::routes::authored_pipelines::BRONZE_TARGET_REFUSED
         );
+    }
+
+    /// BLD-21: `POST /api/pipelines` refuses an output table name the
+    /// compiler would refuse on an input or a step, with the shared message.
+    /// `state_without_pool()` proves the guard runs before any store,
+    /// orchestrator or tenant lookup decides anything. The assistant's
+    /// `create_pipeline` tool calls this same handler, so it is refused too.
+    #[tokio::test]
+    async fn create_with_an_invalid_target_table_is_refused_before_the_store() {
+        let body = Bytes::from_static(
+            br#"{"name":"pl-bad-target-table","kind":"batch","sourceZone":"silver","sourceTable":"s","targetZone":"gold","targetTable":"a; DROP TABLE b","schedule":"manual","transforms":[]}"#,
+        );
+        let err = create(
+            State(state_without_pool()),
+            Extension(fixture_user_principal()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect_err("an invalid target table must be refused");
+        assert_eq!(err.0.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.0.to_string(),
+            crate::routes::authored_pipelines::TARGET_TABLE_REFUSED
+        );
+    }
+
+    /// BLD-21 positive control: a valid `targetTable` passes the new guard
+    /// and reaches the store, which without a pool answers 503. Without this
+    /// test a guard that refused every name would still make the negative
+    /// test green. The closed local port keeps the unit test off any real
+    /// `Dagster` host.
+    #[tokio::test]
+    async fn create_with_a_valid_target_table_passes_the_guard_and_reaches_the_store() {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+        env.insert(
+            "DAGSTER_URL".to_owned(),
+            "http://127.0.0.1:1/graphql".to_owned(),
+        );
+        let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        let body = Bytes::from_static(
+            br#"{"name":"pl-good-target-table","kind":"batch","sourceZone":"silver","sourceTable":"s","targetZone":"gold","targetTable":"orders_clean","schedule":"manual","transforms":[]}"#,
+        );
+        let err = create(
+            State(state),
+            Extension(fixture_user_principal()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect_err("no pool configured: the store answers 503");
+        assert_eq!(err.0.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// BLD-21: `generate` derives its fallback target table from this name,
+    /// so a leading digit, a reserved `__` prefix, four very long words or
+    /// an empty result must all still yield a name the compiler accepts —
+    /// with room for the `_out` suffix.
+    #[test]
+    fn derive_pipeline_name_always_yields_a_name_the_compiler_accepts() {
+        for text in [
+            "2026 sales report build",
+            "a_very_long_word another_very_long_word third_very_long_word fourth_very_long_word",
+            "__internal secret data",
+            "!!!",
+            "orders by country",
+        ] {
+            let name = derive_pipeline_name(text);
+            assert!(
+                crate::pipeline_compile::valid_name(&name),
+                "{text:?} derived {name:?}, which the compiler would refuse"
+            );
+            assert!(
+                crate::pipeline_compile::valid_name(&format!("{name}_out")),
+                "{text:?} derived a fallback target table {name:?}_out that is too long"
+            );
+        }
     }
 
     /// WS5 item D4, failing-test-first: `pipeline_audit_event` did not

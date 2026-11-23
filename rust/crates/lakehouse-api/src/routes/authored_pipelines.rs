@@ -45,18 +45,24 @@
 //! traceback). It is logged and never returned; the response says only
 //! whether the orchestrator picked the change up (AGENTS.md principle 4).
 
-//! # The two rules every write here is refused by (DATA-19, BLD-4)
+//! # The rules every write is refused by (DATA-19, BLD-4, BLD-21)
 //!
-//! `validate_target_zone` and [`validate_per_table_upstream`] are the
-//! two rules a write is checked against before anything is stored, and
-//! both run from the same three call sites (create, update, restore) so
-//! the message a reader gets is the same whichever route they used. The
-//! first refuses a `bronze` TARGET: Bronze is written by ingestion and by
-//! nothing else. The second refuses a per-table upstream — `file_ingest_job`
-//! (DATA-19) or `ingest_job` (BLD-4) — on a source that is not `bronze`,
-//! because each of those jobs loads one Bronze table per chain trigger and
-//! the sensor behind the chain counts only the runs that loaded the
-//! pipeline's own table — so the chain would be wired and would never fire.
+//! `validate_target_zone`, [`validate_target_table`] and
+//! [`validate_per_table_upstream`] are the rules a write is checked against
+//! before anything is stored. Each has one message, so a reader gets the
+//! same sentence whichever route they used. The name rule (BLD-21) runs on
+//! all four save routes: create, generate, update and restore. The zone rule
+//! and the per-table upstream rule keep their three call sites (create,
+//! update and restore). The zone rule refuses a `bronze` TARGET: Bronze is
+//! written by ingestion and by nothing else. The name rule applies
+//! `crate::pipeline_compile::valid_name` — the compiler's rule for inputs
+//! and steps — to the output table: a rule that holds on one field and not
+//! another would let a pipeline save cleanly and fail on its next run. The
+//! upstream rule refuses a per-table upstream — `file_ingest_job` (DATA-19)
+//! or `ingest_job` (BLD-4) — on a source that is not `bronze`, because each
+//! of those jobs loads one Bronze table per chain trigger and the sensor
+//! behind the chain counts only the runs that loaded the pipeline's own
+//! table — so the chain would be wired and would never fire.
 
 use axum::Extension;
 use axum::body::Bytes;
@@ -475,6 +481,37 @@ pub const BRONZE_TARGET_REFUSED: &str =
 pub fn validate_target_zone(target_zone: &str) -> Result<(), ApiRejection> {
     if target_zone == "bronze" {
         return Err(ApiError::BadRequest(BRONZE_TARGET_REFUSED.to_owned()).into());
+    }
+    Ok(())
+}
+
+/// BLD-21: the one refusal an invalid output table name gets on every
+/// pipeline save (create, generate, update and restore).
+///
+/// One constant for all four routes, so the same bad name yields the same
+/// sentence wherever it was submitted. The message names the rule, not the
+/// value: a caller-controlled table name never reaches a response
+/// (AGENTS.md principle 4).
+pub const TARGET_TABLE_REFUSED: &str = "a target table must be letters, digits and underscores (not starting with a digit or __), \
+     at most 48 characters";
+
+/// Whether `target_table` is a name the engine and the catalog will accept
+/// (BLD-21).
+///
+/// Delegates to `crate::pipeline_compile::valid_name` — the same D2 rule the
+/// compiler applies to an input's or a step's name — rather than
+/// paraphrasing it, so a name cannot be accepted on the output of a pipeline
+/// and refused on its inputs. The console checks this field too; the API is
+/// the authority that refuses it at save time, before the run can.
+///
+/// # Errors
+///
+/// [`ApiRejection`] (the route maps it to 400) carrying
+/// [`TARGET_TABLE_REFUSED`] verbatim when
+/// `crate::pipeline_compile::valid_name` refuses `target_table`.
+pub fn validate_target_table(target_table: &str) -> Result<(), ApiRejection> {
+    if !crate::pipeline_compile::valid_name(target_table) {
+        return Err(ApiError::BadRequest(TARGET_TABLE_REFUSED.to_owned()).into());
     }
     Ok(())
 }
@@ -2295,6 +2332,11 @@ pub async fn update(
     // (PR #59 review) moved them into the shared `validate_pipeline_input`
     // that this route and `restore_version` both call below.
     validate_target_zone(&body.target_zone)?;
+    // BLD-21: the output table is held to the same name rule the compiler
+    // applies to inputs and steps, here before any store or orchestrator
+    // call. It sits beside the zone guard so all four save routes answer
+    // the same bad name with the same sentence.
+    validate_target_table(&body.target_table)?;
     // BLD-1 part 1 / D3: one function turns either body form into D1's shape.
     let mut form = definition_form(
         body.inputs.clone(),
@@ -2527,6 +2569,48 @@ pub async fn delete(
 /// definition-mutating route, because the rebuilt job may differ
 /// from the one currently running.
 ///
+/// F2.8 (PR #59 review), restore side: the tenant-scoped validation walk
+/// `update` also runs — Dagster's job names best effort (an unreachable
+/// orchestrator narrows `depends_on` to authored ids only), the caller's
+/// scope, the other authored chains, then the shared `validate_pipeline_input`
+/// over the snapshot's transforms, `max_retries` and `depends_on`. A
+/// cross-tenant `pl-` id reads as "unknown" (F2.2).
+///
+/// # Errors
+///
+/// [`ApiRejection`] (400) from the shared validator, and whatever the
+/// Dagster list or the chain query surface — both classified by their
+/// own layers first.
+async fn validate_snapshot_pipeline_input(
+    state: &AppState,
+    pool: &PgPool,
+    principal: &Principal,
+    headers: &HeaderMap,
+    id: &str,
+    transforms: &[String],
+    max_retries: i16,
+    depends_on: &[String],
+) -> Result<(), ApiRejection> {
+    let dagster_jobs = match state.dagster.list_jobs().await {
+        Ok(j) => j,
+        Err(err) => {
+            tracing::warn!(%err, "restore_version: dagster unreachable, depends_on accepts authored upstreams only");
+            Vec::new()
+        }
+    };
+    let scope = crate::routes::authored_pipelines::resolve_caller_scope(principal, headers)?;
+    let others_rows = collect_authored_depends_on_with_tenants(pool, Some(id)).await?;
+    let others = in_scope_depends_on_rows(&others_rows, scope);
+    validate_pipeline_input(
+        id,
+        transforms,
+        Some(max_retries),
+        Some(depends_on),
+        &others,
+        &dagster_jobs,
+    )
+}
+
 /// # Errors
 ///
 /// 404 for a non-`pl-` id or for an unknown `(id, version)` pair;
@@ -2562,6 +2646,10 @@ pub async fn restore_version(
     // the shared `validate_pipeline_input` this route calls below,
     // which also takes the tenant-scoped `others`.
     validate_target_zone(&snapshot.target_zone)?;
+    // BLD-21: a stored snapshot can predate this rule too, so a restore is
+    // held to the same output-name check as create, generate and update.
+    // Refuse replaying a name the engine would refuse on the next run.
+    validate_target_table(&snapshot.target_table)?;
     // BLD-1 part 1 / D13: the inputs and steps this version held. A snapshot
     // written before the shape existed is turned into it by D3's rule, so a
     // restore of an old version reproduces what that version's pipeline was.
@@ -2579,34 +2667,33 @@ pub async fn restore_version(
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
     // PR review (BLD-7, SHOULD-FIX 1): a restore keeps the row's current
     // connector (`ConnectorChange::Keep` below) but replays the snapshot's
-    // source, which may predate the connector. Hold it to the same rule.
-    if let Some(kept) = current.connector_id.as_deref() {
-        if restored_inputs.len() != 1 {
-            return Err(ApiError::BadRequest(
-                "a pipeline with a connector has exactly one input".to_owned(),
-            )
-            .into());
-        }
-        validate_connector_source(pool, kept, &first.zone, &first.table).await?;
-    }
-    let dagster_jobs = match state.dagster.list_jobs().await {
-        Ok(j) => j,
-        Err(err) => {
-            tracing::warn!(%err, "restore_version: dagster unreachable, depends_on accepts authored upstreams only");
-            Vec::new()
-        }
-    };
-    let scope = crate::routes::authored_pipelines::resolve_caller_scope(&principal, &headers)?;
-    let others_rows = collect_authored_depends_on_with_tenants(pool, Some(&id)).await?;
-    let others = in_scope_depends_on_rows(&others_rows, scope);
-    validate_pipeline_input(
+    // source, which may predate the connector — the same rule, through the
+    // same helper `create` and `update` use. `Keep` never re-checks the
+    // tenant: it was checked when the connector was set.
+    check_connector_for_definition(
+        pool,
+        &ConnectorChange::Keep,
+        current.connector_id.as_deref(),
+        current.tenant_id,
+        &restored_inputs,
+    )
+    .await?;
+    // F2.8 (PR #59 review): the shared validator runs the transform grammar,
+    // the `max_retries` range, and the snapshot's dependency walk, scoped to
+    // the caller's tenant through [`validate_snapshot_pipeline_input`] — the
+    // restore side of the walk `update` runs, so a cross-tenant `pl-` id
+    // reads as "unknown" (F2.2).
+    validate_snapshot_pipeline_input(
+        &state,
+        pool,
+        &principal,
+        &headers,
         &id,
         &snapshot.transforms,
-        Some(snapshot.max_retries),
-        Some(&snapshot.depends_on),
-        &others,
-        &dagster_jobs,
-    )?;
+        snapshot.max_retries,
+        &snapshot.depends_on,
+    )
+    .await?;
     // BLD-1 part 1 / D10 (`SEC-71`): a version that reads differently from
     // the current definition, restored by someone other than the current
     // author, makes that person the author -- the same rule an edit follows.
@@ -4032,6 +4119,42 @@ mod tests {
         for zone in ["silver", "gold", "serving", "lake", "Bronze"] {
             validate_target_zone(zone).expect("a ClickHouse zone stays writable");
         }
+    }
+
+    /// BLD-21: the output table is held to the same name rule the compiler
+    /// applies to inputs and steps. The four valid cases include the exact
+    /// 48-character boundary; every refusal carries the one shared message,
+    /// whatever made the name invalid.
+    #[test]
+    fn validate_target_table_applies_the_compilers_name_rule_at_save_time() {
+        let at_limit = "a".repeat(crate::pipeline_compile::MAX_NAME_CHARS);
+        let over_limit = "a".repeat(crate::pipeline_compile::MAX_NAME_CHARS + 1);
+        for name in ["orders_clean", "sales_2026", "t", at_limit.as_str()] {
+            validate_target_table(name).unwrap_or_else(|_| panic!("{name} must be accepted"));
+        }
+        for name in [
+            "",
+            "has space",
+            "a; DROP TABLE b",
+            "db.tbl",
+            "__reserved",
+            "123abc",
+            "has-hyphen",
+            over_limit.as_str(),
+        ] {
+            assert_eq!(
+                validate_target_table(name)
+                    .expect_err("{name} must be refused")
+                    .0
+                    .to_string(),
+                TARGET_TABLE_REFUSED,
+                "name {name:?} must carry the shared refusal"
+            );
+        }
+        assert_eq!(
+            TARGET_TABLE_REFUSED,
+            "a target table must be letters, digits and underscores (not starting with a digit or __), at most 48 characters"
+        );
     }
 
     /// BLD-19: Gold is `serving` in the catalog and in lineage; a legacy
