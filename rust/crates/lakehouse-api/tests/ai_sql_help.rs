@@ -631,8 +631,14 @@ const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
 // sentences), placed at the end of the Ask suffix, and the Build prompt's
 // bytes are unchanged. (Before: `bdb95459...f810`.) The AI team reviews the
 // sentence (Assistant parity).
+//
+// Updated by hand for `BLD-19`: `create_pipeline`'s tool description now names
+// `serving` (the Gold database the catalog lists) instead of `gold` in its
+// source/target zone lines; the system prompt carries the tool list, so those
+// changed bytes move this pin. The offered-tool list above is untouched — no
+// tool was added or removed. (Before: `f77c95e5...e1ed`.)
 const SYSTEM_SHA256_WITHOUT_ALLOWLIST: &str =
-    "f77c95e5d54877e61a80a4ef1dee442a31e92a5ecda832d3f803148f762ae1ed";
+    "9b30b77a862c97ecd8d4af3b409850e1731ca2802097cdeebfc7b42967ab805a";
 
 fn sha256_hex(text: &str) -> String {
     use std::fmt::Write as _;
