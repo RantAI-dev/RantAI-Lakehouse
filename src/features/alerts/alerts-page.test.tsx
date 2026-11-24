@@ -1,3 +1,4 @@
+import { describeDigestSchedule } from "@/features/dashboards/report-words"
 import { cleanup, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "bun:test"
 import type { AlertRule } from "@/services/contracts/alerts"
@@ -202,9 +203,23 @@ describe("alertRuleSaveInput", () => {
     })
   })
 
-  it("sends the form unchanged for the older kinds", () => {
-    const alert = { ...FORM, type: "alert", connector: undefined }
-    expect(alertRuleSaveInput(alert)).toBe(alert)
+  it("sends only the fields the API takes for the older kinds, never what the server added", () => {
+    const alert = {
+      ...FORM, type: "alert", connector: undefined, createdAt: "2026-11-01", ownerId: "u1",
+      chartTitle: "Visits", dashboardId: "b1", targetHidden: false, lastDelivery: { at: "x", delivered: true },
+    }
+    const body = JSON.parse(JSON.stringify(alertRuleSaveInput(alert)))
+    for (const key of ["createdAt", "ownerId", "chartTitle", "dashboardId", "targetHidden", "lastDelivery", "id", "connector"]) {
+      expect(body).not.toHaveProperty(key)
+    }
+    expect(body).toMatchObject({ name: "  Load failed ", type: "alert", agg: "sum", op: ">", threshold: 3, enabled: true })
+  })
+
+  it("keeps a digest's schedule when the list switches it, and sends none with another kind", () => {
+    const schedule = { kind: "weekly", weekday: 1, hour: 8, minute: 0 } as const
+    const digest = { ...FORM, type: "digest", schedule, timeZone: "Asia/Jakarta" }
+    expect(alertRuleSaveInput(digest)).toMatchObject({ schedule, timeZone: "Asia/Jakarta" })
+    expect(alertRuleSaveInput({ ...digest, type: "alert" })).not.toHaveProperty("schedule")
   })
 })
 
@@ -454,5 +469,11 @@ describe("a rule whose target is hidden (DEC-16)", () => {
     expect(screen.getByText("https://hooks.example.com/t")).toBeTruthy()
     expect(screen.getByRole("switch").getAttribute("aria-disabled")).toBeNull()
     expect(screen.getByRole("button", { name: "Test run now" })).toBeTruthy()
+  })
+})
+
+describe("the digest row's schedule line (BI-65)", () => {
+  it("reads the schedule in a short line", () => {
+    expect(describeDigestSchedule({ kind: "weekly", weekday: 1, hour: 8, minute: 0 }, "UTC")).toBe("Mondays · 08:00 UTC")
   })
 })

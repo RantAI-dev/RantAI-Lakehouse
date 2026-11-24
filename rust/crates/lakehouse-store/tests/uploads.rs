@@ -38,13 +38,13 @@ use lakehouse_store::uploads::{
     NewReceiving, NewTableDrop, NewUpload, TableClaim, Upload, UploadPart, attach_run, claim_table,
     delete, dropped_table, find_by_sha256, forget_table_drop_at, get, get_by_run_id,
     heal_table_drop, insert, list, list_claims, list_dropped_tables, loading_into,
-    loads_under_limits, mark_finished, mark_group_within_limits, mark_ingesting,
-    mark_ingesting_within_limits, record_table_drop, table_being_loaded, table_claim,
-    table_claimed, table_claims, upload_in_tenants,
+    loads_under_limits, mark_finished, mark_finished_with_bad_values, mark_group_within_limits,
+    mark_ingesting, mark_ingesting_within_limits, record_table_drop, table_being_loaded,
+    table_claim, table_claimed, table_claims, upload_in_tenants,
 };
 use lakehouse_store::uploads::{
     LARGE_LOAD_BYTES, count_receiving, find_by_parts_digest, finish_receiving, insert_receiving,
-    list_parts, record_bad_values, record_part, stale_receiving,
+    list_parts, record_part, stale_receiving,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -611,6 +611,96 @@ async fn mark_finished_with_an_error_fails_and_stores_no_row_count(
         Some("The load into the table failed.")
     );
     assert_eq!(failed.rows, None);
+    Ok(())
+}
+
+/// `REL-15`: the report and the terminal status are written by ONE update. A
+/// reader cannot observe `failed`/`ingested` with the report still missing,
+/// and the row that update returns already carries both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn settling_a_typed_load_writes_terminal_status_and_bad_values_in_one_update(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-finish-report").await;
+
+    // A `stop` load: failed with the reason, and the report in the same row the
+    // update returns. A count handed in with an error is still dropped.
+    add(&pool, "up-1", tenant_a, "").await;
+    start(&pool, "up-1", "stock_raw", LoadMode::Replace, Some("run-1")).await;
+    let stopped = json!({ "count": 1, "byColumn": [{ "column": "qty", "count": 1 }], "rows": [] });
+    let failed = mark_finished_with_bad_values(
+        &pool,
+        "up-1",
+        Some("run-1"),
+        Some("Some values do not fit their column's type."),
+        Some(99),
+        Some(&stopped),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(failed.status, "failed");
+    assert_eq!(
+        failed.error.as_deref(),
+        Some("Some values do not fit their column's type.")
+    );
+    assert_eq!(failed.rows, None, "a failed load stores no count");
+    assert_eq!(failed.bad_values.as_ref().map(|j| &j.0), Some(&stopped));
+    let reread = get(&pool, "up-1").await.unwrap().unwrap();
+    assert_eq!((reread.status.as_str(), reread.rows), ("failed", None));
+    assert_eq!(reread.bad_values.as_ref().map(|j| &j.0), Some(&stopped));
+
+    // A `null` load: ingested with its row count and the report.
+    add(&pool, "up-2", tenant_a, "").await;
+    start(&pool, "up-2", "stock_raw", LoadMode::Replace, Some("run-2")).await;
+    let nulled = json!({ "count": 2, "byColumn": [{ "column": "qty", "count": 2 }], "rows": [] });
+    let ingested =
+        mark_finished_with_bad_values(&pool, "up-2", Some("run-2"), None, Some(7), Some(&nulled))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(ingested.status, "ingested");
+    assert_eq!(ingested.rows, Some(7));
+    assert!(ingested.error.is_none());
+    assert_eq!(ingested.bad_values.as_ref().map(|j| &j.0), Some(&nulled));
+    let reread = get(&pool, "up-2").await.unwrap().unwrap();
+    assert_eq!(reread.bad_values.as_ref().map(|j| &j.0), Some(&nulled));
+
+    // No report is the common case: the load still settles and bad values stay
+    // NULL, rather than inventing an empty report.
+    add(&pool, "up-3", tenant_a, "").await;
+    start(&pool, "up-3", "stock_raw", LoadMode::Replace, Some("run-3")).await;
+    let clean = mark_finished_with_bad_values(&pool, "up-3", Some("run-3"), None, Some(3), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(clean.status, "ingested");
+    assert!(clean.bad_values.is_none());
+    assert!(
+        get(&pool, "up-3")
+            .await
+            .unwrap()
+            .unwrap()
+            .bad_values
+            .is_none()
+    );
+
+    // A report for a run another reader already settled is not written onto the
+    // newer load: the wrong run changes nothing at all.
+    let missed = mark_finished_with_bad_values(
+        &pool,
+        "up-3",
+        Some("run-other"),
+        None,
+        Some(9),
+        Some(&nulled),
+    )
+    .await
+    .unwrap();
+    assert!(missed.is_none());
+    let row = get(&pool, "up-3").await.unwrap().unwrap();
+    assert_eq!((row.status.as_str(), row.rows), ("ingested", Some(3)));
+    assert!(row.bad_values.is_none());
     Ok(())
 }
 
@@ -2473,20 +2563,15 @@ async fn a_column_list_belongs_to_the_load_that_was_told_it_and_the_next_claim_c
     attach_run(&pool, "up-col", "run-1").await.unwrap().unwrap();
 
     let report = json!({ "count": 1, "byColumn": [{ "column": "qty", "count": 1 }], "rows": [] });
-    assert!(
-        record_bad_values(&pool, "up-col", "run-1", &report)
+    // `REL-15`: the report and the terminal status land in one update. The row
+    // that update returns already carries both; no reader can see one first.
+    let settled =
+        mark_finished_with_bad_values(&pool, "up-col", Some("run-1"), None, Some(3), Some(&report))
             .await
             .unwrap()
-    );
-    assert!(
-        !record_bad_values(&pool, "up-col", "run-other", &report)
-            .await
-            .unwrap()
-    );
-    mark_finished(&pool, "up-col", Some("run-1"), None, Some(3))
-        .await
-        .unwrap()
-        .unwrap();
+            .unwrap();
+    assert_eq!(settled.status, "ingested");
+    assert_eq!(settled.bad_values.as_ref().map(|j| &j.0), Some(&report));
     let done = get(&pool, "up-col").await.unwrap().unwrap();
     assert_eq!(done.bad_values.as_ref().map(|j| &j.0), Some(&report));
     assert_eq!(serde_json::to_value(&done).unwrap()["badValues"], report);

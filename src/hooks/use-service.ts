@@ -84,6 +84,12 @@ export type ActionState<T> =
  * Invoking `run` aborts any in-flight invocation, keeps the previous data
  * visible while pending, and resolves to the result (or `null` on failure so
  * callers can branch without try/catch). Aborted calls never surface as errors.
+ *
+ * `state.error` is for rendering: it is the value of the render that created
+ * the caller's closure, so a caller that reads it on the line after
+ * `await run(...)` gets `null` (or the previous attempt's error), not the
+ * failure it just awaited. `getError()` is for that call site: it reads the
+ * latest invocation's error from a ref that `run` writes before it resolves.
  */
 export function useServiceAction<Args extends unknown[], T>(
   action: (signal: AbortSignal, ...args: Args) => Promise<T>
@@ -91,6 +97,7 @@ export function useServiceAction<Args extends unknown[], T>(
   run: (...args: Args) => Promise<T | null>
   reset: () => void
   cancel: () => void
+  getError: () => ServiceError | null
 } {
   const [state, setState] = React.useState<ActionState<T>>({
     status: "idle",
@@ -102,6 +109,11 @@ export function useServiceAction<Args extends unknown[], T>(
     actionRef.current = action
   })
   const controllerRef = React.useRef<AbortController | null>(null)
+  // WEB-6: `setState` commits on the next render, so `state.error` on the line
+  // after `await run(...)` is still the old closure's value. This ref is
+  // written inside `run` itself, before it resolves, for callers that must
+  // show the error of the invocation they just awaited (a failure toast).
+  const lastErrorRef = React.useRef<ServiceError | null>(null)
 
   React.useEffect(() => () => controllerRef.current?.abort(), [])
 
@@ -109,6 +121,7 @@ export function useServiceAction<Args extends unknown[], T>(
     controllerRef.current?.abort()
     const controller = new AbortController()
     controllerRef.current = controller
+    lastErrorRef.current = null
     setState((prev) => ({ status: "pending", data: prev.data, error: null }))
     try {
       const data = await actionRef.current(controller.signal, ...args)
@@ -118,6 +131,9 @@ export function useServiceAction<Args extends unknown[], T>(
       return data
     } catch (err) {
       const serviceError = toServiceError(err)
+      // An invocation that `run` just superseded can still reject late; it
+      // must not overwrite the new invocation's error with an older one.
+      if (controllerRef.current === controller) lastErrorRef.current = serviceError
       if (!controller.signal.aborted && serviceError.code !== "aborted") {
         setState({ status: "error", data: null, error: serviceError })
       }
@@ -127,6 +143,7 @@ export function useServiceAction<Args extends unknown[], T>(
 
   const reset = React.useCallback(() => {
     controllerRef.current?.abort()
+    lastErrorRef.current = null
     setState({ status: "idle", data: null, error: null })
   }, [])
 
@@ -141,5 +158,9 @@ export function useServiceAction<Args extends unknown[], T>(
     )
   }, [])
 
-  return { ...state, run, reset, cancel }
+  // WEB-6: read the fresh error at the awaited call site, not the stale
+  // `state.error` captured by that call site's render.
+  const getError = React.useCallback((): ServiceError | null => lastErrorRef.current, [])
+
+  return { ...state, run, reset, cancel, getError }
 }

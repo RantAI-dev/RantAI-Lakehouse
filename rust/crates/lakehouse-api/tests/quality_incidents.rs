@@ -15,7 +15,11 @@ use crate::common;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use lakehouse_store::governance::{CreateQualityRuleInput, create_quality_rule};
+use lakehouse_store::governance::{
+    CreateClassificationRuleInput, CreateQualityRuleInput, create_classification_rule,
+    create_quality_rule,
+};
+use lakehouse_store::quality::{IncidentKind, ScheduleMode};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -2053,4 +2057,350 @@ async fn a_rules_history_lists_its_runs_with_the_threshold_each_ran_with() {
     )
     .await;
     assert_eq!(code, StatusCode::NOT_FOUND);
+}
+
+// ── GOV-16: the six quality/governance reads the GOV-15 tenant gate left
+// ── unnarrowed by the caller's role table access. A person granted only
+// ── silver.orders sees that table's rows and nothing of silver.customers;
+// ── an unrestricted principal sees both. For a single-resource read, a
+// ── hidden table answers exactly what an absent one answers.
+
+/// `GOV-16`: the incident list omits incidents on tables the role hides, and a
+/// caller who reads every table still sees them all.
+#[tokio::test]
+async fn the_incident_list_hides_incidents_on_tables_the_role_may_not_read() {
+    let (router, pool, _ch) = app().await;
+    let a = rule(&pool, "g16_inc_a", "email not null >= 90%").await;
+    let b = rule_on(
+        &pool,
+        "g16_inc_b",
+        "silver.customers",
+        "email not null >= 90%",
+    )
+    .await;
+    lakehouse_store::quality::record_failure(
+        &pool,
+        "silver.orders",
+        Some(&a),
+        IncidentKind::Check,
+        "a failed",
+    )
+    .await
+    .unwrap();
+    lakehouse_store::quality::record_failure(
+        &pool,
+        "silver.customers",
+        Some(&b),
+        IncidentKind::Check,
+        "b failed",
+    )
+    .await
+    .unwrap();
+
+    let cookie = narrowed(&pool).await;
+    let rows = incidents(&router, &cookie, "open").await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["asset"], "silver.orders");
+
+    let cookie = admin(&pool).await;
+    let rows = incidents(&router, &cookie, "open").await;
+    let mut assets: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row["asset"].as_str())
+        .collect();
+    assets.sort_unstable();
+    assert_eq!(assets, ["silver.customers", "silver.orders"], "{assets:?}");
+}
+
+/// `GOV-16`: the schedule list omits schedules on tables the role hides, and a
+/// caller who reads every table still sees them all.
+#[tokio::test]
+async fn the_schedule_list_hides_schedules_on_tables_the_role_may_not_read() {
+    let (router, pool, _ch) = app().await;
+    let by = create_principal_with_permissions(&pool, "governance:read").await;
+    for asset in ["silver.orders", "silver.customers"] {
+        lakehouse_store::quality::put_schedule(&pool, asset, ScheduleMode::Interval, 120, by)
+            .await
+            .unwrap();
+    }
+
+    let cookie = narrowed(&pool).await;
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "GET",
+        "/api/governance/quality/schedules",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let schedules = body["schedules"].as_array().unwrap();
+    assert_eq!(schedules.len(), 1, "{body}");
+    assert_eq!(schedules[0]["asset"], "silver.orders");
+
+    let cookie = admin(&pool).await;
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "GET",
+        "/api/governance/quality/schedules",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let mut assets: Vec<&str> = body["schedules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["asset"].as_str())
+        .collect();
+    assets.sort_unstable();
+    assert_eq!(assets, ["silver.customers", "silver.orders"], "{assets:?}");
+}
+
+/// `GOV-16`: a rule's run history on a hidden table reads as an unknown rule
+/// id — byte for byte — and an unrestricted caller still reads it.
+#[tokio::test]
+async fn a_rule_on_a_hidden_table_has_the_run_history_of_an_unknown_rule() {
+    let (router, pool, ch) = app().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "FROM console.quality_run WHERE rule_id",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [
+                {"name": "status", "type": "String"},
+                {"name": "value", "type": "String"},
+                {"name": "run_by", "type": "String"},
+                {"name": "threshold", "type": "String"},
+                {"name": "ran_at", "type": "String"},
+            ],
+            "data": [{"status": "passed", "value": "1", "run_by": "schedule",
+                      "threshold": "", "ran_at": "2026-11-16T03:00:00Z"}],
+            "rows": 1,
+        })))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+    let a = rule(&pool, "g16_runs_a", "email not null >= 90%").await;
+    let b = rule_on(
+        &pool,
+        "g16_runs_b",
+        "silver.customers",
+        "email not null >= 90%",
+    )
+    .await;
+
+    let cookie = narrowed(&pool).await;
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "GET",
+        &format!("/api/governance/quality/{a}/runs"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["runs"].as_array().unwrap().len(), 1, "{body}");
+
+    let (code, hidden) = call(
+        &router,
+        &cookie,
+        "GET",
+        &format!("/api/governance/quality/{b}/runs"),
+        None,
+    )
+    .await;
+    let (code_unknown, unknown) = call(
+        &router,
+        &cookie,
+        "GET",
+        "/api/governance/quality/00000000-0000-4000-8000-000000000000/runs",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{hidden}");
+    assert_eq!(code, code_unknown);
+    assert_eq!(hidden, unknown, "hidden and unknown read identically");
+
+    let cookie = admin(&pool).await;
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "GET",
+        &format!("/api/governance/quality/{b}/runs"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["runs"].as_array().unwrap().len(), 1, "{body}");
+}
+
+/// `GOV-16`: a hidden table's learning state reads exactly like a table nobody
+/// has ever loaded — the same empty answer — and an unrestricted caller sees
+/// the same answer for a table that has no load history.
+#[tokio::test]
+async fn a_hidden_tables_learning_state_reads_like_a_table_nobody_holds() {
+    let (router, pool, _ch) = app().await;
+    let cookie = narrowed(&pool).await;
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "GET",
+        "/api/governance/quality/learning/silver.orders",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+
+    // No load was ever recorded for `silver.customers`, so a reader who may
+    // read it gets the endpoint's empty "still learning" answer. The narrowed
+    // caller must get that SAME body, with no read of the table's history:
+    // a hidden table and a table nobody has loaded are indistinguishable.
+    let cookie = admin(&pool).await;
+    let (code_admin, absent) = call(
+        &router,
+        &cookie,
+        "GET",
+        "/api/governance/quality/learning/silver.customers",
+        None,
+    )
+    .await;
+    assert_eq!(code_admin, StatusCode::OK, "{absent}");
+
+    let cookie = narrowed(&pool).await;
+    let (code_hidden, hidden) = call(
+        &router,
+        &cookie,
+        "GET",
+        "/api/governance/quality/learning/silver.customers",
+        None,
+    )
+    .await;
+    assert_eq!(code_hidden, code_admin);
+    assert_eq!(hidden, absent, "hidden and never-loaded read identically");
+}
+
+/// `GOV-16`: the assistant's quality summary counts only the tables the person
+/// behind the chat may read; an unrestricted person sees every verdict.
+#[tokio::test]
+async fn the_assistant_quality_summary_counts_only_the_tables_the_person_may_read() {
+    let (router, pool, ch) = app().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("_silver_meta.quality"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [{"name": "tabel", "type": "String"}, {"name": "verdict", "type": "String"}],
+            "data": [
+                {"tabel": "silver.orders", "verdict": "pass"},
+                {"tabel": "silver.customers", "verdict": "fail"},
+                {"tabel": "orders", "verdict": "warn"},
+            ],
+            "rows": 3,
+        })))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+
+    let user = create_assistant_principal(&pool, "governance:read").await;
+    narrow_to_orders(&pool, user).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/ai/tool",
+        Some(json!({"tool": "get_quality", "args": {}, "mode": "ask"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "executed", "{body}");
+    assert_eq!(
+        body["result"]["summary"],
+        json!([{"verdict": "pass", "n": "1"}]),
+        "only the granted table is counted"
+    );
+
+    let user = create_assistant_principal(&pool, "*:*,governance:read").await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/ai/tool",
+        Some(json!({"tool": "get_quality", "args": {}, "mode": "ask"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"]["summary"],
+        json!([
+            {"verdict": "fail", "n": "1"},
+            {"verdict": "pass", "n": "1"},
+            {"verdict": "warn", "n": "1"},
+        ]),
+        "an unrestricted caller sees every table's verdict"
+    );
+}
+
+/// `GOV-16`: the classification list omits rows on tables the role hides, and
+/// a caller who reads every table still sees them all.
+#[tokio::test]
+async fn the_classification_list_hides_rows_on_tables_the_role_may_not_read() {
+    let (router, pool, _ch) = app().await;
+    for asset in ["silver.orders", "silver.customers"] {
+        create_classification_rule(
+            &pool,
+            &CreateClassificationRuleInput {
+                asset: asset.to_owned(),
+                column: None,
+                classification: "internal".to_owned(),
+                masking_rule: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let cookie = narrowed(&pool).await;
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "GET",
+        "/api/governance/classification",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let assets: Vec<&str> = body["classifications"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["asset"].as_str())
+        .collect();
+    assert_eq!(assets, ["silver.orders"], "{assets:?}");
+
+    let cookie = admin(&pool).await;
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "GET",
+        "/api/governance/classification",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let mut assets: Vec<&str> = body["classifications"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["asset"].as_str())
+        .collect();
+    assets.sort_unstable();
+    assert!(
+        assets.contains(&"silver.orders") && assets.contains(&"silver.customers"),
+        "{assets:?}"
+    );
+    // The seeded authored rules and every observed row are still there for a
+    // reader who may read every table.
+    assert!(assets.len() >= 4, "{assets:?}");
 }

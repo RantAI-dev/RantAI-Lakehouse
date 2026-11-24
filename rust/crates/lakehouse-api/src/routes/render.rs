@@ -65,6 +65,36 @@ fn refused() -> Response {
         .into_response()
 }
 
+/// Add the token's acting tenant to the headers a print-view read uses.
+///
+/// `SEC-54` (SEC-50 slice 2 M5): a PDF or chart image is exported while the
+/// browser worked under `X-Tenant: B`; the renderer must read under B, not
+/// under the person's first tenant. `tenant` is absent for older tokens and
+/// for a scheduled job, in which case the first tenant still applies. A
+/// malformed id, or a tenant the person has since left, is the one fixed
+/// refusal — `tenant_scope::resolve` is the same membership check the
+/// interactive routes use, and it runs now, not when the token was minted.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready Response the callers return verbatim; boxing it would change the handlers for no gain on the success path"
+)]
+fn tenant_headers_for(
+    claims: &lakehouse_embed::RenderClaims,
+    principal: &lakehouse_auth::Principal,
+    headers: &mut HeaderMap,
+) -> Result<(), Response> {
+    let Some(raw) = claims.tenant.as_deref() else {
+        return Ok(());
+    };
+    let tenant: uuid::Uuid = raw.parse().map_err(|_err| refused())?;
+    let for_tenant = crate::tenant_scope::headers_for_tenant(tenant).map_err(|_err| refused())?;
+    crate::tenant_scope::resolve(principal, &for_tenant).map_err(|_err| refused())?;
+    for (name, value) in &for_tenant {
+        headers.insert(name, value.clone());
+    }
+    Ok(())
+}
+
 /// `POST /api/render/data { token }` — the dashboard payload for the person
 /// the token names, with a `render` block for the print view's first page.
 ///
@@ -86,6 +116,11 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         Ok(admitted) => admitted,
         Err(response) => return response,
     };
+    // SEC-54: the print view reads under the tenant the token carries.
+    let mut headers = HeaderMap::new();
+    if let Err(response) = tenant_headers_for(&claims, &principal, &mut headers) {
+        return response;
+    }
     // BI-53 (QA LH-BI-1-01 F3): the print view's own read is a stage of one
     // PDF; durations only, never a token or a name.
     tracing::info!("render data requested");
@@ -93,7 +128,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     // BI-18 part D (T2): a report token is good for that report and nothing
     // else, read as the person now, through the reader route's own function.
     if let Some(report) = claims.report.as_deref() {
-        return report_data(&state, &principal, report, &claims).await;
+        return report_data(&state, &principal, report, &claims, &headers).await;
     }
     let query = DashboardQuery::for_render(
         &claims.board,
@@ -108,9 +143,10 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         Some(chart) => query.only_chart(chart),
         None => query,
     };
-    // `SEC-50` slice 2 M4/M5: the PDF reads as the person the token names —
-    // their first tenant, because the token carries no tenant (M5).
-    let read = payload_for(&state, &principal, &query, &HeaderMap::new()).await;
+    // `SEC-50` slice 2 M4 + `SEC-54`: the PDF and chart image read as the
+    // person the token names, under the tenant the token carries (their
+    // first tenant only when the token has none, e.g. a scheduled job).
+    let read = payload_for(&state, &principal, &query, &headers).await;
     tracing::info!(
         payload_ms = crate::routes::pdf_export::millis(read_started),
         ok = read.is_ok(),
@@ -150,6 +186,7 @@ async fn report_data(
     principal: &lakehouse_auth::Principal,
     report: &str,
     claims: &lakehouse_embed::RenderClaims,
+    headers: &HeaderMap,
 ) -> Response {
     use crate::routes::dashboard_reports as reports;
     let started = std::time::Instant::now();
@@ -164,7 +201,9 @@ async fn report_data(
         Err(lakehouse_core::ApiError::NotFound(_)) => return refused(),
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
-    let read = reports::read_charts(state, principal, &viewer, &found, &HeaderMap::new()).await;
+    // SEC-54: the report PDF reads under the token's tenant, not the
+    // person's first one.
+    let read = reports::read_charts(state, principal, &viewer, &found, headers).await;
     tracing::info!(
         payload_ms = crate::routes::pdf_export::millis(started),
         ok = read.is_ok(),
@@ -283,6 +322,13 @@ pub async fn map_geojson(
         Ok(admitted) => admitted,
         Err(response) => return response,
     };
+    // SEC-54: keep the browser's other headers (an `If-None-Match`, for one)
+    // but add the token's tenant, so the map is read under the same tenant as
+    // the PDF that embeds it.
+    let mut headers = headers;
+    if let Err(response) = tenant_headers_for(&claims, &principal, &mut headers) {
+        return response;
+    }
     let viewer = match crate::routes::dashboard_access::viewer_for(&state, &principal).await {
         Ok(viewer) => viewer,
         Err(err) => return crate::error::ApiRejection(err).into_response(),

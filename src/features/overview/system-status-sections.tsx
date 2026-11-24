@@ -23,9 +23,15 @@ import {
   formatPercent,
   formatRelativeTime,
 } from "@/lib/format"
-import { formatSignedBytes } from "@/lib/lakehouse-view"
+import {
+  formatSignedBytes,
+  lakehouseTableHref,
+  systemCompactionWarningMessage,
+  tablesNeedingCompaction,
+} from "@/lib/lakehouse-view"
 import type { Measured } from "@/lib/measured"
 import {
+  icebergTablesWithoutRuns,
   latestRunPerTable,
   maintenanceTableHref,
   overallServiceState,
@@ -33,7 +39,10 @@ import {
 import { cn } from "@/lib/utils"
 import { governanceService, lakehouseService, overviewService } from "@/services"
 import type { MaintenanceRun } from "@/services/contracts/governance"
-import type { LakehouseCapacityBucket } from "@/services/contracts/lakehouse"
+import type {
+  LakehouseCapacityBucket,
+  LakehouseTableSummary,
+} from "@/services/contracts/lakehouse"
 import type { PlatformService, ServicesReport } from "@/services/contracts/ops"
 
 type Reloadable<T> = ServiceState<T> & { reload: () => void }
@@ -136,6 +145,53 @@ function OpenAlertsLink({ count }: { count: number }) {
       <BellRing className="size-4" aria-hidden />
       {count === 0 ? "No open alerts" : count === 1 ? "1 open alert" : `${count} open alerts`}
     </Button>
+  )
+}
+
+/**
+ * OPS-21: the deployment-wide compaction warning, rendered at the top of
+ * System status. It fires only from MEASURED small-file counts on tables that
+ * need compaction while Trino cannot do it (`checked && ok` false on the same
+ * probe set Services reports — `compactionAvailable` in the response). A
+ * failed/unavailable summary, an unmeasured row, a below-threshold count, and
+ * an available Trino are all silent: no invented warning from absent data.
+ * Each affected table links to the page where its count can be inspected.
+ */
+export function CompactionWarning({ refreshKey }: { refreshKey: number }) {
+  const status = useService((s) => lakehouseService.getCompactionStatus(s), [refreshKey])
+  if (status.status !== "success") return null
+
+  const affected = tablesNeedingCompaction(status.data)
+  if (affected.length === 0) return null
+
+  return (
+    <div
+      role="alert"
+      className="rounded-lg border border-destructive/40 bg-destructive/5 p-4 text-sm"
+    >
+      <p className="font-semibold text-destructive">Compaction needed, but nothing can do it</p>
+      <p className="mt-1 text-foreground">
+        {systemCompactionWarningMessage(affected.length)}
+      </p>
+      <ul className="mt-2 flex flex-wrap gap-x-4 gap-y-1">
+        {affected.map((t) => (
+          <li key={`${t.namespace}.${t.name}`} className="text-foreground">
+            <Link
+              href={lakehouseTableHref(t.namespace, t.name)}
+              className="font-mono text-primary hover:underline"
+            >
+              {t.namespace}.{t.name}
+            </Link>
+            <span className="text-muted-foreground"> — {t.smallFileCount} small files</span>
+          </li>
+        ))}
+      </ul>
+      {status.data.unmeasuredTables > 0 ? (
+        <p className="mt-2 text-xs text-muted-foreground">
+          {status.data.unmeasuredTables} more {status.data.unmeasuredTables === 1 ? "table was" : "tables were"} not measured and are not listed.
+        </p>
+      ) : null}
+    </div>
   )
 }
 
@@ -377,6 +433,58 @@ const runColumns: ColumnDef<MaintenanceRun>[] = [
   },
 ]
 
+type IcebergTableLoad = {
+  tables: LakehouseTableSummary[]
+  /** Namespaces whose table list failed — reported, never silently dropped. */
+  failedNamespaces: string[]
+}
+
+/**
+ * Every Iceberg table Lakekeeper serves for the caller's warehouse, one
+ * `listTables` fan-out per namespace (`DATA-45`). `Promise.allSettled` keeps a
+ * single namespace's failure (a refusal, a timeout) from hiding the tables in
+ * the namespaces that did answer; those names come back to be shown honestly.
+ * A failure of the namespace list itself rejects, so `useService` reports it
+ * and the maintenance-runs list above stays intact.
+ */
+async function loadIcebergTables(signal: AbortSignal): Promise<IcebergTableLoad> {
+  const namespaces = await lakehouseService.listNamespaces(undefined, signal)
+  const settled = await Promise.allSettled(
+    namespaces.map((ns) => lakehouseService.listTables(ns.name, undefined, signal))
+  )
+  const tables: LakehouseTableSummary[] = []
+  const failedNamespaces: string[] = []
+  settled.forEach((result, index) => {
+    const name = namespaces[index].name
+    if (result.status === "fulfilled") tables.push(...result.value)
+    else if (!signal.aborted) failedNamespaces.push(name)
+  })
+  return { tables, failedNamespaces }
+}
+
+const icebergColumns: ColumnDef<LakehouseTableSummary>[] = [
+  {
+    key: "table",
+    header: "Table",
+    render: (t) => (
+      <Link
+        href={lakehouseTableHref(t.namespace, t.name)}
+        className="font-mono text-sm text-primary hover:underline"
+      >
+        {t.namespace}.{t.name}
+      </Link>
+    ),
+    sortValue: (t) => `${t.namespace}.${t.name}`,
+  },
+  {
+    key: "lastRun",
+    header: "Last maintenance run",
+    // No run exists for these tables: an honest absence, never a made-up
+    // count or status (rule 2, S2-D2 "Not measured").
+    render: () => <span className="text-xs text-muted-foreground">No run recorded yet</span>,
+  },
+]
+
 /**
  * Section 5: what the nightly maintenance job last did to each table
  * (`GET /api/governance/maintenance`, `bronze_maintenance_job`). On
@@ -385,9 +493,26 @@ const runColumns: ColumnDef<MaintenanceRun>[] = [
  * skipped; compaction runs through Trino (ADR 0009) and has no record here
  * (`docs/plans/CLICKHOUSE-26.8-REMEASUREMENT.md`). Each row links to its
  * table's page, where its maintenance policy is set.
+ *
+ * `DATA-45`: the runs list only names tables that have a run, so tables with
+ * no catalog entry (Gold exports, for example) and newly created Iceberg
+ * tables were reachable by URL alone after WEB-3 slice 2 removed the old
+ * Table Maintenance "Tables" tab. A second, independent list below shows the
+ * discovered Iceberg tables that have no run, each linking to its table page.
+ * It loads on its own so a failed Lakekeeper lookup cannot hide the runs.
  */
 export function MaintenanceSection({ refreshKey }: { refreshKey: number }) {
   const runs = useService((s) => governanceService.listMaintenanceRuns(s), [refreshKey])
+  const iceberg = useService((s) => loadIcebergTables(s), [refreshKey])
+  // When the runs failed there is no key to filter by; show every discovered
+  // table as "without a run" rather than pretending a run exists.
+  const tablesWithoutRuns =
+    iceberg.status === "success"
+      ? icebergTablesWithoutRuns(
+          iceberg.data.tables,
+          runs.status === "success" ? runs.data : []
+        )
+      : []
 
   return (
     <SectionCard
@@ -414,6 +539,51 @@ export function MaintenanceSection({ refreshKey }: { refreshKey: number }) {
           />
         )
       ) : null}
+
+      {/* DATA-45: the runs table above only reaches tables that have a run.
+          This second list reaches the ones that do not — including Gold
+          exports the catalog registry never recorded. It is a subsection of
+          the same card (WEB-3 "one place each"), and it fails on its own. */}
+      <div className="mt-5 border-t border-border pt-4">
+        <h3 className="text-sm font-semibold">Iceberg tables without a maintenance run</h3>
+        <p className="mb-3 mt-0.5 text-xs text-muted-foreground">
+          Iceberg tables in this warehouse with no run recorded yet — including tables that have
+          no catalog entry, such as Gold exports. Open one to see its schema and snapshots.
+        </p>
+        {iceberg.status === "loading" ? <LoadingSkeleton rows={2} /> : null}
+        {iceberg.status === "error" ? (
+          <p className="flex flex-wrap items-center gap-1 text-sm text-muted-foreground">
+            The Iceberg table list could not be loaded here. The maintenance runs above are
+            unaffected.
+            <Button size="sm" variant="ghost" onClick={iceberg.reload}>
+              <RotateCcw className="size-3.5" aria-hidden />
+              Retry
+            </Button>
+          </p>
+        ) : null}
+        {iceberg.status === "success" ? (
+          <>
+            {iceberg.data.failedNamespaces.length > 0 ? (
+              <p className="mb-2 text-xs text-muted-foreground">
+                Tables in {iceberg.data.failedNamespaces.join(", ")} could not be listed; the other
+                namespaces are shown.
+              </p>
+            ) : null}
+            {tablesWithoutRuns.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                No Iceberg tables without a maintenance run were found.
+              </p>
+            ) : (
+              <DataTable
+                columns={icebergColumns}
+                rows={tablesWithoutRuns}
+                rowKey={(t) => `${t.namespace}.${t.name}`}
+                pageSize={10}
+              />
+            )}
+          </>
+        ) : null}
+      </div>
     </SectionCard>
   )
 }

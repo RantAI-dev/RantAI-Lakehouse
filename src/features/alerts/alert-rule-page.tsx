@@ -17,7 +17,13 @@ import {
 import Link from "next/link"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { alertRuleService, connectorService, dashboardService, metricService } from "@/services"
+import { alertRuleService, connectorService, dashboardService, metricService, settingsService } from "@/services"
+import { HelpHint } from "@/components/patterns/help-hint"
+import { FormHint } from "@/components/patterns/form-fields"
+import {
+  DEFAULT_SCHEDULE, draftFromSchedule, LEGACY_DIGEST_SCHEDULE, ScheduleFields, scheduleOfDraft, zoneOfDraft,
+  type ScheduleDraft,
+} from "@/features/dashboards/schedule-fields"
 import {
   LOAD_ALERT_KINDS,
   QUALITY_ALERT_KIND,
@@ -25,6 +31,7 @@ import {
   type SaveAlertRuleInput,
 } from "@/services/contracts/alerts"
 import { isLoadAlertKind, isQualityAlertKind, ruleKindLabel } from "./rules-columns"
+import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { readableErrorMessage } from "@/lib/notify-message"
 import { TablePicker, useTableCatalog } from "@/features/governance/table-picker"
 import type { Metric } from "@/services/contracts/metrics"
@@ -159,7 +166,32 @@ export function alertRuleSaveInput(f: AlertRule): SaveAlertRuleInput {
       ...(f.severity ? { severity: f.severity } : {}),
     }
   }
-  if (!isLoadAlertKind(f.type)) return f
+  if (!isLoadAlertKind(f.type)) {
+    // BI-65 (decision 4): the API refuses a field it does not know, so this is
+    // the fields of `SaveAlertRuleInput` and not the stored rule as it came
+    // back (`createdAt`, `ownerId`, `chartTitle`, `lastDelivery` and the rest
+    // are the server's, never sent). A schedule goes only with a digest.
+    return {
+      name: f.name,
+      type: f.type,
+      mart: f.mart,
+      measure: f.measure,
+      metric: f.metric,
+      agg: f.agg,
+      op: f.op,
+      threshold: f.threshold,
+      board: f.board,
+      channel: f.channel,
+      target: f.target,
+      enabled: f.enabled,
+      severity: f.severity,
+      chart: f.chart,
+      series: f.series,
+      filters: f.filters,
+      condition: f.condition,
+      ...(f.type === "digest" && f.schedule ? { schedule: f.schedule, timeZone: f.timeZone } : {}),
+    }
+  }
   return {
     name: f.name.trim(),
     type: f.type,
@@ -356,15 +388,22 @@ type DigestConditionProps = {
   readonly setF: React.Dispatch<React.SetStateAction<AlertRule>>
   readonly boards: { id: string; name: string }[]
   readonly boardsError: string | null
+  /** BI-65: when it is sent. */
+  readonly draft: ScheduleDraft
+  readonly onDraftChange: (next: ScheduleDraft) => void
+  readonly reportZone: string
 }
 
-function DigestConditionFields({ f, setF, boards, boardsError }: DigestConditionProps) {
+function DigestConditionFields({ f, setF, boards, boardsError, draft, onDraftChange, reportZone }: DigestConditionProps) {
   return (
+    <>
     <div className="grid gap-1.5">
       {/* UX-1-R9: the backend refuses a digest rule with no board. */}
       <Label htmlFor="alert-rule-dashboard" required>Dashboard</Label>
+      {/* BI-65 (owner QA): the select only knows a label for the values it is given in `items`; without them the closed trigger showed the board id. A board no longer in the list (deleted) falls back to its id. */}
       <Select
         value={f.board ?? ""}
+        items={boards.map((b) => ({ value: b.id, label: b.name }))}
         onValueChange={(v) => setF((prev) => ({ ...prev, board: v ?? "" }))}
       >
         <SelectTrigger id="alert-rule-dashboard" className="w-full" aria-required>
@@ -380,6 +419,13 @@ function DigestConditionFields({ f, setF, boards, boardsError }: DigestCondition
       </Select>
       {boardsError ? <p className="mt-1 text-xs text-destructive">{boardsError}</p> : null}
     </div>
+    {/* BI-65: the same fields the Subscriptions dialog has (one component). */}
+    <ScheduleFields id="alert-rule-when" draft={draft} onChange={onDraftChange} reportZone={reportZone} />
+    <FormHint>
+      <span className="min-w-0 truncate">Sent within 15 minutes of this time</span>
+      <HelpHint>The alerts run every 15 minutes, so a digest goes out at the first run after its time.</HelpHint>
+    </FormHint>
+    </>
   )
 }
 
@@ -398,7 +444,7 @@ export function legacyOwnerNote(
 /** The stored rule these fields show, or `null` for a new one. */
 export function AlertRulePage({ ruleId }: { ruleId?: string }) {
   const router = useRouter()
-  const backHref = "/alerts"
+  const backHref = "/alerts?tab=rules"
   const { user } = useAuth()
   const canSeeAllTenants = seesEveryTenant(user?.permissions)
 
@@ -420,10 +466,23 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
   // picked from the catalog, not typed.
   const tableCatalog = useTableCatalog()
   const [formErr, setFormErr] = React.useState<string | null>(null)
+  // BI-65: a digest's schedule. A new one starts every Monday at 08:00 in the
+  // report time zone (an empty zone reads as it); one saved before schedules
+  // opens as what it does, daily at 08:00.
+  const reporting = useService((signal) => settingsService.getReporting(signal), [])
+  const reportZone = reporting.status === "success" ? reporting.data.timeZone : "UTC"
+  const [draft, setDraft] = React.useState<ScheduleDraft>(() => draftFromSchedule(DEFAULT_SCHEDULE, ""))
   // The saved rule the form was filled from: only it knows whether it was
   // ever given an owner, and a rename is not a save of what the form holds.
   const [stored, setStored] = React.useState<AlertRule | null>(null)
   const seeded = React.useRef(false)
+  // BI-65 (owner QA): what the form held when it was filled (a new rule: empty),
+  // to tell "unsaved changes" from none when the back arrow is pressed.
+  const [baseline, setBaseline] = React.useState(() =>
+    JSON.stringify({ f: EMPTY_FORM, draft: draftFromSchedule(DEFAULT_SCHEDULE, "") })
+  )
+  const [leaving, setLeaving] = React.useState(false)
+  const dirty = JSON.stringify({ f, draft }) !== baseline
 
   const saveAction = useServiceAction(
     (signal, input: SaveAlertRuleInput, id: string | null) =>
@@ -459,6 +518,12 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
     seeded.current = true
     setStored(rule)
     setF({ ...rule })
+    const seededDraft =
+      rule.type === "digest"
+        ? draftFromSchedule(rule.schedule ?? LEGACY_DIGEST_SCHEDULE, rule.timeZone ?? "")
+        : draftFromSchedule(DEFAULT_SCHEDULE, "")
+    if (rule.type === "digest") setDraft(seededDraft)
+    setBaseline(JSON.stringify({ f: { ...rule }, draft: seededDraft }))
     // The rows this rule watches are the mart's, so the measure picker is
     // given them before the form is used.
     if (rule.mart && alertRuleFormFields(rule.type, canSeeAllTenants).martMeasure) {
@@ -551,11 +616,19 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
       setFormErr("Name the table, or * for every table.")
       return
     }
-    const saved = await saveAction.run(alertRuleSaveInput(f), ruleId ?? null)
+    const input = alertRuleSaveInput(f)
+    if (f.type === "digest") {
+      const schedule = scheduleOfDraft(draft)
+      if (!schedule) { setFormErr("Choose a time."); return }
+      input.schedule = schedule
+      input.timeZone = zoneOfDraft(draft, reportZone)
+    }
+    const saved = await saveAction.run(input, ruleId ?? null)
     if (saved) router.push(backHref)
   }
 
   return (
+    <>
     <FormPage
       title={ruleId ? "Edit rule" : "New rule"}
       description="Alerts fire when a Gold metric crosses a threshold. Digests summarise a dashboard on a schedule. Connector and upload rules tell you when a load fails or succeeds."
@@ -573,7 +646,8 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
         formErr ?? (saveAction.error ? readableErrorMessage(saveAction.error.message) : null)
       }
       onSubmit={() => void save()}
-      onCancel={() => router.push(backHref)}
+      // BI-65 (owner QA): one way out, the back arrow; unsaved changes ask first.
+      onBack={() => (dirty ? setLeaving(true) : router.push(backHref))}
       className="max-w-xl"
     >
         <div className="grid gap-3">
@@ -729,7 +803,8 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
               metrics={metrics}
             />
           ) : formFields.board ? (
-            <DigestConditionFields f={f} setF={setF} boards={boards} boardsError={boardsError} />
+            <DigestConditionFields f={f} setF={setF} boards={boards} boardsError={boardsError}
+              draft={draft} onDraftChange={setDraft} reportZone={reportZone} />
           ) : null}
 
           <div className="grid gap-1.5">
@@ -752,5 +827,15 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
           ) : null}
         </div>
     </FormPage>
+    <ConfirmActionDialog
+      open={leaving}
+      onOpenChange={setLeaving}
+      title="Discard your changes?"
+      description="The rule keeps what it had before; what you changed here is not saved."
+      confirmLabel="Discard changes"
+      destructive
+      onConfirm={() => router.push(backHref)}
+    />
+    </>
   )
 }
