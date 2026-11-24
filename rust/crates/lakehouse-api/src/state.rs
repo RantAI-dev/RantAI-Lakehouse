@@ -26,6 +26,7 @@ use crate::catalog_search_cache::SearchSnapshotCache;
 use crate::config::Config;
 use crate::connector_secret_store::{ConnectorSecretStore, SharedKeyring};
 use crate::gold_lock::MartLocks;
+use crate::routes::ai::data_map::DataMapCache;
 use crate::secret_crypto::{CryptoError, Keyring, MANAGED_FILE_PREFIX};
 use crate::secret_manager::{ManagerResolver, SecretManagerKind, SecretManagerSettings};
 use crate::upload_convert::ConversionRunner;
@@ -191,6 +192,11 @@ pub struct AppState {
     /// populated, like [`Self::bronze_stats_cache`]; holds nothing per
     /// caller.
     pub catalog_search_cache: Arc<SearchSnapshotCache>,
+    /// The copilot's DATA MAP cache (OPS-36). Held here, not in a process-wide
+    /// `static`, so each app — and each deployment instance — builds and
+    /// reuses its own map: a chat in one test app can no longer read the map
+    /// another app's `ClickHouse` mock built and change the system prompt.
+    pub(crate) data_map_cache: Arc<DataMapCache>,
     /// `Trino` `/v1/statement` client for `routes::query::run`'s
     /// `engine: "trino"` path (WS2 §4). Always present, like
     /// [`Self::clickhouse`], never `Option` — the `trino` compose profile
@@ -758,9 +764,9 @@ impl AppState {
     #[allow(
         clippy::too_many_lines,
         reason = "one struct literal naming every shared handle, a line per \
-                  field; `tile_slots` (BI-4 part A), `result_cache` (part B), `query_limits` (BI-5) and \
-                  `readiness_cache` (REL-2 S1 review SHOULD-FIX 1) are \
-                  the lines that took it from 100 to 103"
+                  field; `tile_slots` (BI-4 part A), `result_cache` (part B), `query_limits` (BI-5), \
+                  `readiness_cache` (REL-2 S1 review SHOULD-FIX 1) and `data_map_cache` (OPS-36) \
+                  are the later lines that grew it past 100"
     )]
     pub fn new(config: Config) -> Self {
         let clickhouse = Arc::new(ChClient::new(
@@ -897,6 +903,7 @@ impl AppState {
             iceberg: Arc::new(RwLock::new(None)),
             bronze_stats_cache: Arc::new(BronzeStatsCache::new()),
             catalog_search_cache: Arc::new(SearchSnapshotCache::new()),
+            data_map_cache: Arc::new(DataMapCache::default()),
             trino: Arc::new(trino),
             health_cache: Arc::new(tokio::sync::Mutex::new(None)),
             readiness_cache: Arc::new(tokio::sync::Mutex::new(None)),

@@ -1923,6 +1923,74 @@ async fn the_audit_actors_route_needs_audit_read_and_a_governance_reader_without
     assert_eq!(allowed.status(), StatusCode::OK);
 }
 
+/// `SEC-66`: the Gold-export and agent-run GETs are no longer open to any
+/// signed-in user. A Dashboard Viewer is refused with 403 at the gate on
+/// every one of them; a holder of the new read permission (and, for Gold,
+/// the pre-existing `gold:export` holder) clears it. The bodies name the
+/// permission so the console can say what is missing. Downstream handlers
+/// are allowed to answer 5xx here — only 401/403 is an authz failure.
+/// WEB-4 retired the runs-LIST route, so only the retained `{id}` detail
+/// is probed for the agent-run read permission; the retired path's 404 is
+/// pinned by `web4_retired_paths_are_not_registered_and_kept_paths_are`.
+#[tokio::test]
+async fn sec66_read_routes_refuse_a_dashboard_viewer_and_accept_the_new_read_grants() {
+    let TestApp { router, pool } = spin_up().await;
+
+    let gold_gets = [
+        "/api/gold/export/mart_x",
+        "/api/gold/exports?mart=mart_x",
+        "/api/gold/export/mart_x/consumers",
+        "/api/gold/publications",
+        "/api/gold/export/mart_x/publication",
+    ];
+    // WEB-4 retired `GET /api/agents/runs` (list); only the detail route is
+    // mounted, so the SEC-66 read gate is checked on that one path.
+    let agent_gets = ["/api/agents/runs/run-x"];
+
+    let viewer = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let viewer_cookie = session_cookie_for_user(&pool, viewer).await;
+    for path in gold_gets.iter().chain(agent_gets.iter()) {
+        let refused = request_with_cookie(&router, "GET", path, &viewer_cookie).await;
+        assert_eq!(
+            refused.status(),
+            StatusCode::FORBIDDEN,
+            "a Dashboard Viewer must be refused on GET {path}"
+        );
+        let bytes = to_bytes(refused.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        let expected = if path.starts_with("/api/gold/") {
+            "gold:read"
+        } else {
+            "agent:read"
+        };
+        assert!(
+            body.contains(expected),
+            "the 403 for GET {path} must name {expected}: {body}"
+        );
+    }
+
+    for (path, permissions, label) in [
+        (gold_gets[0], "gold:read", "a gold:read holder"),
+        (gold_gets[1], "gold:export", "a gold:export holder"),
+        (gold_gets[2], "gold:read", "a gold:read holder"),
+        (gold_gets[3], "gold:read", "a gold:read holder"),
+        (gold_gets[4], "gold:export", "a gold:export holder"),
+        (agent_gets[0], "agent:read", "an agent:read holder"),
+    ] {
+        let user_id = create_principal_with_permissions(&pool, permissions).await;
+        let cookie = session_cookie_for_user(&pool, user_id).await;
+        let response = request_with_cookie(&router, "GET", path, &cookie).await;
+        assert!(
+            !matches!(
+                response.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ),
+            "{label} must clear the gate on GET {path}, got {}",
+            response.status()
+        );
+    }
+}
+
 /// `WEB-8` S2 T8 (D8): `GET /api/governance/row-filter-grammar` needs
 /// `policy:read` and nothing less, asserted both ways: no session is 401, a
 /// principal with another permission is 403, and a `policy:read` holder gets
@@ -4662,7 +4730,9 @@ async fn role_edit_and_delete_are_gated_in_both_directions() {
             .expect("read the role"),
         (
             "Analyst".to_owned(),
-            "query:read, catalog:read, lineage:read,assistant:use,ops:read,alert:read,governance:read".to_owned()
+            // SEC-66: 0153 appends the two read grants to every working
+            // built-in role; the refused caller must not rewrite any of it.
+            "query:read, catalog:read, lineage:read,assistant:use,ops:read,alert:read,governance:read,gold:read,agent:read".to_owned()
         ),
         "a refused caller must not rewrite the role"
     );
@@ -4825,6 +4895,70 @@ async fn overview_alerts_refuses_dashboard_read_principal() {
     let allowed = request_with_cookie(&router, "GET", "/api/overview/alerts", &cookie).await;
     assert_ne!(allowed.status(), StatusCode::FORBIDDEN);
     assert_ne!(allowed.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// SEC-67: the three overview alert state-change routes are `alert:write`
+/// writes, while the list above stays readable with `alert:read` alone. Pin
+/// the table rows and both sides of the gate on each route: no session is
+/// 401, an `alert:read`-only principal is 403, and an `alert:write` principal
+/// gets past the gate (the handler then returns 404 for the unknown id).
+#[tokio::test]
+async fn overview_alert_state_change_routes_require_alert_write() {
+    let TestApp { router, pool } = spin_up().await;
+
+    for (pattern, action) in [
+        ("/api/overview/alerts/{id}/acknowledge", "acknowledge"),
+        ("/api/overview/alerts/{id}/resolve", "resolve"),
+        ("/api/overview/alerts/{id}/silence", "silence"),
+    ] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == "POST" && *p == pattern)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresPermission("alert:write")),
+            "POST {pattern}"
+        );
+
+        let path = format!("/api/overview/alerts/sec67-unknown-id/{action}");
+
+        // No session -> 401.
+        let anonymous = request_with_cookie(&router, "POST", &path, "").await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{path}");
+
+        // `alert:read` may see the list but not change it -> 403.
+        let reader = create_principal_with_permissions(&pool, "alert:read").await;
+        let reader_cookie = session_cookie_for_user(&pool, reader).await;
+        let denied = request_with_cookie(&router, "POST", &path, &reader_cookie).await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN, "{path}");
+
+        // `alert:write` gets past auth/authz. Silence needs a JSON body; the
+        // unknown alert id then makes the handler answer 404.
+        let writer = create_principal_with_permissions(&pool, "alert:write").await;
+        let writer_cookie = session_cookie_for_user(&pool, writer).await;
+        let allowed = if action == "silence" {
+            request_with_cookie_and_body(
+                &router,
+                "POST",
+                &path,
+                &writer_cookie,
+                br#"{"untilMinutes":60}"#.to_vec(),
+            )
+            .await
+        } else {
+            request_with_cookie(&router, "POST", &path, &writer_cookie).await
+        };
+        let status = allowed.status();
+        assert!(
+            status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+            "{path}: an alert:write principal must get past the gate, got {status}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{path}: the handler returns 404 for an unknown alert id"
+        );
+    }
 }
 
 /// BLD-1 part 1 / D8: the run route that replaced `.../enforce` is in

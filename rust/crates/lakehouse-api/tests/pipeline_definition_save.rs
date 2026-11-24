@@ -113,6 +113,7 @@ async fn send(router: &axum::Router, request: Request<Body>) -> (StatusCode, Val
 
 /// Today's body shape, which every console before this change sends.
 fn legacy_body(name: &str) -> Value {
+    let target_table = format!("{}_out", name.replace('-', "_"));
     json!({
         "name": name,
         "kind": "batch",
@@ -120,13 +121,14 @@ fn legacy_body(name: &str) -> Value {
         "sourceTable": "orders",
         "transforms": ["dedupe(id)", "select(id,total)"],
         "targetZone": "silver",
-        "targetTable": format!("{name}_out"),
+        "targetTable": target_table,
         "schedule": "manual",
     })
 }
 
 /// The new body shape: one input and one SQL step over it.
 fn new_body(name: &str) -> Value {
+    let target_table = format!("{}_out", name.replace('-', "_"));
     json!({
         "name": name,
         "kind": "batch",
@@ -139,7 +141,7 @@ fn new_body(name: &str) -> Value {
              "sql": "SELECT o.id, c.name FROM orders AS o LEFT JOIN customers AS c ON o.customer_id = c.id"},
         ],
         "targetZone": "silver",
-        "targetTable": format!("{name}_out"),
+        "targetTable": target_table,
         "schedule": "manual",
     })
 }

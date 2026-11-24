@@ -70,6 +70,11 @@
     "description": "Publish Gold marts and export them as open files."
   },
   {
+    "name": "gold:read",
+    "area": "Pipelines",
+    "description": "View Gold mart exports, publication state and outside readers."
+  },
+  {
     "name": "policy:read",
     "area": "Governance",
     "description": "View governance policies and SLAs."
@@ -133,6 +138,11 @@
     "name": "assistant:ask",
     "area": "Assistant",
     "description": "The assistant in Ask mode only. Its read tools may read tables, metrics and the catalog that the person may read (masks, row filters and GOV-7 still apply)."
+  },
+  {
+    "name": "agent:read",
+    "area": "Assistant",
+    "description": "View assistant agent runs and their step history."
   },
   {
     "name": "agent:approve",

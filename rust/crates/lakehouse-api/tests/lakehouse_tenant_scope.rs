@@ -2378,9 +2378,10 @@ async fn seed_an_agent_run(pool: &PgPool) -> String {
     "run-sec-20".to_owned()
 }
 
-/// The grant of a plain reader of the agents pages: the run history is open
-/// to any login, so the grant says nothing about the gate under test.
-const AGENTS_READER: &str = "dashboard:read";
+/// The grant of a plain reader of the agents pages. SEC-66 put the run
+/// history behind `agent:read`, so this now carries that grant alongside
+/// `dashboard:read`; the tenant split under test is unchanged.
+const AGENTS_READER: &str = "dashboard:read, agent:read";
 
 #[tokio::test]
 async fn the_quality_list_holds_only_the_tables_the_caller_may_read() {
