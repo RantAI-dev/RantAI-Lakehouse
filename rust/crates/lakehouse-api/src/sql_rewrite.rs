@@ -5694,14 +5694,29 @@ pub fn enforce(
     // Passing an empty list states the rule instead of relying on a type
     // mix-up (decision 2026-09-27, plan §8 item 3).
     classify_statement_for_principal(sql, dialect, &[], has_any_obligation)?;
-    let tables = referenced_tables(sql, dialect).ok_or(RewriteError::Unparseable)?;
+    let keys = referenced_table_keys(sql, dialect).ok_or(RewriteError::Unparseable)?;
     let mut obligations = HashMap::new();
-    for table in &tables {
-        if let Some(obl) = obligations_source.obligations_for(table, principal_roles) {
-            obligations.insert(table.clone(), obl);
+    for key in &keys {
+        if let Some(obl) = obligations_source.obligations_for(&key.short, principal_roles) {
+            obligations.insert(key.short.clone(), obl);
+        }
+        // `BI-44` slice 2: keep the catalog-scoped obligation under its own
+        // key too. `substitute_governed_tables` merges the two when both
+        // apply, and fails closed if they disagree about the real columns.
+        if key.full != key.short
+            && let Some(obl) = obligations_source.obligations_for(&key.full, principal_roles)
+        {
+            obligations.insert(key.full.clone(), obl);
         }
     }
-    let obligated: HashSet<String> = obligations.keys().cloned().collect();
+    let mut obligated: HashSet<String> = obligations.keys().cloned().collect();
+    // A view is classified by short keys (the shape `system.tables` holds),
+    // so a catalog-scoped obligation must also mark its short key there.
+    obligated.extend(
+        keys.iter()
+            .filter(|key| obligations.contains_key(&key.full))
+            .map(|key| key.short.clone()),
+    );
     classify_views(sql, dialect, views_catalog, &obligated)?;
     substitute_governed_tables(sql, dialect, engine, &obligations, placeholders)
 }

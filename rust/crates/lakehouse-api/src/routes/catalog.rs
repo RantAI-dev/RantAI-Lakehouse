@@ -406,17 +406,7 @@ async fn in_place_list(state: &AppState, requested: Option<u32>) -> Response {
         };
     let tables = match outcome {
         Ok(tables) => tables,
-        Err(err) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({
-                    "error": err.to_string(),
-                    "assets": [],
-                    "namespaces": [],
-                })),
-            )
-                .into_response();
-        }
+        Err(err) => return ApiRejection(err.into_api_error()).into_response(),
     };
     let assets: Vec<Value> = tables
         .iter()

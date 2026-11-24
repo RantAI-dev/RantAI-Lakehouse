@@ -24,7 +24,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::QueryEngine;
-use crate::upstream_error::{self, Class};
+use crate::upstream_error::{self, Class, FailedAs};
 
 /// What one engine can read in place for one source type. The `reason` is
 /// `Some` only for an unsupported source, and is an honest sentence naming
@@ -168,6 +168,14 @@ pub const INTROSPECTION: upstream_error::Context = upstream_error::Context::new(
 );
 
 impl IntrospectionError {
+    /// The HTTP error this classified failure becomes. The fixed message and
+    /// its reference are built inside [`upstream_error`], so no route ever
+    /// renders an upstream error's own text (SEC-11).
+    #[must_use]
+    pub fn into_api_error(self) -> lakehouse_core::ApiError {
+        self.0.into_api_error(FailedAs::ServiceUnavailable)
+    }
+
     /// Classifies a `Trino` error: a query or HTTP-status failure is the
     /// engine answering with a refusal, everything else (transport,
     /// timeout, row cap) is an engine that could not serve the request.
