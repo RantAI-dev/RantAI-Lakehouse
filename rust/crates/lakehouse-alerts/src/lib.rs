@@ -3603,6 +3603,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
 
     use super::*;
+    use lakehouse_core::secret::SecretValue;
 
     // ── `late` helper (plan 1f) ─────────────────────────────────────────
     //
@@ -5180,7 +5181,7 @@ mod tests {
             port: 587,
             secure: false,
             user: None,
-            pass: String::new(),
+            pass: SecretValue::new(String::new()),
             from: String::new(),
             ca_bundle: None,
         })
