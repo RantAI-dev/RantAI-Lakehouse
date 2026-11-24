@@ -11,7 +11,17 @@
  */
 
 export const LINKS = {
-  console: "/login",
+  /**
+   * Where "Open the console" leads.
+   *
+   * The landing page is also published as a static site
+   * (`https://lakehouse.rantai.dev`, `ops/landing-pages`), which serves no
+   * console of its own: a relative `/login` there would 404. That build sets
+   * `NEXT_PUBLIC_CONSOLE_URL` to the demo console, and Next inlines it at
+   * build time. Without the variable — `bun run dev`, the console's own
+   * `/landing` route, and the unit tests — the relative default stands.
+   */
+  console: process.env.NEXT_PUBLIC_CONSOLE_URL || "/login",
   talk: "mailto:contact@rantai.dev?subject=RantAI%20Lakehouse",
   email: "mailto:contact@rantai.dev",
   source: "https://github.com/RantAI-dev/RantAI-Lakehouse",

@@ -1229,6 +1229,12 @@ fn deployment_features(
 /// `GET /api/settings/deployment` — which of the deployment's features are
 /// set up, and what is missing for the ones that are not (plan D8).
 ///
+/// `installMode` and `queryEngine` (`BI-44`) are additive top-level fields
+/// naming the configuration this process resolved at boot. They let the
+/// console and an operator see which installation they are looking at
+/// without reading the deployment's environment; they are facts about the
+/// deployment, not a claim that any service is healthy.
+///
 /// It reports configuration, never health: a feature is "on" when its
 /// settings are in place. Backups are not in the list — the API cannot see
 /// the backup container's settings (feature page, Limits).
@@ -1251,6 +1257,8 @@ pub async fn get_deployment(State(state): State<AppState>) -> ApiResult<ApiJson<
     let single_sign_on = crate::runtime_settings::oidc(&state).await.is_some();
     Ok(ApiJson(json!({
         "features": deployment_features(&state, &email, &assistant, &sso, single_sign_on),
+        "installMode": state.config.install_mode.name(),
+        "queryEngine": state.config.default_query_engine_name(),
     })))
 }
 

@@ -28,6 +28,29 @@
     35% { scale: 1.28; }
     100% { scale: 1; }
   }
+  /*
+   * BI-71 (owner's mockup A, 2026-11-21): "Where does this come from" draws
+   * its route once, on open, in the direction the data flows. Each step's
+   * icon pops in, its words rise in, and the line to the next step grows
+   * downward; the panel staggers them with `animation-delay`. Transforms and
+   * opacity only, 240 ms each (DESIGN.md §3); the reduced-motion rule below
+   * stops all three.
+   */
+  --animate-route-draw: route-draw 240ms var(--ease-ui) both;
+  --animate-route-pop: route-pop 240ms var(--ease-ui) both;
+  --animate-route-rise: route-rise 240ms var(--ease-ui) both;
+  @keyframes route-draw {
+    from { transform: scaleY(0); }
+    to { transform: scaleY(1); }
+  }
+  @keyframes route-pop {
+    from { opacity: 0; transform: scale(0.6); }
+    to { opacity: 1; transform: scale(1); }
+  }
+  @keyframes route-rise {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
 }
 
 /*

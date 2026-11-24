@@ -113,6 +113,7 @@ async fn send(router: &axum::Router, request: Request<Body>) -> (StatusCode, Val
 
 /// Today's body shape, which every console before this change sends.
 fn legacy_body(name: &str) -> Value {
+    let target_table = format!("{}_out", name.replace('-', "_"));
     json!({
         "name": name,
         "kind": "batch",
@@ -120,13 +121,14 @@ fn legacy_body(name: &str) -> Value {
         "sourceTable": "orders",
         "transforms": ["dedupe(id)", "select(id,total)"],
         "targetZone": "silver",
-        "targetTable": format!("{name}_out"),
+        "targetTable": target_table,
         "schedule": "manual",
     })
 }
 
 /// The new body shape: one input and one SQL step over it.
 fn new_body(name: &str) -> Value {
+    let target_table = format!("{}_out", name.replace('-', "_"));
     json!({
         "name": name,
         "kind": "batch",
@@ -139,7 +141,7 @@ fn new_body(name: &str) -> Value {
              "sql": "SELECT o.id, c.name FROM orders AS o LEFT JOIN customers AS c ON o.customer_id = c.id"},
         ],
         "targetZone": "silver",
-        "targetTable": format!("{name}_out"),
+        "targetTable": target_table,
         "schedule": "manual",
     })
 }
@@ -1126,4 +1128,203 @@ async fn an_edit_of_a_form_step_by_another_user_moves_the_author() {
         .await
         .unwrap();
     assert_eq!(author_after, yoga.to_string());
+}
+
+// ── BLD-20: one pipeline per output table (HTTP level) ───────────────────
+//
+// The store owns the guard, so every save route inherits it. These prove the
+// 409 and its plain-English message reach the caller through the three write
+// routes a person actually uses: create, edit and version restore.
+
+/// `new_body` with a caller-chosen output table, so two different pipeline
+/// names can claim the same one.
+fn body_with_target(name: &str, zone: &str, table: &str) -> Value {
+    let mut body = new_body(name);
+    body["targetZone"] = json!(zone);
+    body["targetTable"] = json!(table);
+    body
+}
+
+/// The shared assertion on a BLD-20 refusal: 409 with a message that says
+/// another pipeline writes that output table and names the normalized key.
+fn assert_output_conflict(status: StatusCode, body: &Value, key: &str) {
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let message = body["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("another pipeline already writes the output table"),
+        "the 409 must say what happened in plain English, got {message:?}"
+    );
+    assert!(
+        message.contains(key),
+        "the 409 must name the claimed output table {key:?}, got {message:?}"
+    );
+}
+
+#[tokio::test]
+async fn creating_a_pipeline_whose_output_table_is_taken_is_409() {
+    let (router, pool, _ch) = app().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let (status, created) = send(
+        &router,
+        request(
+            "POST",
+            "/api/pipelines",
+            &cookie,
+            Some(GROUP_TENANT),
+            Some(body_with_target(
+                "bld20-create-a",
+                "silver",
+                "shared_output",
+            )),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    // Different pipeline name, same (case-different) output table.
+    let (status, refused) = send(
+        &router,
+        request(
+            "POST",
+            "/api/pipelines",
+            &cookie,
+            Some(GROUP_TENANT),
+            Some(body_with_target(
+                "bld20-create-b",
+                "Silver",
+                "Shared_Output",
+            )),
+        ),
+    )
+    .await;
+    assert_output_conflict(status, &refused, "silver.shared_output");
+
+    // The refused create wrote no row.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM pipeline_definition")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "the 409 must not leave a second pipeline behind");
+}
+
+#[tokio::test]
+async fn editing_a_pipeline_to_steal_another_output_table_is_409() {
+    let (router, pool, _ch) = app().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let (status, a) = send(
+        &router,
+        request(
+            "POST",
+            "/api/pipelines",
+            &cookie,
+            Some(GROUP_TENANT),
+            Some(body_with_target("bld20-edit-a", "silver", "edit_shared")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{a}");
+    let (status, b) = send(
+        &router,
+        request(
+            "POST",
+            "/api/pipelines",
+            &cookie,
+            Some(GROUP_TENANT),
+            Some(body_with_target("bld20-edit-b", "gold", "b_only")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    let b_id = b["id"].as_str().unwrap().to_owned();
+
+    let (status, refused) = send(
+        &router,
+        request(
+            "PUT",
+            &format!("/api/pipelines/{b_id}"),
+            &cookie,
+            Some(GROUP_TENANT),
+            Some(body_with_target("bld20-edit-b", "silver", "edit_shared")),
+        ),
+    )
+    .await;
+    assert_output_conflict(status, &refused, "silver.edit_shared");
+
+    // B kept its own output table — the refused edit changed nothing.
+    let target: String = sqlx::query_scalar("SELECT target FROM pipeline_definition WHERE id = $1")
+        .bind(&b_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // BLD-19 (04e6ff031) canonicalizes a `gold` target to `serving` at the
+    // API write boundary, so B's own unchanged table is `serving.b_only`.
+    assert_eq!(target, "serving.b_only");
+}
+
+#[tokio::test]
+async fn restoring_a_version_that_claims_a_taken_output_table_is_409() {
+    let (router, pool, _ch) = app().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    // A's version 1 claims `silver.restore_shared`.
+    let (status, a) = send(
+        &router,
+        request(
+            "POST",
+            "/api/pipelines",
+            &cookie,
+            Some(GROUP_TENANT),
+            Some(body_with_target(
+                "bld20-restore-a",
+                "silver",
+                "restore_shared",
+            )),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{a}");
+    let a_id = a["id"].as_str().unwrap().to_owned();
+
+    // Move A off that table, then let B claim it.
+    let (status, moved) = send(
+        &router,
+        request(
+            "PUT",
+            &format!("/api/pipelines/{a_id}"),
+            &cookie,
+            Some(GROUP_TENANT),
+            Some(body_with_target("bld20-restore-a", "gold", "a_only")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{moved}");
+    let (status, b) = send(
+        &router,
+        request(
+            "POST",
+            "/api/pipelines",
+            &cookie,
+            Some(GROUP_TENANT),
+            Some(body_with_target(
+                "bld20-restore-b",
+                "silver",
+                "restore_shared",
+            )),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+
+    // Restoring A's version 1 would overwrite B's table — refused.
+    let (status, refused) = send(
+        &router,
+        request(
+            "POST",
+            &format!("/api/pipelines/{a_id}/versions/1/restore"),
+            &cookie,
+            Some(GROUP_TENANT),
+            None,
+        ),
+    )
+    .await;
+    assert_output_conflict(status, &refused, "silver.restore_shared");
 }

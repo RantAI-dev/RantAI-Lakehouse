@@ -15,7 +15,7 @@ import { isIcebergCandidate } from "@/lib/lakehouse-view"
 import { governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import type { LineageGraph } from "@/services/contracts/governance"
-import { LineageMindmap, edgePipeline, mindmapModel } from "./asset-lineage-map"
+import { LineageMindmap, edgePipeline, mindmapModel, useChartPlacement } from "./asset-lineage-map"
 import { icebergTableOf, type IcebergTableState } from "./asset-storage"
 import { ColumnLineageCard, MappingList } from "./column-lineage"
 import { TableGrantNote } from "./table-grant-note"
@@ -196,8 +196,15 @@ function RelatedList({ items }: { items: Related[] }) {
 }
 
 /** The recorded graph around the asset, or why there is none to draw. */
-function GraphCard({ a, state }: { a: AssetDetail; state: AssetLineageState }) {
-  if (state.status === "loading") {
+export function GraphCard({ a, state }: { a: AssetDetail; state: AssetLineageState }) {
+  // BI-71 decision 4: the charts that read the asset are grouped by
+  // dashboard, which needs the viewer's charts and dashboards. Asked only
+  // when the graph has charts; while they load the map keeps its one
+  // loading look rather than drawing every chart and then folding them.
+  const loaded = state.status === "success" ? state.data : null
+  const charted = !!loaded?.supported && loaded.nodes.some((n) => n.id.startsWith("chart:"))
+  const { loading: placing, placement } = useChartPlacement(charted)
+  if (state.status === "loading" || placing) {
     return (
       <SectionCard size="sm" title="Lineage">
         <div className="flex gap-3 py-1" role="status" aria-label="Loading lineage">
@@ -269,7 +276,7 @@ function GraphCard({ a, state }: { a: AssetDetail; state: AssetLineageState }) {
           : `${upstream.length} upstream · ${downstream.length} downstream of this asset, by recorded lineage.`
       }
     >
-      <LineageMindmap model={model} />
+      <LineageMindmap model={model} placement={placement} />
       {/* What the graph cannot contain, so a missing step is not read as "there is none". */}
       {[graph.note, ...(graph.coverage ?? [])].filter(Boolean).map((caveat) => (
         <p key={caveat} className="mt-2 text-xs text-muted-foreground">
