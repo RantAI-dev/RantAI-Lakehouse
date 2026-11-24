@@ -16,6 +16,7 @@
   "scripts": {
     "dev": "bun --bun next dev",
     "build": "next build",
+    "build:landing": "bun scripts/build-landing-pages.ts",
     "start": "bun --bun next start",
     "lint": "bun --bun eslint",
     "test": "bun test src",
@@ -51,7 +52,6 @@
     "next": "16.4.6",
     "next-themes": "^0.4.6",
     "nuqs": "^2.10.2",
-    "ogl": "^1.0.11",
     "radix-ui": "^1.8.1",
     "react": "19.3.1",
     "react-day-picker": "^10.0.2",

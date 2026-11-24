@@ -82,6 +82,9 @@ class OpSourceMetadataTest(unittest.TestCase):
             op_metadata.source_metadata("dispar_orchestrate/x.py::y", reads=["a\nb"])
 
     def test_an_authored_op_declares_its_own_source_and_target_tables(self) -> None:
+        # BLD-19: Gold is `serving` in the catalog and lineage; a legacy
+        # stored `gold` target is the same zone and must be advertised under
+        # that canonical name, never as an orphan `gold` database.
         op_def = authored_factory._op_for_pipeline(
             {
                 "id": "pl-demo-1",
@@ -95,7 +98,21 @@ class OpSourceMetadataTest(unittest.TestCase):
             }
         )
         self.assertEqual(op_def.tags["reads"], "ClickHouse silver.events")
-        self.assertEqual(op_def.tags["writes"], "ClickHouse gold.events_clean")
+        self.assertEqual(op_def.tags["writes"], "ClickHouse serving.events_clean")
+
+        serving = authored_factory._op_for_pipeline(
+            {
+                "id": "pl-demo-2",
+                "definition": {
+                    "sourceZone": "silver",
+                    "sourceTable": "events",
+                    "targetZone": "serving",
+                    "targetTable": "events_clean",
+                    "transforms": [],
+                },
+            }
+        )
+        self.assertEqual(serving.tags["writes"], "ClickHouse serving.events_clean")
 
     def test_every_op_carries_the_default_retry_policy(self) -> None:
         """PART D of `parts/1b-dagster-one-op-per-unit-and-retries.md`:

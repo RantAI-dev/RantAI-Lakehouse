@@ -5,6 +5,8 @@
  * `lakehouse_notify::DeliverResult` exactly.
  */
 
+import type { ReportSchedule } from "./reports"
+
 /**
  * Mirrors `AlertKind` (`rust/crates/lakehouse-alerts/src/lib.rs`): `alert`,
  * `digest`, `freshness`, the four pipeline kinds (which have no form here and
@@ -128,6 +130,14 @@ export type AlertRule = {
    */
   ownerId?: string
   /**
+   * `BI-65`: when a digest is sent, the same shape as a report subscription's
+   * schedule. Absent on a digest saved before schedules (sent daily at 08:00 in
+   * the report time zone) and on every other kind.
+   */
+  schedule?: ReportSchedule
+  /** `BI-65`: the IANA zone `schedule` is read in. */
+  timeZone?: string
+  /**
    * `BI-39` D8: the watched chart's title and its dashboard's id and name, read
    * live when the list is answered. All three are absent together when the
    * caller cannot see the chart any more (never stored, so a rename shows at
@@ -172,6 +182,9 @@ export type SaveAlertRuleInput = {
   series?: string
   filters?: unknown[]
   condition?: string
+  /** `BI-65`: a digest's schedule and zone; the server refuses them on any other kind. */
+  schedule?: ReportSchedule
+  timeZone?: string
 }
 
 /** Body of `GET /api/alerts/status`. */

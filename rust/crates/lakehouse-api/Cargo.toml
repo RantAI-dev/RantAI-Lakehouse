@@ -258,15 +258,11 @@ async-trait = { workspace = true }
 # `copy_bidirectional`), which is the only thing in this crate's tests that
 # needs a socket of its own.
 tokio = { workspace = true, features = ["test-util", "net", "io-util"] }
-# `tests/gold_publication.rs` (DATA-1) proves the per-mart publication
-# routes' ClickHouse-backed halves (404 for an unknown mart, skip-when-
-# unchanged for `?ifChanged=true`) against a REAL `ClickHouse` — the same
-# `testcontainers` arrangement `lakehouse-test-support` provides for
-# Postgres, pinned to the compose file's own `26.8` tag. Versions mirror
-# `lakehouse-test-support`'s own declarations so Cargo unifies on one
-# build.
+# `tests/email_settings_route.rs` starts a Mailpit `GenericImage` with
+# `testcontainers`. The ClickHouse image and its `REL-14` start retry now
+# live in `lakehouse-test-support`'s shared harness, used by the eight
+# ClickHouse-backed test modules here and in `src/routes/bronze_registry_fixture.rs`.
 testcontainers = { version = "0.27", features = ["reusable-containers"] }
-testcontainers-modules = { version = "0.15", features = ["clickhouse"] }
 # `pipeline_source.rs`'s tests (WS4 item C2) exercise the allowlist builder
 # against a real filesystem (a real `..`/absolute-path/symlink escape must
 # actually resolve to a file outside a real base directory to prove
