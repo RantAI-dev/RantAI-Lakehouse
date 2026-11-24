@@ -61,7 +61,12 @@ describe("EmailSettingsForm (ADM-7)", () => {
   it("never pre-fills the password, and only asks for it when it is replaced", async () => {
     mockApi({ ...SAVED, password: { set: true, source: "console" } })
     render(<EmailSettingsForm canWrite />)
-    await screen.findByText("Set")
+    // "Set" is derived from the fetched data and renders before the load
+    // effect has initialised the fields. Waiting for that effect-driven
+    // value proves the form has settled, so Replace cannot race a late
+    // state update (REL-24).
+    const port = (await screen.findByLabelText("Port")) as HTMLInputElement
+    await waitFor(() => expect(port.value).toBe("587"))
     expect(screen.queryByLabelText("Password")).toBeNull()
     fireEvent.click(screen.getByRole("button", { name: "Replace" }))
     const password = (await screen.findByLabelText("Password")) as HTMLInputElement

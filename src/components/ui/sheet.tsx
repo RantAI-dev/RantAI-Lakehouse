@@ -6,6 +6,7 @@ import { XIcon } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
+import { useSurfaceThemeClass } from "@/components/ui/surface-theme"
 
 function Sheet({ ...props }: SheetPrimitive.Root.Props) {
   return <SheetPrimitive.Root data-slot="sheet" {...props} />
@@ -46,6 +47,8 @@ function SheetContent({
   side?: "top" | "right" | "bottom" | "left"
   showCloseButton?: boolean
 }) {
+  // WEB-10: the portal stays on <body>; copy the opener's theme onto the sheet.
+  const surfaceThemeClass = useSurfaceThemeClass()
   return (
     <SheetPortal>
       <SheetOverlay />
@@ -62,6 +65,7 @@ function SheetContent({
             "inset-x-0 top-0 h-auto border-b border-border data-ending-style:-translate-y-full data-starting-style:-translate-y-full",
           side === "bottom" &&
             "inset-x-0 bottom-0 h-auto border-t border-border data-ending-style:translate-y-full data-starting-style:translate-y-full",
+          surfaceThemeClass,
           className
         )}
         {...props}

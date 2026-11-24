@@ -396,6 +396,7 @@ describe("useQueryStudio Bronze tables", () => {
       snapshotCount: 0,
       metadataLogCount: 0,
     },
+    compactionAvailable: false,
   } as unknown as LakehouseTableDetail
 
   function mountWithBronze(

@@ -202,3 +202,110 @@ relies on the engine answering after 3 s and the request being dropped at
 timing-based: if CI shows it flaky, widen the gap. Full `bun run test` and
 lint, not run by rule. The real behaviour in a browser (Stop then History) was
 not run.
+
+## Handoff, PR 3 (`BI-65`)
+
+Branch `feat/bi-65-digest-schedule`, not pushed. Commits: `d2bbf7abd` (store
+clock + migration `0152`), `10a397435` (alerts crate, API, assistant tool,
+`tool_schemas.json`), `a90898b74` (console, CHANGELOG).
+
+**Deviation from decision 1's wording, no decision changed.** `lakehouse-alerts`
+does not depend on `lakehouse-store` (a documented rule at `FreshnessSource`),
+so the report `Schedule` type is not used there. The rule carries the schedule
+as the JSON the API validated (`AlertRule.schedule: Option<Value>`,
+`time_zone: Option<String>`); the API parses it with the report's
+`ScheduleInput`/`schedule_of` (now `pub(crate)`) and canonicalises it with
+`schedule_json` on save. The due decision lives in `lakehouse-store::alert_state`
+(`digest_turn`), reached by the evaluator through two new `StateSource` methods
+(`digest_turn`, `digest_give_back`). `alert_rule_state` got `digest_clock_at`
+(no fitting column existed). First sight of a digest starts its clock and sends
+nothing; its first send is the first schedule time after that (so a digest
+never sends for a time before it existed). A schedule or zone edit clears the
+clock. A run of one named rule (`?id=`, test, assistant `run_alert_rule`) sends
+at once and does not move the clock.
+
+**Commands run (VM).** `rustfmt --edition 2024 --check` on every changed `.rs`:
+clean. `bun x tsc --noEmit -p .`: 0 errors. `bun x eslint` on changed TS: 0
+errors (2 pre-existing-style warnings in files not by this change, one now gone).
+`bun test src/features/alerts src/features/dashboards/subscriptions-dialog.test.tsx
+src/features/dashboards/schedule-fields.test.tsx
+src/features/dashboards/report-words.test.ts src/features/copilot/capabilities.test.ts`:
+121 pass, 0 fail.
+
+**Producers and consumers changed.**
+- `AlertRule` literals: `lakehouse-alerts` tests (`freshness_rule`, `metric_rule`),
+  `lakehouse-api/src/routes/alerts.rs` tests (two). `AlertRuleInput` is under
+  `deny_unknown_fields`; its producers: `routes/alerts.rs::parse_body` (400 names
+  the field), `routes/ai/tools/alerts.rs::parse_input` (now returns an error
+  naming the field instead of an empty input; `confirmed`/`ownerId` are stripped
+  by `gate::strip_confirmed` before it), the console `alertRuleSaveInput` (it
+  used to send the whole stored rule, including `createdAt`, `ownerId`,
+  `chartTitle`; it now sends only `SaveAlertRuleInput` fields), the chart-alert
+  dialog (explicit fields, unchanged). Python/Dagster only calls `/api/alerts/run`.
+- `console.alert_rule`: `ensure` adds `schedule`, `time_zone` (additive loop),
+  `COLS`, `row_to_rule`, the insert (24 columns, 24 values, checked by script).
+- `StateSource` impls: `FakeState` (tests) and `ApiStateSource` (now holds
+  `state`, built in `run_one` only).
+- `tool_schemas.json` was edited by hand (cargo not allowed): the same two
+  tools get `schedule` and `timeZone` after `board`, and the create description
+  gains the digest sentence; produced with a JSON round trip that reproduces the
+  file byte for byte beforehand. CI's `tool_schemas_snapshot_is_byte_identical`
+  is the check; if it fails, run `write_tool_schema_fixture` once.
+- `tests/sec11_guard.rs`: one allowlist entry (serde text over the model's own
+  tool arguments), with its reason.
+- New migration `0152_alert_rule_state_digest_clock.sql` (next free number).
+
+**Tests added.** Store (`tests/alert_state.rs`, real Postgres): not before its
+time, once after, not again on the next tick, once a day for the default, race,
+give-back, clock restart on edit, unknown zone. Alerts crate: not-due digest
+sends and reads nothing, no clock source is skipped, claim given back when the
+digest is skipped, unknown field refused by name, schedule only on a digest, new
+digest needs a schedule, schedule round trip through the row. AI tool: schedule
+args read, stray argument refused. Console: shared control (new test file), both
+forms, digest row line, save input fields.
+
+**Not verified (no cargo on the VM).** Nothing Rust compiled, clippy not run,
+no `sqlx::test` run; every Rust test above is first compiled by CI. Points to
+watch: `DigestTurnError` `#[from]` derives; `sqlx::query_scalar` into
+`Option<Option<OffsetDateTime>>`; let-chain in `save_rule_with_checks`; the HTTP
+status of the unknown-field 400 is covered only through the existing
+`parse_body` mapping, not by a new route test. No browser check of the form,
+no QA. `docs/core/features/sharing-and-delivery.md` (AC12 wording) and
+`BACKLOG.md` are not updated (planner's after merge).
+
+## Handoff 2, PR 3 (`BI-65`): owner QA fixes on the Alerts pages
+
+Three findings from the owner's QA of 2026-11-21, one commit on
+`feat/bi-65-digest-schedule`.
+
+- **The tab is in the address.** `alerts-view.tsx` reads `?tab=rules`
+  (anything else is Active Incidents) and a tab click does
+  `router.replace(..., { scroll: false })`. `app/(overview)/alerts/page.tsx`
+  wraps it in `Suspense`, as the lineage page does for `useSearchParams`. The
+  rule pages' `backHref` is `/alerts?tab=rules`, used after a save and by the
+  back arrow.
+- **Dashboard name.** Cause: base-ui's `Select` shows a label only for values
+  it was given in `items` on the root; `SelectValue` otherwise prints the raw
+  value (`b_813fc488`). The digest's select now passes `items` built from the
+  boards. A board missing from the list (deleted) still shows its id.
+- **One way back.** `FormPage` got an optional `onBack` (takes over the back
+  arrow's click) and `onCancel` is now optional (no Cancel button without it);
+  the other twelve form pages keep Cancel. The rule page passes no `onCancel`
+  and compares the form and schedule draft with what they held when filled;
+  when different, back opens the existing `ConfirmActionDialog` ("Discard your
+  changes?", as the Subscriptions dialog does). The page has no Esc handler, so
+  none was added.
+
+Commands (memory-wrapped, from the worktree):
+
+- `bun test src/features/alerts src/components/patterns/form-page.test.tsx`:
+  72 pass, 0 fail, 5 files (new `alerts-view.test.tsx`; new cases for no
+  Cancel, discard confirm, dashboard name, `onBack`).
+- `bun x tsc --noEmit -p .`: clean.
+- `bun x eslint` on the changed files and `src/features/alerts`: 0 errors, 1
+  existing warning in `alerts-page.tsx` (useMemo deps, not touched).
+
+Not verified: no browser check, no QA; the full `bun run test` and
+`bun run lint` were not run (VM memory). `alerts-view.test.tsx` restores the
+modules it mocks in `afterAll`, because bun's `mock.module` otherwise leaks into
+the other alerts test files.
