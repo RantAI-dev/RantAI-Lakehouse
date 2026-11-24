@@ -70,12 +70,12 @@ The harness must normalize these rather than compare them by value:
   `ops-workloads.workloads[].elapsedMs` (an in-flight query's live elapsed
   time).
 - **Live cluster aggregates** — `system.query_log` rollups in `ops-usage`,
-  `ops-observability`, `overview-get`, `storage-get`; `ops-workloads` reads
-  `system.processes` and is empty on a quiet cluster. Also normalized for the
-  same reason: `ops-observability.slos[].current` (a live SLO snapshot
-  embedded in a string, e.g. `"1233ms"`, so the generic numeric-leaf rule
-  can't catch it) and `ops-usage.tenants[].computeUnits`/`.budgetSpent` (a
-  per-tenant echo of the same live `computeUnits7d` aggregate).
+  `overview-get`, `storage-get`; `ops-workloads` reads `system.processes`
+  and is empty on a quiet cluster. WEB-4 retired `ops-observability` (and
+  its `slos[].current` string snapshot), so its corpus entry is gone.
+  Also normalized for the same reason:
+  `ops-usage.tenants[].computeUnits`/`.budgetSpent` (a per-tenant echo of the
+  same live `computeUnits7d` aggregate).
 - **Row counts** — `catalog-list` per-dataset `rows` change after each sync.
 - **Unordered catalog listing** — `catalog-list`'s `assets` and `namespaces`
   come from `SELECT ... FROM bronze_meta.dataset_catalog UNION ALL SELECT

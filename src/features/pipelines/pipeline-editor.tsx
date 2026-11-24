@@ -17,6 +17,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { catalogRefusal } from "@/lib/catalog-refusal"
 import { withNotify } from "@/lib/notify"
 import {
   MAX_INPUTS,
@@ -61,7 +62,7 @@ import {
   type SaveBlocker,
 } from "@/lib/pipeline-editor"
 import { cn } from "@/lib/utils"
-import { connectorService, lakehouseService, pipelineService } from "@/services"
+import { assetService, connectorService, lakehouseService, pipelineService } from "@/services"
 import type {
   Pipeline,
   PipelineDetail,
@@ -89,6 +90,13 @@ import {
 } from "./pipeline-editor-panes"
 import { isSchedulable, PipelineScheduleField } from "./pipeline-schedule-field"
 import { BRONZE_ZONE, reuploadTriggerOn, showsReuploadSwitch, withReuploadTrigger } from "./pipeline-reupload-trigger"
+import {
+  catalogAssetId,
+  catalogNamespaceForZone,
+  INPUT_ZONE_VALUES,
+  OUTPUT_ZONE_VALUES,
+  ZONE_LABELS,
+} from "./pipeline-zones"
 
 /** The key a selection is filed under: the item's id, or `output`. */
 function selectionKey(selection: EditorSelection): string {
@@ -196,13 +204,10 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
     )
   }
 
-  // WEB-8 D8: zones are the lakehouse's namespaces; `null` while they are
-  // read or when the read failed, because neither is "there are no zones".
-  const namespaces = useService((signal) => lakehouseService.listNamespaces(undefined, signal), [])
-  const zoneNames = namespaces.status === "success" ? namespaces.data.map((namespace) => namespace.name) : null
-  const zoneNote =
-    namespaces.status === "error" ? "Could not read the lakehouse's namespaces; type the zone name instead." : undefined
-  const icebergZones = React.useMemo(() => new Set(zoneNames ?? []), [zoneNames])
+  // The zone pickers offer the product's medallion zones, not Lakekeeper's
+  // Iceberg namespaces: the latter leak `default` and hide ClickHouse's
+  // `silver` and `serving`. Both lists are fixed, so neither picker has a
+  // loading or failed state. `pipeline-zones.ts` explains the mapping.
 
   // Every input's columns with their types, read per input by
   // `InputColumnsReader` below (BLD-1 part 1 S3 review R1-S6: one read keyed
@@ -532,9 +537,8 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
           index={index}
           canRemove={editor.inputs.length > 1}
           connector={connector}
-          zones={zoneNames}
-          zoneNote={zoneNote}
-          icebergZones={icebergZones}
+          zones={INPUT_ZONE_VALUES}
+          zoneLabels={ZONE_LABELS}
           columns={inputColumns[input.id] ?? null}
           problem={problemFor(input.id)}
           invalid={invalidFor(input.id)}
@@ -654,8 +658,8 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
       <OutputPane
         targetZone={targetZone}
         targetTable={targetTable}
-        zones={zoneNames}
-        zoneNote={zoneNote}
+        zones={OUTPUT_ZONE_VALUES}
+        zoneLabels={ZONE_LABELS}
         writtenFrom={outputSourceLine({ inputs, steps: editor.steps }, plainCopy)}
         plainCopy={plainCopy}
         plainCopyAllowed={editor.steps.length === 0}
@@ -779,7 +783,6 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
           id={input.id}
           zone={input.zone.trim()}
           table={input.table.trim()}
-          listable={icebergZones.has(input.zone.trim())}
           onColumns={reportColumns}
         />
       ))}
@@ -1126,40 +1129,68 @@ function TriggerRow({
   )
 }
 
+/** One catalog column, read defensively: a tenant refusal has no `schema` at all. */
+function catalogColumn(field: unknown): Column | null {
+  if (typeof field !== "object" || field === null) return null
+  const value = field as { name?: unknown; dataType?: unknown }
+  if (typeof value.name !== "string" || typeof value.dataType !== "string") return null
+  return { name: value.name, type: value.dataType }
+}
+
 /**
- * Reads one input's columns with their types, from the read the table page
- * uses, and hands them to the editor; it renders nothing. One per input, so
- * an input's columns are read again only when its own zone or table changes
- * (R1-S6). `getTableDetail` answers for an Iceberg namespace only, so an
- * input in a zone it does not list gets `null` (the fields stay free text)
- * instead of asking a question with no answer; a table that cannot be read
- * is `null` too.
+ * Reads one input's columns with their types and hands them to the editor; it
+ * renders nothing. One per input, so an input's columns are read again only
+ * when its own zone or table changes (R1-S6).
+ *
+ * Bronze is an Iceberg table (`getTableDetail`). Silver and Gold (`serving`)
+ * are ClickHouse tables in the catalog, read by asset id the way Query Studio
+ * reads them. A zone that is neither, or a table that cannot be read, leaves
+ * the fields as free text instead of asking a question with no answer. The
+ * `useService` read is keyed on the zone and table: when either changes, the
+ * old request is aborted and `null` is reported while the new one loads, so
+ * a slow answer for the previous zone cannot overwrite the new one's columns.
  */
 function InputColumnsReader({
   id,
   zone,
   table,
-  listable,
   onColumns,
 }: {
   id: string
   zone: string
   table: string
-  listable: boolean
   onColumns: (id: string, columns: Column[] | null) => void
 }) {
-  const detail = useService(
-    (signal) => (listable && table !== "" ? lakehouseService.getTableDetail(zone, table, signal) : Promise.resolve(null)),
-    [zone, table, listable]
+  const catalogNamespace = catalogNamespaceForZone(zone)
+  const columns = useService<Column[] | null>(
+    (signal) => {
+      if (table === "") return Promise.resolve(null)
+      if (catalogNamespace !== null) {
+        return assetService.getAsset(catalogAssetId(catalogNamespace, table), signal).then((detail) => {
+          // The tenant gate answers `200` with `{ supported: false }` and no
+          // `schema`; read the refusal first so nothing throws in this handler.
+          if (catalogRefusal(detail)) return null
+          const schema: unknown = detail.schema
+          if (!Array.isArray(schema)) return null
+          const read = schema.map(catalogColumn).filter((column): column is Column => column !== null)
+          return read.length > 0 ? read : null
+        })
+      }
+      if (zone === BRONZE_ZONE) {
+        return lakehouseService.getTableDetail(zone, table, signal).then((detail) => {
+          if (!Array.isArray(detail.schema)) return null
+          const read = detail.schema.map((field) => ({ name: field.name, type: field.type }))
+          return read.length > 0 ? read : null
+        })
+      }
+      return Promise.resolve(null)
+    },
+    [catalogNamespace, zone, table]
   )
-  const columns = React.useMemo(() => {
-    if (detail.status !== "success" || !Array.isArray(detail.data?.schema)) return null
-    const read = detail.data.schema.map((field) => ({ name: field.name, type: field.type }))
-    return read.length > 0 ? read : null
-  }, [detail.status, detail.data])
+  const ready = columns.status === "success" ? columns.data : null
   React.useEffect(() => {
-    onColumns(id, columns)
-  }, [id, columns, onColumns])
+    onColumns(id, ready)
+  }, [id, ready, onColumns])
   return null
 }
 

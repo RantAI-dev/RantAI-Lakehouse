@@ -3,6 +3,7 @@ import {
   formatSignedBytes,
   isIcebergCandidate,
   lakehouseCapacityUrl,
+  lakehouseCompactionStatusUrl,
   lakehouseMaintenanceUrl,
   lakehouseNamespacesUrl,
   lakehouseTableDetailUrl,
@@ -12,6 +13,11 @@ import {
   msToIso,
   snapshotRelativeTime,
   snapshotsNewestFirst,
+  systemCompactionWarningMessage,
+  tableCompactionWarningMessage,
+  tableNeedsCompactionWarning,
+  tablesNeedingCompaction,
+  NEEDS_COMPACTION_FILE_COUNT,
 } from "./lakehouse-view"
 import type { LakehouseMaintenance, LakehouseSnapshot } from "@/services/contracts/lakehouse"
 
@@ -228,5 +234,98 @@ describe("maintenanceSummary", () => {
     expect(summary).toContain("keep snapshots: not set")
     expect(summary).toContain("orphan-file age: not set")
     expect(summary).toContain("no small-file compaction")
+  })
+})
+
+describe("lakehouseCompactionStatusUrl", () => {
+  it("points at the single System-status compaction endpoint", () => {
+    expect(lakehouseCompactionStatusUrl()).toBe("/api/lakehouse/compaction-status")
+  })
+})
+
+// OPS-21: the warning is driven only by a MEASURED count and a confirmed-off
+// Trino. These pure helpers are the same ones both UI surfaces call.
+describe("tableNeedsCompactionWarning", () => {
+  it("warns from a measured count at the need count when Trino is off", () => {
+    expect(
+      tableNeedsCompactionWarning({
+        smallFileCount: NEEDS_COMPACTION_FILE_COUNT,
+        compactionAvailable: false,
+      })
+    ).toBe(true)
+  })
+
+  it("is silent when the count was not measured", () => {
+    expect(tableNeedsCompactionWarning({ smallFileCount: null, compactionAvailable: false })).toBe(
+      false
+    )
+  })
+
+  it("is silent when the count is below the need count", () => {
+    expect(
+      tableNeedsCompactionWarning({
+        smallFileCount: NEEDS_COMPACTION_FILE_COUNT - 1,
+        compactionAvailable: false,
+      })
+    ).toBe(false)
+  })
+
+  it("is silent when Trino can compact", () => {
+    expect(tableNeedsCompactionWarning({ smallFileCount: 999, compactionAvailable: true })).toBe(
+      false
+    )
+  })
+
+  it("is silent when the API did not send the Trino flag", () => {
+    expect(tableNeedsCompactionWarning({ smallFileCount: 999 })).toBe(false)
+  })
+})
+
+describe("tableCompactionWarningMessage", () => {
+  it("names the measured count, the threshold, and the trino profile fix", () => {
+    const message = tableCompactionWarningMessage(42, 32 * 1024 * 1024)
+    expect(message).toContain("42")
+    expect(message).toContain("32.0 MB")
+    expect(message).toContain("--profile trino")
+    expect(message).toContain("trino profile")
+  })
+})
+
+describe("systemCompactionWarningMessage", () => {
+  it("names the trino profile fix and agrees with the table count", () => {
+    const one = systemCompactionWarningMessage(1)
+    const many = systemCompactionWarningMessage(3)
+    expect(one).toContain("1 table has")
+    expect(many).toContain("3 tables have")
+    expect(one).toContain("--profile trino")
+    expect(many).toContain("trino profile")
+  })
+})
+
+describe("tablesNeedingCompaction", () => {
+  const status = {
+    compactionAvailable: false,
+    needsCompactionFileCount: NEEDS_COMPACTION_FILE_COUNT,
+    tables: [
+      { namespace: "bronze", name: "orders", smallFileCount: 42 },
+      { namespace: "bronze", name: "clean", smallFileCount: 1 },
+      { namespace: "bronze", name: "events", smallFileCount: NEEDS_COMPACTION_FILE_COUNT },
+    ],
+  }
+
+  it("lists only measured tables at or above the need count, sorted", () => {
+    expect(tablesNeedingCompaction(status).map((t) => t.name)).toEqual(["events", "orders"])
+  })
+
+  it("is empty when Trino is available, however high the counts", () => {
+    expect(tablesNeedingCompaction({ ...status, compactionAvailable: true })).toEqual([])
+  })
+
+  it("is empty when the API did not send the Trino flag", () => {
+    const withoutFlag = {
+      tables: status.tables,
+      needsCompactionFileCount: NEEDS_COMPACTION_FILE_COUNT,
+    } as unknown as Parameters<typeof tablesNeedingCompaction>[0]
+    expect(tablesNeedingCompaction(withoutFlag)).toEqual([])
   })
 })

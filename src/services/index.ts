@@ -73,8 +73,9 @@ export const governanceService = clickhouseGovernanceService
  */
 export type { RowFilterGrammar } from "./contracts/governance"
 // Ops is real — the service list from ClickHouse+Dagster. WEB-3 slice 1
-// removed the observability and workloads reads with their pages; the
-// backend routes stay registered (WEB-4 retires them).
+// removed the observability and workloads reads with their pages. WEB-4
+// retired `/api/ops/observability`; `/api/ops/workloads` stays because the
+// assistant's `list_workloads`/`kill_query` tools still read it.
 export const opsService = clickhouseOpsService
 // Identity is now real — users/roles/tenants/service identities live in
 // Postgres. Every contract method is served, so mock/identity.ts has been

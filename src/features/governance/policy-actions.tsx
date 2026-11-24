@@ -113,7 +113,9 @@ export function PolicyActions({
     if (!asking || !confirmation) return
     const done = await run.run(asking)
     if (done === null) {
-      notifyError(`${confirmation.title} failed`, run.error)
+      // WEB-6: `run.error` here is the closure's stale state (null on the
+      // first failure); `getError()` is the error of THIS invocation.
+      notifyError(`${confirmation.title} failed`, run.getError())
       return
     }
     notifySuccess(confirmation.done)

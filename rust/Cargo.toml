@@ -16,6 +16,9 @@ rust-version = "1.99"
 license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
+# `SEC-59`: `lakehouse-notify::SmtpConfig::pass` is a
+# `lakehouse_core::secret::SecretValue`, so the notify crate needs core.
+lakehouse-core = { path = "crates/lakehouse-core" }
 # `multipart`: `POST /api/uploads` reads one multipart part (`routes::uploads`,
 # ADR 0014, decision 2). It adds axum's `Multipart` extractor, which is built on
 # the `multer` crate: the one package `Cargo.lock` gained (3.1.0, MIT, allowed by
