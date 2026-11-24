@@ -172,5 +172,89 @@ handoff and review round.
 
 ## Handoff
 
-(pending slice 1; the developer appends commits, commands with counts, and
-anything skipped or not verified before pushing.)
+Developer: implementation sub-agent, 2026-11-24. Branch
+`feat/bi-44-in-place-mode-foundation`, base `origin/main` at `ae360d951`.
+Not pushed at the time of writing this section.
+
+### Commits (plan order)
+
+- `33ae5c1e0` T1 `BI-44 docs: spec, feature page and four-slice plan`
+- `1b972f164` T2 `BI-44 config: fail-closed install mode and single-engine mutual exclusion`
+- `9f79666db` T3 `BI-44 API: route engine to the installed engine and report it honestly`
+- `c475af8c7` T4 `BI-44 compose: standalone one-engine BI-only deployment files`
+- `5e902822d` T3 follow-up `BI-44 test: backtick product names in integration test docs`
+  (clippy `-D warnings` found them once `tests/it.rs` registered the new module)
+- this commit: the handoff.
+
+### What was built
+
+- **T1** `docs/core/specs/bi-44.md` (modes, source matrix, governance,
+  security, resource rationale, `BI-44-AC1`..`AC7` with the memory number
+  marked *(proposed)*), `docs/core/features/bi-assistant-only-install.md`
+  and this four-slice plan with anchors at `ae360d951`.
+- **T2** `config.rs`: `InstallMode`, `QueryEngine`, trimmed/case-insensitive
+  parsers that refuse unknown non-empty values, three new `ConfigError`
+  variants, `Config` fields, `is_bi_only`, `default_query_engine_name`,
+  `engine_allowed`, and the `bi-only` mutual-exclusion gate. Full mode
+  accepts both URLs exactly as before. `docs/CONFIGURATION.md`,
+  `.env.example` and `CHANGELOG.md` changed in the same commit.
+- **T3** `routes/query.rs`: one `resolve_request_engine` used by `run` and
+  `estimate`, plus the same check at the shared `run_statement_with`
+  choke point so the assistant cannot dial the inactive engine. The
+  effective engine reaches `sql_rewrite::Engine::{ClickHouse,Trino}` and
+  the policy rewrite. `health.rs` probes only the chosen engine in
+  `bi-only` and builds `checked: false` rows for absent services;
+  `readiness.rs` adds `"skipped"` (only in `bi-only`) and a `trino` check
+  that is absent in full mode. `GET /api/settings/deployment` gains
+  `installMode`/`queryEngine`. Tests: `tests/bi_only_query_mode.rs`
+  (registered in `tests/it.rs`, as required by `autotests = false`), plus
+  two deployment-route tests.
+- **T4** `ops/bi-only/`: two self-contained Compose files (seven services
+  each, exact root image tags/digests and image variables, one engine per
+  file, read-only catalog mount in the federated variant), an operator
+  README and a six-test `unittest` suite.
+
+### Verification (foreground, on the final code commit `5e902822d`)
+
+Every command was run from `/tmp/wt-bi44-s1`; Rust used
+`CARGO_INCREMENTAL=0` and `CARGO_TARGET_DIR=/home/shiro/rantai/RantAI-Lakehouse/rust/target`.
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check -p lakehouse-api` (from `rust/`) | clean |
+| `cargo clippy --manifest-path rust/Cargo.toml -p lakehouse-api --all-targets -- -D warnings` | finished with no warnings |
+| `cargo test --manifest-path rust/Cargo.toml -p lakehouse-api --lib` | **3951 passed**, 0 failed, 19 ignored |
+| `cargo test --manifest-path rust/Cargo.toml -p lakehouse-api --test it -- bi_only_query_mode deployment_settings_route route_auth sec11_guard` | **120 passed**, 0 failed, 1763 filtered out |
+| `python3 -m unittest discover -s ops/bi-only -v` | **6 tests**, OK |
+| `python3 -m unittest discover -s ops/lint -v` | **76 tests**, OK |
+| `python3 ops/lint/check_image_digests.py` | 45 third-party images pinned, 9 locally built exempt |
+| `bash scripts/ci/check_test_modules.sh` | every test file compiled into a test binary |
+| `git diff --check` | clean |
+
+### Skipped / not verified
+
+- **Not verified:** `docker compose up` of either new file from a clean
+  project name. Slice 4 owns that E2E gate; the slice-1 proof is the
+  static suite plus the root image-digest lint. `docker compose config`
+  was not used as a substitute.
+- **Not run:** the full workspace block (`cargo clippy --workspace`,
+  `cargo test --workspace`, `bun run typecheck/lint/test`, Dagster pytest)
+  and `docker compose --profile '*' config --quiet`. The reviewer runs
+  the verification block before merge; this branch touches only
+  `lakehouse-api` Rust, Python test/lint files and documentation.
+- **No migrations added** (`0154`–`0157` remain reserved by the merge
+  queue). No SQL or generated build output is staged.
+
+### Design notes for the reviewer
+
+1. `Config::engine_allowed` returns `true` for every name in `full` mode,
+   deliberately preserving the existing `Engine::from_name` fallback;
+   only `bi-only` narrows it. Unknown names are refused there, so a typo
+   cannot silently become a `ClickHouse` run.
+2. `readiness::Check::Skipped` is a third JSON word. It appears only in
+   `bi-only` bodies; the full stack's `checks` object still has exactly
+   three keys and no `trino` key (`skip_serializing_if`).
+3. The standalone files have no `build:` blocks: they reference the same
+   image variables as the root file, and the README tells the operator to
+   build those images with the root Compose file first. This also keeps
+   warehouse-only context paths out of the deployment templates.
