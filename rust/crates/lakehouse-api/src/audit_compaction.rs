@@ -24,8 +24,8 @@
 //! # The counters
 //!
 //! The sign-in counter is [`lakehouse_auth::source_throttle`]'s table
-//! (`login_source_throttle`, migration `0153`); this module owns the
-//! gate's counter (`gate_refusal_throttle`, migration `0154`) and the
+//! (`login_source_throttle`, migration `0158`); this module owns the
+//! gate's counter (`gate_refusal_throttle`, migration `0159`) and the
 //! sweep of both.
 //!
 //! # The sweep

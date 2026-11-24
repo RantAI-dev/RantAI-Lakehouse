@@ -522,15 +522,17 @@ services:
       GOTENBERG_URL: ${GOTENBERG_URL:-http://gotenberg:3000}
       CONSOLE_INTERNAL_URL: ${CONSOLE_INTERNAL_URL:-http://console:3000}
       RENDER_TOKEN_SECRET: ${RENDER_TOKEN_SECRET:-}
-      # SEC-75 D1: the proxies whose `X-Forwarded-For` the API reads. The
-      # console proxies `/api` to this service, so the peer's address is
-      # the console's and only the console may name the caller's. The
-      # default is the console's own service name on this network; the
-      # API resolves the name again every few minutes, because a compose
-      # network's addresses are not fixed (a recreated container comes
-      # back with another one). An entry that is not a network, an
-      # address or a service name stops the API at start (fail closed).
-      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-console}
+      # SEC-75 decision B: the proxies whose `X-Forwarded-For` the API reads.
+      # Empty by default: no header is trusted, the peer is the source, and
+      # the per-source 429 is off (counts and audit compaction still run).
+      # List only an edge proxy that OVERWRITES `X-Forwarded-For` with the
+      # address it saw: then the 429 applies, and every path to the API must
+      # go through that edge. Never list the console: its Next.js `/api`
+      # rewrite forwards a client-supplied header verbatim without appending
+      # the browser's address, so a caller could choose its own source. An
+      # entry that is not a network, address or service name stops the API at
+      # start (fail closed).
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
       # RPT-1: the console as people open it, for the link in a scheduled
       # report's email (`<this>/dashboards/<id>`). An address, not a credential;
       # empty means the email carries no link.

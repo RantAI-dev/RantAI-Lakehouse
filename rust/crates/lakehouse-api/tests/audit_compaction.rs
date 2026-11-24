@@ -173,6 +173,42 @@ async fn fail_sign_ins(
     window
 }
 
+/// Fail `count` sign-ins from `source`, insisting every answer is `401`.
+///
+/// [`fail_sign_ins`] allows a `429` over the source's budget. With no
+/// trusted edge declared (`SEC-75` decision B) there is no such answer, and
+/// accepting one here would hide the regression this scenario guards.
+async fn fail_sign_ins_with_no_source_limit(
+    pool: &sqlx::PgPool,
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    source: &str,
+    prefix: &str,
+    count: usize,
+) -> OffsetDateTime {
+    let window = wait_for_a_window_with_room(pool).await;
+    for attempt in 0..count {
+        let status = fail_sign_in(
+            client,
+            addr,
+            &format!("{prefix}-{attempt}@{IDENTIFIER_DOMAIN}"),
+            source,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt} answered {status}; no trusted edge means no per-source 429"
+        );
+    }
+    assert_eq!(
+        current_window(pool).await,
+        window,
+        "the run crossed the window boundary: it took longer than the margin"
+    );
+    window
+}
+
 /// The `audit_event` rows with this `action` written in this window,
 /// oldest first, each as the JSON of the whole row.
 async fn audit_rows_in_window(
@@ -324,6 +360,51 @@ async fn sixty_failed_signins_from_one_source_write_one_refused_row_and_one_summ
     assert!(
         summary["args"]["windowEndedAt"].is_string(),
         "the summary names the window: {summary}"
+    );
+    assert_nothing_the_visitor_typed(summary, "spray", FAILURES);
+}
+
+/// With no trusted edge declared (`SEC-75` decision B), sixty failures from
+/// one peer all answer `401`: the per-source `429` needs an operator-declared
+/// proxy. Counting and compaction still run, so the trail keeps one first
+/// row and the sweep writes one summary with the count of the other 59.
+#[tokio::test]
+async fn with_no_trusted_edge_sixty_failures_get_no_429_but_still_compact() {
+    let (TestApp { router, pool }, state) = spin_up_with_state(&HashMap::new(), |_| {}).await;
+    let addr = serve(router).await;
+    let client = reqwest::Client::new();
+    // Nothing is trusted, so the header the helper sends is ignored and
+    // the loopback peer is the source.
+    let peer = "127.0.0.1";
+
+    let window =
+        fail_sign_ins_with_no_source_limit(&pool, &client, addr, peer, "spray", FAILURES).await;
+
+    let rows = audit_rows_in_window(&pool, "auth.login", window).await;
+    assert_eq!(rows.len(), 1, "sixty failures, one row: {rows:#?}");
+    assert_eq!(rows[0]["outcome"], "refused");
+    assert_eq!(rows[0]["args"]["source"], peer, "the row names the peer");
+    assert_nothing_the_visitor_typed(&rows[0], "spray", FAILURES);
+
+    close_the_window_of_a_source(&pool, peer).await;
+    let counts = lakehouse_api::audit_compaction::sweep(&state)
+        .await
+        .expect("the sweep runs");
+    assert_eq!(counts.summaries, 1, "one summary: {counts:?}");
+
+    let rows = audit_rows(&pool, "auth.login").await;
+    assert_eq!(rows.len(), 2, "one refused row and one summary: {rows:#?}");
+    let summary = summary_of(
+        &rows,
+        "59 more failed sign-ins from this source in 15 minutes.",
+    );
+    assert_eq!(
+        summary["args"]["source"], peer,
+        "the summary names the peer"
+    );
+    assert_eq!(
+        summary["args"]["count"], 59,
+        "the count of the later failures"
     );
     assert_nothing_the_visitor_typed(summary, "spray", FAILURES);
 }

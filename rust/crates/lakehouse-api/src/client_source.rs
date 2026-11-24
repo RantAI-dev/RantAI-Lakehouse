@@ -1,12 +1,14 @@
 //! The source of a request: the address it came from (`SEC-75`, plan
-//! `adm-130`, decision 1).
+//! `adm-130`, decision B).
 //!
 //! # Why
 //!
 //! The API is served behind the console's own `/api` proxy, so the peer
-//! address of a request is the proxy's, not the browser's. Without a
-//! trusted source the API cannot tell one caller from another, and every
-//! limit it applies is one limit for everybody.
+//! address of a request is the proxy's, not the browser's. The default
+//! `TRUSTED_PROXIES` list is empty: no header is trusted and every caller
+//! shares the peer as source. Without a trusted source the API cannot
+//! tell one caller from another, and every limit it applies is one limit
+//! for everybody.
 //!
 //! # The rule
 //!
@@ -17,9 +19,11 @@
 //!   only a trusted peer may name a source.
 //! * A peer in the trusted list may name the source in
 //!   `X-Forwarded-For`. The source is then the RIGHT-MOST entry of that
-//!   header that is not itself trusted. Proxies append the address they
-//!   saw, so the right-most entry is the address the caller had, and
-//!   anything to its left was written by the caller.
+//!   header that is not itself trusted. Only an edge proxy that OVERWRITES
+//!   `X-Forwarded-For` with the address it saw makes the right-most entry
+//!   the caller's; the console's `/api` rewrite forwards a client-supplied
+//!   header verbatim, so listing it would let a caller choose its own
+//!   source (`SEC-82`).
 //! * No header, no usable header, or a header whose entries are all
 //!   trusted: the source is the peer.
 //! * An empty trusted list trusts no header at all (fail closed).

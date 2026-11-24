@@ -1984,39 +1984,33 @@ peer that sent it.
 
 What to list:
 
-- The console's own address, which on the compose stack is its service
-  name (`console`): the console is the peer the API sees, and only a
-  trusted peer may name a source.
-- The outer reverse proxy's or load balancer's address or network, when one
-  sits in front of the console. The API then takes the right-most
+- An edge proxy or load balancer that OVERWRITES `X-Forwarded-For` with the
+  address it saw, and only such a proxy.
+- That proxy's address or network. The API then takes the right-most
   `X-Forwarded-For` entry that is not itself trusted, which is the address
   that proxy saw.
-- A compose service name, like the console's. The name is resolved again
-  every five minutes, because a compose network's addresses are not fixed
-  and a recreated container comes back with another one.
+- That proxy's compose service name. The name is resolved again every five
+  minutes, because a compose network's addresses are not fixed and a
+  recreated container comes back with another one.
 
 An entry that is neither a network, nor an address, nor a service name stops
 the API at start: a dropped entry would quietly stop trusting a proxy the
 operator named, and every caller would then look like one source.
 
-**The limit of the current deployment.** The console proxies `/api` to the
-API and is in `TRUSTED_PROXIES` by default, so the source of a request is
-the address the console saw: the console sends the caller's address in
-`X-Forwarded-For`, and the API takes the right-most entry of that header
-that is not itself trusted. Without the console in the trusted list every
-request through it has the console's own address as its source, so all
-callers behind it share one source bucket and the 50-failure limit
-applies to the whole group.
+**The limit of the current deployment.** With the default empty
+`TRUSTED_PROXIES`, the header is never read and every request through the
+console has the console's address as its source. The per-source 429 is
+therefore OFF: with one shared source, a limit would 429 everyone behind the
+console. The client source counting and the audit compaction still run.
 
-**Behind an outer reverse proxy or load balancer**, list that proxy too
-and make sure it APPENDS the address it saw to `X-Forwarded-For` rather
-than replacing the header. The console's own `/api` proxy keeps a
-client-supplied `X-Forwarded-For` unchanged (Next.js sets it with `??=`),
-so a proxy that replaces the header the same way lets a caller name its
-own source: the limit can be evaded by rotating the address, and every
-forged address gets its own first row in the audit trail. That gap is
-reported in the `SEC-75` pull request and is not fixed by this change; the
-API ignores a header whose peer is not trusted.
+**Behind a listed edge proxy**, every path to the API must go through that
+edge; a peer not on the list remains its own source. The edge must OVERWRITE
+`X-Forwarded-For` with the address it saw, not append to it. The console's
+`/api` rewrite keeps a client-supplied header unchanged (Next.js sets it
+with `??=`), so a caller behind it could otherwise name its own source and
+evade the limit. The console-side fix — the console setting the header from
+its own peer, or a dedicated edge container — is `SEC-82`, not part of this
+change. The API ignores a header whose peer is not trusted.
 
 ## Proposal: `GET /api/auth/providers` (not built)
 

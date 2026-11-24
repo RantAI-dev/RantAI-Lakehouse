@@ -165,7 +165,7 @@ pub struct AppState {
     /// `crate::auth::authenticators`.
     pub auth: Option<AuthState>,
     /// The proxies whose `X-Forwarded-For` the API reads (`SEC-75`
-    /// decision 1) — see [`crate::client_source::TrustedProxies`].
+    /// decision B) — see [`crate::client_source::TrustedProxies`].
     ///
     /// An `RwLock`, not a plain value: the compose service names in the
     /// list are resolved again every few minutes, because a compose
@@ -891,7 +891,7 @@ impl AppState {
             config.upload_max_conversions as usize,
             u64::from(config.upload_convert_memory_mb),
         );
-        // `SEC-75` decision 1: the proxies whose `X-Forwarded-For` the API
+        // `SEC-75` decision B: the proxies whose `X-Forwarded-For` the API
         // reads. Built before the struct literal, because the literal
         // moves `config` into its `Arc`.
         let trusted_proxies = crate::client_source::TrustedProxies::new(

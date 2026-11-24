@@ -325,10 +325,9 @@ async fn a_lock_is_listed_in_the_audit_log_as_the_sign_in_forms_and_not_the_assi
 /// saw for one administrator are six sign-ins, not one sign-in that
 /// repeats.
 ///
-/// The network address is now recorded too (`SEC-75` decision 7, which
-/// closes the `ADM-14` D10 leftover): this test calls the route without
-/// connect information, so the source is the fixed `unknown` bucket — see
-/// `lakehouse_api::client_source::UNKNOWN_SOURCE`.
+/// The network address stays unrecorded (`ADM-14` D10; `SEC-82` may change
+/// that): the API has no trusted source for it, so the created session's
+/// `created_ip` is `null` whatever the request's peer or headers were.
 #[tokio::test]
 async fn a_sign_in_records_the_browser_and_creates_exactly_one_session() {
     let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
@@ -355,10 +354,8 @@ async fn a_sign_in_records_the_browser_and_creates_exactly_one_session() {
     assert_eq!(user_agent.as_deref(), Some("QA-Browser/1.0"));
     assert_eq!(
         created_ip.as_deref(),
-        Some("unknown"),
-        "the session records the source of the sign-in (SEC-75 decision 7); \
-         this test calls the route without connect information, so the \
-         source is the fixed \"unknown\" bucket"
+        None,
+        "the session records no network address (ADM-14 D10; SEC-82 may change this)"
     );
 }
 

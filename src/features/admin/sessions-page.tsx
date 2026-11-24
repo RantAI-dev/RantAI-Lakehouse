@@ -56,10 +56,9 @@ export function SessionsPanel() {
         </span>
       ),
     },
-    // SEC-75 decision 7 (QA LH-SEC-5-01, ADM-14 D9/D10): the SOURCE of the
-    // sign-in — the address a trusted proxy saw, or the peer's own address,
-    // `unknown` when the API cannot see the peer's address at all. "Not
-    // recorded" is now only a session that predates that change.
+    // ADM-14 D10 (QA LH-SEC-5-01): "Not recorded" for the address the API
+    // has no trusted source for. `SEC-82` may change this; the page must not
+    // show a wrong address in the meantime.
     { key: "ip", header: "IP", render: (r) => r.createdIp ?? "Not recorded" },
     {
       key: "ua",

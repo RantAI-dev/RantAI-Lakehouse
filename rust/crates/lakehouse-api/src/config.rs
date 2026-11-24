@@ -126,7 +126,7 @@ pub enum ConfigError {
     #[error("WEBHOOK_ALLOWED_CIDRS: {0}")]
     MalformedWebhookAllowedCidrs(String),
     /// `TRUSTED_PROXIES` holds an entry that is neither a network, nor an
-    /// address, nor a compose service name (`SEC-75` decision 1).
+    /// address, nor a compose service name (`SEC-75` decision B).
     ///
     /// Fails config resolution for the same reason
     /// [`ConfigError::MalformedWebhookAllowedCidrs`] does: a dropped
@@ -415,15 +415,17 @@ pub struct Config {
     /// deliberately no "allow every internal address" switch for webhooks.
     /// Empty by default.
     pub webhook_allowed_cidrs: Vec<ipnet::IpNet>,
-    /// The addresses and networks of the proxies whose `X-Forwarded-For`
-    /// the API reads (`TRUSTED_PROXIES`, `SEC-75` decision 1).
+    /// The addresses and networks of the declared edge proxies whose
+    /// `X-Forwarded-For` the API reads (`TRUSTED_PROXIES`, `SEC-75`
+    /// decision B).
     ///
     /// Empty by default: with nothing trusted, every request's source is
     /// the peer address, and a header nobody vouched for is never read
     /// (fail closed).
     pub trusted_proxy_cidrs: Vec<ipnet::IpNet>,
-    /// The compose service names of the proxies whose `X-Forwarded-For`
-    /// the API reads (`TRUSTED_PROXIES`, `SEC-75` decision 1).
+    /// The compose service names of the declared edge proxies whose
+    /// `X-Forwarded-For` the API reads (`TRUSTED_PROXIES`, `SEC-75`
+    /// decision B).
     ///
     /// A name, not an address, because a compose network's addresses are
     /// not fixed: the name is resolved again every few minutes (see
@@ -2061,8 +2063,8 @@ impl Config {
                 .map_err(|_| ConfigError::InvalidPort(raw.clone()))?,
             None => 8080,
         };
-        // `TRUSTED_PROXIES` (`SEC-75` decision 1): the networks, addresses
-        // and compose service names of the proxies whose
+        // `TRUSTED_PROXIES` (`SEC-75` decision B): the networks, addresses
+        // and compose service names of the declared edge proxies whose
         // `X-Forwarded-For` the API reads. Refused when an entry is none
         // of those, for the same reason `CONNECTOR_PROBE_ALLOWED_CIDRS`
         // is: a dropped entry would quietly stop trusting a proxy the
@@ -2197,7 +2199,7 @@ impl Config {
                 env.get("WEBHOOK_ALLOWED_CIDRS").map_or("", String::as_str),
             )
             .map_err(ConfigError::MalformedWebhookAllowedCidrs)?,
-            // `SEC-75` decision 1: the proxies whose `X-Forwarded-For`
+            // `SEC-75` decision B: the proxies whose `X-Forwarded-For`
             // the API reads. A list of networks, addresses and compose
             // service names; an entry that is none of them refuses the
             // configuration instead of being dropped (a dropped entry

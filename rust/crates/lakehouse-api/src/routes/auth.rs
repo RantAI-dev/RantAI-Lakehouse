@@ -231,6 +231,10 @@ fn locked_response(locked_until: Option<time::OffsetDateTime>) -> ApiError {
 /// The answer of a sign-in refused because its SOURCE is over the
 /// per-source limit (`SEC-75` decision 2).
 ///
+/// This refusal exists only when an edge is declared (`SEC-75 decision B`):
+/// without one every caller shares the peer as its source, so there is no
+/// address to limit by. The count behind it still runs either way.
+///
 /// The same fixed sentence for every source, and nothing about the
 /// account in it: the refusal says that the address is over its budget,
 /// never whether the account exists or whether the password was right.
@@ -242,6 +246,10 @@ fn source_limited_response(retry_after_secs: u64) -> ApiError {
 }
 
 /// Refuse a sign-in whose source is over its budget (`SEC-75` decision 2).
+///
+/// The caller invokes this only when a trusted edge is declared
+/// (`SEC-75 decision B`). Counting and audit compaction run in every
+/// deployment; only this refusal is gated on the edge.
 ///
 /// `Ok(())` when the source may try again. The check runs BEFORE the
 /// password is checked and BEFORE the account throttle is touched: a
@@ -256,7 +264,8 @@ fn source_limited_response(retry_after_secs: u64) -> ApiError {
 /// # Errors
 ///
 /// Returns a `429` when the source is over its budget (`SEC-75`
-/// decision 2). When the counter cannot be read, the storage error of
+/// decision 2), only where a trusted edge is declared (`SEC-75 decision
+/// B`). When the counter cannot be read, the storage error of
 /// [`source_throttle::current`] surfaces as its classified 500
 /// (`"authentication error"`).
 async fn check_source_budget(pool: &PgPool, source: &str) -> ApiResult<()> {
@@ -324,12 +333,18 @@ fn session_user_agent(headers: &HeaderMap) -> Option<String> {
 /// belongs to the address, not to the person who happened to type the
 /// right password once.
 ///
+/// `SEC-75 decision B`: the `429` applies only when a trusted edge is
+/// declared — the parsed `TRUSTED_PROXIES` list is non-empty. Without one,
+/// the source is every caller's own peer and a header is never read, so
+/// there is no address to limit by. The count and its audit compaction run
+/// in every deployment, edge or no edge.
+///
 /// # Errors
 ///
 /// 400 on an unparseable body; 401 on bad credentials (same status for
 /// "no such email" and "wrong password" — see the module doc comment);
-/// 429 when the key is locked or the source is over its limit; 503 if no
-/// Postgres pool is configured.
+/// 429 when the key is locked or, where a trusted edge is declared, the
+/// source is over its limit; 503 if no Postgres pool is configured.
 pub async fn login(
     State(state): State<AppState>,
     source: ClientSource,
@@ -344,12 +359,17 @@ pub async fn login(
         )
     })?;
 
-    // `SEC-75` decision 2: the source's budget, checked BEFORE anything
-    // else the request would cost. An over-budget source gets `429` and
-    // a `Retry-After`; its account is not touched and its password is
-    // never checked, so a spray of guesses costs the API nothing but the
-    // one query this line runs.
-    check_source_budget(pool, source.as_str()).await?;
+    // `SEC-75 decision B`: the source's `429` exists only where an edge is
+    // declared; with no trusted proxy the peer is everyone's source. The
+    // per-source count and its compaction still run either way. When it
+    // applies, the check runs BEFORE anything else the request would cost:
+    // an over-budget source gets `429` and a `Retry-After`, its account is
+    // not touched and its password is never checked.
+    let edge_declared = !state.config.trusted_proxy_cidrs.is_empty()
+        || !state.config.trusted_proxy_names.is_empty();
+    if edge_declared {
+        check_source_budget(pool, source.as_str()).await?;
+    }
 
     let LoginBody {
         identifier,
@@ -425,10 +445,10 @@ pub async fn login(
 /// session cookie.
 ///
 /// It is a helper of its own so that the ORDER of these steps stays
-/// readable in one place. The session records the source of the sign-in
-/// (`SEC-75` decision 7) and the audit row is written only after the
-/// session exists; a reader who has to scroll through the whole route
-/// to see that order will eventually break it.
+/// readable in one place. The session deliberately records no network
+/// address (`ADM-14` D10; `SEC-82` may change that) and the audit row is
+/// written only after the session exists; a reader who has to scroll
+/// through the whole route to see that order will eventually break it.
 ///
 /// # Errors
 ///
@@ -437,7 +457,7 @@ pub async fn login(
 async fn complete_sign_in(
     state: &AppState,
     pool: &PgPool,
-    source: &ClientSource,
+    _source: &ClientSource,
     headers: &HeaderMap,
     principal: Principal,
     key: &str,
@@ -457,13 +477,11 @@ async fn complete_sign_in(
         pool,
         user_id,
         session::DEFAULT_SESSION_TTL,
-        // `SEC-75` decision 7: the session records the source of
-        // the sign-in, so the Sessions page shows an address.
-        // Before this the API had no trusted source for the
-        // client's (the `ADM-14` D10 comment), because it was
-        // served without connect information and read no
-        // `X-Forwarded-For`.
-        Some(source.as_str()),
+        // `ADM-14` D10: the API has no trusted source for the client's
+        // address, so the session records none and the Sessions page says
+        // "Not recorded" rather than showing a wrong address. `SEC-82` may
+        // change this.
+        None,
         session_user_agent(headers).as_deref(),
         &[],
     )
@@ -829,11 +847,9 @@ fn sessions_decision_for(principal: &Principal) -> SessionsDecision {
 ///
 /// `user_agent` is the browser as it named itself at sign-in (`ADM-14`
 /// decision D9), and `null` for a session older than that change.
-/// `created_ip` is the SOURCE of the sign-in (`SEC-75` decision 7): the
-/// address a trusted proxy saw, or the peer's own address, and `unknown`
-/// when the API cannot see the peer's address at all — see
-/// `crate::client_source`. The `ADM-14` decision D10 leftover ("the API
-/// has no trusted source") is closed by that decision; see
+/// `created_ip` is always `null`: the API has no trusted source for the
+/// client's address, so the page says "Not recorded" rather than showing a
+/// wrong one (`ADM-14` D10; `SEC-82` may change this); see
 /// `lakehouse_store::sessions::SessionRow`'s own doc comment.
 ///
 /// # Errors
@@ -1418,7 +1434,7 @@ impl ExchangeFailure {
 )]
 pub async fn oidc_callback(
     State(state): State<AppState>,
-    source: ClientSource,
+    _source: ClientSource,
     Query(query): Query<OidcCallbackQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
@@ -1579,10 +1595,11 @@ pub async fn oidc_callback(
         pool,
         user_id,
         session::DEFAULT_SESSION_TTL,
-        // `SEC-75` decision 7: the session records the source of the
-        // sign-in, so the Sessions page shows an address — the same
-        // source the password sign-in records.
-        Some(source.as_str()),
+        // `ADM-14` D10: the API has no trusted source for the client's
+        // address, so the session records none and the Sessions page says
+        // "Not recorded" rather than showing a wrong address. `SEC-82` may
+        // change this; the password sign-in does the same.
+        None,
         session_user_agent(&headers).as_deref(),
         &login.mapped_role_names,
     )
@@ -3641,11 +3658,9 @@ mod tests {
             "expected the flow cookie to be cleared even on success: {set_cookies:?}"
         );
 
-        // QA LH-SEC-5-01 (ADM-14 D9/D10), as SEC-75 decision 7 changes it:
-        // the single sign-on callback records the browser it came from AND
-        // the source of the sign-in. This test calls the handler without
-        // connect information, so the source is the fixed `unknown` bucket
-        // (see `crate::client_source::UNKNOWN_SOURCE`).
+        // QA LH-SEC-5-01 (ADM-14 D9/D10): the single sign-on callback
+        // records the browser it came from but no network address — the API
+        // has no trusted source for it (`SEC-82` may change that).
         let (count, user_agent, created_ip): (i64, Option<String>, Option<String>) =
             sqlx::query_as("SELECT count(*), max(user_agent), max(created_ip) FROM session")
                 .fetch_one(&pool)
@@ -3654,8 +3669,8 @@ mod tests {
         assert_eq!(user_agent.as_deref(), Some("QA-Browser/1.0"));
         assert_eq!(
             created_ip.as_deref(),
-            Some("unknown"),
-            "the session records the source of the sign-in (SEC-75 decision 7)"
+            None,
+            "the session records no network address (ADM-14 D10; SEC-82 may change this)"
         );
         Ok(())
     }

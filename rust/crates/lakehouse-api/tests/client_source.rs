@@ -33,6 +33,8 @@ const WRONG_PASSWORD: &str = "not-the-password";
 
 /// The address the test's peer has on the loopback interface.
 const LOOPBACK: &str = "127.0.0.1";
+/// The client a trusted peer names in `X-Forwarded-For`.
+const NAMED_CLIENT: &str = "203.0.113.7";
 
 /// How many seconds of its window a run of failures needs, so that it
 /// cannot cross the boundary.
@@ -217,6 +219,11 @@ async fn seed_password_identity(pool: &sqlx::PgPool) {
 
 /// A header a peer nobody vouched for wrote: the source is the peer, and
 /// the header is not read at all.
+///
+/// The non-empty trusted list here does not vouch for the 127.0.0.1
+/// peer, so the forged address never gets a counter or a budget of its own
+/// (`SEC-75 decision B`). With an empty list the same is true of every
+/// peer: the header is never read and there is no per-source 429.
 #[tokio::test]
 async fn a_forged_header_from_an_untrusted_peer_is_ignored() {
     let TestApp { router, pool } = spin_up_with_env(&env_with_trusted("192.0.2.0/24")).await;
@@ -269,9 +276,10 @@ async fn a_trusted_peer_without_a_header_falls_back_to_the_peer() {
     assert_eq!(source_counts(&pool).await, vec![(LOOPBACK.to_owned(), 1)]);
 }
 
-/// The sign-in after the source's budget is gone is refused with `429`
-/// and a `Retry-After`, before the password is checked — and the
-/// account it named is never touched.
+/// The sign-in after a trusted edge's named client has spent its budget
+/// is refused with `429` and a `Retry-After`, before the password is
+/// checked — and the account it named is never touched (`SEC-75 decision B`:
+/// the per-source 429 needs a declared edge).
 #[tokio::test]
 async fn the_signin_after_the_per_source_limit_is_refused_with_429() {
     let TestApp { router, pool } = spin_up_with_env(&env_with_trusted("127.0.0.1/32")).await;
@@ -281,14 +289,25 @@ async fn the_signin_after_the_per_source_limit_is_refused_with_429() {
 
     // 50 failures, each with an identifier of its own, so that no
     // ACCOUNT is locked on the way (the account throttle is keyed by the
-    // identifier) and only the source's budget is spent.
-    fail_sign_ins(&pool, &client, addr, "spray", 50, None).await;
-    assert_eq!(source_counts(&pool).await, vec![(LOOPBACK.to_owned(), 50)]);
+    // identifier) and only the CLIENT the trusted peer names is spent.
+    fail_sign_ins(&pool, &client, addr, "spray", 50, Some(NAMED_CLIENT)).await;
+    assert_eq!(
+        source_counts(&pool).await,
+        vec![(NAMED_CLIENT.to_owned(), 50)],
+        "the trusted peer named the client whose budget was spent"
+    );
 
     let rows_before = audit_rows(&pool, "auth.login").await.len();
     // The 51st sign-in, with the CORRECT password: it is refused, so the
     // password was never checked.
-    let resp = sign_in(&client, addr, SIGNED_IN_EMAIL, REAL_PASSWORD, None).await;
+    let resp = sign_in(
+        &client,
+        addr,
+        SIGNED_IN_EMAIL,
+        REAL_PASSWORD,
+        Some(NAMED_CLIENT),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     let retry_after = resp
         .headers()
@@ -367,10 +386,11 @@ async fn a_successful_signin_does_not_reset_the_source_count() {
     );
 }
 
-/// The session records the source of the sign-in, so the Sessions page
-/// shows an address (`SEC-75` decision 7).
+/// The session records no network address, even when a trusted proxy named a
+/// client in `X-Forwarded-For` — the Sessions page says "Not recorded"
+/// (`ADM-14` D10; `SEC-82` may change this).
 #[tokio::test]
-async fn the_session_records_the_source_of_the_signin() {
+async fn the_session_does_not_record_the_source_of_the_signin() {
     let TestApp { router, pool } = spin_up_with_env(&env_with_trusted("127.0.0.1/32")).await;
     let addr = serve(router).await;
     let client = reqwest::Client::new();
@@ -386,10 +406,10 @@ async fn the_session_records_the_source_of_the_signin() {
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let (created_ip,): (String,) =
-        sqlx::query_as("SELECT created_ip FROM session WHERE created_ip IS NOT NULL ORDER BY created_at DESC LIMIT 1")
+    let (created_ip,): (Option<String>,) =
+        sqlx::query_as("SELECT created_ip FROM session ORDER BY created_at DESC LIMIT 1")
             .fetch_one(&pool)
             .await
             .expect("the session of the sign-in");
-    assert_eq!(created_ip, "203.0.113.7");
+    assert_eq!(created_ip, None, "the session records no network address");
 }

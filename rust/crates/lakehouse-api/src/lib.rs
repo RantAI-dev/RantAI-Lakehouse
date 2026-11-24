@@ -220,7 +220,7 @@ pub async fn run() -> anyhow::Result<()> {
     // window is fifteen minutes long and a summary that waits for the next
     // hour is a summary an operator reads too late.
     spawn_audit_compaction(&state);
-    // `SEC-75` decision 1: the trusted proxies' compose service names are
+    // `SEC-75` decision B: the trusted proxies' compose service names are
     // resolved BEFORE the first request is served — a named proxy that is
     // not resolved yet is not trusted, and then every caller looks like
     // the proxy — and again every five minutes after that. See
@@ -255,7 +255,7 @@ pub async fn run() -> anyhow::Result<()> {
         .with_context(|| format!("failed to bind {addr}"))?;
     tracing::info!(%addr, "lakehouse-api listening");
 
-    // `SEC-75` decision 1: the API is served with the peer's address, so
+    // `SEC-75` decision B: the API is served with the peer's address, so
     // a request's source can be told from the proxy's `X-Forwarded-For`
     // when the proxy is trusted (see `crate::client_source`). Without the
     // connect information every request would look like it came from the
@@ -272,7 +272,7 @@ pub async fn run() -> anyhow::Result<()> {
 }
 
 /// How often the trusted proxies' compose service names are resolved
-/// again (`SEC-75` decision 1): five minutes.
+/// again (`SEC-75` decision B): five minutes.
 ///
 /// A compose network's addresses are not fixed — a container that is
 /// recreated comes back with another one — so a name resolved once at
