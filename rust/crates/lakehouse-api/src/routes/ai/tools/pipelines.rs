@@ -1450,6 +1450,9 @@ mod t1_3_tests {
         let created = lakehouse_store::pipelines::create_pipeline(
             &pool,
             &lakehouse_store::pipelines::CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: "b-pipeline".to_owned(),

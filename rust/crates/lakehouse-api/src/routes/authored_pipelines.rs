@@ -1188,6 +1188,9 @@ fn update_input_from_body(
     run_as: lakehouse_store::pipelines::RunAsChange,
 ) -> UpdatePipelineInput {
     UpdatePipelineInput {
+        incremental_strategy: "append".to_owned(),
+        partition_granularity: "day".to_owned(),
+        lookback_hours: 0,
         kind: body.kind.clone(),
         source_zone: first.zone.clone(),
         source_table: first.table.clone(),
@@ -2723,6 +2726,9 @@ pub async fn restore_version(
     // `status` are deliberately excluded: a restore is a replay of the
     // editable fields, not a rename/re-promotion (Plan R4 2b).
     let input = UpdatePipelineInput {
+        incremental_strategy: "append".to_owned(),
+        partition_granularity: "day".to_owned(),
+        lookback_hours: 0,
         kind: snapshot.kind,
         source_zone: first.zone.clone(),
         source_table: first.table.clone(),
@@ -3592,6 +3598,9 @@ mod tests {
 
         fn create_input(name: &str, depends_on: Vec<String>) -> CreatePipelineInput {
             CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
@@ -3996,6 +4005,9 @@ mod tests {
 
         fn create_input(name: &str, depends_on: Vec<String>) -> CreatePipelineInput {
             CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
@@ -4467,6 +4479,9 @@ mod tests {
         /// default (`NULL`) so the `*:*` principal passes `in_scope`.
         fn pipeline_input(name: &str, target_zone: &str) -> CreatePipelineInput {
             CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
@@ -4649,6 +4664,9 @@ mod tests {
             connector_id: Option<&str>,
         ) -> pipelines::Pipeline {
             let input = CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
@@ -5002,6 +5020,9 @@ mod tests {
         /// zone is the only field D2 reads, and `silver` is the refusal.
         fn pipeline_input(name: &str) -> CreatePipelineInput {
             CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
@@ -5118,6 +5139,9 @@ mod tests {
             // through the store because the create and update ROUTES now
             // refuse that body itself.
             let pre_refusal = UpdatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 run_as: pipelines::RunAsChange::Keep,
@@ -5177,6 +5201,9 @@ mod tests {
             .await
             .expect("seed the row the refused restore would rewrite");
             let pre_refusal = UpdatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 run_as: pipelines::RunAsChange::Keep,
@@ -5294,6 +5321,9 @@ mod tests {
 
         fn create_input(name: &str, tenant_id: uuid::Uuid) -> CreatePipelineInput {
             CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
@@ -5494,6 +5524,9 @@ mod tests {
 
         fn create_input(name: &str, depends_on: Vec<String>) -> CreatePipelineInput {
             CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
@@ -5636,6 +5669,9 @@ mod tests {
             tenant_id: Option<uuid::Uuid>,
         ) -> CreatePipelineInput {
             CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
@@ -6077,6 +6113,9 @@ mod tests {
             let pl = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    incremental_strategy: "append".to_owned(),
+                    partition_granularity: "day".to_owned(),
+                    lookback_hours: 0,
                     inputs: Vec::new(),
                     steps: Vec::new(),
                     name: "pl-lag-test".to_owned(),
@@ -6175,6 +6214,9 @@ mod tests {
             let pl = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    incremental_strategy: "append".to_owned(),
+                    partition_granularity: "day".to_owned(),
+                    lookback_hours: 0,
                     inputs: Vec::new(),
                     steps: Vec::new(),
                     name: "pl-bounds".to_owned(),
@@ -6232,6 +6274,9 @@ mod tests {
             let pl = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    incremental_strategy: "append".to_owned(),
+                    partition_granularity: "day".to_owned(),
+                    lookback_hours: 0,
                     inputs: Vec::new(),
                     steps: Vec::new(),
                     name: "pl-tenant-b".to_owned(),
@@ -6293,6 +6338,9 @@ mod tests {
             let pl = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    incremental_strategy: "append".to_owned(),
+                    partition_granularity: "day".to_owned(),
+                    lookback_hours: 0,
                     inputs: Vec::new(),
                     steps: Vec::new(),
                     name: "pl-b-multi".to_owned(),
@@ -6355,6 +6403,9 @@ mod tests {
             let pl = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    incremental_strategy: "append".to_owned(),
+                    partition_granularity: "day".to_owned(),
+                    lookback_hours: 0,
                     inputs: Vec::new(),
                     steps: Vec::new(),
                     name: "pl-b-admin".to_owned(),

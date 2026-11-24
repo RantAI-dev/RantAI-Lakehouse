@@ -3311,6 +3311,9 @@ pub async fn create(
     // until an admin assigns one (D2).
     let run_as = author_id(&principal);
     let input = CreatePipelineInput {
+        incremental_strategy: "append".to_owned(),
+        partition_granularity: "day".to_owned(),
+        lookback_hours: 0,
         name: body.name,
         kind: body.kind,
         source_zone: first.zone.clone(),
@@ -3571,6 +3574,9 @@ pub async fn generate(
     )
     .await?;
     let input = CreatePipelineInput {
+        incremental_strategy: "append".to_owned(),
+        partition_granularity: "day".to_owned(),
+        lookback_hours: 0,
         inputs: form.inputs,
         steps: form.steps,
         name,
@@ -6643,6 +6649,9 @@ mod tests {
             let seeded = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    incremental_strategy: "append".to_owned(),
+                    partition_granularity: "day".to_owned(),
+                    lookback_hours: 0,
                     inputs: Vec::new(),
                     steps: Vec::new(),
                     name: "source-route-scope".to_owned(),
@@ -10151,6 +10160,9 @@ mod tests {
             let seeded = create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    incremental_strategy: "append".to_owned(),
+                    partition_granularity: "day".to_owned(),
+                    lookback_hours: 0,
                     inputs: Vec::new(),
                     steps: Vec::new(),
                     name: id.clone(),
@@ -11233,6 +11245,9 @@ mod tests {
 
         fn seed_input(name: &str) -> CreatePipelineInput {
             CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
@@ -12310,6 +12325,9 @@ mod tests {
             tenant_id: Option<uuid::Uuid>,
         ) -> CreatePipelineInput {
             CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
