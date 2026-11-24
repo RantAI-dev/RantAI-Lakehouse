@@ -20,6 +20,7 @@ from dispar_orchestrate.incremental_write import (
     IncrementalConfig,
     _helpers,
     _is_date_type,
+    _is_nullable,
     _literal,
     write_incrementally,
 )
@@ -82,6 +83,10 @@ class TestIncrementalConfig(unittest.TestCase):
             self.assertTrue(_is_date_type(value), value)
         for value in ("String", "Int64", "Nullable(UInt32)"):
             self.assertFalse(_is_date_type(value), value)
+        for value in ("Nullable(DateTime)", "LowCardinality(Nullable(Date))"):
+            self.assertTrue(_is_nullable(value), value)
+        for value in ("DateTime", "Date32", "LowCardinality(DateTime)", "String"):
+            self.assertFalse(_is_nullable(value), value)
 
 
 class TestTypedLiterals(unittest.TestCase):
@@ -92,6 +97,14 @@ class TestTypedLiterals(unittest.TestCase):
             "parseDateTime64BestEffort('2026-01-02 03:04:05', 6)",
         )
         self.assertEqual(_literal("42", "Int64"), "toInt64(42)")
+        self.assertEqual(
+            _literal("2026-01-02 03:04:05", "DateTime('UTC')"),
+            "toDateTime('2026-01-02 03:04:05')",
+        )
+        self.assertEqual(
+            _literal("18446744073709551615", "UInt64"),
+            "toUInt64(18446744073709551615)",
+        )
         self.assertEqual(_literal("o'hara", "String"), _literal("o'hara", "String"))
         self.assertIn("\\'", _literal("o'hara", "String"))
         self.assertEqual(
@@ -104,6 +117,8 @@ class TestTypedLiterals(unittest.TestCase):
             _literal("not-a-number", "Int64")
         with self.assertRaises(RuntimeError):
             _literal("2026-01-02", "SomeExoticType")
+        with self.assertRaises(RuntimeError):
+            _literal("-1", "UInt64")
 
 
 class TestWriteIncrementally(unittest.TestCase):
@@ -155,6 +170,8 @@ class TestWriteIncrementally(unittest.TestCase):
         self.assertEqual(result.full_reason, "configured_batch")
         self.assertEqual(result.rows, 3)
         self.assertNotIn("incremental_column", result.metadata())
+        self.assertNotIn("watermark_before", result.metadata())
+        self.assertNotIn("watermark_after", result.metadata())
         create = next(s for s in self.ch.statements if s.startswith("CREATE TABLE"))
         self.assertIn("ENGINE = MergeTree ORDER BY tuple()", create)
         self.assertIn(SELECT, create)
@@ -163,12 +180,27 @@ class TestWriteIncrementally(unittest.TestCase):
     def test_full_refresh_of_an_incremental_pipeline_is_reported_as_requested(self) -> None:
         config = IncrementalConfig("incremental", "event_time", "append", "day", 0, True)
         counts = iter([5, 9])
-        result = self._run(config, self._incremental_router(count=5))
-        # The query router above answers the two counts with the same dict, so
-        # the delta is 0 — the point is the reason and the mode, not the count.
+        watermarks = iter(["2026-01-02 03:00:00", "2026-01-02 05:00:00"])
+
+        base = self._incremental_router()
+
+        def router(statement: str) -> list[dict]:
+            if statement.startswith("SELECT max("):
+                return [{"wm": next(watermarks)}]
+            if statement.startswith("SELECT count() AS n"):
+                return [{"n": next(counts)}]
+            return base(statement)
+
+        result = self._run(config, router)
         self.assertEqual(result.full_reason, "requested")
         self.assertEqual(result.materialization_mode, "full")
         self.assertEqual(result.incremental_column, "event_time")
+        # BEFORE must be read from the OLD target, not after EXCHANGE.
+        self.assertEqual(result.watermark_before, "2026-01-02 03:00:00")
+        self.assertEqual(result.watermark_after, "2026-01-02 05:00:00")
+        self.assertNotEqual(result.watermark_before, result.watermark_after)
+        self.assertIn("watermark_before", result.metadata())
+        self.assertIn("watermark_after", result.metadata())
 
     def test_first_run_runs_a_full_rebuild(self) -> None:
         result = self._run(_APPEND, self._incremental_router(exists=0, count=0, wm=None))
@@ -332,12 +364,49 @@ class TestWriteIncrementally(unittest.TestCase):
             self.assertIn("SETTINGS allow_database_iceberg = 1", statement)
 
     def test_authored_job_error_is_the_factories_non_retryable_type(self) -> None:
-        error_type, is_safe, reading = _helpers()
+        error_type, is_safe, reading, canonical = _helpers()
         self.assertTrue(callable(is_safe))
         self.assertTrue(callable(reading))
+        self.assertTrue(callable(canonical))
         self.assertTrue(callable(error_type))
         with self.assertRaises(error_type):
             self._run(_APPEND, self._incremental_router(columns=[{"name": "other", "type": "Date"}]))
+
+
+    def test_a_legacy_gold_target_zone_is_canonicalized_to_serving_in_every_statement(self) -> None:
+        counts = iter([0, 3])
+        self.ch.router = lambda s: [{"n": next(counts)}]
+        with mock.patch("dispar_orchestrate.incremental_write._ch_exec", side_effect=self.ch.execute), \
+             mock.patch("dispar_orchestrate.incremental_write._ch_query_json", side_effect=self.ch.query):
+            write_incrementally(TARGET, "gold", TABLE, SELECT, False, _BATCH)
+
+        self.assertIn("CREATE DATABASE IF NOT EXISTS serving", self.ch.statements)
+        self.assertTrue(
+            any("CREATE TABLE" in s and "serving.`" + TABLE + "`" in s for s in self.ch.statements)
+        )
+        self.assertFalse(any("gold." in s for s in self.ch.statements))
+
+    def test_probe_and_append_staging_tables_have_an_engine_and_the_database_exists(self) -> None:
+        self._run(_APPEND, self._incremental_router())
+        probe = next(
+            s for s in self.ch.statements if s.startswith("CREATE TABLE") and "__probe_" in s
+        )
+        staging = next(
+            s for s in self.ch.statements if s.startswith("CREATE TABLE") and "__staging_" in s
+        )
+        for create in (probe, staging):
+            self.assertIn("ENGINE = MergeTree ORDER BY tuple()", create)
+        self.assertIn("CREATE DATABASE IF NOT EXISTS serving", self.ch.statements)
+
+    def test_partition_replace_refuses_a_nullable_date_cursor_before_any_engine_ddl(self) -> None:
+        router = self._incremental_router(column_type="Nullable(DateTime)")
+        with self.assertRaises(RuntimeError) as caught:
+            self._run(_REPLACE_DAY, router)
+        self.assertIn("non-nullable Date or DateTime cursor", str(caught.exception))
+        self.assertFalse(any(s.startswith("ALTER TABLE") for s in self.ch.statements))
+        self.assertFalse(
+            any("PARTITION BY" in s for s in self.ch.statements if s.startswith("CREATE TABLE"))
+        )
 
 
 if __name__ == "__main__":

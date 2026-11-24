@@ -24,9 +24,10 @@ Every value interpolated into SQL here is either a server-controlled,
 validated identifier (zone/table/cursor column) or a typed literal built from
 the live watermark. The cursor column is re-checked against
 ``authored_factory._is_safe_ch_identifier`` and must be present in the
-compiled SELECT's output; ``partition_replace`` further requires a Date or
-DateTime cursor, unwrapping ``Nullable`` and ``LowCardinality``. A condition
-this build cannot execute raises ``AuthoredJobError``, which the factory wraps
+compiled SELECT's output; ``partition_replace`` further requires a NON-NULLABLE
+Date or DateTime cursor (``LowCardinality`` is unwrapped, but ``Nullable`` is
+refused because ClickHouse rejects it in ``PARTITION BY`` / ``ORDER BY``). A
+condition this build cannot execute raises ``AuthoredJobError``, which the factory wraps
 in a non-retryable ``Failure`` — an unsupported config will not change
 between attempts, so retrying it only burns the op's retry budget.
 
@@ -124,33 +125,38 @@ class MaterializationResult:
         out: dict[str, Any] = {
             "rows": self.rows,
             "materialization_mode": self.materialization_mode,
-            "watermark_before": self.watermark_before,
-            "watermark_after": self.watermark_after,
             "partitions_replaced": self.partitions_replaced,
         }
         if self.full_reason is not None:
             out["full_refresh_reason"] = self.full_reason
         if self.incremental_column is not None:
             out["incremental_column"] = self.incremental_column
+        # Dagster metadata entries cannot carry a raw None; an unmeasured
+        # watermark is omitted rather than reported as a fabricated value.
+        if self.watermark_before is not None:
+            out["watermark_before"] = self.watermark_before
+        if self.watermark_after is not None:
+            out["watermark_after"] = self.watermark_after
         return out
 
 
-def _helpers() -> tuple[type[RuntimeError], Any, Any]:
+def _helpers() -> tuple[type[RuntimeError], Any, Any, Any]:
     """Lazy imports: `authored_factory.py` imports this module at load time,
     so importing it back at module scope would be a cycle. By the time a run
     calls this the factory is fully loaded."""
     from dispar_orchestrate.authored_factory import (
         AuthoredJobError,
+        _canonical_clickhouse_zone,
         _is_safe_ch_identifier,
         _reading,
     )
 
-    return AuthoredJobError, _is_safe_ch_identifier, _reading
+    return AuthoredJobError, _is_safe_ch_identifier, _reading, _canonical_clickhouse_zone
 
 
 def _refuse(message: str) -> RuntimeError:
     """A non-retryable config refusal, raised as the factory's own error type."""
-    error_type, _, _ = _helpers()
+    error_type, _, _, _ = _helpers()
     return error_type(message)
 
 
@@ -197,6 +203,17 @@ def _is_date_type(ch_type: str) -> bool:
     return base == "Date" or base == "Date32" or base.startswith("DateTime")
 
 
+def _is_nullable(ch_type: str) -> bool:
+    """Whether a ClickHouse cursor type can hold NULL. `Nullable(...)` in a
+    `PARTITION BY` / `ORDER BY` is rejected by the engine (Code 44), so
+    `partition_replace` must refuse such a column rather than send DDL that
+    fails on the live table. `LowCardinality(Nullable(...))` is nullable too."""
+    result = ch_type.strip()
+    while result.startswith("LowCardinality(") and result.endswith(")"):
+        result = result[len("LowCardinality(") : -1].strip()
+    return result.startswith("Nullable(") and result.endswith(")")
+
+
 def _literal(value: Any, ch_type: str) -> str:
     """A typed ClickHouse literal for the live watermark. A raw value is
     NEVER interpolated: strings go through `_sql_string_literal`, dates and
@@ -206,7 +223,10 @@ def _literal(value: Any, ch_type: str) -> str:
     if base in ("Date", "Date32"):
         cast = "toDate" if base == "Date" else "toDate32"
         return f"{cast}({_sql_string_literal(text)})"
-    if base == "DateTime":
+    if base == "DateTime" or base.startswith("DateTime("):
+        # `DateTime('UTC')` and other timezone-aware spellings are still a
+        # DateTime; the literal carries the watermark's text and ClickHouse
+        # applies the column's own timezone when it casts it.
         return f"toDateTime({_sql_string_literal(text)})"
     if base.startswith("DateTime64"):
         precision = "3"
@@ -215,7 +235,16 @@ def _literal(value: Any, ch_type: str) -> str:
         return f"parseDateTime64BestEffort({_sql_string_literal(text)}, {precision})"
     if base == "UUID":
         return f"toUUID({_sql_string_literal(text)})"
-    if base.startswith(("Int", "UInt")):
+    if base.startswith("UInt"):
+        try:
+            number = int(value)
+        except (TypeError, ValueError) as exc:
+            raise _refuse("the incremental cursor's watermark is not an unsigned integer") from exc
+        if number < 0:
+            raise _refuse("the incremental cursor's watermark is not a valid unsigned integer")
+        # `toInt64` would overflow for a UInt64 watermark above i64::MAX.
+        return f"toUInt64({number})"
+    if base.startswith("Int"):
         try:
             number = int(value)
         except (TypeError, ValueError) as exc:
@@ -270,15 +299,20 @@ def _compiled_columns(
     """Describe the compiled SELECT through a zero-row probe table. A source
     read that fails leaves no probe behind (`DROP` is in the `finally`), and
     the live target is never touched."""
-    _, _, _reading = _helpers()
+    _, _, _reading, _ = _helpers()
     probe = f"__probe_{table}"
+    # The probe runs before any full rebuild, so on a first run into a brand
+    # new zone the database does not exist yet. ClickHouse also requires an
+    # ENGINE on `CREATE TABLE ... AS SELECT ... LIMIT 0`.
+    _ch_exec(target, f"CREATE DATABASE IF NOT EXISTS {zone}")
     _ch_exec(target, f"DROP TABLE IF EXISTS {zone}.`{probe}`")
     try:
         _ch_exec(
             target,
             _reading(
                 reads_iceberg,
-                f"CREATE TABLE {zone}.`{probe}` AS {select_sql} LIMIT 0",
+                f"CREATE TABLE {zone}.`{probe}` ENGINE = MergeTree ORDER BY tuple() "
+                f"AS {select_sql} LIMIT 0",
             ),
         )
         rows = _ch_query_json(target, f"DESCRIBE TABLE {zone}.`{probe}`")
@@ -319,7 +353,7 @@ def _full_rebuild(
     """The original atomic staging + `EXCHANGE TABLES`, with the engine clause
     the target actually needs. This is both the batch path and the fallback
     for every shape that cannot be safely materialized incrementally."""
-    _, _, _reading = _helpers()
+    _, _, _reading, _ = _helpers()
     staging = _staging_name(table)
     clause = _engine_clause(config, column) if column is not None else _engine_clause(config, "")
     # Keep the target-creation sequence the pre-BLD-12 op used: the database
@@ -343,6 +377,17 @@ def _full_rebuild(
             ),
         )
         before = _count(target, zone, table)
+        # The BEFORE watermark must be read while the live table still holds
+        # the old rows; reading it after EXCHANGE would always equal AFTER.
+        # A first run, a schema change or an empty target has no meaningful
+        # old cursor (and may not even have the column yet).
+        watermark_before = (
+            _watermark(target, zone, table, column)
+            if column is not None
+            and before > 0
+            and reason not in ("first_run", "schema_changed", "empty_target")
+            else None
+        )
         _ch_exec(
             target,
             _reading(reads_iceberg, f"INSERT INTO {zone}.`{staging}` {select_sql}"),
@@ -352,6 +397,7 @@ def _full_rebuild(
             f"EXCHANGE TABLES {zone}.`{table}` AND {zone}.`{staging}`",
         )
         after = _count(target, zone, table)
+        watermark_after = _watermark(target, zone, table, column) if column is not None else None
     finally:
         _ch_exec(target, f"DROP TABLE IF EXISTS {zone}.`{staging}`")
     return MaterializationResult(
@@ -359,8 +405,8 @@ def _full_rebuild(
         materialization_mode="full",
         full_reason=reason,
         incremental_column=column if config.kind == "incremental" else None,
-        watermark_before=_watermark(target, zone, table, column) if column else None,
-        watermark_after=_watermark(target, zone, table, column) if column else None,
+        watermark_before=watermark_before,
+        watermark_after=watermark_after,
     )
 
 
@@ -377,7 +423,7 @@ def _append(
 ) -> MaterializationResult:
     """Watermark append: stage rows newer than the live max and insert only
     those. A failed source read leaves the live target untouched."""
-    _, _, _reading = _helpers()
+    _, _, _reading, _ = _helpers()
     staging = _staging_name(table)
     wm_expr = _literal(watermark, column_type)
     _ch_exec(target, f"DROP TABLE IF EXISTS {zone}.`{staging}`")
@@ -386,7 +432,8 @@ def _append(
             target,
             _reading(
                 reads_iceberg,
-                f"CREATE TABLE {zone}.`{staging}` AS {select_sql} LIMIT 0",
+                f"CREATE TABLE {zone}.`{staging}` ENGINE = MergeTree ORDER BY tuple() "
+                f"AS {select_sql} LIMIT 0",
             ),
         )
         _ch_exec(
@@ -437,7 +484,7 @@ def _partition_replace(
     """Replace only the partitions the staged window touched. `system.parts`
     is the source of truth for which partitions that is — no guessing from
     the watermark's own value (a late row can change the answer)."""
-    _, _, _reading = _helpers()
+    _, _, _reading, _ = _helpers()
     staging = _staging_name(table)
     window_start = _window_start_expr(watermark, column_type, config)
     clause = _engine_clause(config, column)
@@ -508,7 +555,10 @@ def write_incrementally(
     (they may succeed on retry); a config refusal is wrapped in a
     non-retryable Dagster `Failure` by the calling op.
     """
-    _, is_safe, _ = _helpers()
+    _, is_safe, _, canonical_zone = _helpers()
+    # BLD-19: a stored definition can still say `gold`; canonicalise before
+    # ANY statement is formatted so no DDL/query creates an orphan database.
+    zone = canonical_zone(target_zone)
     column = config.column
     if config.kind == "incremental":
         if not column or len(column) > MAX_CURSOR_CHARS or not is_safe(column):
@@ -524,63 +574,71 @@ def write_incrementally(
 
     compiled: list[tuple[str, str]] = []
     if column is not None:
-        compiled = _compiled_columns(target, target_zone, target_table, select_sql, reads_iceberg)
+        compiled = _compiled_columns(target, zone, target_table, select_sql, reads_iceberg)
         types = dict(compiled)
         if column not in types:
             raise _refuse("the incremental cursor column is not in the compiled SELECT output")
         column_type = types[column]
-        if config.strategy == "partition_replace" and not _is_date_type(column_type):
-            raise _refuse(
-                "partition_replace requires a Date or DateTime cursor column; "
-                "use the append strategy for a numeric or text cursor"
-            )
+        if config.strategy == "partition_replace":
+            if not _is_date_type(column_type):
+                raise _refuse(
+                    "partition_replace requires a Date or DateTime cursor column; "
+                    "use the append strategy for a numeric or text cursor"
+                )
+            if _is_nullable(column_type):
+                raise _refuse(
+                    "partition_replace requires a non-nullable Date or DateTime cursor column; "
+                    "coalesce it in a SQL step or use the append strategy"
+                )
     else:
         column_type = ""
 
     if config.kind != "incremental":
         return _full_rebuild(
-            target, target_zone, target_table, select_sql, reads_iceberg, config,
+            target, zone, target_table, select_sql, reads_iceberg, config,
             None, "configured_batch",
         )
     if column is None:
         raise _refuse("the incremental cursor column is missing")
     if config.full_refresh:
         return _full_rebuild(
-            target, target_zone, target_table, select_sql, reads_iceberg, config,
+            target, zone, target_table, select_sql, reads_iceberg, config,
             column, "requested",
         )
-    exists = _table_exists(target, target_zone, target_table)
+    exists = _table_exists(target, zone, target_table)
     if not exists:
         return _full_rebuild(
-            target, target_zone, target_table, select_sql, reads_iceberg, config,
+            target, zone, target_table, select_sql, reads_iceberg, config,
             column, "first_run",
         )
-    if _live_columns(target, target_zone, target_table) != compiled:
+    if _live_columns(target, zone, target_table) != compiled:
         return _full_rebuild(
-            target, target_zone, target_table, select_sql, reads_iceberg, config,
+            target, zone, target_table, select_sql, reads_iceberg, config,
             column, "schema_changed",
         )
-    if _live_partition_key(target, target_zone, target_table) != _expected_partition_key(config, column):
+    if _live_partition_key(target, zone, target_table) != _expected_partition_key(config, column):
         return _full_rebuild(
-            target, target_zone, target_table, select_sql, reads_iceberg, config,
+            target, zone, target_table, select_sql, reads_iceberg, config,
             column, "partition_key_changed",
         )
-    wm = _watermark(target, target_zone, target_table, column)
+    # One query answers both the emptiness check and the watermark: a second
+    # `SELECT max(...)` here would be a redundant read of the live table.
     state = _ch_query_json(
         target,
-        f"SELECT count() AS n, max(`{column}`) AS wm FROM {target_zone}.`{target_table}`",
+        f"SELECT count() AS n, max(`{column}`) AS wm FROM {zone}.`{target_table}`",
     )
     if not state or int(state[0]["n"]) == 0 or state[0]["wm"] is None:
         return _full_rebuild(
-            target, target_zone, target_table, select_sql, reads_iceberg, config,
+            target, zone, target_table, select_sql, reads_iceberg, config,
             column, "empty_target",
         )
+    wm = state[0]["wm"]
     if config.strategy == "append":
         return _append(
-            target, target_zone, target_table, select_sql, reads_iceberg,
+            target, zone, target_table, select_sql, reads_iceberg,
             config, column, column_type, wm,
         )
     return _partition_replace(
-        target, target_zone, target_table, select_sql, reads_iceberg,
+        target, zone, target_table, select_sql, reads_iceberg,
         config, column, column_type, wm,
     )
