@@ -1,6 +1,6 @@
 //! Golden-corpus parity harness — the cutover gate.
 //!
-//! Replays every entry in `rust/tests/parity/corpus/*.json` (73 real
+//! Replays every entry in `rust/tests/parity/corpus/*.json` (72 real
 //! responses captured from the live `TypeScript` backend) against a running
 //! Rust service and asserts structural equality modulo fields that are
 //! genuinely non-deterministic (timestamps, generated ids, live cluster
@@ -136,11 +136,9 @@ fn extra_normalize_keys(name: &str) -> HashSet<&'static str> {
         // normalized) — the Rust handler deliberately stops returning the
         // embed HMAC signing key. See this corpus entry's `comment` and
         // rust/tests/parity/README.md. Nothing left here to normalize.
-        // Live SLO snapshot text (e.g. `"1233ms"`), embedded in a string
-        // rather than a bare number so the generic numeric-leaf rule can't
-        // catch it. Same "live cluster aggregate" category as
-        // `queryP95Ms`/`p95Ms`, see README.
-        "ops-observability" => HashSet::from(["current"]),
+        // WEB-4 retired `ops-observability`: its corpus entry (and the
+        // `current` SLO-snapshot normalizer it needed) were removed with
+        // the route. `queryP95Ms`/`p95Ms` stay for the other rollups.
         // Per-tenant echoes of the live `computeUnits7d` aggregate.
         "ops-usage" => HashSet::from(["computeUnits", "budgetSpent"]),
         _ => HashSet::new(),
@@ -263,8 +261,8 @@ fn is_globally_volatile_key(key: &str) -> bool {
             | "scannedBytes7d"
             | "costUnits"
             // Live cluster aggregates (system.query_log / system.processes
-            // rollups in ops-usage, ops-observability, overview-get,
-            // storage-get; ops-workloads is read entirely as structure-only
+            // rollups in ops-usage, overview-get, storage-get;
+            // ops-workloads is read entirely as structure-only
             // below the JSON-object level via the same numeric rule).
             | "computeUnits7d"
             | "volume24h"

@@ -4199,7 +4199,7 @@ pub async fn chart_export(
     // BI-19 part D (plan D13): an image is made by the renderer, not by a row
     // stream, so it has its own path (and its own audit action).
     if q.format.as_deref() == Some("png") {
-        return crate::routes::pdf_export::export_chart_png(&state, &principal, &q).await;
+        return crate::routes::pdf_export::export_chart_png(&state, &principal, &q, &headers).await;
     }
     export_chart(
         &state,

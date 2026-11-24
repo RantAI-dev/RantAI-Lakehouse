@@ -115,6 +115,26 @@ impl Stack {
         )
     }
 
+    /// The same route with an explicit `X-Tenant`, for a principal who is a
+    /// member of more than one tenant (`SEC-54`).
+    async fn get_as(&self, cookie: &str, uri: &str, tenant: &str) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .uri(uri)
+            .header("cookie", cookie)
+            .header("x-tenant", tenant)
+            .body(Body::empty())
+            .unwrap();
+        let response = self.app.router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
     async fn caller(&self, permissions: &str) -> String {
         let id = create_principal_with_permissions(&self.app.pool, permissions).await;
         session_cookie_for_user(&self.app.pool, id).await
@@ -301,4 +321,49 @@ async fn a_caller_with_lineage_read_only_is_told_no_chart_names() {
         )
         .await;
     assert_eq!(named["charts"][0]["chartTitle"], json!("Visitors"));
+}
+
+/// `SEC-54`: `used_by` resolves the caller's active tenant through the
+/// standard `tenant_scope::resolve` helper. A principal of two tenants must
+/// see the shared catalog's charts when `X-Tenant` selects the catalog's
+/// tenant, be refused when it selects their other tenant, and get the
+/// same 404 for a tenant they do not belong to at all.
+#[tokio::test]
+async fn the_used_by_list_follows_the_tenant_the_header_selects() {
+    let stack = Stack::start().await;
+    rows(
+        &stack.ch,
+        "FROM console.bi_chart",
+        vec![chart_row("c_1", "Visitors", "b_1", "ui")],
+    )
+    .await;
+    let user =
+        create_principal_with_permissions(&stack.app.pool, "lineage:read,dashboard:read").await;
+    in_the_catalog_tenant(&stack.app.pool, user).await;
+    // The same person also belongs to the seeded second tenant.
+    let retail: uuid::Uuid = "11111111-1111-4111-8111-000000000002".parse().unwrap();
+    sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(user)
+    .bind(retail)
+    .execute(&stack.app.pool)
+    .await
+    .unwrap();
+    let cookie = session_cookie_for_user(&stack.app.pool, user).await;
+    let uri = "/api/governance/lineage/used-by?table=serving.mart_visits";
+
+    let (status, body) = stack.get_as(&cookie, uri, CATALOG_TENANT).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["charts"][0]["chartId"], json!("c_1"), "{body}");
+
+    let (status, body) = stack.get_as(&cookie, uri, &retail.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["supported"], json!(false), "{body}");
+    assert!(body.get("charts").is_none(), "{body}");
+
+    let (status, body) = stack
+        .get_as(&cookie, uri, &uuid::Uuid::new_v4().to_string())
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
