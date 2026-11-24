@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { PlusIcon } from "lucide-react"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
@@ -17,6 +18,7 @@ import { formatRelativeTime } from "@/lib/format"
 import { notifySuccess } from "@/lib/notify"
 import { governanceService } from "@/services"
 import type { QualitySchedule } from "@/services/contracts/governance"
+import { AddScheduleDialog } from "./quality-schedule-add-dialog"
 import { intervalLabel, ScheduleControls, scheduleSentence } from "./quality-schedule"
 import { TableKeyLink } from "./table-key-link"
 
@@ -26,14 +28,16 @@ import { TableKeyLink } from "./table-key-link"
  * the same control the asset page uses to change one. The endpoint lists
  * only tables with a saved schedule (`routes/quality_schedules.rs`); every
  * other table runs on the default, which the tab says in one line rather
- * than listing tables it was not told about. Changing or resetting needs
- * `governance:write`; a reader sees the list without the buttons.
+ * than listing tables it was not told about. `DATA-46` adds a schedule for a
+ * table that has none through a catalog table picker; changing or resetting
+ * needs `governance:write`, so a reader sees the list without the buttons.
  *
  * **Reset** (S3a-D3) deletes the table's own schedule, so the table goes
  * back to the default and leaves this list.
  */
 export function QualitySchedulesTab({ canWrite }: { canWrite: boolean }) {
   const state = useService((signal) => governanceService.listQualitySchedules(signal), [])
+  const [adding, setAdding] = React.useState(false)
   const [editing, setEditing] = React.useState<QualitySchedule | null>(null)
   const [resetting, setResetting] = React.useState<QualitySchedule | null>(null)
   const reset = useServiceAction((signal, asset: string) =>
@@ -90,10 +94,18 @@ export function QualitySchedulesTab({ canWrite }: { canWrite: boolean }) {
 
   return (
     <div className="flex flex-col gap-3">
-      <p className="text-sm text-muted-foreground">
-        A table not listed here runs its checks every {intervalLabel(defaultIntervalMinutes)} (the
-        default). A table&apos;s schedule is also on its page, under Quality.
-      </p>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-sm text-muted-foreground">
+          A table not listed here runs its checks every {intervalLabel(defaultIntervalMinutes)} (the
+          default). Its schedule is also on the table&apos;s page, under Quality.
+        </p>
+        {canWrite ? (
+          <Button size="sm" onClick={() => setAdding(true)}>
+            <PlusIcon data-icon="inline-start" />
+            Add schedule
+          </Button>
+        ) : null}
+      </div>
       <DataTable
         columns={columns}
         rows={schedules}
@@ -101,11 +113,26 @@ export function QualitySchedulesTab({ canWrite }: { canWrite: boolean }) {
         emptyState={
           <EmptyState
             title="No table has a schedule of its own"
-            description={`Every table runs its checks every ${intervalLabel(defaultIntervalMinutes)}. Set another schedule from a table's Quality tab.`}
+            description={
+              canWrite
+                ? `Every table runs its checks every ${intervalLabel(defaultIntervalMinutes)}. Use Add schedule to set one for a table.`
+                : `Every table runs its checks every ${intervalLabel(defaultIntervalMinutes)}.`
+            }
             className="py-4"
           />
         }
       />
+      {adding ? (
+        <AddScheduleDialog
+          scheduledTables={schedules.map((s) => s.asset)}
+          defaultInterval={defaultIntervalMinutes}
+          onClose={() => setAdding(false)}
+          onSaved={() => {
+            setAdding(false)
+            state.reload()
+          }}
+        />
+      ) : null}
       {resetting ? (
         <ConfirmActionDialog
           open
