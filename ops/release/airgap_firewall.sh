@@ -20,13 +20,15 @@
 # (`rust/crates/lakehousectl/src/docker.rs`), whose traffic originates
 # from the daemon.
 #
-# WHY NOT DOCKER-USER (YET):
+# WHY THIS SCRIPT IS THE HOST SIDE, NOT DOCKER-USER:
 # Container traffic traverses `FORWARD`/`DOCKER-USER`, not host `OUTPUT`.
-# `docker-compose.yml` still has Alpine init containers that run
-# `apk add --no-cache curl jq` / `openssl` at startup; blocking container
-# egress here would break the very stack the proof installs. Container-
-# level egress blocking belongs to REL-16, once those init containers are
-# replaced. This script touches `OUTPUT` only.
+# When REL-12 wrote this script, Alpine init containers still ran
+# `apk add --no-cache curl jq` / `openssl` at startup, so blocking container
+# egress would have broken the very stack the proof installs. REL-16 (#711)
+# replaced them with the bundled `rantai-lakehouse-init` image, and the
+# release workflow now REJECTs container egress on `DOCKER-USER` itself.
+# This script stays on the host `OUTPUT` side: the two cuts are
+# complementary and the release proof asserts both before it installs.
 #
 # WHY LOOPBACK IS ACCEPTED FIRST:
 # Both proofs call the local console/API on 127.0.0.1 and `update-proof`
