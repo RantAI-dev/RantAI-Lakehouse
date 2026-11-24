@@ -9,6 +9,7 @@
 import { lakehouseTableHref } from "./lakehouse-view"
 import type { PlatformService } from "@/services/contracts/ops"
 import type { MaintenanceRun, ReplicationSlot } from "@/services/contracts/governance"
+import type { LakehouseTableSummary } from "@/services/contracts/lakehouse"
 
 /** The one-line answer to "is the system up?", from the services probe. */
 export type OverallServiceState = {
@@ -107,4 +108,29 @@ export function maintenanceTableHref(tableName: string): string | null {
   const dot = tableName.indexOf(".")
   if (dot <= 0 || dot === tableName.length - 1) return null
   return lakehouseTableHref(tableName.slice(0, dot), tableName.slice(dot + 1))
+}
+
+/**
+ * Iceberg tables in the warehouse that have no recorded maintenance run
+ * (`DATA-45`).
+ *
+ * `GET /api/lakehouse/tables` lists every table Lakekeeper serves, including
+ * ones the console's catalog registry never recorded (Gold export tables, for
+ * example). `GET /api/governance/maintenance` lists runs for whichever tables
+ * have one (Bronze nightly runs and Gold export runs alike). A discovered
+ * table is therefore "without a run" only when its two-part `namespace.name`
+ * is absent from the run list — the same key `maintenance.py` records. These
+ * tables get an honest "No run recorded yet" in the UI, never an invented
+ * count or status.
+ *
+ * Sorted by namespace then name so the section's order is stable.
+ */
+export function icebergTablesWithoutRuns(
+  tables: readonly LakehouseTableSummary[],
+  runs: readonly MaintenanceRun[]
+): LakehouseTableSummary[] {
+  const covered = new Set(runs.map((r) => r.tableName))
+  return tables
+    .filter((t) => !covered.has(`${t.namespace}.${t.name}`))
+    .sort((a, b) => a.namespace.localeCompare(b.namespace) || a.name.localeCompare(b.name))
 }
