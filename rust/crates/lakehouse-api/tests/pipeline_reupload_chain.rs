@@ -55,7 +55,10 @@ async fn seed_pipeline(pool: &sqlx::PgPool, prefix: &str, tenant_id: Option<uuid
             transforms: Vec::new(),
             fbic_enabled: false,
             target_zone: "silver".to_owned(),
-            target_table: "orders_clean".to_owned(),
+            // BLD-20 enforces a unique output table across live pipelines, so
+            // each seeded pipeline needs its own valid ClickHouse identifier
+            // (lowercase ASCII/digits/underscores — UUID simple has no hyphens).
+            target_table: format!("orders_clean_{}", uuid::Uuid::new_v4().simple()),
             schedule: "manual".to_owned(),
             owner: None,
             description: None,
