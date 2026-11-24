@@ -16,7 +16,13 @@
 //!   either;
 //! * a kind outside the list is drained all the same and keeps its own 404:
 //!   it has no size sentence, so a body of its own over the cap keeps the
-//!   404 too, never a 413.
+//!   404 too, never a 413;
+//! * an upload the handler already stored and audited keeps its own 2xx
+//!   when the drain gives up on what follows its form (`PR #638 review
+//!   2`): a stored upload is never converted into a 413 — pinned by the
+//!   unit tests on `answer_at_cap`, because through this router the
+//!   route's own 1 MiB body limit always answers such a body first, so
+//!   what runs end to end here is the form the trailing data refused.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -59,13 +65,20 @@ fn png_bytes(total: usize) -> Vec<u8> {
 }
 
 /// A one-part form whose `file` part holds `bytes`.
+///
+/// The closing boundary matches the one the `Content-Type` declares: the
+/// old closing line was the literal `--BOUNDARY--`, which never matched
+/// the declared `PICTUREBOUNDARY`, so no form parsed to its end — no
+/// earlier test needed it to, since every one of them is answered before
+/// the parser reaches the form's end (`PR #638 review 2`'s test is the
+/// first that must read the `file` part and store it).
 fn picture_form(bytes: &[u8]) -> Vec<u8> {
     let mut body = format!(
         "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"logo.png\"\r\nContent-Type: image/png\r\n\r\n"
     )
     .into_bytes();
     body.extend_from_slice(bytes);
-    body.extend_from_slice(b"\r\n--BOUNDARY--\r\n");
+    body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
     body
 }
 
@@ -83,6 +96,35 @@ fn counted_body(total: usize, chunk: usize, taken: Arc<AtomicU64>) -> Body {
             (sent + len, taken),
         ))
     });
+    Body::from_stream(stream)
+}
+
+/// A body that is the form's own bytes and then `junk` bytes that are not
+/// the form's: the multipart reader stops at the form's closing boundary,
+/// so only the drain reads the junk. Counted, like [`counted_body`], so
+/// the test can say where the API stopped reading.
+fn form_then_junk(form: Vec<u8>, junk: usize, taken: Arc<AtomicU64>) -> Body {
+    let stream = unfold(
+        (Some(form), 0_usize, taken),
+        move |(form, sent, taken)| async move {
+            if let Some(chunk) = form {
+                taken.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                return Some((
+                    Ok::<Bytes, std::convert::Infallible>(chunk.into()),
+                    (None, sent, taken),
+                ));
+            }
+            if sent >= junk {
+                return None;
+            }
+            let len = (64 * 1024).min(junk - sent);
+            taken.fetch_add(len as u64, Ordering::Relaxed);
+            Some((
+                Ok::<Bytes, std::convert::Infallible>(Bytes::from(vec![0x41_u8; len])),
+                (None, sent + len, taken),
+            ))
+        },
+    );
     Body::from_stream(stream)
 }
 
@@ -506,5 +548,110 @@ async fn a_kind_outside_the_list_over_the_cap_keeps_its_own_404() {
         taken.load(Ordering::Relaxed),
         DRAIN_CAP,
         "the API must stop reading at the cap"
+    );
+}
+
+/// A valid upload on the drained route: the form parses, the picture is
+/// stored, the audit row is written and the answer is the handler's own
+/// 200. The drain keeps it: the body is small, so the drain finds nothing
+/// over the cap in it.
+///
+/// This is also the first test that reads a [`picture_form`] to its end,
+/// which is why the form's closing boundary had to be fixed to match the
+/// one the `Content-Type` declares (the old literal `--BOUNDARY--` never
+/// matched the declared `PICTUREBOUNDARY`; no earlier test parsed past the
+/// refusal it was sent to assert, so it never showed).
+#[tokio::test]
+async fn a_valid_upload_on_the_drained_route_is_stored_and_answers_200() {
+    let app = common::spin_up().await;
+    let cookie = admin_cookie(&app.pool).await;
+    let png = png_bytes(64);
+
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/api/settings/general/images/logo")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .header("cookie", cookie)
+        .body(Body::from(picture_form(&png)))
+        .unwrap();
+    let response = app.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The picture really was stored: the 200 is about a save that happened.
+    let stored = lakehouse_store::workspace_settings::get(&app.pool)
+        .await
+        .unwrap()
+        .expect("the settings row exists");
+    let logo = stored.logo.expect("the logo was saved");
+    assert_eq!(&*logo.bytes, &png[..]);
+    assert_eq!(logo.content_type, "image/png");
+}
+
+/// PR #638 review 2's shape — a valid small form followed by over-cap
+/// trailing data — pinned to the answer it can actually reach today.
+///
+/// A 2xx answer whose leftover body then crosses the drain's cap cannot be
+/// driven through this router: the multipart parser drains every byte the
+/// shared body hands it until the route's own body limit (1 MiB,
+/// `PICTURE_BODY_LIMIT_BYTES`, far below the drain's 16 MiB cap) refuses
+/// the rest, so for this body the inner answer is the 422 with the size
+/// sentence, the picture is never stored, and the drain's cap answers the
+/// 413 over it. The success-stands half of the cap decision — the store
+/// happened, so the 2xx must survive the cap — is pinned where it lives,
+/// by the unit tests on `answer_at_cap` in `routes::picture_drain`
+/// (`PR #638 review 2`): the day a route change lets a stored upload meet
+/// the cap (a raised body limit, an answer that reads less), the decision
+/// is already the right one.
+///
+/// What this test also pins: the drain still reads the trailing data to
+/// its cap and no further, and the form at the head of the body is not
+/// kept alive by the refusal.
+#[tokio::test]
+async fn a_valid_form_with_over_cap_trailing_data_is_refused_and_the_reading_stops_at_the_cap() {
+    let app = common::spin_up().await;
+    let cookie = admin_cookie(&app.pool).await;
+    let taken = Arc::new(AtomicU64::new(0));
+    let png = png_bytes(64);
+
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/api/settings/general/images/logo")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .header("cookie", cookie)
+        .body(form_then_junk(
+            picture_form(&png),
+            20 * 1024 * 1024,
+            taken.clone(),
+        ))
+        .unwrap();
+    let response = app.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let text = String::from_utf8_lossy(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+        .to_string();
+    assert!(text.contains(LOGO_SIZE), "{text}");
+
+    // Nothing was stored: the refusal the caller can act on is honest.
+    assert!(
+        lakehouse_store::workspace_settings::get(&app.pool)
+            .await
+            .unwrap()
+            .and_then(|row| row.logo)
+            .is_none(),
+        "an upload whose body the route's own limit refused must not be stored"
+    );
+
+    // The drain still stopped at the cap: the trailing data was never read
+    // to its end.
+    let read = taken.load(Ordering::Relaxed);
+    assert!(read > DRAIN_CAP, "the drain did reach the cap: {read}");
+    assert!(
+        read <= DRAIN_CAP + 64 * 1024,
+        "the drain read past the cap plus one junk frame: {read}"
     );
 }

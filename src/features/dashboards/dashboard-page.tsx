@@ -9,6 +9,7 @@ import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { SurfaceThemeProvider } from "@/components/ui/surface-theme";
 import { cn } from "@/lib/utils";
 import { dashboardDestination, queryDestination, urlDestination } from "@/lib/click-destination";
 import { binRangeFilter, isLastBin, toggleBinFilter } from "@/lib/chart-bins";
@@ -1407,9 +1408,12 @@ export function DashboardPage({ boardId }: { boardId: string }) {
 
   // `dark` on the container themes the dashboard alone (the tokens and the
   // `dark:` variants key off an ancestor with the class); the rest of the
-  // console, and anything portalled out of this element, keeps its theme.
+  // console keeps its theme. WEB-10: portals still land on <body> (never inside
+  // this scrolling pane), but the surface's theme class travels with them so a
+  // popup opened from a light board is light too.
   return (
     <ReportingProvider reporting={data?.reporting}>
+    <SurfaceThemeProvider themeClass={look.surfaceThemeClass}>
     <div
       ref={frameFade}
       data-slot="dashboard-frame"
@@ -1817,6 +1821,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ) : null}
       <ChartLineagePanel chart={lineageChart} onOpenChange={(next) => { if (!next) setLineageChart(null); }} />
     </div>
+    </SurfaceThemeProvider>
     </ReportingProvider>
   );
 }

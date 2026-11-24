@@ -1249,29 +1249,6 @@ pub async fn mark_group_within_limits(
     Ok(MarkOutcome::Marked(Box::new(marked)))
 }
 
-/// Keep the report of values that did not fit on the upload the load belongs to
-/// (`DATA-18`, plan AD6). Written when the API settles the row, whatever the
-/// outcome: a `stop` load fails with the report, a `null` load succeeds with it.
-/// Only a row that is `ingesting` or just settled under `run_id` takes it.
-///
-/// # Errors
-///
-/// Returns [`StoreError::Database`] on a database failure.
-pub async fn record_bad_values(
-    pool: &PgPool,
-    id: &str,
-    run_id: &str,
-    report: &Value,
-) -> Result<bool, StoreError> {
-    let done = sqlx::query("UPDATE file_upload SET bad_values = $3 WHERE id = $1 AND run_id = $2")
-        .bind(id)
-        .bind(run_id)
-        .bind(Json(report.clone()))
-        .execute(pool)
-        .await?;
-    Ok(done.rows_affected() > 0)
-}
-
 /// Give a claimed upload the Dagster run that carries its load out: sets
 /// `run_id` on a row that is `ingesting` and has no run yet.
 ///
@@ -1306,7 +1283,9 @@ pub async fn attach_run(
         .await?)
 }
 
-/// Settle a load: `ingested` when `error` is `None`, `failed` otherwise.
+/// Settle a load with no report of values that did not fit: `ingested` when
+/// `error` is `None`, `failed` otherwise. The same transition as
+/// [`mark_finished_with_bad_values`], with `bad_values = NULL`.
 ///
 /// `run_id` is the run the caller is settling, as recorded by
 /// [`mark_ingesting`] or [`attach_run`]; `None` names a claim that never got
@@ -1335,11 +1314,46 @@ pub async fn mark_finished(
     error: Option<&str>,
     row_count: Option<i64>,
 ) -> Result<Option<Upload>, StoreError> {
+    mark_finished_with_bad_values(pool, id, run_id, error, row_count, None).await
+}
+
+/// Settle a typed load and keep the job's report of values that did not fit in
+/// the same database transition (`DATA-18`, plan AD6; `REL-15`).
+///
+/// `REL-15`: status, `error`, `row_count` and `bad_values` are set by ONE
+/// `UPDATE`, returning the finished row. The API reads the report from object
+/// storage *before* calling this, so no reader — not a concurrent
+/// `GET /api/uploads/{id}`, not another caller settling the same run — can see
+/// a terminal status before its report. A `stop` load fails with the report;
+/// a `null` load succeeds with it. `bad_values = None` is the common case of a
+/// load that found none, and stays `NULL`.
+///
+/// The run, count and secondary-file rules are exactly those of
+/// [`mark_finished`]: only a row `ingesting` under `run_id` changes, a failed
+/// load stores no count, and the files loaded with it end in the same
+/// transaction with the same reason (their own report is not written — the
+/// report belongs to the primary that was typed).
+///
+/// Returns `None` when no row changed, so a report attached to a run another
+/// reader has already settled is never written to the newer load.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn mark_finished_with_bad_values(
+    pool: &PgPool,
+    id: &str,
+    run_id: Option<&str>,
+    error: Option<&str>,
+    row_count: Option<i64>,
+    bad_values: Option<&Value>,
+) -> Result<Option<Upload>, StoreError> {
     let sql = format!(
         "UPDATE file_upload \
          SET status = CASE WHEN $3::text IS NULL THEN 'ingested' ELSE 'failed' END, \
              error = $3, \
              row_count = CASE WHEN $3::text IS NULL THEN $4::bigint ELSE NULL END, \
+             bad_values = $5, \
              updated_at = now() \
          WHERE id = $1 AND status = 'ingesting' AND run_id IS NOT DISTINCT FROM $2 \
          RETURNING {COLS}"
@@ -1351,6 +1365,7 @@ pub async fn mark_finished(
         .bind(run_id)
         .bind(error)
         .bind(row_count)
+        .bind(bad_values.map(|report| Json(report.clone())))
         .fetch_optional(&mut *tx)
         .await?;
     if settled.is_some() {
