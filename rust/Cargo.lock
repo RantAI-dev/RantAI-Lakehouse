@@ -2953,6 +2953,7 @@ name = "lakehouse-notify"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "lakehouse-core",
  "lettre",
  "rcgen",
  "reqwest 0.12.28",
