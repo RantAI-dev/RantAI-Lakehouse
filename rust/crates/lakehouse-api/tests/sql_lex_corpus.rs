@@ -27,9 +27,6 @@ use lakehouse_api::sql_guard::is_read_only;
 use lakehouse_api::sql_rewrite::Engine;
 use lakehouse_clickhouse::ChClient;
 use serde_json::{Map, Value, json};
-use testcontainers::ImageExt;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::clickhouse::ClickHouse;
 
 /// What the corpus claims about one statement, and what the test then
 /// asserts on both sides.
@@ -245,33 +242,15 @@ enum Verdict {
 /// A disposable `ClickHouse` 26.8 — the compose file's own tag.
 struct EngineServer {
     /// Kept alive for the test: dropping it removes the container.
-    _container: testcontainers::ContainerAsync<ClickHouse>,
+    _container: lakehouse_test_support::clickhouse::Container,
     /// The HTTP client the corpus speaks to the engine with.
     client: ChClient,
 }
 
 impl EngineServer {
     async fn start() -> Self {
-        // The compose service's env trio (the compose file's own local-dev
-        // default), as `tests/ops_workloads.rs` starts it.
-        let container = ClickHouse::default()
-            .with_env_var("CLICKHOUSE_USER", "default")
-            .with_env_var("CLICKHOUSE_PASSWORD", "")
-            .with_env_var("CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT", "1")
-            .with_tag("26.8")
-            .start()
-            .await
-            .expect("start the ClickHouse testcontainer");
-        let host = container.get_host().await.expect("container host");
-        let port = container
-            .get_host_port_ipv4(8123)
-            .await
-            .expect("container HTTP port");
-        let client = ChClient::new(
-            format!("http://{host}:{port}"),
-            "default".to_owned(),
-            String::new(),
-        );
+        let (url, container) = lakehouse_test_support::clickhouse::start().await;
+        let client = ChClient::new(url, "default".to_owned(), String::new());
         Self {
             _container: container,
             client,
