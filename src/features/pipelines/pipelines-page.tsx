@@ -49,20 +49,41 @@ export function PipelinesPage() {
       (signal, id: string) => pipelineService.triggerRun(id, signal)
     )
   )
+  // BLD-18: the row menu offers Pause/Resume for authored pipelines. The
+  // service calls the same routes the detail page uses, which stop/start
+  // the cron schedule, dependency sensor and target-lag freshness sensor.
+  const pauseAction = useServiceAction(
+    withNotify(
+      { success: "Automatic runs paused", error: "Could not pause the pipeline" },
+      (signal, id: string) => pipelineService.pausePipeline(id, signal)
+    )
+  )
+  const resumeAction = useServiceAction(
+    withNotify(
+      { success: "Automatic runs resumed", error: "Could not resume the pipeline" },
+      (signal, id: string) => pipelineService.resumePipeline(id, signal)
+    )
+  )
 
   const columns = React.useMemo(
     () =>
       getPipelineColumns({
         onView: (p) => router.push(`/pipelines/${p.id}`),
-        // Only an orchestrator job can be launched; an authored pipeline
-        // has no engine behind it, and the menu says so rather than
-        // offering an action that always fails.
+        // BLD-11 review R4: the trigger route launches authored pipelines
+        // too (only drafts are refused), so this handler is shared with the
+        // Dagster rows; the menu says "mark it ready first" only for drafts.
         onTrigger: async (p) => {
           const run = await triggerAction.run(p.id)
           if (run) state.reload()
         },
+        onPause: async (p) => {
+          if (await pauseAction.run(p.id)) state.reload()
+        },
+        onResume: async (p) => {
+          if (await resumeAction.run(p.id)) state.reload()
+        },
       }),
-    [router, triggerAction, state]
+    [router, triggerAction, pauseAction, resumeAction, state]
   )
 
   const pipelines = React.useMemo(

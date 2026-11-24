@@ -53,6 +53,9 @@ dashboard it embeds elsewhere.
   the assistant's answers are not changed by this setting.
 - Time zone and number format are set in Settings → Reporting and apply to
   dashboards only, not to the rest of the console.
+- A client other than the console that sends more than 16 MiB through the
+  console's `/api` proxy gets the proxy's own error, because the API stops
+  reading at that cap.
 
 ## Acceptance checklist (owner)
 

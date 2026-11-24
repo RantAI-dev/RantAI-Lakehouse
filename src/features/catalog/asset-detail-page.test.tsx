@@ -309,3 +309,18 @@ describe("AssetDetailPage row count (QA LH-DATA-15-07)", () => {
     expect(rows.textContent).not.toContain("—")
   })
 })
+
+describe("AssetDetailPage connect dialog (reczz28d1eZjrBAZ)", () => {
+  it("opens a compact Connect dialog with the governed REST tab", async () => {
+    stubApi({})
+    renderPage()
+    expect(await screen.findByText("Orders Silver")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }))
+    expect(await screen.findByRole("dialog")).toBeTruthy()
+    expect(screen.getByText("Connect to Orders Silver")).toBeTruthy()
+    expect(screen.getByRole("tab", { name: "Governed REST API" })).toBeTruthy()
+    // Silver is not published in Iceberg, so there is no second tab.
+    expect(screen.queryByRole("tab", { name: "Iceberg REST Catalog" })).toBeNull()
+    expect(screen.getByText(/POST \/api\/query\/run/)).toBeTruthy()
+  })
+})

@@ -1076,6 +1076,11 @@ async fn a_reader_is_refused_every_report_write() {
 const RENDER_SECRET: &str = "test-render-secret-not-real";
 
 fn report_token(user: Uuid, report: &str) -> String {
+    report_token_for(user, report, None)
+}
+
+/// A report token with an explicit acting tenant (`SEC-54`).
+fn report_token_for(user: Uuid, report: &str, tenant: Option<&str>) -> String {
     let iat = (unix_now() - 5.0).floor();
     sign_render(
         &RenderClaims {
@@ -1084,6 +1089,7 @@ fn report_token(user: Uuid, report: &str) -> String {
             chart: None,
             report: Some(report.to_owned()),
             principal: user.to_string(),
+            tenant: tenant.map(str::to_owned),
             filters: None,
             params: None,
             grain: None,
@@ -1143,6 +1149,50 @@ async fn a_report_token_reads_the_report_in_order_as_the_person_it_names() {
     assert!(
         body.get("layout").is_none() && body.get("results").is_none(),
         "{body}"
+    );
+}
+
+/// `SEC-54`: the report PDF's charts are read under the tenant in the token,
+/// not the reader's first tenant. The reader belongs to both; the seeded ids
+/// sort so the catalog tenant is first and the second tenant is not the one
+/// that owns the shared mart.
+#[tokio::test]
+async fn a_report_token_reads_its_charts_under_the_tenant_it_carries() {
+    let f = fixture_with(&[("RENDER_TOKEN_SECRET", RENDER_SECRET)]).await;
+    let second = "11111111-1111-4111-8111-000000000002";
+    sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(f.reader_id)
+    .bind(second.parse::<Uuid>().unwrap())
+    .execute(&f.app.pool)
+    .await
+    .unwrap();
+    let (_, made) = create(
+        &f,
+        &f.writer,
+        json!({ "title": "Tenant report", "blocks": [chart("c_one")] }),
+    )
+    .await;
+    let id = made["report"]["id"].as_str().unwrap().to_owned();
+
+    let (status, body) = render_data(
+        &f,
+        &report_token_for(f.reader_id, &id, Some(common::CATALOG_TENANT)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["charts"]["c_one"].get("spec").is_some(),
+        "CONTROL: the first tenant reads the chart: {body}"
+    );
+
+    let (status, body) = render_data(&f, &report_token_for(f.reader_id, &id, Some(second))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["charts"]["c_one"]["cell"]["error"],
+        "Table not found or not available to your organisation: serving.mart_x",
+        "the second tenant cannot read the shared mart: {body}"
     );
 }
 
@@ -1262,6 +1312,69 @@ async fn the_report_pdf_opens_the_report_print_view_and_is_audited() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(said["error"], "report not found.");
     assert_eq!(gotenberg.received_requests().await.unwrap().len(), 1);
+}
+
+/// `SEC-54`: the report PDF's token carries the tenant the caller worked
+/// under, so the report print view reads that tenant's charts.
+#[tokio::test]
+async fn the_report_pdf_token_carries_the_second_tenant_the_caller_exported_under() {
+    let gotenberg = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/forms/chromium/convert/url"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"%PDF-1.7 fake".to_vec()))
+        .mount(&gotenberg)
+        .await;
+    let uri = gotenberg.uri();
+    let f = fixture_with(&[
+        ("RENDER_TOKEN_SECRET", RENDER_SECRET),
+        ("GOTENBERG_URL", uri.as_str()),
+        ("CONSOLE_INTERNAL_URL", "http://console.test:3000"),
+    ])
+    .await;
+    let second = "11111111-1111-4111-8111-000000000002";
+    sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(f.reader_id)
+    .bind(second.parse::<Uuid>().unwrap())
+    .execute(&f.app.pool)
+    .await
+    .unwrap();
+    let (_, made) = create(
+        &f,
+        &f.writer,
+        json!({ "title": "Tenant report", "blocks": [chart("c_one")] }),
+    )
+    .await;
+    let id = made["report"]["id"].as_str().unwrap().to_owned();
+
+    let resp = f
+        .app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/dashboard/reports/{id}/pdf"))
+                .header("cookie", &f.reader)
+                .header("x-tenant", second)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let sent = gotenberg.received_requests().await.unwrap();
+    let form = String::from_utf8_lossy(&sent[0].body).into_owned();
+    let marker = "http://console.test:3000/render/report/";
+    let at = form.find(marker).expect("the report print view is opened");
+    let token: String = form[at + marker.len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .collect();
+    let claims = lakehouse_embed::verify_render(&token, RENDER_SECRET, unix_now()).unwrap();
+    assert_eq!(claims.tenant.as_deref(), Some(second), "{claims:?}");
+    assert_eq!(claims.report.as_deref(), Some(id.as_str()));
 }
 
 const TEST_GEOJSON: &str = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"NAME":"North"},"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}}]}"#;

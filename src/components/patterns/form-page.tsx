@@ -30,6 +30,7 @@ export function FormPage({
   error,
   onSubmit,
   onCancel,
+  onBack,
   children,
   className,
 }: {
@@ -46,7 +47,10 @@ export function FormPage({
   /** The API's own sentence, shown above the footer instead of a toast. */
   error?: string | null
   onSubmit: () => void
-  onCancel: () => void
+  /** The footer's Cancel. Leave it out when the back arrow is the one way out (one action, one control). */
+  onCancel?: () => void
+  /** Takes over the back arrow's click (a page with unsaved changes asks first); the link still carries `backHref`. */
+  onBack?: () => void
   children: React.ReactNode
   className?: string
 }) {
@@ -55,6 +59,14 @@ export function FormPage({
       <div className="flex flex-col gap-2 border-b border-border pb-4">
         <Link
           href={backHref}
+          onClick={
+            onBack
+              ? (e) => {
+                  e.preventDefault()
+                  onBack()
+                }
+              : undefined
+          }
           className="inline-flex w-fit items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground"
         >
           <ArrowLeftIcon className="size-4" aria-hidden />
@@ -79,9 +91,11 @@ export function FormPage({
       ) : null}
 
       <div className="flex items-center justify-end gap-2 border-t border-border pt-4">
-        <Button type="button" variant="outline" disabled={submitting} onClick={onCancel}>
-          Cancel
-        </Button>
+        {onCancel ? (
+          <Button type="button" variant="outline" disabled={submitting} onClick={onCancel}>
+            Cancel
+          </Button>
+        ) : null}
         <Button type="button" disabled={!canSubmit || submitting} onClick={onSubmit}>
           {submitting ? submittingLabel : submitLabel}
         </Button>

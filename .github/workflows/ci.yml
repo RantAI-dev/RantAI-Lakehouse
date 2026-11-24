@@ -9,6 +9,9 @@ on:
     # filter means every PR above the first gets ZERO check runs and merges
     # unverified.
     branches: [main, 'lakehouse/**']
+    # OPS-38 D1: a draft PR runs only the fast checks, so marking a PR ready
+    # must trigger a full run (`ready_for_review`).
+    types: [opened, synchronize, reopened, ready_for_review]
   # OPS-24 D3: the full run that replaces "every push runs everything". The
   # nightly run (19:23 UTC, an hour with no pull-request run) and the manual
   # one are the backstop that still exercises every gate. Neither event has a
@@ -83,6 +86,11 @@ jobs:
       # `CI_PUSH_FULL` itself, so an expression's case-insensitive `==` cannot
       # call `TRUE` on when the script calls it off.
       push_full: ${{ steps.scope.outputs.push_full }}
+      # OPS-38 D1: `draft` is `true` only on a `pull_request` event whose PR is
+      # a draft (compared in `detect_change_scope.sh`, fail closed). `heavy` is
+      # the one helper output every heavy job checks (`heavy == 'true'`).
+      draft: ${{ steps.scope.outputs.draft }}
+      heavy: ${{ steps.scope.outputs.draft != 'true' && 'true' || 'false' }}
       # OPS-25 D1/D7: the gate groups this run selected. `gate_groups` is
       # `none` or the selected groups between commas (`,cdc,`); `ci-required`
       # reads it to decide whether a skipped gate job was allowed to be
@@ -140,6 +148,8 @@ jobs:
           # `true`. Labels are in the event payload, so no new permission is
           # needed for this.
           ALL_GATES_LABEL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:all-gates') }}
+          # OPS-38 D1: raw draft flag; compared case-sensitively inside the script.
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
         run: ./scripts/ci/detect_change_scope.sh
 
       - name: Self-test push proof
@@ -268,7 +278,9 @@ jobs:
       - name: Check every compose image is pinned by digest (REL-2)
         run: python3 ops/lint/check_image_digests.py
 
-      # The unit tests of that check and of the gates' registry and result
+      # The unit tests of that check, of the REL-17 pin-resolution checker
+      # (its live registry calls belong to the scheduled image-pins workflow,
+      # not to this required PR check), and of the gates' registry and result
       # table module (no network, no containers; seconds).
       #
       # `ops/bench` too (DATA-24 T2): the catalog-search bench's own tests
@@ -279,6 +291,13 @@ jobs:
           python3 -m unittest discover -s ops/lint -p 'test_*.py'
           python3 -m unittest discover -s ops/gates -p 'test_*.py'
           python3 -m unittest discover -s ops/bench -p 'test_*.py'
+
+      # OPS-18: the bounded retry helper used by the security workflows to
+      # download gitleaks and cargo-deny. Its self-test stubs curl and sleep,
+      # so success-on-retry, the bounded-failure exit code and the missing
+      # trailing sleep are proved without network access or real waiting.
+      - name: Test the CI download retry helper (OPS-18)
+        run: bash ./scripts/ci/tests/test_retry_download.sh
 
       # REL-2 S2-T1 … S2-T3: the release tooling (the version check, the
       # Compose renderer, the manifest). Its own tests are pytest cases;
@@ -395,7 +414,7 @@ jobs:
   dagster-unit-tests:
     name: Dagster · unit tests
     needs: changes
-    if: needs.changes.outputs.dagster == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.heavy == 'true' && (needs.changes.outputs.dagster == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -431,7 +450,7 @@ jobs:
   dagster-loader-tests:
     name: Dagster · loader tests
     needs: changes
-    if: needs.changes.outputs.dagster == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.heavy == 'true' && (needs.changes.outputs.dagster == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -507,7 +526,7 @@ jobs:
   clippy:
     name: Rust · clippy
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.heavy == 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ${{ fromJSON(needs.changes.outputs.compile_runner || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
@@ -557,7 +576,7 @@ jobs:
   build:
     name: Rust · build
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.heavy == 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ${{ fromJSON(needs.changes.outputs.compile_runner || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
@@ -602,7 +621,7 @@ jobs:
   test:
     name: Rust · test ${{ matrix.partition }}/3 (stable)
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.heavy == 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     strategy:
       # REL-20 (D4): three partitions. `count:` balances by test count rather
@@ -695,6 +714,11 @@ jobs:
       # OPS-24 R12: each attempt is bounded by `timeout 180` (a pull that hangs
       # would otherwise hold the job for its 30-minute limit), and the last
       # attempt is not followed by a sleep nothing waits for.
+      # REL-14: pre-pulling `clickhouse/clickhouse-server:26.8` here is the CI
+      # half of the "bytes remaining on stream" fix — a test that finds the
+      # image locally never pulls it. The Rust half is the bounded start
+      # retry in `lakehouse-test-support::clickhouse`, which covers jobs
+      # that do not pre-pull and local runs.
       - name: Pull the test images (the pull is retried, a test never is)
         if: needs.changes.outputs.proven != 'true'
         run: |
@@ -830,7 +854,7 @@ jobs:
   msrv:
     name: Rust · MSRV check (1.99.0)
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.heavy == 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ${{ fromJSON(needs.changes.outputs.compile_runner || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
@@ -882,7 +906,7 @@ jobs:
   g1-rustfs:
     name: Rust · G1 acceptance (RustFS)
     needs: changes
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_storage == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_storage == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -930,7 +954,7 @@ jobs:
   g2-seaweedfs:
     name: Rust · G2 storage boundary (SeaweedFS)
     needs: changes
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_storage == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_storage == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -1014,7 +1038,7 @@ jobs:
   images:
     name: Images · build lakehouse-api + dagster once
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.heavy == 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -1107,7 +1131,7 @@ jobs:
   g3a-dagster:
     name: Rust · G3a Dagster + dlt Bronze ingest
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_pipelines == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_pipelines == 'true'
     runs-on: ubuntu-latest
     # BLD-2 review R1 SHOULD-FIX 16: raised to 45 for the BLD-2 D11 target lag
     # verification step inside G7, which takes 5 append iterations with settling
@@ -1237,8 +1261,8 @@ jobs:
       # would fail on any service that has a `build:` block and no local
       # image, so it is built here, with the SAME `-p`/`--profile` flags as
       # the `up` below, which is what names the image the `up` will look for.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g3aci --profile dagster build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g3aci --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up lakehouse-api + Dagster + the G3a source table + the Iceberg query database
         run: >
@@ -1299,7 +1323,7 @@ jobs:
   g3-maintenance:
     name: Rust · G3 Bronze maintenance job
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_pipelines == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_pipelines == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -1349,8 +1373,8 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g3ci --profile dagster build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g3ci --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up lakehouse-api + Dagster + the G3a source table
         run: >
@@ -1389,7 +1413,7 @@ jobs:
   g4-cdc:
     name: Rust · G4 change capture into Bronze
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_cdc == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_cdc == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -1472,8 +1496,8 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster --profile cdc build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster --profile cdc build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, Kafka, Kafka Connect, and Dagster
         # SRC-9 task 6: the `-f` pair on every compose call of this job (the
@@ -1556,7 +1580,7 @@ jobs:
   g4-mysql:
     name: Rust · G4 MySQL change capture into Bronze
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_cdc == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_cdc == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -1637,8 +1661,8 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g4myci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mysql.override.yml --profile g6-sql --profile dagster --profile cdc --profile g4-mysql build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g4myci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mysql.override.yml --profile g6-sql --profile dagster --profile cdc --profile g4-mysql build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, Kafka, Kafka Connect, and Dagster
         # SRC-9 task 6: the `-f` pair on every compose call of this job (the
@@ -1708,7 +1732,7 @@ jobs:
   g4-mongo:
     name: Rust · G4 MongoDB change capture into Bronze
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_cdc == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_cdc == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -1792,8 +1816,8 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g4mgci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mongo.override.yml --profile dagster --profile cdc --profile g4-mongo build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g4mgci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mongo.override.yml --profile dagster --profile cdc --profile g4-mongo build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, Kafka, Kafka Connect, and Dagster
         # SRC-9 task 6: the `-f` pair on every compose call of this job (the
@@ -1861,7 +1885,7 @@ jobs:
   g4-oracle:
     name: Rust · G4 Oracle change capture into Bronze
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_cdc == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_cdc == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -1936,8 +1960,8 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g4oraci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml -f ops/g4/docker-compose.g4-oracle.override.yml --profile g6-oracle --profile dagster --profile cdc --profile g4-oracle build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g4oraci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml -f ops/g4/docker-compose.g4-oracle.override.yml --profile g6-oracle --profile dagster --profile cdc --profile g4-oracle build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, Kafka, Kafka Connect, and Dagster
         # SRC-9 task 6: the `-f` pair on every compose call of this job (the
@@ -2007,7 +2031,7 @@ jobs:
   g4-mssql:
     name: Rust · G4 SQL Server change capture into Bronze
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_cdc == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_cdc == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -2090,8 +2114,8 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g4msci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mssql.override.yml --profile g6-sql --profile dagster --profile cdc --profile g4-mssql build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g4msci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mssql.override.yml --profile g6-sql --profile dagster --profile cdc --profile g4-mssql build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, Kafka, Kafka Connect, and Dagster
         # SRC-9 task 6: the `-f` pair on every compose call of this job (the
@@ -2172,7 +2196,7 @@ jobs:
     # `scripts/ci/required_gate.sh` requires acceptance gates when Dagster
     # changed, so a trigger without `dagster` skipped this job and failed
     # `ci-required` on every Dagster-only PR (found on #251, `SEC-52`).
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_secrets == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_secrets == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -2217,8 +2241,8 @@ jobs:
       # Fixture image, built here rather than shared (the API depends on
       # oidc-mock being healthy, so it must be up even though this gate signs
       # in through Keycloak, not the mock); see `g4-cdc`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p sec3ci -f docker-compose.yml -f ops/sso/docker-compose.keycloak.override.yml --profile sso build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p sec3ci -f docker-compose.yml -f ops/sso/docker-compose.keycloak.override.yml --profile sso build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up Postgres, ClickHouse, oidc-mock, the API and Keycloak
         run: >
@@ -2256,7 +2280,7 @@ jobs:
   g6-ingest:
     name: Rust · G6 ingest matrix (SQL sources)
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_ingest == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_ingest == 'true'
     runs-on: ubuntu-latest
     # 25, not 20, as the job timeout (PR #101, product owner 2026-10-10): it
     # is the cut-off, not the target. Before the split this one job took
@@ -2330,10 +2354,10 @@ jobs:
       # `rest-stub-g6` is in the `g6`/`g6-other` profiles and is built by
       # `g6-ingest-other`. Same `-f` pair and `--profile` flags as the "up"
       # step below.
-      - name: Build the oidc-mock fixture image
+      - name: Build the oidc-mock and init fixture images
         run: >
           docker compose -p g6ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
-          --profile g6-sql --profile dagster build oidc-mock
+          --profile g6-sql --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up the g6 SQL matrix (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, not a bare `up` on the activated
@@ -2419,7 +2443,7 @@ jobs:
   g6-ingest-other:
     name: Rust · G6 ingest matrix (files, APIs, streams)
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_ingest == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_ingest == 'true'
     runs-on: ubuntu-latest
     # The cut-off, as in `g6-ingest`; the target is under 20 minutes.
     timeout-minutes: 25
@@ -2483,10 +2507,10 @@ jobs:
       # `build:` block and no `image:`. Same `-f` pair and `--profile` flags
       # as the "up" step below (`rest-stub-g6` is invisible to `build`
       # without them).
-      - name: Build the oidc-mock and rest-stub-g6 fixture images
+      - name: Build the oidc-mock, init and rest-stub-g6 fixture images
         run: >
           docker compose -p g6otherci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
-          --profile g6-other --profile dagster build oidc-mock rest-stub-g6
+          --profile g6-other --profile dagster build oidc-mock lakekeeper-warehouse-init rest-stub-g6
 
       - name: Bring up the g6 files, APIs and streams matrix (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, as `g6-ingest` explains (the dagster profile
@@ -2534,10 +2558,10 @@ jobs:
       # A separate compose project has its own image names, so the fixture
       # it needs is built again here (`oidc-mock` only: the link-local stack
       # does not start `rest-stub-g6`).
-      - name: Build the oidc-mock fixture image for the link-local project
+      - name: Build the oidc-mock and init fixture images for the link-local project
         run: >
           docker compose -p g6ci-linklocal -f docker-compose.yml -f ops/g6/docker-compose.g6-linklocal-secrets.override.yml
-          --profile g6-linklocal --profile dagster build oidc-mock
+          --profile g6-linklocal --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up a SEPARATE, override-free (for INGEST_ALLOW_INTERNAL_HOSTS) project for the link-local assertion
         # "Override-free" means no `ops/g6/docker-compose.g6.override.yml`
@@ -2586,7 +2610,7 @@ jobs:
   g6-oracle:
     name: Rust · G6 Oracle connector
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_ingest == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_ingest == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -2641,10 +2665,10 @@ jobs:
       # `oracle-g6` is a pinned upstream image (pulled, not built) and
       # `g6-oracle-test-runner` uses the shared Dagster image (the override
       # gives it the same `image:` key), so `oidc-mock` is the only build.
-      - name: Build the oidc-mock fixture image
+      - name: Build the oidc-mock and init fixture images
         run: >
           docker compose -p g6oracleci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml
-          --profile g6-oracle --profile dagster build oidc-mock
+          --profile g6-oracle --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up the Oracle gate stack (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, as g6-ingest explains (the dagster profile
@@ -2698,7 +2722,7 @@ jobs:
   g9-upload:
     name: Rust · G9 file upload
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_upload == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_upload == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -2757,8 +2781,8 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g9ci --profile dagster build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g9ci --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up lakehouse-api, Dagster and the API's Iceberg query database
         # Explicit service list, as g6-ingest explains: a bare `up` on the
@@ -2800,7 +2824,7 @@ jobs:
   g6-alerts:
     name: Rust · SRC-17 alert delivery
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_alerts == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_alerts == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -2868,10 +2892,10 @@ jobs:
       # uses the shared Dagster image (the override gives it the same
       # `image:` key), so `oidc-mock` is the only build. Same `-f` pair and
       # `--profile` flags as the "up" step below.
-      - name: Build the oidc-mock fixture image
+      - name: Build the oidc-mock and init fixture images
         run: >
           docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
-          --profile g6-sql --profile g6-alerts --profile dagster build oidc-mock
+          --profile g6-sql --profile g6-alerts --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up the alert delivery stack (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, as g6-ingest explains (the dagster profile
@@ -2949,7 +2973,7 @@ jobs:
   g6-ops:
     name: Rust · SRC-11 connector operations
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_ingest == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_ingest == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -3014,10 +3038,10 @@ jobs:
       # Fixture image, built here rather than shared; see `g6-alerts`.
       # `g6-ops-test-runner` uses the shared Dagster image, so `oidc-mock`
       # is the only build.
-      - name: Build the oidc-mock fixture image
+      - name: Build the oidc-mock and init fixture images
         run: >
           docker compose -p g6opsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
-          --profile g6-sql --profile g6-ops --profile dagster build oidc-mock
+          --profile g6-sql --profile g6-ops --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up the connector operations stack (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, as g6-alerts and g6-ingest explain. The
@@ -3082,7 +3106,7 @@ jobs:
   g6-credentials:
     name: Rust · SRC-12 credentials at rest
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_secrets == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_secrets == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -3156,9 +3180,9 @@ jobs:
           echo "refused, naming the variable:"
           cat "$RUNNER_TEMP/no-key.err"
 
-      - name: Build the oidc-mock fixture image
+      - name: Build the oidc-mock and init fixture images
         run: >
-          docker compose -p src12ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g6/docker-compose.src12.override.yml --profile g6-sql --profile g6-ops --profile dagster build oidc-mock
+          docker compose -p src12ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g6/docker-compose.src12.override.yml --profile g6-sql --profile g6-ops --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up the stack
         run: >
@@ -3234,7 +3258,7 @@ jobs:
   g6-secret-managers:
     name: Rust · SRC-12 secret managers (Vault, AWS)
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_secrets == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_secrets == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -3304,8 +3328,8 @@ jobs:
           # SEC-36: generated per run; no key-shaped literal in the repository.
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
-      - name: Build the oidc-mock fixture image
-        run: $COMPOSE build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: $COMPOSE build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up the stack and the two secret-manager fixtures
         run: >
@@ -3370,7 +3394,7 @@ jobs:
   g6-oauth:
     name: Rust · SRC-12 OAuth sign-in
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_secrets == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_secrets == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -3433,8 +3457,8 @@ jobs:
           # SEC-36: generated per run; no key-shaped literal in the repository.
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
-      - name: Build the oidc-mock fixture image
-        run: $COMPOSE build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: $COMPOSE build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up the stack
         run: >
@@ -3482,7 +3506,7 @@ jobs:
   g6-discovery-scale:
     name: Rust · SRC-13 discovery of 10,000 tables
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_ingest == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_ingest == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -3541,10 +3565,10 @@ jobs:
           # SEC-36: generated per run; no key-shaped literal in the repository.
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
-      - name: Build the oidc-mock fixture image
+      - name: Build the oidc-mock and init fixture images
         run: >
           docker compose -p src13scaleci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
-          --profile src13-scale build oidc-mock
+          --profile src13-scale build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up the API and its PostgreSQL
         # Explicit service list: the API starts its own `depends_on` (postgres,
@@ -3599,7 +3623,7 @@ jobs:
   g6-saas-a:
     name: Rust · SRC-3 business-app connectors (A)
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_saas == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_saas == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -3666,7 +3690,7 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       - name: Build the fixture images (oidc-mock, saas-stub-g6)
-        run: $COMPOSE build oidc-mock saas-stub-g6
+        run: $COMPOSE build oidc-mock lakekeeper-warehouse-init saas-stub-g6
 
       - name: Bring up the API, Dagster and the mock vendor server
         run: $COMPOSE up -d --no-build lakehouse-api dagster-code-location dagster-webserver dagster-daemon saas-stub-g6
@@ -3699,7 +3723,7 @@ jobs:
   g6-saas-b:
     name: Rust · SRC-3 business-app connectors (B)
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_saas == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_saas == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -3766,7 +3790,7 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       - name: Build the fixture images (oidc-mock, saas-stub-g6)
-        run: $COMPOSE build oidc-mock saas-stub-g6
+        run: $COMPOSE build oidc-mock lakekeeper-warehouse-init saas-stub-g6
 
       - name: Bring up the API, Dagster and the mock vendor server
         run: $COMPOSE up -d --no-build lakehouse-api dagster-code-location dagster-webserver dagster-daemon saas-stub-g6
@@ -3808,11 +3832,15 @@ jobs:
   gold-export:
     name: Rust · Gold export to Iceberg (ADR 0010)
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_pipelines == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_pipelines == 'true'
     runs-on: ubuntu-latest
     # DATA-2: raised from 20 by measured acceptance test execution time
     # (327s, ~6 minutes) plus 5 minutes of slack (11 minutes total raise).
-    timeout-minutes: 31
+    # DATA-6: raised from 31 by the five latest-copy steps' measured wall
+    # on the local stack (settle 2.3s + follow-up run 6.4s + switching-off
+    # job wait ~20s + the small refusals, ~40s ≈ 1 minute) plus 5 minutes
+    # of slack (6 minutes total raise).
+    timeout-minutes: 37
     env:
       LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
       LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
@@ -3885,8 +3913,8 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p goldci --profile dagster build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p goldci --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up lakehouse-api + Dagster (and the full Lakekeeper/authz chain)
         run: >
@@ -3924,7 +3952,7 @@ jobs:
   g8-governance:
     name: Rust · G8 governance masking (${{ matrix.engine }})
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_governance == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_governance == 'true'
     runs-on: ubuntu-latest
     # Raised from 15: the `trino` leg's stack carries the whole Lakekeeper
     # chain (the coordinator's own `depends_on`), which takes a few
@@ -3995,8 +4023,8 @@ jobs:
           fi
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g8ci build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g8ci build oidc-mock lakekeeper-warehouse-init
 
       # DATA-21 S2: the `trino` leg needs the Trino coordinator (the
       # `trino` profile, whose own `depends_on` brings up the Lakekeeper
@@ -4036,7 +4064,7 @@ jobs:
   image-smoke:
     name: Image smoke test · lakehouse-api /health
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -4118,7 +4146,7 @@ jobs:
   g8-time-travel:
     name: Rust · G8 time travel keeps the policy (${{ matrix.engine }})
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_governance == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_governance == 'true'
     runs-on: ubuntu-latest
     # Raised from 25: the `trino` leg's stack carries the Trino
     # coordinator, whose own startup (and the Lakekeeper chain behind it)
@@ -4182,8 +4210,8 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g8ttci --profile dagster build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g8ttci --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       # DATA-21 S2: the `trino` leg adds the Trino coordinator, which
       # reads the Bronze table through Lakekeeper's Iceberg catalog. The
@@ -4302,6 +4330,7 @@ jobs:
           SCOPE_DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
           SCOPE_ALL: ${{ needs.changes.outputs.all }}
           PUSH_PROVEN: ${{ needs.changes.outputs.proven }}
+          PR_DRAFT: ${{ needs.changes.outputs.draft }}
           # OPS-25 D7: which gate groups this run selected. A gate whose group
           # was selected is required; a skip is accepted only for a gate whose
           # group was not selected. An empty or malformed value requires every
@@ -4358,7 +4387,7 @@ jobs:
       # added; lower it only with a measured reason like this one.
       # Same scope as the `test` job: only when it actually ran.
       - name: Download nextest partition counts (REL-20)
-        if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true')
+        if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true')
         uses: actions/download-artifact@v8
         with:
           pattern: test-counts-*
@@ -4366,7 +4395,7 @@ jobs:
           path: ${{ runner.temp }}/counts
 
       - name: Check nextest partition sum (REL-20)
-        if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true')
+        if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true')
         run: |
           set -euo pipefail
           total=0

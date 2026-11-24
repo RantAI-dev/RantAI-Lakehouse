@@ -34,7 +34,7 @@
 
 use axum::Extension;
 use axum::extract::{Query, State};
-use axum::http::header;
+use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_bi::store;
@@ -157,6 +157,11 @@ pub(crate) struct PdfJob<'a> {
     pub board: &'a str,
     /// The person the render token names (the print view reads as them).
     pub person: uuid::Uuid,
+    /// The tenant the person worked under (`X-Tenant`), resolved and checked
+    /// against their membership by the caller (`SEC-54`). `None` for a
+    /// scheduled job, which has no acting tenant and reads as the owner's
+    /// first one.
+    pub tenant: Option<String>,
     pub values: DashboardValues<'a>,
     pub paper: Paper,
     pub orientation: Orientation,
@@ -225,6 +230,7 @@ pub(crate) async fn make_pdf(state: &AppState, job: &PdfJob<'_>) -> Result<Vec<u
             report: None,
             board: job.board,
             person: job.person,
+            tenant: job.tenant.as_deref(),
             values: job.values,
             paper: (job.paper.as_str(), job.orientation.as_str()),
         },
@@ -258,6 +264,8 @@ pub(crate) struct PngJob<'a> {
     pub board: &'a str,
     pub chart: &'a str,
     pub person: uuid::Uuid,
+    /// The acting tenant, resolved from `X-Tenant` before minting (`SEC-54`).
+    pub tenant: Option<String>,
     pub values: DashboardValues<'a>,
 }
 
@@ -279,6 +287,7 @@ pub(crate) async fn make_png(state: &AppState, job: &PngJob<'_>) -> Result<Vec<u
             report: None,
             board: job.board,
             person: job.person,
+            tenant: job.tenant.as_deref(),
             values: job.values,
             // The claims carry a paper and an orientation for a PDF; an image
             // has neither, and says so rather than naming a paper it is not on.
@@ -305,6 +314,7 @@ pub(crate) async fn make_report_pdf(
     state: &AppState,
     report: &str,
     person: uuid::Uuid,
+    tenant: Option<String>,
     (paper, orientation): (Paper, Orientation),
 ) -> Result<Vec<u8>, PdfFailure> {
     let started = std::time::Instant::now();
@@ -319,6 +329,7 @@ pub(crate) async fn make_report_pdf(
             report: Some(report),
             board: "",
             person,
+            tenant: tenant.as_deref(),
             values: DashboardValues::default(),
             paper: (paper.as_str(), orientation.as_str()),
         },
@@ -358,6 +369,9 @@ struct RenderPage<'a> {
     report: Option<&'a str>,
     board: &'a str,
     person: uuid::Uuid,
+    /// The tenant the print view reads as, from the caller's `X-Tenant`
+    /// (`SEC-54`); absent for a scheduled job with no acting tenant.
+    tenant: Option<&'a str>,
     values: DashboardValues<'a>,
     paper: (&'a str, &'a str),
 }
@@ -384,6 +398,7 @@ fn render_page<'s>(
             chart: page.chart.map(str::to_owned),
             report: page.report.map(str::to_owned),
             principal: page.person.to_string(),
+            tenant: page.tenant.map(str::to_owned),
             filters: page.values.filters.map(str::to_owned),
             params: page.values.params.map(str::to_owned),
             grain: page.values.grain.map(str::to_owned),
@@ -419,7 +434,12 @@ pub async fn export_pdf(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     Query(q): Query<PdfQuery>,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
+    // SEC-54: resolve the acting tenant BEFORE minting. A caller cannot mint
+    // a render token for a tenant it does not belong to: `resolve` answers
+    // the same 404 for a forged or malformed `X-Tenant` (tenant_scope.rs).
+    let tenant = crate::tenant_scope::resolve(&principal, &headers)?.map(|id| id.to_string());
     // BI-19 part B1 (plan D8): the router floor is "signed in", so the entry
     // check comes first and a caller with neither `dashboard:read` nor a rule
     // is refused before anything else is looked at.
@@ -468,6 +488,7 @@ pub async fn export_pdf(
         &PdfJob {
             board: board_id,
             person: principal.id.uuid(),
+            tenant,
             values: DashboardValues {
                 filters: q.filters.as_deref(),
                 params: q.params.as_deref(),
@@ -554,7 +575,10 @@ pub async fn export_report_pdf(
     Extension(principal): Extension<Principal>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Query(q): Query<ReportPdfQuery>,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
+    // SEC-54: the report PDF prints under the tenant the caller worked in.
+    let tenant = crate::tenant_scope::resolve(&principal, &headers)?.map(|id| id.to_string());
     let viewer = viewer_for(&state, &principal).await?;
     if matches!(principal.id, lakehouse_auth::PrincipalId::Service(_)) {
         return Err(ApiError::BadRequest(PDF_FOR_PEOPLE.to_owned()).into());
@@ -571,6 +595,7 @@ pub async fn export_report_pdf(
         &state,
         &report_id,
         principal.id.uuid(),
+        tenant,
         (paper, orientation),
     )
     .await
@@ -625,7 +650,11 @@ pub(crate) async fn export_chart_png(
     state: &AppState,
     principal: &Principal,
     q: &crate::routes::dashboard::ChartExportQuery,
+    headers: &HeaderMap,
 ) -> ApiResult<Response> {
+    // SEC-54: the chart image prints under the tenant the caller worked in,
+    // checked against their membership before the token is minted.
+    let tenant = crate::tenant_scope::resolve(principal, headers)?.map(|id| id.to_string());
     // The entry check (and the resolved viewer) first, as the PDF route does.
     let viewer = viewer_for(state, principal).await?;
     if matches!(principal.id, lakehouse_auth::PrincipalId::Service(_)) {
@@ -665,6 +694,7 @@ pub(crate) async fn export_chart_png(
             board,
             chart: chart_id,
             person: principal.id.uuid(),
+            tenant,
             values: DashboardValues {
                 filters: q.filters.as_deref(),
                 params: q.params.as_deref(),

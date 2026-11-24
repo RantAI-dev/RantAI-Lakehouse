@@ -166,7 +166,7 @@ pub(in crate::routes) async fn run_tool(
         "lakehouse_overview" => data::lakehouse_overview(state, principal).await,
         "describe_dataset" => data::describe_dataset(state, principal, args).await,
         "get_lineage" => data::get_lineage(state, principal, args).await,
-        "get_quality" => data::get_quality(ch).await,
+        "get_quality" => data::get_quality(state, principal).await,
         "trigger_lakehouse_build" => pipelines::trigger_build(state, principal).await,
         "get_build_status" => pipelines::get_build_status(&state.dagster).await,
         "describe_mart" => data::describe_mart(state, principal, args).await,

@@ -24,12 +24,12 @@ function stubProperty(target: object, key: PropertyKey, descriptor: PropertyDesc
   }
 }
 
-const rect = (width: number): DOMRect =>
-  ({ width, height: 0, top: 0, left: 0, right: width, bottom: 0, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect
+const rect = (width: number, height = 0): DOMRect =>
+  ({ width, height, top: 0, left: 0, right: width, bottom: height, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect
 
-/** Every element's `getBoundingClientRect()` is `width(element)` wide. */
-export function stubRectWidth(width: (el: Element) => number): Undo {
-  const value = function getBoundingClientRect(this: Element) { return rect(width(this)) }
+/** Every element's `getBoundingClientRect()` is `width(element)` wide, and `height` tall (0 unless given). */
+export function stubRectWidth(width: (el: Element) => number, height = 0): Undo {
+  const value = function getBoundingClientRect(this: Element) { return rect(width(this), height) }
   const undo = [Element.prototype, HTMLElement.prototype].map((p) => stubProperty(p, "getBoundingClientRect", { value, writable: true }))
   return () => { for (const u of undo.reverse()) u() }
 }

@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# `SEC-59`: `SmtpConfig::pass` holds the password as a `SecretValue`, so its
+# `Debug` redacts it instead of printing it into logs and panics.
+lakehouse-core = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -175,6 +175,52 @@ pub trait LagTokenReader: Send + Sync {
     /// reason; both kinds fail the whole check.
     async fn token(&self, input: &InputTable) -> Result<Option<String>, TokenError>;
 
+    /// The token for `input` plus the input's own change time, when the
+    /// reader can name one (BLD-11 F4/D5). A Bronze input's Iceberg snapshot
+    /// carries its commit time; a Silver/Gold `ClickHouse` fingerprint has
+    /// none, so that half is `None` there. The default keeps readers that
+    /// only know tokens working: for them the clock starts at the first
+    /// check that sees the change, as before.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError`] on the same conditions as [`Self::token`].
+    async fn token_at(
+        &self,
+        input: &InputTable,
+    ) -> Result<Option<(String, Option<OffsetDateTime>)>, TokenError> {
+        let token = self.token(input).await?;
+        Ok(token.map(|token| (token, None)))
+    }
+
+    /// Read every input with its time, failing on the FIRST one that cannot
+    /// be read (the same rule as [`Self::tokens`]). The time map holds only
+    /// inputs whose reader could name a commit time; a missing key means
+    /// "start the clock at the first check that saw the change".
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError`] from the first unreadable input. One unreadable input
+    /// is enough: a pipeline whose upstream table we cannot see cannot be
+    /// honestly called fresh, and reading the rest would not change that.
+    async fn tokens_at(
+        &self,
+        inputs: &[InputTable],
+    ) -> Result<(TokenMap, BTreeMap<String, OffsetDateTime>), TokenError> {
+        let mut tokens = TokenMap::new();
+        let mut times = BTreeMap::new();
+        for input in inputs {
+            let Some((token, time)) = self.token_at(input).await? else {
+                return Err(TokenError::Missing);
+            };
+            if let Some(time) = time {
+                times.insert(input.key(), time);
+            }
+            tokens.insert(input.key(), token);
+        }
+        Ok((tokens, times))
+    }
+
     /// Read every input, failing on the FIRST one that cannot be read.
     ///
     /// # Errors
@@ -183,14 +229,8 @@ pub trait LagTokenReader: Send + Sync {
     /// is enough: a pipeline whose upstream table we cannot see cannot be
     /// honestly called fresh, and reading the rest would not change that.
     async fn tokens(&self, inputs: &[InputTable]) -> Result<TokenMap, TokenError> {
-        let mut out = TokenMap::new();
-        for input in inputs {
-            let Some(token) = self.token(input).await? else {
-                return Err(TokenError::Missing);
-            };
-            out.insert(input.key(), token);
-        }
-        Ok(out)
+        let (tokens, _) = self.tokens_at(inputs).await?;
+        Ok(tokens)
     }
 }
 
@@ -212,10 +252,20 @@ pub struct StateTokenReader<'a> {
 #[async_trait::async_trait]
 impl LagTokenReader for StateTokenReader<'_> {
     async fn token(&self, input: &InputTable) -> Result<Option<String>, TokenError> {
+        Ok(self.token_at(input).await?.map(|(token, _)| token))
+    }
+
+    async fn token_at(
+        &self,
+        input: &InputTable,
+    ) -> Result<Option<(String, Option<OffsetDateTime>)>, TokenError> {
         if input.zone == BRONZE_ZONE {
             return iceberg_snapshot_token(self.state, input).await;
         }
-        clickhouse_fingerprint_token(self.state, input).await
+        // A `ClickHouse` fingerprint is over the table's contents, not its
+        // commit history, so the reader can name no time for it (D5).
+        let token = clickhouse_fingerprint_token(self.state, input).await?;
+        Ok(token.map(|token| (token, None)))
     }
 }
 
@@ -225,10 +275,14 @@ impl LagTokenReader for StateTokenReader<'_> {
 /// languages reading the same stored `source_zone`.
 pub const BRONZE_ZONE: &str = "bronze";
 
+/// The Bronze input's Iceberg snapshot token and the snapshot's commit time
+/// (BLD-11 D5). The token is what changed; the time is when the data was
+/// actually loaded, which is where the lag clock must start. An out-of-range
+/// commit time is `None`, never a guessed `now`.
 async fn iceberg_snapshot_token(
     state: &crate::state::AppState,
     input: &InputTable,
-) -> Result<Option<String>, TokenError> {
+) -> Result<Option<(String, Option<OffsetDateTime>)>, TokenError> {
     let client = crate::lakehouse_catalog::client(state)
         .await
         .map_err(|err| {
@@ -249,9 +303,13 @@ async fn iceberg_snapshot_token(
         // A table with no snapshot yet has changed zero times; that is a
         // real token (an empty table that later gets rows will move away
         // from it), so it is NOT `None`/Missing.
-        Ok(summary) => Ok(Some(format!(
-            "iceberg:{}",
-            token_value(summary.current_snapshot_id)
+        Ok(summary) => Ok(Some((
+            format!("iceberg:{}", token_value(summary.current_snapshot_id)),
+            summary.last_updated_ms.and_then(|ms| {
+                // Milliseconds to nanoseconds is lossless in i128; an
+                // out-of-range value is left unset, not clamped to a guess.
+                OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()
+            }),
         ))),
         Err(lakehouse_iceberg::rest::RestError::NotFound) => Ok(None),
         Err(err) => {
@@ -846,6 +904,25 @@ pub async fn run_lag_check(
     let (target_seconds, downstream) = target_of(pipeline);
     let job_name = crate::routes::authored_pipelines::job_name(&pipeline.id);
 
+    // BLD-18: fail closed on a paused pipeline. The Python factory drops a
+    // `paused` row's freshness sensor on the next code-location reload, but
+    // a tick that already started before `stopSensor` landed can still ask
+    // this route for a decision. This is the choke point the sensor asks,
+    // so a pause must be honoured here even if that race happens. No state
+    // row is written: a paused pipeline is not measured while paused.
+    if pipeline.status == "paused" {
+        return Ok(LagCheckOutcome {
+            decision: Decision::Wait,
+            run_key: None,
+            job_name,
+            status: LagStatus::NotMeasured,
+            lag_seconds: None,
+            target_seconds: None,
+            behind_streak: 0,
+            reason: Some("pipeline is paused".to_owned()),
+        });
+    }
+
     // BLD-2 review R1 SHOULD-FIX 6: A pipeline with no target lag must not decide run / behind:
     // answer wait with not_measured and touch nothing.
     if target_seconds.is_none() && !downstream {
@@ -1059,6 +1136,33 @@ fn check_retries_and_reset(state: &mut CheckState, tokens: &TokenMap, max_retrie
     state.request_attempt > max_retries
 }
 
+/// When the lag clock starts for a change (BLD-11 F4, D5): the earliest
+/// commit time among the inputs whose token differs from what the last run
+/// consumed (all inputs when nothing was consumed), clamped to the last
+/// consumed run's start and to `now`. A change committed before that run
+/// started may already be in its output; a future commit time is clock skew,
+/// never negative lag. When no changed input can name a time, the clock
+/// starts at `now` — the first check that saw the change, as before.
+fn clock_start(
+    times: &BTreeMap<String, OffsetDateTime>,
+    tokens: &TokenMap,
+    consumed: Option<&TokenMap>,
+    consumed_at: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> OffsetDateTime {
+    let earliest = times
+        .iter()
+        .filter(|(key, _)| consumed.is_none_or(|c| c.get(*key) != tokens.get(*key)))
+        .map(|(_, time)| *time)
+        .min();
+    let Some(start) = earliest else {
+        return now;
+    };
+    // Lower bound first, then the hard `now` upper bound: a stored
+    // `consumed_at` ahead of `now` must not produce a negative lag.
+    start.max(consumed_at.unwrap_or(start)).min(now)
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -1078,6 +1182,13 @@ async fn evaluate_upstream_chain(
     now: OffsetDateTime,
 ) -> Result<Option<LagCheckOutcome>, ApiError> {
     for u_pipe in chain {
+        // BLD-18: a paused downstream pipeline is not launched by a
+        // reading pipeline's check. It has no freshness sensor of its own
+        // (`targetLag.kind == "downstream"`), so stopping a sensor cannot
+        // silence this path; the chain walk has to skip it here.
+        if u_pipe.status == "paused" {
+            continue;
+        }
         // BLD-2 review R3 BLOCKER 2 / decision R12: U row was locked in one ordered statement with P
         let u_stored = locked_states.remove(&u_pipe.id).flatten();
         let mut u_state = CheckState::from_stored(u_stored.as_ref());
@@ -1100,6 +1211,9 @@ async fn evaluate_upstream_chain(
             pipelines::upsert_lag_state_conn(tx, &u_update)
                 .await
                 .map_err(|err| store_err(&u_pipe.id, "upstream state row unwritable", err))?;
+            // BLD-11 F4/D5: P's own tokens are NOT read on this path (we are
+            // waiting on U's outstanding run), so there is no commit time to
+            // start from; the first check that sees the wait starts the clock.
             let pending_since = state.pending_since.unwrap_or(now);
             state.pending_since = Some(pending_since);
             let lag_seconds = (now - pending_since).whole_seconds();
@@ -1165,8 +1279,10 @@ async fn evaluate_upstream_chain(
             }));
         };
 
-        let u_tokens = match reader.tokens(&u_inputs).await {
-            Ok(tokens) => tokens,
+        // BLD-11 F4/D5: read U's commit times with its tokens so P's wait
+        // clock can start when U's Bronze input was loaded, not on this tick.
+        let (u_tokens, u_times) = match reader.tokens_at(&u_inputs).await {
+            Ok(pair) => pair,
             Err(err) => {
                 let p_update =
                     make_lag_update(pipeline, state, now, LagStatus::NotMeasured.as_str(), 0);
@@ -1214,7 +1330,15 @@ async fn evaluate_upstream_chain(
                 .await
                 .map_err(|err| store_err(&u_pipe.id, "upstream state row unwritable", err))?;
 
-            let pending_since = state.pending_since.unwrap_or(now);
+            // BLD-11 F4/D5: P is waiting on U's changed input; start its
+            // clock from that input's commit time (U's tokens/times), not now.
+            let pending_since = state.pending_since.unwrap_or(clock_start(
+                &u_times,
+                &u_tokens,
+                u_state.consumed_tokens.as_ref(),
+                u_state.consumed_at,
+                now,
+            ));
             state.pending_since = Some(pending_since);
             let lag_seconds = (now - pending_since).whole_seconds();
             // BLD-2 review R3 BLOCKER 1 / decision R14: For a P waiting on an exhausted U,
@@ -1258,7 +1382,15 @@ async fn evaluate_upstream_chain(
             })?;
         }
 
-        let pending_since = state.pending_since.unwrap_or(now);
+        // BLD-11 F4/D5: the change P is waiting for is U's, so start P's
+        // clock from U's input commit time when the reader can name one.
+        let pending_since = state.pending_since.unwrap_or(clock_start(
+            &u_times,
+            &u_tokens,
+            u_state.consumed_tokens.as_ref(),
+            u_state.consumed_at,
+            now,
+        ));
         state.pending_since = Some(pending_since);
         let lag_seconds = (now - pending_since).whole_seconds();
         let never_consumed = state.consumed_tokens.is_none();
@@ -1362,8 +1494,10 @@ async fn decide(
     job_name: &str,
     now: OffsetDateTime,
 ) -> Result<LagCheckOutcome, ApiError> {
-    let tokens = match reader.tokens(inputs).await {
-        Ok(tokens) => tokens,
+    // BLD-11 F4/D5: read the inputs' commit times with their tokens so the
+    // clock starts when a Bronze input was loaded, not on this check tick.
+    let (tokens, times) = match reader.tokens_at(inputs).await {
+        Ok(pair) => pair,
         Err(err) => {
             return Ok(LagCheckOutcome {
                 decision: Decision::Wait,
@@ -1397,7 +1531,15 @@ async fn decide(
         });
     }
 
-    let pending_since = state.pending_since.unwrap_or(now);
+    // BLD-11 F4/D5: start at the earliest changed input's commit time when
+    // one is known; otherwise at now, the first check that saw the change.
+    let pending_since = state.pending_since.unwrap_or(clock_start(
+        &times,
+        &tokens,
+        state.consumed_tokens.as_ref(),
+        state.consumed_at,
+        now,
+    ));
     state.pending_since = Some(pending_since);
     let lag_seconds = (now - pending_since).whole_seconds();
     let never_consumed = state.consumed_tokens.is_none();
@@ -1933,6 +2075,9 @@ mod tests {
     /// both must fail the whole check.
     struct FakeTokens {
         tokens: HashMap<String, String>,
+        // BLD-11 D5: an optional commit time per key, the test stand-in for
+        // an Iceberg snapshot's `last_updated_ms`.
+        times: HashMap<String, OffsetDateTime>,
         missing: Vec<String>,
         unreadable: Vec<String>,
     }
@@ -1941,6 +2086,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 tokens: HashMap::new(),
+                times: HashMap::new(),
                 missing: Vec::new(),
                 unreadable: Vec::new(),
             }
@@ -1948,6 +2094,14 @@ mod tests {
 
         fn with(mut self, key: &str, token: &str) -> Self {
             self.tokens.insert(key.to_owned(), token.to_owned());
+            self
+        }
+
+        /// A token with a commit time (a Bronze input), so the test can pin
+        /// where the lag clock starts (BLD-11 D5).
+        fn with_time(mut self, key: &str, token: &str, time: OffsetDateTime) -> Self {
+            self.tokens.insert(key.to_owned(), token.to_owned());
+            self.times.insert(key.to_owned(), time);
             self
         }
 
@@ -1965,6 +2119,13 @@ mod tests {
     #[async_trait::async_trait]
     impl LagTokenReader for FakeTokens {
         async fn token(&self, input: &InputTable) -> Result<Option<String>, TokenError> {
+            Ok(self.token_at(input).await?.map(|(token, _)| token))
+        }
+
+        async fn token_at(
+            &self,
+            input: &InputTable,
+        ) -> Result<Option<(String, Option<OffsetDateTime>)>, TokenError> {
             let key = input.key();
             if self.missing.contains(&key) {
                 return Ok(None);
@@ -1972,7 +2133,11 @@ mod tests {
             if self.unreadable.contains(&key) {
                 return Err(TokenError::Unreadable);
             }
-            Ok(self.tokens.get(&key).cloned())
+            Ok(self
+                .tokens
+                .get(&key)
+                .cloned()
+                .map(|token| (token, self.times.get(&key).copied())))
         }
     }
 
@@ -2015,6 +2180,34 @@ mod tests {
 
     fn source_input() -> InputTable {
         input_of("bronze", "orders")
+    }
+
+    /// BLD-18: a freshness-sensor tick that already started when Pause
+    /// landed can still reach this route before the code-location reload
+    /// removes the sensor. The row's paused status must win here — no run,
+    /// no measurement, no state write — rather than relying on the reload
+    /// having finished first.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_paused_pipeline_answers_wait_without_a_run_or_a_state_write(pool: PgPool) {
+        let (dagster, _server) = dagster_with(&job_name("pl-paused"), None, &[]).await;
+        let mut p = pipeline("pl-paused", 10);
+        p.status = "paused".to_owned();
+        let reader = FakeTokens::new().with("bronze.orders", "iceberg:1");
+
+        let outcome = run_lag_check(&pool, &dagster, &reader, &p, &[source_input()], at(1_000))
+            .await
+            .expect("checking a paused pipeline is not an error");
+
+        assert_eq!(outcome.decision, Decision::Wait);
+        assert_eq!(outcome.run_key, None);
+        assert_eq!(outcome.reason.as_deref(), Some("pipeline is paused"));
+        assert!(
+            pipelines::get_lag_state(&pool, &p.id)
+                .await
+                .expect("read the lag state")
+                .is_none(),
+            "a paused pipeline is not measured"
+        );
     }
 
     /// A `Dagster` stub whose answers both queries the check can make: the
@@ -2268,6 +2461,244 @@ mod tests {
             .expect("a row exists");
         assert_eq!(stored.requested_run_key.as_deref(), Some(key.as_str()));
         assert_eq!(stored.last_status.as_deref(), Some("behind"));
+    }
+
+    /// BLD-11 F4/D5: a Bronze input's lag clock starts at the snapshot's
+    /// commit time, so a check 100 s after the load reads 100 s — not the
+    /// 0 s the old code produced by starting at this check's `now`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_clock_starts_at_a_bronze_inputs_commit_time(pool: PgPool) {
+        let pipeline = seed_pipeline(&pool, "pl-x", 10).await;
+        let now = at(1_000);
+        let committed = at(900);
+        let reader = FakeTokens::new().with_time("bronze.orders", "iceberg:8", committed);
+        let (dagster, _server) = dagster_with(&job_name("pl-x"), Some("STARTED"), &[]).await;
+
+        let outcome = run_lag_check(&pool, &dagster, &reader, &pipeline, &[source_input()], now)
+            .await
+            .expect("the check succeeds");
+        assert_eq!(
+            outcome.lag_seconds,
+            Some(100),
+            "the clock starts at the load"
+        );
+        let stored = pipelines::get_lag_state(&pool, "pl-x")
+            .await
+            .expect("read the state row")
+            .expect("a row exists");
+        assert_eq!(stored.pending_since, Some(committed));
+    }
+
+    /// BLD-11 D5: a future commit time is clock skew and must not read as
+    /// negative lag; the clock starts at `now`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_commit_time_in_the_future_starts_the_clock_now(pool: PgPool) {
+        let pipeline = seed_pipeline(&pool, "pl-x", 10).await;
+        let now = at(1_000);
+        let reader = FakeTokens::new().with_time("bronze.orders", "iceberg:8", at(1_100));
+        let (dagster, _server) = dagster_with(&job_name("pl-x"), Some("STARTED"), &[]).await;
+
+        let outcome = run_lag_check(&pool, &dagster, &reader, &pipeline, &[source_input()], now)
+            .await
+            .expect("the check succeeds");
+        assert_eq!(
+            outcome.lag_seconds,
+            Some(0),
+            "no negative lag from a future commit"
+        );
+        let stored = pipelines::get_lag_state(&pool, "pl-x")
+            .await
+            .expect("read the state row")
+            .expect("a row exists");
+        assert_eq!(stored.pending_since, Some(now));
+    }
+
+    /// BLD-11 D5: a change committed before the last consumed run started
+    /// may already be in that run's output, so the clock starts at that
+    /// run's start, not at the older commit time.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_commit_time_before_the_last_consumed_run_starts_at_that_run(pool: PgPool) {
+        let pipeline = seed_pipeline(&pool, "pl-x", 10).await;
+        let now = at(1_000);
+        let consumed_at = at(950);
+        pipelines::upsert_lag_state(
+            &pool,
+            &LagStateUpdate {
+                pipeline_id: pipeline.id.clone(),
+                tenant_id: pipeline.tenant_id,
+                consumed_tokens: Some(tokens_to_json(&tokens_of(&[(
+                    "bronze.orders",
+                    "iceberg:7",
+                )]))),
+                consumed_at: Some(consumed_at),
+                pending_since: None,
+                requested_run_key: None,
+                requested_tokens: None,
+                requested_at: None,
+                request_attempt: 0,
+                last_check_at: now,
+                last_status: "met".to_owned(),
+                behind_streak: 0,
+            },
+        )
+        .await
+        .expect("seed the consumed state");
+        let reader = FakeTokens::new().with_time("bronze.orders", "iceberg:8", at(900));
+        let (dagster, _server) = dagster_with(&job_name("pl-x"), Some("STARTED"), &[]).await;
+
+        let outcome = run_lag_check(&pool, &dagster, &reader, &pipeline, &[source_input()], now)
+            .await
+            .expect("the check succeeds");
+        assert_eq!(
+            outcome.lag_seconds,
+            Some(50),
+            "the consumed run's start is the floor"
+        );
+        let stored = pipelines::get_lag_state(&pool, "pl-x")
+            .await
+            .expect("read the state row")
+            .expect("a row exists");
+        assert_eq!(stored.pending_since, Some(consumed_at));
+    }
+
+    /// BLD-11 D5: a Silver/Gold input (or any reader that cannot name a
+    /// commit time) keeps today's behaviour — start at the first check that
+    /// saw the change.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_input_with_no_commit_time_starts_the_clock_at_the_first_check(pool: PgPool) {
+        let pipeline = seed_pipeline(&pool, "pl-x", 10).await;
+        let now = at(1_000);
+        let reader = FakeTokens::new().with("bronze.orders", "iceberg:8");
+        let (dagster, _server) = dagster_with(&job_name("pl-x"), Some("STARTED"), &[]).await;
+
+        let outcome = run_lag_check(&pool, &dagster, &reader, &pipeline, &[source_input()], now)
+            .await
+            .expect("the check succeeds");
+        assert_eq!(
+            outcome.lag_seconds,
+            Some(0),
+            "no commit time: now is the start"
+        );
+        let stored = pipelines::get_lag_state(&pool, "pl-x")
+            .await
+            .expect("read the state row")
+            .expect("a row exists");
+        assert_eq!(stored.pending_since, Some(now));
+    }
+
+    /// BLD-11 D5: with several changed inputs, the earliest commit time
+    /// starts the clock.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn with_two_changed_inputs_the_earlier_commit_starts_the_clock(pool: PgPool) {
+        let pipeline = seed_pipeline(&pool, "pl-x", 10).await;
+        let now = at(1_000);
+        let reader = FakeTokens::new()
+            .with_time("bronze.orders", "iceberg:8", at(960))
+            .with_time("bronze.customers", "iceberg:3", at(900));
+        let inputs = [
+            input_of("bronze", "orders"),
+            input_of("bronze", "customers"),
+        ];
+        let (dagster, _server) = dagster_with(&job_name("pl-x"), Some("STARTED"), &[]).await;
+
+        let outcome = run_lag_check(&pool, &dagster, &reader, &pipeline, &inputs, now)
+            .await
+            .expect("the check succeeds");
+        assert_eq!(
+            outcome.lag_seconds,
+            Some(100),
+            "the earlier of the two commits wins"
+        );
+    }
+
+    /// BLD-11 F4/D5: in a downstream chain P waits on U's changed input, so
+    /// P's clock starts from U's Bronze input's commit time, not this tick.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_downstream_chain_starts_ps_clock_at_its_upstream_inputs_commit(pool: PgPool) {
+        let (dagster, _server) = dagster_with(&job_name("pl-u"), Some("STARTED"), &[]).await;
+        let tenant_id = seed_tenant(&pool).await;
+
+        let _u = pipelines::create_pipeline(
+            &pool,
+            &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
+                name: "u_pipe".to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "bronze".to_owned(),
+                source_table: "orders".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "silver".to_owned(),
+                target_table: "u_clean".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id: Some(tenant_id),
+                depends_on: Vec::new(),
+                connector_id: None,
+                id: Some("pl-u".to_owned()),
+                target_lag: Some(TargetLag::Downstream),
+                run_as: None,
+            },
+            None,
+        )
+        .await
+        .expect("create u");
+
+        let p = pipelines::create_pipeline(
+            &pool,
+            &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
+                name: "p_pipe".to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "silver".to_owned(),
+                source_table: "u_clean".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "gold".to_owned(),
+                target_table: "p_mart".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id: Some(tenant_id),
+                depends_on: Vec::new(),
+                connector_id: None,
+                id: Some("pl-p".to_owned()),
+                target_lag: Some(TargetLag::Lag { minutes: 10 }),
+                run_as: None,
+            },
+            None,
+        )
+        .await
+        .expect("create p");
+
+        let p_inputs = inputs_of(&pool, &p)
+            .await
+            .expect("p inputs")
+            .expect("p parseable");
+        let reader = FakeTokens::new()
+            .with_time("bronze.orders", "iceberg:1", at(900))
+            .with("silver.u_clean", "fp:1");
+        let now = at(1_000);
+
+        let outcome = run_lag_check(&pool, &dagster, &reader, &p, &p_inputs, now)
+            .await
+            .expect("check on p");
+        assert_eq!(
+            outcome.job_name, "authored__pl_u",
+            "the upstream runs first"
+        );
+        assert_eq!(
+            outcome.lag_seconds,
+            Some(100),
+            "P's clock starts at U's input commit, not at this check"
+        );
     }
 
     /// The requested run lands: its tokens become what the pipeline

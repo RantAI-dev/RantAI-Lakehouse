@@ -759,6 +759,7 @@ fn render_token(person: uuid::Uuid, board_id: &str) -> String {
             board: board_id.to_owned(),
             chart: None,
             principal: person.to_string(),
+            tenant: None,
             filters: None,
             params: None,
             grain: None,

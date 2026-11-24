@@ -50,7 +50,9 @@
 //! 2. Every name is an `Ident` of at most 48 characters (D2), not starting
 //!    with `__`, and unique across inputs and steps without regard to case.
 //! 3. Every zone and table is an `Ident` (F2: the API checks the names it
-//!    stores, instead of leaving it to the orchestrator at run time).
+//!    stores, instead of leaving it to the orchestrator at run time). A
+//!    legacy `gold` zone is read as `serving` (BLD-19): Gold marts live in
+//!    the `serving` database the catalog lists.
 //! 4. A `transform` step reads an input or an earlier step, and each of its
 //!    transform strings parses (D2, D4).
 //! 5. A SQL step is one read-only statement (D5, [`check_pipeline_step_sql`]),
@@ -71,6 +73,21 @@ use lakehouse_store::pipelines::{PipelineInput, PipelineStep};
 use crate::pipeline_forms;
 use crate::sql_guard::check_pipeline_step_sql;
 use crate::transform_grammar::{Transform, parse_transform};
+
+/// BLD-19: the `ClickHouse` database that holds Gold is `serving`, not
+/// `gold`. `routes::catalog` lists only `silver` and `serving` (returning
+/// `serving.<name>` with `layer: "gold"`), and `routes::lineage::zone_node`
+/// maps both spellings to `table:serving.<name>`. A pipeline still storing
+/// `gold` would otherwise make the orchestrator create an orphan `gold`
+/// database that neither the catalog nor lineage lists. Normalising here as
+/// well as at every API write boundary means such a row reads
+/// `serving.<table>` without a migration. `bronze` is deliberately left
+/// alone so [`crate::routes::authored_pipelines::validate_target_zone`]
+/// still refuses a Bronze target.
+#[must_use]
+pub fn canonical_clickhouse_zone(zone: &str) -> &str {
+    if zone == "gold" { "serving" } else { zone }
+}
 
 /// At most 5 inputs per pipeline (decision 4).
 pub const MAX_INPUTS: usize = 5;
@@ -145,6 +162,10 @@ const INVALID_TABLE: &str =
 const READS_NOT_INPUT: &str = "this step reads a table that is not an input; add it under Inputs";
 const READS_LATER_STEP: &str = "this step reads a step that comes after it; reorder the steps";
 const TRANSFORM_REFUSED: &str = "this transform is not in the supported grammar";
+/// BLD-11 review R5: a rename that would leave two output columns with one
+/// name is refused when the pipeline is saved, not left to fail on its next
+/// run with a duplicate-column error from the engine.
+const DUPLICATE_OUTPUT_COLUMN: &str = "two columns would have the same name after this step; give the renamed column a different name";
 const OUTPUT_IS_INPUT: &str =
     "the output table is one of the inputs; the output cannot be one of the inputs";
 const BRONZE_NEEDS_CATALOG: &str =
@@ -236,6 +257,43 @@ fn parse_transforms(
         .collect()
 }
 
+/// BLD-11 review R5: refuse a transform step whose own transforms would emit
+/// two columns with one name. With an explicit `select` the emitted names are
+/// the selected columns after renaming; without one, the renamed columns are
+/// appended to `*` and only collisions between rename targets are knowable —
+/// the source table's columns are not part of a saved definition.
+fn check_output_names(parsed: &[Transform], index: usize) -> Result<(), DefinitionError> {
+    let renames: Vec<(&Ident, &Ident)> = parsed
+        .iter()
+        .filter_map(|transform| match transform {
+            Transform::Rename { from, to } => Some((from, to)),
+            _ => None,
+        })
+        .collect();
+    let emitted: Vec<String> = match parsed.iter().find_map(|transform| match transform {
+        Transform::Select { columns } => Some(columns),
+        _ => None,
+    }) {
+        Some(selected) => selected
+            .iter()
+            .map(|column| {
+                renames
+                    .iter()
+                    .find(|(from, _)| *from == column)
+                    .map_or_else(|| column.to_string(), |(_, to)| to.to_string())
+            })
+            .collect(),
+        None => renames.iter().map(|(_, to)| to.to_string()).collect(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    for name in emitted {
+        if !seen.insert(name) {
+            return Err(DefinitionError::step(index, DUPLICATE_OUTPUT_COLUMN));
+        }
+    }
+    Ok(())
+}
+
 /// D4a: whether this definition is today's shape — one input and either no
 /// step or exactly one `transform` step reading it — which is what compiles
 /// to today's statement (no `WITH`). Every shape is noted for column lineage
@@ -269,8 +327,11 @@ pub fn validate_and_compile(
 ) -> Result<String, DefinitionError> {
     let compiled = compile(inputs, steps, None, catalog_db)?;
     if let Some((zone, table)) = target {
+        // BLD-19: `gold` and `serving` name the same Gold table, so a legacy
+        // spelling cannot hide an output that is also an input.
+        let zone = canonical_clickhouse_zone(zone);
         for (index, input) in inputs.iter().enumerate() {
-            if input.zone == zone && input.table == table {
+            if canonical_clickhouse_zone(&input.zone) == zone && input.table == table {
                 return Err(DefinitionError::input(index, OUTPUT_IS_INPUT));
             }
         }
@@ -358,6 +419,8 @@ fn validate(
     };
 
     for (index, step) in steps[..limit].iter().enumerate() {
+        // BLD-16 / J1 moved the per-step rules into `check_step` so the save,
+        // the preview, the run and the compile route all refuse identically.
         check_step(step, index, inputs, steps)?;
     }
     Ok((limit, last))
@@ -383,14 +446,22 @@ fn check_step(
         PipelineStep::Transform {
             reads, transforms, ..
         } => {
-            for (position, text) in transforms.iter().enumerate() {
-                parse_transform(text).map_err(|_| {
-                    DefinitionError::at(
-                        format!("steps[{index}].transforms[{position}]"),
-                        TRANSFORM_REFUSED,
-                    )
-                })?;
-            }
+            let parsed = transforms
+                .iter()
+                .enumerate()
+                .map(|(position, text)| {
+                    parse_transform(text).map_err(|_| {
+                        DefinitionError::at(
+                            format!("steps[{index}].transforms[{position}]"),
+                            TRANSFORM_REFUSED,
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            // BLD-11 review R5: a duplicate output name is refused here, at
+            // save, instead of failing on the pipeline's next run. Re-applied
+            // on top of BLD-16's `check_step` extraction in the merge.
+            check_output_names(&parsed, index)?;
             // R1-B6 / D6a: a step names what it reads EXACTLY, case
             // included — `ClickHouse` matches a `WITH` name by exact case,
             // so a reference that differs only in case would be looked up
@@ -605,19 +676,21 @@ fn check_step_tables(
 /// The `FROM` expression for one input: `bronze` is read through the catalog
 /// database as `` <catalog>.`bronze.<table>` ``, every other zone as
 /// `` <zone>.`<table>` `` — the rule the orchestrator's `_resolve_source` used
-/// to own (D4).
+/// to own (D4). BLD-19: a legacy `gold` zone is read from `serving`, the
+/// Gold database the catalog and lineage both name.
 fn input_source(
     input: &PipelineInput,
     index: usize,
     catalog_db: Option<&str>,
 ) -> Result<String, DefinitionError> {
-    if input.zone == "bronze" {
+    let zone = canonical_clickhouse_zone(&input.zone);
+    if zone == "bronze" {
         let Some(db) = catalog_db else {
             return Err(DefinitionError::input(index, BRONZE_NEEDS_CATALOG));
         };
         return Ok(format!("{db}.`bronze.{}`", input.table));
     }
-    Ok(format!("{}.`{}`", input.zone, input.table))
+    Ok(format!("{zone}.`{}`", input.table))
 }
 
 /// One step's CTE entry, without the name (the caller adds it): D4's port of
@@ -690,6 +763,48 @@ fn step_body(step: &PipelineStep, index: usize) -> Result<String, DefinitionErro
     }
 }
 
+/// Build the projection for a transform step that has no explicit `select`
+/// (BLD-11 F7, D11). A plain `*` would ignore `cast`/`rename` entirely, so
+/// renamed columns are cut from `*` with `EXCEPT` and appended at the end as
+/// `<old> AS <new>` (cast under the new name when it is also cast), while
+/// casts on columns that keep their name go into `REPLACE`. `EXCEPT` comes
+/// before `REPLACE` — the order `sqlparser`'s `ClickHouse` dialect parses. With
+/// neither transform this is the unchanged `*`.
+fn render_star_with_transforms(renames: &[(String, String)], casts: &[(String, String)]) -> String {
+    use std::fmt::Write as _;
+
+    if renames.is_empty() && casts.is_empty() {
+        return "*".to_owned();
+    }
+    let mut projection = "*".to_owned();
+    if !renames.is_empty() {
+        let excluded = renames
+            .iter()
+            .map(|(from, _)| from.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(projection, " EXCEPT ({excluded})");
+    }
+    // A cast on a renamed column is applied to the appended expression, not
+    // to `*`; only the columns that keep their name are replaced in place.
+    let in_place = casts
+        .iter()
+        .filter(|(column, _)| !renames.iter().any(|(from, _)| from == column))
+        .map(|(column, ty)| format!("CAST({column} AS {ty}) AS {column}"))
+        .collect::<Vec<_>>();
+    if !in_place.is_empty() {
+        let _ = write!(projection, " REPLACE ({})", in_place.join(", "));
+    }
+    for (from, to) in renames {
+        let expression = casts
+            .iter()
+            .find(|(column, _)| column == from)
+            .map_or_else(|| from.clone(), |(_, ty)| format!("CAST({from} AS {ty})"));
+        let _ = write!(projection, ", {expression} AS {to}");
+    }
+    projection
+}
+
 /// BLD-16 / J6: the SQL of one form step, as a person reads it — the body
 /// the compiler puts inside that step's `WITH` entry, over the inputs and
 /// the earlier steps by their names, before the access rewrite (the
@@ -734,6 +849,14 @@ pub fn step_sql(
 /// rename), filters are joined by `AND`, and the last `dedupe` key gives
 /// `ORDER BY k LIMIT 1 BY k`. Every dynamic piece is rendered through
 /// [`Transform::render_clickhouse`], never string-interpolated here.
+///
+/// BLD-11 F7 (D11): with an explicit `select`, nothing below changes. With no
+/// `select` the step used to be plain `SELECT *`, silently dropping every
+/// `cast`/`rename` (the Gold table kept the source type). Now a cast or
+/// rename with no select is applied to all columns through `ClickHouse`'s
+/// `* EXCEPT`/`* REPLACE`: renamed columns are excluded from `*` and appended
+/// at the end as `<old> AS <new>` (or `CAST(<old> AS T) AS <new>` when cast),
+/// while cast columns that keep their name are replaced in place.
 #[must_use]
 pub fn render_transform_step(from: &str, transforms: &[Transform]) -> String {
     let mut columns: Option<Vec<String>> = None;
@@ -758,7 +881,7 @@ pub fn render_transform_step(from: &str, transforms: &[Transform]) -> String {
     }
 
     let select_columns = columns.map_or_else(
-        || "*".to_owned(),
+        || render_star_with_transforms(&renames, &casts),
         |columns| {
             columns
                 .iter()
@@ -793,7 +916,7 @@ pub fn render_transform_step(from: &str, transforms: &[Transform]) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::{DefinitionError, compile, validate_and_compile};
+    use super::{DefinitionError, canonical_clickhouse_zone, compile, validate_and_compile};
 
     fn input(name: &str, zone: &str, table: &str) -> lakehouse_store::pipelines::PipelineInput {
         lakehouse_store::pipelines::PipelineInput {
@@ -911,6 +1034,36 @@ mod tests {
         assert_eq!(err.path(), "inputs[0]");
     }
 
+    /// BLD-19: Gold lives in `serving`, so both spellings of an input read
+    /// the same `ClickHouse` database and no text can create an orphan
+    /// `gold` one. `bronze` must not be touched: its refusal is the
+    /// target-zone rule's business, not this normalisation's.
+    #[test]
+    fn a_serving_or_legacy_gold_input_reads_serving_and_bronze_is_untouched() {
+        assert_eq!(canonical_clickhouse_zone("gold"), "serving");
+        assert_eq!(canonical_clickhouse_zone("serving"), "serving");
+        assert_eq!(canonical_clickhouse_zone("silver"), "silver");
+        assert_eq!(canonical_clickhouse_zone("bronze"), "bronze");
+        for zone in ["serving", "gold"] {
+            let inputs = vec![input("orders", zone, "orders")];
+            assert_eq!(
+                compile(&inputs, &[], None, None).unwrap(),
+                "SELECT * FROM serving.`orders`",
+                "zone {zone} must read the Gold database the catalog lists"
+            );
+        }
+    }
+
+    /// BLD-19: the legacy spelling cannot slip past the output-is-input
+    /// check just because the target is written `gold` and the input
+    /// `serving` (or the other way round).
+    #[test]
+    fn a_legacy_gold_target_is_compared_to_a_serving_input() {
+        let inputs = vec![input("orders", "serving", "orders")];
+        let err = validate_and_compile(&inputs, &[], Some(("gold", "orders")), None).unwrap_err();
+        assert_eq!(err.path(), "inputs[0]");
+    }
+
     /// The statement `test_authored_factory.py:209` pinned (`SELECT id,
     /// CAST(amount AS Float64) AS amount_usd FROM silver.`orders` WHERE
     /// status = 'active' ORDER BY id LIMIT 1 BY id`) — now inside D4's
@@ -933,6 +1086,79 @@ mod tests {
             "SELECT id, CAST(amount AS Float64) AS amount_usd FROM silver.`orders` \
              WHERE status = 'active' ORDER BY id LIMIT 1 BY id"
         );
+    }
+
+    fn render_from(from: &str, transforms: &[&str]) -> String {
+        let parsed: Vec<crate::transform_grammar::Transform> = transforms
+            .iter()
+            .map(|text| crate::transform_grammar::parse_transform(text).expect("a valid transform"))
+            .collect();
+        super::render_transform_step(from, &parsed)
+    }
+
+    fn render(transforms: &[&str]) -> String {
+        render_from("silver.`orders`", transforms)
+    }
+
+    /// BLD-11 F7 (D11): a cast with no `select` used to be dropped (plain
+    /// `SELECT *`), leaving the Gold column at the source type. It now goes
+    /// into `* REPLACE`, replacing the column in place.
+    #[test]
+    fn a_cast_with_no_select_replaces_the_column_in_place() {
+        assert_eq!(
+            render(&["cast(amount,Float64)"]),
+            "SELECT * REPLACE (CAST(amount AS Float64) AS amount) FROM silver.`orders`"
+        );
+    }
+
+    /// BLD-11 F7 (D11): a rename with no `select` used to be dropped. It now
+    /// cuts the old name from `*` and appends the renamed column at the end.
+    #[test]
+    fn a_rename_with_no_select_moves_the_column_to_the_end() {
+        assert_eq!(
+            render(&["rename(amount,amount_usd)"]),
+            "SELECT * EXCEPT (amount), amount AS amount_usd FROM silver.`orders`"
+        );
+    }
+
+    /// BLD-11 F7 (D11): a column cast and renamed with no `select` is cast
+    /// under its new name, appended at the end.
+    #[test]
+    fn a_cast_and_rename_of_one_column_with_no_select_cast_it_under_its_new_name() {
+        assert_eq!(
+            render(&["rename(amount,amount_usd)", "cast(amount,Float64)"]),
+            "SELECT * EXCEPT (amount), CAST(amount AS Float64) AS amount_usd FROM silver.`orders`"
+        );
+    }
+
+    /// BLD-11 F7: a filter or dedupe with no `select` still selects every
+    /// column — this is today's behaviour and stays unchanged.
+    #[test]
+    fn a_filter_or_dedupe_alone_still_selects_star() {
+        assert_eq!(
+            render(&["filter(status = 'active')", "dedupe(id)"]),
+            "SELECT * FROM silver.`orders` WHERE status = 'active' ORDER BY id LIMIT 1 BY id"
+        );
+    }
+
+    /// BLD-11 F7 (D11): the rendered `* EXCEPT`/`* REPLACE` statements must
+    /// be SQL the access rewrite can parse; otherwise a transform step would
+    /// compile to text no tenant gate or lineage pass can read.
+    #[test]
+    fn a_no_select_cast_or_rename_statement_parses_and_names_its_input() {
+        let dialect = sqlparser::dialect::ClickHouseDialect {};
+        for transforms in [
+            vec!["cast(amount,Float64)"],
+            vec!["rename(amount,amount_usd)"],
+            vec!["rename(amount,amount_usd)", "cast(amount,Float64)"],
+        ] {
+            let sql = render_from("orders", &transforms);
+            assert_eq!(
+                crate::sql_rewrite::referenced_tables(&sql, &dialect),
+                Some(vec!["orders".to_owned()]),
+                "statement parses and reads its input: {sql}"
+            );
+        }
     }
 
     #[test]
@@ -1144,6 +1370,38 @@ mod tests {
         )];
         let err = refusal(&one_input(), &steps);
         assert_eq!(err.path(), "steps[0].transforms[1]");
+    }
+
+    // BLD-11 review R5: a rename that lands on a name this step also emits
+    // would fail the next run on a duplicate column; refuse it at save.
+    #[test]
+    fn a_second_rename_to_the_same_name_is_refused_at_save() {
+        let steps = vec![transform_step(
+            "dup",
+            "orders",
+            &["rename(a,b)", "rename(c,b)"],
+        )];
+        let err = refusal(&one_input(), &steps);
+        assert_eq!(err.path(), "steps[0]");
+        assert_eq!(err.message(), super::DUPLICATE_OUTPUT_COLUMN);
+    }
+
+    #[test]
+    fn a_rename_onto_another_selected_column_is_refused_at_save() {
+        let steps = vec![transform_step(
+            "dup",
+            "orders",
+            &["select(a,b)", "rename(a,b)"],
+        )];
+        let err = refusal(&one_input(), &steps);
+        assert_eq!(err.path(), "steps[0]");
+        assert_eq!(err.message(), super::DUPLICATE_OUTPUT_COLUMN);
+    }
+
+    #[test]
+    fn a_single_rename_still_compiles() {
+        let steps = vec![transform_step("ok", "orders", &["rename(a,b)"])];
+        assert!(compile(&one_input(), &steps, None, Some("icecat_api")).is_ok());
     }
 
     #[test]

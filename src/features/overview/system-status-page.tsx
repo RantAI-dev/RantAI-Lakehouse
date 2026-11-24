@@ -11,6 +11,7 @@ import { useService } from "@/hooks/use-service"
 import { opsService } from "@/services"
 import { FreshnessStrip } from "./freshness-strip"
 import {
+  CompactionWarning,
   MaintenanceSection,
   QueriesSection,
   ServicesSection,
@@ -80,6 +81,11 @@ export function SystemStatusPage() {
       />
 
       <StatusSummary services={services} refreshKey={refreshKey} />
+
+      {/* OPS-21: renders nothing unless tables have measured small files that
+          need compaction while the trino profile is off — a warning, not a
+          permanent section. Loads on its own like every other section. */}
+      <CompactionWarning refreshKey={refreshKey} />
 
       <nav
         aria-label="Sections"

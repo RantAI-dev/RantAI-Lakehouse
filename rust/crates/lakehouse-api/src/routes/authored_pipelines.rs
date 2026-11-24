@@ -45,18 +45,24 @@
 //! traceback). It is logged and never returned; the response says only
 //! whether the orchestrator picked the change up (AGENTS.md principle 4).
 
-//! # The two rules every write here is refused by (DATA-19, BLD-4)
+//! # The rules every write is refused by (DATA-19, BLD-4, BLD-21)
 //!
-//! `validate_target_zone` and [`validate_per_table_upstream`] are the
-//! two rules a write is checked against before anything is stored, and
-//! both run from the same three call sites (create, update, restore) so
-//! the message a reader gets is the same whichever route they used. The
-//! first refuses a `bronze` TARGET: Bronze is written by ingestion and by
-//! nothing else. The second refuses a per-table upstream — `file_ingest_job`
-//! (DATA-19) or `ingest_job` (BLD-4) — on a source that is not `bronze`,
-//! because each of those jobs loads one Bronze table per chain trigger and
-//! the sensor behind the chain counts only the runs that loaded the
-//! pipeline's own table — so the chain would be wired and would never fire.
+//! `validate_target_zone`, [`validate_target_table`] and
+//! [`validate_per_table_upstream`] are the rules a write is checked against
+//! before anything is stored. Each has one message, so a reader gets the
+//! same sentence whichever route they used. The name rule (BLD-21) runs on
+//! all four save routes: create, generate, update and restore. The zone rule
+//! and the per-table upstream rule keep their three call sites (create,
+//! update and restore). The zone rule refuses a `bronze` TARGET: Bronze is
+//! written by ingestion and by nothing else. The name rule applies
+//! `crate::pipeline_compile::valid_name` — the compiler's rule for inputs
+//! and steps — to the output table: a rule that holds on one field and not
+//! another would let a pipeline save cleanly and fail on its next run. The
+//! upstream rule refuses a per-table upstream — `file_ingest_job` (DATA-19)
+//! or `ingest_job` (BLD-4) — on a source that is not `bronze`, because each
+//! of those jobs loads one Bronze table per chain trigger and the sensor
+//! behind the chain counts only the runs that loaded the pipeline's own
+//! table — so the chain would be wired and would never fire.
 
 use axum::Extension;
 use axum::body::Bytes;
@@ -77,6 +83,11 @@ use crate::json::ApiJson;
 use crate::routes::pipelines::record_pipeline_audit;
 use crate::state::AppState;
 use crate::upstream_error;
+
+// BLD-19: one canonical spelling of the Gold database at every API write
+// boundary and in the compiler. Re-exported here because create/update and
+// restore all enter this module to validate their target zone.
+pub use crate::pipeline_compile::canonical_clickhouse_zone;
 
 /// Ticks read per request: enough to see a day of a 15-minute schedule.
 const MAX_TICKS: u32 = 50;
@@ -114,6 +125,19 @@ pub fn schedule_name(id: &str) -> String {
 #[must_use]
 pub fn sensor_name(id: &str) -> String {
     format!("{}_after", job_name(id))
+}
+
+/// The target-lag (freshness) sensor name `authored_factory.py` gives a
+/// pipeline whose `targetLag.kind == "lag"` (`lag_sensor_name` there).
+///
+/// BLD-18: pausing must stop this sensor explicitly, next to the cron
+/// schedule and the dependency `_after` sensor. Dagster keeps a sensor's
+/// stored RUNNING/STOPPED state across a code-location reload, so the
+/// Python `paused` skip alone cannot silence a sensor that was already
+/// running before the reload.
+#[must_use]
+pub fn lag_sensor_name(id: &str) -> String {
+    format!("{}_lag", job_name(id))
 }
 
 /// The id part of an `authored__<id>` Dagster job name (the prefix every
@@ -453,9 +477,15 @@ pub const BRONZE_TARGET_REFUSED: &str =
 /// orchestrator's op applies, so a stored pipeline that predates this
 /// refusal (or that arrives from a client the assistant never
 /// validated) fails loudly at run time instead of writing somewhere
-/// meaningless. `silver`, `gold`, `serving`, `lake`, and anything else the
-/// store's column accepts is left alone here: narrowing the set is the
-/// catalog's job, not this route's.
+/// meaningless. `silver`, `serving`, `lake`, and anything else the store's
+/// column accepts is left alone here: narrowing the set is the catalog's
+/// job, not this route's.
+///
+/// BLD-19: the legacy `gold` spelling is NOT a fourth writable zone. Every
+/// caller runs [`canonical_clickhouse_zone`] before this check, so a client
+/// or a stored version that says `gold` is validated and written as
+/// `serving` — the `ClickHouse` database the catalog lists and lineage
+/// names. `bronze` is deliberately left to this check, not normalised.
 ///
 /// # Errors
 ///
@@ -464,6 +494,37 @@ pub const BRONZE_TARGET_REFUSED: &str =
 pub fn validate_target_zone(target_zone: &str) -> Result<(), ApiRejection> {
     if target_zone == "bronze" {
         return Err(ApiError::BadRequest(BRONZE_TARGET_REFUSED.to_owned()).into());
+    }
+    Ok(())
+}
+
+/// BLD-21: the one refusal an invalid output table name gets on every
+/// pipeline save (create, generate, update and restore).
+///
+/// One constant for all four routes, so the same bad name yields the same
+/// sentence wherever it was submitted. The message names the rule, not the
+/// value: a caller-controlled table name never reaches a response
+/// (AGENTS.md principle 4).
+pub const TARGET_TABLE_REFUSED: &str = "a target table must be letters, digits and underscores (not starting with a digit or __), \
+     at most 48 characters";
+
+/// Whether `target_table` is a name the engine and the catalog will accept
+/// (BLD-21).
+///
+/// Delegates to `crate::pipeline_compile::valid_name` — the same D2 rule the
+/// compiler applies to an input's or a step's name — rather than
+/// paraphrasing it, so a name cannot be accepted on the output of a pipeline
+/// and refused on its inputs. The console checks this field too; the API is
+/// the authority that refuses it at save time, before the run can.
+///
+/// # Errors
+///
+/// [`ApiRejection`] (the route maps it to 400) carrying
+/// [`TARGET_TABLE_REFUSED`] verbatim when
+/// `crate::pipeline_compile::valid_name` refuses `target_table`.
+pub fn validate_target_table(target_table: &str) -> Result<(), ApiRejection> {
+    if !crate::pipeline_compile::valid_name(target_table) {
+        return Err(ApiError::BadRequest(TARGET_TABLE_REFUSED.to_owned()).into());
     }
     Ok(())
 }
@@ -1056,6 +1117,11 @@ pub const LEGACY_FORM_CANNOT_EDIT: &str = "This pipeline has inputs and steps th
 /// used as given. A body that sends both is a 400, because "which one wins"
 /// is not a question a caller should have to guess.
 ///
+/// BLD-19: input zones are normalised here, before the compiler sees them,
+/// so a legacy `gold.foo` input compiles to and is stored as
+/// `serving.foo` — the name the catalog and lineage use. A `bronze` input
+/// is untouched: that zone has its own read path in the compiler.
+///
 /// # Errors
 ///
 /// [`ApiRejection`] (400) when the body sends both forms, or neither.
@@ -1072,8 +1138,10 @@ pub(crate) fn definition_form(
         return Err(ApiError::BadRequest(BOTH_FORMS.to_owned()).into());
     }
     if has_new {
+        let mut inputs = inputs.unwrap_or_default();
+        canonicalize_input_zones(&mut inputs);
         return Ok(DefinitionForm {
-            inputs: inputs.unwrap_or_default(),
+            inputs,
             steps: steps.unwrap_or_default(),
             legacy_transforms: None,
         });
@@ -1090,12 +1158,37 @@ pub(crate) fn definition_form(
             ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
         })?;
     }
+    let zone = canonical_clickhouse_zone(zone);
     let (inputs, steps) = pipelines::legacy_definition(zone, table, transforms);
     Ok(DefinitionForm {
         inputs,
         steps,
         legacy_transforms: Some(transforms.to_vec()),
     })
+}
+
+/// BLD-19: the one place input zones are normalised for every body form.
+/// A restore of a stored definition (which never goes through
+/// [`definition_form`]) calls this too, so an old `gold` input cannot reach
+/// the compiler or the orchestrator under that spelling.
+pub(crate) fn canonicalize_input_zones(inputs: &mut [lakehouse_store::pipelines::PipelineInput]) {
+    for input in inputs {
+        input.zone = canonical_clickhouse_zone(&input.zone).to_owned();
+    }
+}
+
+/// BLD-19: the inputs and steps a version snapshot replays, with Gold input
+/// zones normalised at the same boundary as every other write path. Kept out
+/// of `restore_version` so that route stays within the line budget.
+fn canonical_snapshot_definition(
+    snapshot: &lakehouse_store::pipelines::PipelineDefinitionSnapshot,
+) -> (
+    Vec<lakehouse_store::pipelines::PipelineInput>,
+    Vec<lakehouse_store::pipelines::PipelineStep>,
+) {
+    let (mut inputs, steps) = pipelines::snapshot_definition(snapshot);
+    canonicalize_input_zones(&mut inputs);
+    (inputs, steps)
 }
 
 /// The editable row an `update` writes, from the body it read and the shape
@@ -1174,7 +1267,11 @@ fn legacy_form_over_stored(
     Ok(DefinitionForm {
         inputs: vec![lakehouse_store::pipelines::PipelineInput {
             name: input_name.clone(),
-            zone: zone.to_owned(),
+            // BLD-19: this path rebuilds the input from the RAW body zone,
+            // bypassing `definition_form`'s normalisation. A legacy `gold`
+            // source must still be stored as `serving`, the Gold database
+            // the catalog and lineage name.
+            zone: canonical_clickhouse_zone(zone).to_owned(),
             table: table.to_owned(),
         }],
         steps: if transforms.is_empty() {
@@ -1193,7 +1290,9 @@ fn legacy_form_over_stored(
 /// The first of a definition's inputs — the one a connector or a per-table
 /// upstream watches (D12). The compiler refuses a definition with none; this
 /// is the route's own guard for the same case before it reaches the compiler.
-fn first_of(
+/// BLD-13: `pub(crate)` so the `ready` transition reuses this exact guard on
+/// a stored definition rather than growing a second copy of it.
+pub(crate) fn first_of(
     inputs: &[lakehouse_store::pipelines::PipelineInput],
 ) -> Result<lakehouse_store::pipelines::PipelineInput, ApiRejection> {
     inputs.first().cloned().ok_or_else(|| {
@@ -2229,7 +2328,12 @@ pub async fn update(
     // fact that the orchestrator rebuilds a job) without it.
     crate::routes::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id)
         .await?;
-    let body: UpdateBody = crate::routes::pipelines::parse_body(&body)?;
+    let mut body: UpdateBody = crate::routes::pipelines::parse_body(&body)?;
+    // BLD-19: a legacy `gold` target is stored (and compiled) as `serving`
+    // instead of making the orchestrator create an orphan `gold` database.
+    // Done before the Bronze refusal so the one zone that must stay refused
+    // is the only one this helper leaves alone.
+    body.target_zone = canonical_clickhouse_zone(&body.target_zone).to_owned();
     // BLD-3 / D4: a `bronze` target is refused with the same message
     // `create` and `restore_version` use, before the store is touched.
     //
@@ -2241,6 +2345,11 @@ pub async fn update(
     // (PR #59 review) moved them into the shared `validate_pipeline_input`
     // that this route and `restore_version` both call below.
     validate_target_zone(&body.target_zone)?;
+    // BLD-21: the output table is held to the same name rule the compiler
+    // applies to inputs and steps, here before any store or orchestrator
+    // call. It sits beside the zone guard so all four save routes answer
+    // the same bad name with the same sentence.
+    validate_target_table(&body.target_table)?;
     // BLD-1 part 1 / D3: one function turns either body form into D1's shape.
     let mut form = definition_form(
         body.inputs.clone(),
@@ -2473,6 +2582,48 @@ pub async fn delete(
 /// definition-mutating route, because the rebuilt job may differ
 /// from the one currently running.
 ///
+/// F2.8 (PR #59 review), restore side: the tenant-scoped validation walk
+/// `update` also runs — Dagster's job names best effort (an unreachable
+/// orchestrator narrows `depends_on` to authored ids only), the caller's
+/// scope, the other authored chains, then the shared `validate_pipeline_input`
+/// over the snapshot's transforms, `max_retries` and `depends_on`. A
+/// cross-tenant `pl-` id reads as "unknown" (F2.2).
+///
+/// # Errors
+///
+/// [`ApiRejection`] (400) from the shared validator, and whatever the
+/// Dagster list or the chain query surface — both classified by their
+/// own layers first.
+async fn validate_snapshot_pipeline_input(
+    state: &AppState,
+    pool: &PgPool,
+    principal: &Principal,
+    headers: &HeaderMap,
+    id: &str,
+    transforms: &[String],
+    max_retries: i16,
+    depends_on: &[String],
+) -> Result<(), ApiRejection> {
+    let dagster_jobs = match state.dagster.list_jobs().await {
+        Ok(j) => j,
+        Err(err) => {
+            tracing::warn!(%err, "restore_version: dagster unreachable, depends_on accepts authored upstreams only");
+            Vec::new()
+        }
+    };
+    let scope = crate::routes::authored_pipelines::resolve_caller_scope(principal, headers)?;
+    let others_rows = collect_authored_depends_on_with_tenants(pool, Some(id)).await?;
+    let others = in_scope_depends_on_rows(&others_rows, scope);
+    validate_pipeline_input(
+        id,
+        transforms,
+        Some(max_retries),
+        Some(depends_on),
+        &others,
+        &dagster_jobs,
+    )
+}
+
 /// # Errors
 ///
 /// 404 for a non-`pl-` id or for an unknown `(id, version)` pair;
@@ -2490,9 +2641,13 @@ pub async fn restore_version(
     crate::routes::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id)
         .await?;
     let pool = crate::routes::pipelines::pool(&state)?;
-    let snapshot = pipelines::get_definition_version(pool, &id, version)
+    let mut snapshot = pipelines::get_definition_version(pool, &id, version)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} version {version} not found")))?;
+    // BLD-19: a version snapshot can also predate the Gold-is-serving rule.
+    // Replaying `gold` verbatim would write a target no catalog or lineage
+    // query lists, so normalise it before the Bronze check and the write.
+    snapshot.target_zone = canonical_clickhouse_zone(&snapshot.target_zone).to_owned();
     // BLD-3 / D4: a stored snapshot can predate the Bronze-target refusal,
     // so a restore is refused on the same rule `update` and `create`
     // apply — replaying such a version would write the Bronze target
@@ -2504,10 +2659,14 @@ pub async fn restore_version(
     // the shared `validate_pipeline_input` this route calls below,
     // which also takes the tenant-scoped `others`.
     validate_target_zone(&snapshot.target_zone)?;
+    // BLD-21: a stored snapshot can predate this rule too, so a restore is
+    // held to the same output-name check as create, generate and update.
+    // Refuse replaying a name the engine would refuse on the next run.
+    validate_target_table(&snapshot.target_table)?;
     // BLD-1 part 1 / D13: the inputs and steps this version held. A snapshot
     // written before the shape existed is turned into it by D3's rule, so a
     // restore of an old version reproduces what that version's pipeline was.
-    let (restored_inputs, restored_steps) = pipelines::snapshot_definition(&snapshot);
+    let (restored_inputs, restored_steps) = canonical_snapshot_definition(&snapshot);
     let first = first_of(&restored_inputs)?;
     // DATA-19 / D2 + BLD-4 / D2: the snapshot is replayed whole, so its
     // `depends_on` is checked against its own source zone on every restore
@@ -2521,34 +2680,33 @@ pub async fn restore_version(
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
     // PR review (BLD-7, SHOULD-FIX 1): a restore keeps the row's current
     // connector (`ConnectorChange::Keep` below) but replays the snapshot's
-    // source, which may predate the connector. Hold it to the same rule.
-    if let Some(kept) = current.connector_id.as_deref() {
-        if restored_inputs.len() != 1 {
-            return Err(ApiError::BadRequest(
-                "a pipeline with a connector has exactly one input".to_owned(),
-            )
-            .into());
-        }
-        validate_connector_source(pool, kept, &first.zone, &first.table).await?;
-    }
-    let dagster_jobs = match state.dagster.list_jobs().await {
-        Ok(j) => j,
-        Err(err) => {
-            tracing::warn!(%err, "restore_version: dagster unreachable, depends_on accepts authored upstreams only");
-            Vec::new()
-        }
-    };
-    let scope = crate::routes::authored_pipelines::resolve_caller_scope(&principal, &headers)?;
-    let others_rows = collect_authored_depends_on_with_tenants(pool, Some(&id)).await?;
-    let others = in_scope_depends_on_rows(&others_rows, scope);
-    validate_pipeline_input(
+    // source, which may predate the connector — the same rule, through the
+    // same helper `create` and `update` use. `Keep` never re-checks the
+    // tenant: it was checked when the connector was set.
+    check_connector_for_definition(
+        pool,
+        &ConnectorChange::Keep,
+        current.connector_id.as_deref(),
+        current.tenant_id,
+        &restored_inputs,
+    )
+    .await?;
+    // F2.8 (PR #59 review): the shared validator runs the transform grammar,
+    // the `max_retries` range, and the snapshot's dependency walk, scoped to
+    // the caller's tenant through [`validate_snapshot_pipeline_input`] — the
+    // restore side of the walk `update` runs, so a cross-tenant `pl-` id
+    // reads as "unknown" (F2.2).
+    validate_snapshot_pipeline_input(
+        &state,
+        pool,
+        &principal,
+        &headers,
         &id,
         &snapshot.transforms,
-        Some(snapshot.max_retries),
-        Some(&snapshot.depends_on),
-        &others,
-        &dagster_jobs,
-    )?;
+        snapshot.max_retries,
+        &snapshot.depends_on,
+    )
+    .await?;
     // BLD-1 part 1 / D10 (`SEC-71`): a version that reads differently from
     // the current definition, restored by someone other than the current
     // author, makes that person the author -- the same rule an edit follows.
@@ -2756,6 +2914,43 @@ fn unavailable() -> Response {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    /// Derive a BLD-21-valid output table from a test pipeline name.
+    ///
+    /// BLD-20 made fixtures derive the target table from the unique pipeline
+    /// name (two pipelines may not claim one output table). BLD-21 then made
+    /// the engine's identifier rule apply at save time: a hyphen in a name
+    /// like `down-pipeline` produced `down-pipeline_tgt`, which is refused
+    /// with a 400 before the route under test can return its intended 404.
+    /// Fold every non-identifier character to `_`, keep the name within the
+    /// compiler's limit, and prefix so it can never start with a digit.
+    fn safe_test_target_table(name: &str) -> String {
+        let mut out = String::from("t_");
+        let mut last_underscore = false;
+        for ch in name.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                out.push(ch);
+                last_underscore = ch == '_';
+            } else if !last_underscore {
+                out.push('_');
+                last_underscore = true;
+            }
+        }
+        out.truncate(crate::pipeline_compile::MAX_NAME_CHARS);
+        out
+    }
+
+    #[test]
+    fn safe_test_target_table_satisfies_bld21_for_every_fixture_name_shape() {
+        let long = "x".repeat(crate::pipeline_compile::MAX_NAME_CHARS + 10);
+        for name in ["down-pipeline", "a--b", "9lead", "__prefix", long.as_str()] {
+            let table = safe_test_target_table(name);
+            assert!(
+                super::validate_target_table(&table).is_ok(),
+                "{name} derived an invalid target table {table:?}"
+            );
+        }
+    }
+
     /// BLD-1 part 1 review R1-B9 / D10a: who an edit makes the author.
     ///
     /// A person who is not the author and changes what the pipeline reads
@@ -2870,6 +3065,13 @@ mod tests {
             "authored__pl_ui_check_flow_mumidzub"
         );
         assert_eq!(schedule_name("pl-a-1"), "authored__pl_a_1_schedule");
+        // BLD-18: the same sanitize rule gives the freshness sensor's name;
+        // the pause/resume route has to know it to stop/start it in Dagster.
+        assert_eq!(lag_sensor_name("pl-a-1"), "authored__pl_a_1_lag");
+        assert_eq!(
+            lag_sensor_name("pl-ui-check-flow-mumidzub"),
+            "authored__pl_ui_check_flow_mumidzub_lag"
+        );
     }
 
     /// R3 plan 2a: a 3-cycle `A → B → C → A` is caught when the user
@@ -3410,7 +3612,13 @@ mod tests {
         /// share state across the `DAGSTER_URL` boundary, and a sync
         /// helper cannot start a wiremock without blocking the
         /// runtime.
-        async fn state_with_dagster(pool: &sqlx::PgPool) -> AppState {
+        ///
+        /// The mock server is returned with the state: wiremock hands a
+        /// dropped server back to a shared pool and resets it, so a server
+        /// dropped here could be taken by another test while this state
+        /// still dials its `DAGSTER_URL`. Bind it to a named variable for the
+        /// whole test.
+        async fn state_with_dagster(pool: &sqlx::PgPool) -> (AppState, wiremock::MockServer) {
             let server = wiremock::MockServer::start().await;
             wiremock::Mock::given(wiremock::matchers::method("POST"))
                 .and(wiremock::matchers::body_string_contains(
@@ -3434,7 +3642,9 @@ mod tests {
                 "DAGSTER_URL".to_owned(),
                 format!("{}/graphql", server.uri()),
             );
-            AppState::new(Config::from_map(&env_with_dagster).expect("a valid test Config"))
+            let state =
+                AppState::new(Config::from_map(&env_with_dagster).expect("a valid test Config"));
+            (state, server)
         }
 
         fn create_input(name: &str, depends_on: Vec<String>) -> CreatePipelineInput {
@@ -3449,7 +3659,12 @@ mod tests {
                 transforms: Vec::new(),
                 fbic_enabled: false,
                 target_zone: "silver".to_owned(),
-                target_table: "tgt".to_owned(),
+                // BLD-20: derive the output table from the pipeline name so
+                // fixtures that author several pipelines in one test do not
+                // trip the store's one-writer-per-output-table guard.
+                // BLD-21: the helper folds name hyphens etc. so the derived
+                // table is a valid engine identifier, never a 400.
+                target_table: safe_test_target_table(name),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,
@@ -3512,8 +3727,9 @@ mod tests {
             //    reference; with the validator it returns the same
             //    400 `update` returns for a fresh edit against the
             //    same graph, naming `pl-b` verbatim.
+            let (state, _dagster) = state_with_dagster(&pool).await;
             let err = restore_version(
-                State(state_with_dagster(&pool).await),
+                State(state),
                 Extension(unrestricted_principal()),
                 HeaderMap::new(),
                 Path((pl_a.id.clone(), 1)),
@@ -3622,8 +3838,9 @@ mod tests {
             //    transform and returns the same 400 body `update`
             //    produces — the canonical
             //    `"invalid transform at transforms[0]: ..."` shape.
+            let (state, _dagster) = state_with_dagster(&pool).await;
             let err = restore_version(
-                State(state_with_dagster(&pool).await),
+                State(state),
                 Extension(unrestricted_principal()),
                 HeaderMap::new(),
                 Path((pl.id.clone(), 2)),
@@ -3851,7 +4068,12 @@ mod tests {
                 transforms: Vec::new(),
                 fbic_enabled: false,
                 target_zone: "silver".to_owned(),
-                target_table: "tgt".to_owned(),
+                // BLD-20: derive the output table from the pipeline name so
+                // fixtures that author several pipelines in one test do not
+                // trip the store's one-writer-per-output-table guard.
+                // BLD-21: the helper folds name hyphens etc. so the derived
+                // table is a valid engine identifier, never a 400.
+                target_table: safe_test_target_table(name),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,
@@ -3964,6 +4186,112 @@ mod tests {
         for zone in ["silver", "gold", "serving", "lake", "Bronze"] {
             validate_target_zone(zone).expect("a ClickHouse zone stays writable");
         }
+    }
+
+    /// BLD-21: the output table is held to the same name rule the compiler
+    /// applies to inputs and steps. The four valid cases include the exact
+    /// 48-character boundary; every refusal carries the one shared message,
+    /// whatever made the name invalid.
+    #[test]
+    fn validate_target_table_applies_the_compilers_name_rule_at_save_time() {
+        let at_limit = "a".repeat(crate::pipeline_compile::MAX_NAME_CHARS);
+        let over_limit = "a".repeat(crate::pipeline_compile::MAX_NAME_CHARS + 1);
+        for name in ["orders_clean", "sales_2026", "t", at_limit.as_str()] {
+            validate_target_table(name).unwrap_or_else(|_| panic!("{name} must be accepted"));
+        }
+        for name in [
+            "",
+            "has space",
+            "a; DROP TABLE b",
+            "db.tbl",
+            "__reserved",
+            "123abc",
+            "has-hyphen",
+            over_limit.as_str(),
+        ] {
+            assert_eq!(
+                validate_target_table(name)
+                    .expect_err("{name} must be refused")
+                    .0
+                    .to_string(),
+                TARGET_TABLE_REFUSED,
+                "name {name:?} must carry the shared refusal"
+            );
+        }
+        assert_eq!(
+            TARGET_TABLE_REFUSED,
+            "a target table must be letters, digits and underscores (not starting with a digit or __), at most 48 characters"
+        );
+    }
+
+    /// BLD-19: Gold is `serving` in the catalog and in lineage; a legacy
+    /// `gold` spelling is the same zone, never a database of its own.
+    /// `bronze` is NOT normalised — it is the one target the refusal above
+    /// owns, and folding it into another zone would hide the refusal.
+    #[test]
+    fn canonical_clickhouse_zone_maps_only_gold_to_serving() {
+        assert_eq!(super::canonical_clickhouse_zone("gold"), "serving");
+        assert_eq!(super::canonical_clickhouse_zone("serving"), "serving");
+        assert_eq!(super::canonical_clickhouse_zone("silver"), "silver");
+        assert_eq!(super::canonical_clickhouse_zone("bronze"), "bronze");
+        assert_eq!(super::canonical_clickhouse_zone("lake"), "lake");
+    }
+
+    /// BLD-19: both body forms normalise their input zones, so the
+    /// definition the store saves (and the compiler reads) never carries
+    /// an orphan `gold.foo` reference.
+    #[test]
+    fn definition_form_normalizes_legacy_gold_input_zones() {
+        let inputs = vec![lakehouse_store::pipelines::PipelineInput {
+            name: "orders".to_owned(),
+            zone: "gold".to_owned(),
+            table: "orders".to_owned(),
+        }];
+        let form = definition_form(Some(inputs), None, None, None, None)
+            .expect("the new body form with an input");
+        assert_eq!(form.inputs[0].zone, "serving");
+
+        let legacy = definition_form(
+            None,
+            None,
+            Some("gold"),
+            Some("orders"),
+            Some(&["dedupe(id)".to_owned()]),
+        )
+        .expect("the legacy body form with a source zone");
+        assert_eq!(legacy.inputs[0].zone, "serving");
+    }
+
+    /// BLD-19: the legacy-form-over-stored path rebuilds the input from the
+    /// raw body source zone, so it needs its own normalisation — otherwise an
+    /// edit that spells Gold `gold` would store an orphan `gold` input even
+    /// though `definition_form` rejected that spelling.
+    #[test]
+    fn legacy_form_over_stored_normalizes_a_legacy_gold_source_zone() {
+        use lakehouse_store::pipelines::PipelineStep;
+
+        let stored = lakehouse_store::pipelines::AuthoredDefinition {
+            inputs: vec![lakehouse_store::pipelines::PipelineInput {
+                name: "orders".to_owned(),
+                zone: "silver".to_owned(),
+                table: "orders".to_owned(),
+            }],
+            steps: Vec::<PipelineStep>::new(),
+            source_zone: "silver".to_owned(),
+            source_table: "orders".to_owned(),
+            incremental_column: None,
+            transforms: Vec::new(),
+            fbic_enabled: false,
+            target_zone: "serving".to_owned(),
+            target_table: "out".to_owned(),
+            connector_id: None,
+            max_retries: 2,
+        };
+        let form = definition_form(None, None, Some("gold"), Some("orders"), None)
+            .expect("a legacy body form");
+        let over = legacy_form_over_stored(&form, &stored, Some("gold"), Some("orders"))
+            .expect("the legacy form can edit a legacy stored definition");
+        assert_eq!(over.inputs[0].zone, "serving");
     }
 
     /// DATA-19 / D2: the pure rule behind the `file_ingest_job` refusal,
@@ -4298,6 +4626,63 @@ mod tests {
                 versions.0, 1,
                 "the refused restore must not have written a `restored` version row"
             );
+        }
+
+        /// BLD-19: a legacy `gold` target is not a writable zone of its
+        /// own — the API saves it as `serving`, so the orchestrator never
+        /// creates an orphan `gold` `ClickHouse` database. Both the route's
+        /// answer and the stored row (what Dagster reads) are checked.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn update_rewrites_a_legacy_gold_target_to_serving(pool: sqlx::PgPool) {
+            let created = pipelines::create_pipeline(
+                &pool,
+                &pipeline_input("pl-gold-update", "silver"),
+                None,
+            )
+            .await
+            .expect("seed the row the update rewrites");
+            let body = Bytes::from_static(
+                br#"{"kind":"batch","sourceZone":"silver","sourceTable":"s","targetZone":"gold","targetTable":"t","schedule":"manual","transforms":[]}"#,
+            );
+            let ApiJson(updated) = update(
+                State(state_for(&pool)),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
+                Path(created.id.clone()),
+                body,
+            )
+            .await
+            .expect("a legacy gold target must be accepted as serving");
+            assert_eq!(updated["target"], "serving.t", "the route's answer");
+            let stored = pipelines::get_pipeline(&pool, &created.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row still exists");
+            assert_eq!(stored.target, "serving.t", "the value Dagster will read");
+        }
+
+        /// BLD-19: a stored version predating the Gold-is-serving rule is
+        /// replayed as `serving`, not as an orphan `gold.<table>`.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn restore_rewrites_a_legacy_gold_target_to_serving(pool: sqlx::PgPool) {
+            let created =
+                pipelines::create_pipeline(&pool, &pipeline_input("pl-gold-restore", "gold"), None)
+                    .await
+                    .expect("seed the pre-rule row the restore replays");
+            let ApiJson(restored) = restore_version(
+                State(state_for(&pool)),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
+                Path((created.id.clone(), 1)),
+            )
+            .await
+            .expect("a stored gold target must restore as serving");
+            assert_eq!(restored["target"], "serving.t");
+            let stored = pipelines::get_pipeline(&pool, &created.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row still exists");
+            assert_eq!(stored.target, "serving.t");
         }
     }
 
@@ -4986,7 +5371,12 @@ mod tests {
                 transforms: Vec::new(),
                 fbic_enabled: false,
                 target_zone: "silver".to_owned(),
-                target_table: "tgt".to_owned(),
+                // BLD-20: derive the output table from the pipeline name so
+                // fixtures that author several pipelines in one test do not
+                // trip the store's one-writer-per-output-table guard.
+                // BLD-21: the helper folds name hyphens etc. so the derived
+                // table is a valid engine identifier, never a 400.
+                target_table: safe_test_target_table(name),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,
@@ -5186,7 +5576,12 @@ mod tests {
                 transforms: Vec::new(),
                 fbic_enabled: false,
                 target_zone: "silver".to_owned(),
-                target_table: "tgt".to_owned(),
+                // BLD-20: derive the output table from the pipeline name so
+                // fixtures that author several pipelines in one test do not
+                // trip the store's one-writer-per-output-table guard.
+                // BLD-21: the helper folds name hyphens etc. so the derived
+                // table is a valid engine identifier, never a 400.
+                target_table: safe_test_target_table(name),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,
@@ -5328,7 +5723,12 @@ mod tests {
                 transforms: Vec::new(),
                 fbic_enabled: false,
                 target_zone: "silver".to_owned(),
-                target_table: "tgt".to_owned(),
+                // BLD-20: derive the output table from the pipeline name so
+                // fixtures that author several pipelines in one test do not
+                // trip the store's one-writer-per-output-table guard.
+                // BLD-21: the helper folds name hyphens etc. so the derived
+                // table is a valid engine identifier, never a 400.
+                target_table: safe_test_target_table(name),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,
