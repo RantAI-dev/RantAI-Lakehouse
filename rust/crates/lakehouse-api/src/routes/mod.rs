@@ -696,6 +696,10 @@ fn lakehouse_router() -> Router<AppState> {
             get(lakehouse::list_maintenance_policies),
         )
         .route("/api/lakehouse/capacity", get(lakehouse::capacity))
+        .route(
+            "/api/lakehouse/compaction-status",
+            get(lakehouse::compaction_status),
+        )
 }
 
 /// The static (non-`{kind}`) `/api/governance/*` routes, split out for the

@@ -1,5 +1,6 @@
 import type {
   LakehouseCapacity,
+  LakehouseCompactionStatus,
   LakehouseMaintenance,
   LakehouseNamespace,
   LakehouseService,
@@ -12,6 +13,7 @@ import { apiFetch } from "../http"
 import { ServiceError, deniedFor } from "../errors"
 import {
   lakehouseCapacityUrl,
+  lakehouseCompactionStatusUrl,
   lakehouseMaintenanceUrl,
   lakehouseNamespacesUrl,
   lakehouseTableDetailUrl,
@@ -75,6 +77,13 @@ export const icebergLakehouseService: LakehouseService = {
       lakehouseTableDetailUrl(namespace, table),
       { cache: "no-store", signal },
       "Lakehouse table detail could not be loaded"
+    )
+  },
+  async getCompactionStatus(signal) {
+    return request<LakehouseCompactionStatus>(
+      lakehouseCompactionStatusUrl(),
+      { cache: "no-store", signal },
+      "Lakehouse compaction status could not be loaded"
     )
   },
   async getMaintenance(namespace, table, signal) {
