@@ -88,6 +88,39 @@ describe("goldService.getConsumers", () => {
   })
 })
 
+describe("goldService zone-aware URLs (DATA-65)", () => {
+  it("a Silver read and trigger append ?zone=silver; Gold keeps the old URL", async () => {
+    const calls = stubFetch(() =>
+      json({
+        zone: "silver",
+        namespace: "silver",
+        table: "orders_clean",
+        published: true,
+        formatVersion: 2,
+        rowsInIceberg: 42,
+        snapshotId: { value: 1, measured: true },
+        exportedAt: "2026-10-02T04:00:00Z",
+      }),
+    )
+    await goldService.getLastExport("orders_clean", undefined, "silver")
+    await goldService.triggerExport("orders_clean", undefined, "silver")
+    await goldService.getConsumers("orders_clean", undefined, "silver")
+    await goldService.getPublication("orders_clean", undefined, "silver")
+    await goldService.listExportRuns("orders_clean", undefined, "silver")
+    expect(calls[0].url).toBe("/api/gold/export/orders_clean?zone=silver")
+    expect(calls[1].url).toBe("/api/gold/export/orders_clean?zone=silver")
+    expect(calls[2].url).toBe("/api/gold/export/orders_clean/consumers?zone=silver")
+    expect(calls[3].url).toBe("/api/gold/export/orders_clean/publication?zone=silver")
+    expect(calls[4].url).toBe("/api/gold/exports?mart=orders_clean&zone=silver")
+  })
+
+  it("the default Gold zone sends no query string at all", async () => {
+    const calls = stubFetch(() => json({ mart: "sales", runs: [] }))
+    await goldService.listExportRuns("sales")
+    expect(calls[0].url).toBe("/api/gold/exports?mart=sales")
+  })
+})
+
 describe("goldService refusals (WEB-12)", () => {
   it("a refused read rejects as permission_denied, not unavailable", async () => {
     stubFetch(() => json({ error: "permission_denied: gold:export" }, 403))

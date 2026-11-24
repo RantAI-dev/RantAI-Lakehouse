@@ -6,6 +6,7 @@ import type {
   GoldExportRun,
   GoldConsumers,
   GoldPublication,
+  GoldZone,
 } from "../contracts/gold"
 import { apiFetch } from "../http"
 import { ServiceError, deniedFor } from "../errors"
@@ -16,6 +17,16 @@ import { ServiceError, deniedFor } from "../errors"
  * existed for this domain: ADR 0010's Gold export was Rust-only from the
  * start, so there is nothing to delegate away from.
  */
+
+/**
+ * DATA-65: a Silver publication is addressed with `?zone=silver`; a Gold
+ * one keeps the exact URL it had before, so no existing test or deployment
+ * changes. Works for routes that already have a query (`?mart=`) too.
+ */
+function withZone(url: string, zone?: GoldZone): string {
+  if (zone !== "silver") return url
+  return url.includes("?") ? `${url}&zone=silver` : `${url}?zone=silver`
+}
 
 async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await apiFetch(url, init)
@@ -64,16 +75,16 @@ export const goldService: GoldService = {
   async listMarts(signal) {
     return (await getJson<{ marts: GoldMart[] }>("/api/dashboard/fields", { signal })).marts
   },
-  async getLastExport(mart, signal) {
-    return getJson<GoldReadBack>(`/api/gold/export/${encodeURIComponent(mart)}`, { signal })
+  async getLastExport(mart, signal, zone) {
+    return getJson<GoldReadBack>(withZone(`/api/gold/export/${encodeURIComponent(mart)}`, zone), { signal })
   },
-  async triggerExport(mart, signal) {
-    return postJson<GoldExportResult>(`/api/gold/export/${encodeURIComponent(mart)}`, signal)
+  async triggerExport(mart, signal, zone) {
+    return postJson<GoldExportResult>(withZone(`/api/gold/export/${encodeURIComponent(mart)}`, zone), signal)
   },
-  async listExportRuns(mart, signal) {
+  async listExportRuns(mart, signal, zone) {
     return (
       await getJson<{ mart: string; runs: GoldExportRun[] }>(
-        `/api/gold/exports?mart=${encodeURIComponent(mart)}`,
+        withZone(`/api/gold/exports?mart=${encodeURIComponent(mart)}`, zone),
         { signal }
       )
     ).runs
@@ -84,13 +95,13 @@ export const goldService: GoldService = {
    * up, and `supported: false` with a `reason` when it is not — the
    * console must show the reason, never a fabricated zero.
    */
-  async getConsumers(mart, signal) {
-    return getJson<GoldConsumers>(`/api/gold/export/${encodeURIComponent(mart)}/consumers`, { signal })
+  async getConsumers(mart, signal, zone) {
+    return getJson<GoldConsumers>(withZone(`/api/gold/export/${encodeURIComponent(mart)}/consumers`, zone), { signal })
   },
-  async getPublication(mart, signal) {
-    return getJson<GoldPublication>(`/api/gold/export/${encodeURIComponent(mart)}/publication`, { signal })
+  async getPublication(mart, signal, zone) {
+    return getJson<GoldPublication>(withZone(`/api/gold/export/${encodeURIComponent(mart)}/publication`, zone), { signal })
   },
-  async setPublication(mart, enabled, signal) {
-    return putJson<GoldPublication>(`/api/gold/export/${encodeURIComponent(mart)}/publication`, { enabled }, signal)
+  async setPublication(mart, enabled, signal, zone) {
+    return putJson<GoldPublication>(withZone(`/api/gold/export/${encodeURIComponent(mart)}/publication`, zone), { enabled }, signal)
   },
 }

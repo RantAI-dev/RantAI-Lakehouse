@@ -89,6 +89,14 @@ async fn ensure_gold_trim_run_table_uncached(ch: &ChClient) -> Result<(), ChErro
         None,
     )
     .await?;
+    // DATA-65: Silver and Gold marts with the same bare name keep
+    // independent trim histories. Pre-existing rows get `gold`, the zone
+    // they were always about.
+    ch.exec(
+        "ALTER TABLE console.gold_trim_run ADD COLUMN IF NOT EXISTS zone String DEFAULT 'gold'",
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -127,6 +135,14 @@ async fn ensure_gold_export_run_table_uncached(ch: &ChClient) -> Result<(), ChEr
     .await?;
     ch.exec(
         "ALTER TABLE console.gold_export_run ADD COLUMN IF NOT EXISTS content_fingerprint String DEFAULT ''",
+        None,
+    )
+    .await?;
+    // DATA-65: zone on each run so `?ifChanged=true`, the card's failure
+    // line and the run list are independent per publication zone. Every
+    // row written before this column existed was a Gold publish.
+    ch.exec(
+        "ALTER TABLE console.gold_export_run ADD COLUMN IF NOT EXISTS zone String DEFAULT 'gold'",
         None,
     )
     .await?;
@@ -307,15 +323,27 @@ fn datetime64_literal(ms: i64) -> String {
     format!("fromUnixTimestamp64Milli({ms})")
 }
 
+#[allow(
+    dead_code,
+    reason = "the Gold-only SQL form is kept for the pre-DATA-65 callers and pinned by tests; \
+              production callers now go through the zone-aware form"
+)]
 fn insert_sql(row: &NewGoldExportRun<'_>) -> String {
+    insert_sql_for_zone(row, "gold")
+}
+
+/// DATA-65: the zone-aware insert. `zone` is always a value the Rust
+/// `PublishZone` chose (`"silver"`/`"gold"`), never caller text.
+fn insert_sql_for_zone(row: &NewGoldExportRun<'_>, zone: &str) -> String {
     format!(
         "INSERT INTO console.gold_export_run \
-         (id, mart, status, rows_exported, format_version, snapshot_id, error, \
+         (id, mart, zone, status, rows_exported, format_version, snapshot_id, error, \
           triggered_by, content_fingerprint, started_at, finished_at) VALUES \
-         ({id}, {mart}, {status}, {rows_exported}, {format_version}, {snapshot_id}, {error}, \
+         ({id}, {mart}, {zone}, {status}, {rows_exported}, {format_version}, {snapshot_id}, {error}, \
           {triggered_by}, {content_fingerprint}, {started_at}, {finished_at})",
         id = SqlLiteral::from(uuid::Uuid::new_v4().to_string()),
         mart = SqlLiteral::from(row.mart),
+        zone = SqlLiteral::from(zone),
         status = SqlLiteral::from(row.status),
         rows_exported = opt_num(row.rows_exported),
         format_version = opt_num(row.format_version),
@@ -332,36 +360,73 @@ fn insert_sql(row: &NewGoldExportRun<'_>) -> String {
 /// swallowed by the caller (`routes::gold::export`), never turned into a
 /// 500 for what was otherwise a successful (or already-failed, for a
 /// different reason) export — this table is a history view, not a
-/// correctness dependency of the export itself.
+/// correctness dependency of the export itself. Gold-only wrapper kept
+/// for backward compatibility (DATA-65).
 ///
 /// # Errors
 ///
 /// Returns [`ChError`] if the table cannot be ensured or the insert
 /// fails.
 pub async fn record_export_run(ch: &ChClient, row: &NewGoldExportRun<'_>) -> Result<(), ChError> {
-    ensure_gold_export_run_table(ch).await?;
-    ch.exec(&insert_sql(row), None).await
+    record_export_run_for_zone(ch, row, "gold").await
 }
 
+/// DATA-65: record one export attempt in `zone`'s history.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the table cannot be ensured or the insert fails.
+pub async fn record_export_run_for_zone(
+    ch: &ChClient,
+    row: &NewGoldExportRun<'_>,
+    zone: &str,
+) -> Result<(), ChError> {
+    ensure_gold_export_run_table(ch).await?;
+    ch.exec(&insert_sql_for_zone(row, zone), None).await
+}
+
+#[allow(
+    dead_code,
+    reason = "the Gold-only SQL form is kept for the pre-DATA-65 callers and pinned by tests; \
+              production callers now go through the zone-aware form"
+)]
 fn list_sql(mart: &str, limit: u32) -> String {
+    list_sql_for_zone(mart, limit, "gold")
+}
+
+/// DATA-65: the zone-aware run list. The `zone` column has a `gold` default
+/// on every pre-existing row, so older history keeps reading as Gold.
+fn list_sql_for_zone(mart: &str, limit: u32, zone: &str) -> String {
     format!(
-        "SELECT id, status, rows_exported, format_version, snapshot_id, error, triggered_by, \
+        "SELECT id, zone, status, rows_exported, format_version, snapshot_id, error, triggered_by, \
           content_fingerprint, \
           toString(started_at) AS started_at, toString(finished_at) AS finished_at \
-          FROM console.gold_export_run WHERE mart = {mart} \
+          FROM console.gold_export_run WHERE mart = {mart} AND zone = {zone} \
           ORDER BY started_at DESC LIMIT {limit} FORMAT JSON",
         mart = SqlLiteral::from(mart),
+        zone = SqlLiteral::from(zone),
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "the Gold-only SQL form is kept for the pre-DATA-65 callers and pinned by tests; \
+              production callers now go through the zone-aware form"
+)]
 fn last_success_sql(mart: &str) -> String {
+    last_success_sql_for_zone(mart, "gold")
+}
+
+/// DATA-65: zone-aware newest-successful-run read.
+fn last_success_sql_for_zone(mart: &str, zone: &str) -> String {
     format!(
         "SELECT toString(toUnixTimestamp64Milli(started_at)) AS started_ms, \
                 content_fingerprint \
           FROM console.gold_export_run \
-          WHERE mart = {mart} AND status = 'success' \
+          WHERE mart = {mart} AND zone = {zone} AND status = 'success' \
           ORDER BY started_at DESC LIMIT 1 FORMAT JSON",
         mart = SqlLiteral::from(mart),
+        zone = SqlLiteral::from(zone),
     )
 }
 
@@ -373,6 +438,9 @@ pub struct GoldExportRunRow {
     /// The UUID minted for this row by [`insert_sql`], rendered back as a
     /// plain string.
     pub id: String,
+    /// DATA-65: the publication zone this run belongs to (`"silver"` or
+    /// `"gold"`). Rows written before migration 0157 read as `"gold"`.
+    pub zone: String,
     /// `"success"` or `"failed"` — mirrors [`NewGoldExportRun::status`].
     pub status: String,
     /// Mirrors [`NewGoldExportRun::rows_exported`].
@@ -404,6 +472,14 @@ fn row_to_export_run(row: &serde_json::Map<String, Value>) -> GoldExportRunRow {
     };
     GoldExportRunRow {
         id: str_field("id"),
+        zone: {
+            let zone = str_field("zone");
+            if zone.is_empty() {
+                "gold".to_owned()
+            } else {
+                zone
+            }
+        },
         status: str_field("status"),
         rows_exported: nullable_u64_col(row, "rows_exported"),
         // `ClickHouse` renders these integers as JSON numbers or as quoted
@@ -435,8 +511,25 @@ pub async fn list_export_runs(
     mart: &str,
     limit: u32,
 ) -> Result<Vec<GoldExportRunRow>, ChError> {
+    list_export_runs_for_zone(ch, mart, limit, "gold").await
+}
+
+/// DATA-65: the most recent `limit` export attempts of one `(zone, mart)`
+/// publication.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the table cannot be ensured or the query fails.
+pub async fn list_export_runs_for_zone(
+    ch: &ChClient,
+    mart: &str,
+    limit: u32,
+    zone: &str,
+) -> Result<Vec<GoldExportRunRow>, ChError> {
     ensure_gold_export_run_table(ch).await?;
-    let result = ch.query(&list_sql(mart, limit), None).await?;
+    let result = ch
+        .query(&list_sql_for_zone(mart, limit, zone), None)
+        .await?;
     Ok(result.data.iter().map(row_to_export_run).collect())
 }
 
@@ -459,8 +552,23 @@ pub async fn last_success_export(
     ch: &ChClient,
     mart: &str,
 ) -> Result<Option<LastSuccessExport>, ChError> {
+    last_success_export_for_zone(ch, mart, "gold").await
+}
+
+/// DATA-65: the newest successful export of one `(zone, mart)` publication.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the table cannot be ensured or the query fails.
+pub async fn last_success_export_for_zone(
+    ch: &ChClient,
+    mart: &str,
+    zone: &str,
+) -> Result<Option<LastSuccessExport>, ChError> {
     ensure_gold_export_run_table(ch).await?;
-    let rows = ch.rows(&last_success_sql(mart), None).await?;
+    let rows = ch
+        .rows(&last_success_sql_for_zone(mart, zone), None)
+        .await?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -481,14 +589,25 @@ pub async fn last_success_export(
 
 /// `mart`'s newest export run of ANY status — the mirror of
 /// [`last_success_sql`] without the `status` filter.
+#[allow(
+    dead_code,
+    reason = "the Gold-only SQL form is kept for the pre-DATA-65 callers and pinned by tests; \
+              production callers now go through the zone-aware form"
+)]
 fn last_run_sql(mart: &str) -> String {
+    last_run_sql_for_zone(mart, "gold")
+}
+
+/// DATA-65: zone-aware newest run of any status.
+fn last_run_sql_for_zone(mart: &str, zone: &str) -> String {
     format!(
         "SELECT status, error, \
                 toString(toUnixTimestamp64Milli(started_at)) AS started_ms \
           FROM console.gold_export_run \
-          WHERE mart = {mart} \
+          WHERE mart = {mart} AND zone = {zone} \
           ORDER BY started_at DESC, finished_at DESC LIMIT 1 FORMAT JSON",
         mart = SqlLiteral::from(mart),
+        zone = SqlLiteral::from(zone),
     )
 }
 
@@ -516,8 +635,21 @@ pub struct LastExportRun {
 ///
 /// Returns [`ChError`] if the table cannot be ensured or the query fails.
 pub async fn last_export_run(ch: &ChClient, mart: &str) -> Result<Option<LastExportRun>, ChError> {
+    last_export_run_for_zone(ch, mart, "gold").await
+}
+
+/// DATA-65: the newest run of any status for one `(zone, mart)` publication.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the table cannot be ensured or the query fails.
+pub async fn last_export_run_for_zone(
+    ch: &ChClient,
+    mart: &str,
+    zone: &str,
+) -> Result<Option<LastExportRun>, ChError> {
     ensure_gold_export_run_table(ch).await?;
-    let rows = ch.rows(&last_run_sql(mart), None).await?;
+    let rows = ch.rows(&last_run_sql_for_zone(mart, zone), None).await?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -688,16 +820,27 @@ pub fn millis_to_rfc3339(ms: i64) -> Option<String> {
         })
 }
 
+#[allow(
+    dead_code,
+    reason = "the Gold-only SQL form is kept for the pre-DATA-65 callers and pinned by tests; \
+              production callers now go through the zone-aware form"
+)]
 fn last_trim_sql(mart: &str) -> String {
+    last_trim_sql_for_zone(mart, "gold")
+}
+
+/// DATA-65: zone-aware newest trim summary. Pre-trim rows read as Gold.
+fn last_trim_sql_for_zone(mart: &str, zone: &str) -> String {
     format!(
         "SELECT status, copies_kept, \
                 toString(toUnixTimestamp64Milli(oldest_kept_exported_at)) AS oldest_kept_ms, \
                 toString(toUnixTimestamp64Milli(finished_at)) AS finished_ms, \
                 reason \
          FROM console.gold_trim_run \
-         WHERE mart = {mart} \
+         WHERE mart = {mart} AND zone = {zone} \
          ORDER BY started_at DESC LIMIT 1 FORMAT JSON",
         mart = SqlLiteral::from(mart),
+        zone = SqlLiteral::from(zone),
     )
 }
 
@@ -740,8 +883,21 @@ fn row_to_trim_summary(row: &serde_json::Map<String, Value>) -> GoldTrimSummary 
 ///
 /// Returns [`ChError`] if the table cannot be ensured or the query fails.
 pub async fn last_trim(ch: &ChClient, mart: &str) -> Result<Option<GoldTrimSummary>, ChError> {
+    last_trim_for_zone(ch, mart, "gold").await
+}
+
+/// DATA-65: the newest trim summary of one `(zone, mart)` publication.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the table cannot be ensured or the query fails.
+pub async fn last_trim_for_zone(
+    ch: &ChClient,
+    mart: &str,
+    zone: &str,
+) -> Result<Option<GoldTrimSummary>, ChError> {
     ensure_gold_trim_run_table(ch).await?;
-    let rows = ch.rows(&last_trim_sql(mart), None).await?;
+    let rows = ch.rows(&last_trim_sql_for_zone(mart, zone), None).await?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -1056,5 +1212,68 @@ mod tests {
         );
         assert!(sql.contains("LIMIT 1 FORMAT JSON"), "{sql}");
         assert!(sql.contains("error"), "{sql}");
+    }
+
+    // ── DATA-65: zone-scoped history ─────────────────────────────────────
+
+    #[test]
+    fn every_zone_scoped_history_query_filters_by_zone() {
+        for sql in [
+            list_sql_for_zone("orders", 50, "silver"),
+            last_success_sql_for_zone("orders", "silver"),
+            last_run_sql_for_zone("orders", "silver"),
+            last_trim_sql_for_zone("orders", "silver"),
+        ] {
+            assert!(sql.contains("mart = 'orders'"), "{sql}");
+            assert!(sql.contains("zone = 'silver'"), "{sql}");
+            assert!(!sql.contains("zone = 'gold'"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn the_gold_wrappers_are_unchanged_for_pre_data65_callers() {
+        for sql in [
+            list_sql("orders", 50),
+            last_success_sql("orders"),
+            last_run_sql("orders"),
+            last_trim_sql("orders"),
+        ] {
+            assert!(sql.contains("zone = 'gold'"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn insert_sql_for_zone_writes_the_zone_column() {
+        let row = NewGoldExportRun {
+            mart: "orders",
+            status: "success",
+            rows_exported: Some(3),
+            format_version: Some(2),
+            snapshot_id: Some(9),
+            error: None,
+            triggered_by: "service:scheduler",
+            content_fingerprint: "3:4:5",
+            started_at_ms: 1_700_000_000_000,
+            finished_at_ms: 1_700_000_001_000,
+        };
+        let sql = insert_sql_for_zone(&row, "silver");
+        assert!(sql.contains("(id, mart, zone, status"), "{sql}");
+        assert!(sql.contains("'silver'"), "{sql}");
+        assert!(insert_sql(&row).contains("'gold'"));
+    }
+
+    #[test]
+    fn a_run_row_without_a_zone_column_reads_as_gold() {
+        let row: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+            "id": "r1", "status": "success", "rows_exported": 1,
+            "format_version": 2, "snapshot_id": 1, "error": null,
+            "triggered_by": "t", "content_fingerprint": "1:2:3",
+            "started_at": "s", "finished_at": "f"
+        }))
+        .unwrap();
+        assert_eq!(row_to_export_run(&row).zone, "gold");
+        let mut silver_row = row;
+        silver_row.insert("zone".to_owned(), Value::String("silver".to_owned()));
+        assert_eq!(row_to_export_run(&silver_row).zone, "silver");
     }
 }

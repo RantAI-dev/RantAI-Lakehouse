@@ -31,6 +31,7 @@ use axum::response::IntoResponse;
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_core::ident::Ident;
+use lakehouse_iceberg::gold::PublishZone;
 use serde_json::{Map, Value, json};
 
 use super::{arg_str, response_to_value};
@@ -60,6 +61,19 @@ async fn iceberg_config_for(
     Ok((mart_ident, iceberg_config))
 }
 
+/// DATA-65: read the optional `zone` tool argument. A missing argument is
+/// Gold, so every existing tool call and its fixture are unchanged. An
+/// unrecognised value answers a fixed sentence — never the caller's text
+/// (AGENTS.md rule 4).
+fn zone_from_args(args: &Map<String, Value>) -> Result<PublishZone, Value> {
+    match args.get("zone").and_then(Value::as_str) {
+        None => Ok(PublishZone::Gold),
+        Some(raw) => PublishZone::parse(raw).ok_or_else(
+            || json!({ "error": "invalid zone: expected one of silver, gold or serving" }),
+        ),
+    }
+}
+
 /// WS7 item D2: `export_mart`'s per-batch query goes through the same
 /// `sql_rewrite::enforce` `POST /api/gold/export/{mart}` uses.
 /// `principal` is `Option` for the same reason `create_connector`'s is
@@ -84,13 +98,17 @@ pub(super) async fn export_gold_mart(
     let Some(principal) = principal else {
         return json!({ "error": "export_gold_mart membutuhkan sesi pengguna yang sudah masuk" });
     };
+    let zone = match zone_from_args(args) {
+        Ok(zone) => zone,
+        Err(err) => return err,
+    };
     let (mart_ident, iceberg_config) = match iceberg_config_for(state, &mart).await {
         Ok(pair) => pair,
         Err(err) => return err,
     };
     let source_table = format!(
         "{}.`{}`",
-        state.config.gold_source_schema,
+        zone.source_ch_schema(&state.config.gold_source_schema),
         mart_ident.as_str()
     );
     let placeholders = crate::sql_rewrite::PlaceholderValues {
@@ -113,7 +131,7 @@ pub(super) async fn export_gold_mart(
     // `tenant_scope::resolve` uses when no header is sent.
     let headers = axum::http::HeaderMap::new();
     let actor = crate::routes::gold::gold_export_gate_actor(Some(principal), &headers);
-    match crate::gold_export::export_mart(
+    match crate::gold_export::export_mart_for_zone(
         state,
         actor,
         &state.clickhouse,
@@ -130,10 +148,12 @@ pub(super) async fn export_gold_mart(
         &principal.role_names,
         &placeholders,
         &obligations,
+        zone,
     )
     .await
     {
         Ok(result) => json!({
+            "zone": zone.namespace_name(),
             "namespace": result.namespace,
             "table": result.table,
             "formatVersion": result.format_version,
@@ -146,20 +166,59 @@ pub(super) async fn export_gold_mart(
     }
 }
 
-pub(super) async fn get_gold_export(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn get_gold_export(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let mart = arg_str(args, "mart");
     if mart.is_empty() {
         return json!({ "error": "mart is required" });
+    }
+    let zone = match zone_from_args(args) {
+        Ok(zone) => zone,
+        Err(err) => return err,
+    };
+    // DATA-64 follow-up / SEC-50: this tool reveals the same row counts as
+    // `GET /api/gold/export/{mart}`, so it carries the same tenant gate the
+    // route and `export_gold_mart` use — through the same one helper, with
+    // an empty header set (a tool call has no `X-Tenant`).
+    let source_table = format!(
+        "{}.`{}`",
+        zone.source_ch_schema(&state.config.gold_source_schema),
+        mart
+    );
+    let headers = axum::http::HeaderMap::new();
+    let actor = crate::routes::gold::gold_export_gate_actor(principal, &headers);
+    if let Err(err) = crate::routes::query::gate_statement(
+        state,
+        &crate::gold_export::mart_count_sql(&source_table),
+        &sqlparser::dialect::ClickHouseDialect {},
+        actor,
+    )
+    .await
+    {
+        return response_to_value(crate::error::ApiRejection(err).into_response()).await;
     }
     let (mart_ident, iceberg_config) = match iceberg_config_for(state, &mart).await {
         Ok(pair) => pair,
         Err(err) => return err,
     };
-    match crate::gold_export::read_back_row_count(&iceberg_config, mart_ident.as_str()).await {
+    match crate::gold_export::read_back_row_count_for_zone(
+        &iceberg_config,
+        mart_ident.as_str(),
+        zone,
+    )
+    .await
+    {
         // `DATA-49` (QA `LH-DATA-1-01`): the same body as the route, so the
         // tool and `GET /api/gold/export/{mart}` cannot drift — a mart never
         // published answers `published: false`, not an error.
-        Ok(readback) => crate::routes::gold::read_back_body(mart_ident.as_str(), readback.as_ref()),
+        Ok(readback) => crate::routes::gold::read_back_body_for_zone(
+            mart_ident.as_str(),
+            readback.as_ref(),
+            zone,
+        ),
         Err(err) => {
             response_to_value(crate::error::ApiRejection(ApiError::from(err)).into_response()).await
         }
@@ -207,7 +266,7 @@ mod tests {
             json!({ "error": "mart is required" })
         );
         assert_eq!(
-            get_gold_export(&s, &Map::new()).await,
+            get_gold_export(&s, None, &Map::new()).await,
             json!({ "error": "mart is required" })
         );
     }
@@ -242,7 +301,7 @@ mod tests {
         args.insert("mart".to_owned(), json!("mart_wisman"));
         let export_result = export_gold_mart(&s, Some(&principal), &args).await;
         assert!(export_result.get("error").is_some(), "{export_result}");
-        let read_result = get_gold_export(&s, &args).await;
+        let read_result = get_gold_export(&s, None, &args).await;
         assert!(read_result.get("error").is_some(), "{read_result}");
     }
 

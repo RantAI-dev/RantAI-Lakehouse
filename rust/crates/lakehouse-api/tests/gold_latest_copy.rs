@@ -40,6 +40,7 @@ async fn state_with(dagster_url: String) -> AppState {
 
 fn request(mart: &str) -> LatestCopyRequest<'_> {
     LatestCopyRequest {
+        zone: lakehouse_iceberg::gold::PublishZone::Gold,
         mart,
         table: "gold_export_smoke",
         copy_exported_at_micros: COPY_MICROS,
