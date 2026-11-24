@@ -162,9 +162,13 @@ const AUDIT_READ_DENIED: &str = "reading the audit trail needs the audit:read pe
 /// history names upload tables of every tenant: see
 /// [`retain_rows_in_reach`]. The classification list is narrowed the same way
 /// (`SEC-20`, plan 96), by each row's `asset`: it names the tables of the
-/// shared catalog and the upload tables of every tenant. The quality list is
-/// narrowed the same way (`SEC-20`, plan ai-118): every rule names the table
-/// it checks. The audit trail is narrowed per tenant (`SEC-20`, plan 100):
+/// shared catalog and the upload tables of every tenant. GOV-16 narrows it by
+/// the role's table access too, through the same
+/// [`crate::routes::quality::asset_readable`] predicate the quality list uses;
+/// no catalog tenant gate is added, so a caller outside the catalog's tenant
+/// still reads the rows of the uploads their own tenant holds. The quality
+/// list is narrowed the same way (`SEC-20`, plan ai-118): every rule names the
+/// table it checks. The audit trail is narrowed per tenant (`SEC-20`, plan 100):
 /// the reader's scope is resolved with
 /// [`crate::routes::audit_scope::scope_for_principal`] and the rows are read
 /// through [`audit_trail`], so a reader sees its own organisation's rows plus
@@ -203,13 +207,28 @@ pub(crate) async fn read_kind(
     }
     // The gate runs before `run`, so a caller the catalog refuses causes no
     // `ClickHouse` query at all (`GOV-15` D8).
-    let narrowing = if parsed == Kind::Quality {
-        match crate::routes::quality::quality_table_access(state, principal, headers).await {
-            Ok(access) => Some(access),
-            Err(err) => return ApiRejection(err).into_response(),
+    let narrowing = match parsed {
+        Kind::Quality => {
+            match crate::routes::quality::quality_table_access(state, principal, headers).await {
+                Ok(access) => Some(access),
+                Err(err) => return ApiRejection(err).into_response(),
+            }
         }
-    } else {
-        None
+        // GOV-16: the classification list is narrowed by the role's table
+        // access too. It gets no catalog tenant gate here: `SEC-20` already
+        // narrows it by the caller's reach, so a caller outside the catalog's
+        // tenant still reads the rows of the uploads their own tenant holds.
+        // A store that cannot answer refuses rather than showing every row.
+        Kind::Classification => match principal {
+            Some(principal) => {
+                match crate::routes::catalog::table_access_for(state, principal).await {
+                    Ok(access) => Some(access),
+                    Err(err) => return ApiRejection(err).into_response(),
+                }
+            }
+            None => None,
+        },
+        _ => None,
     };
     // `SEC-20` (plan 95, plan 96 for the classification list): the reach is
     // resolved here for the same reason, so a header naming a tenant the caller
@@ -261,7 +280,12 @@ pub(crate) async fn read_kind(
         parsed => match run(state, parsed).await {
             Ok(mut body) => {
                 if let Some(access) = narrowing {
-                    retain_readable_rules(&access, &mut body);
+                    let rows_key = if parsed == Kind::Classification {
+                        "classifications"
+                    } else {
+                        "quality"
+                    };
+                    retain_readable_rows(&access, &mut body, rows_key);
                 }
                 if let Some(reach) = row_reach
                     && let Some((rows, table)) = parsed.reach_rows()
@@ -291,32 +315,35 @@ pub(crate) async fn read_kind(
     }
 }
 
-/// Drops every quality row whose `asset` the caller's table access hides, in
-/// place — the rule [`crate::routes::catalog::retain_visible`] applies to the
-/// catalog's own rows (`GOV-15` D6).
+/// Drops every row of `body[rows_key]` whose `asset` the caller's table access
+/// hides, in place — the rule [`crate::routes::catalog::retain_visible`]
+/// applies to the catalog's own rows (`GOV-15` D6, `GOV-16`).
 ///
 /// `retain_visible` itself cannot be called: it reads a row's `tableKey` or
-/// dotted `id`, while a quality row's key is its `asset` (an authored rule's
-/// `id` is a UUID, an observed row's `q-<n>`). A row with no `asset` string is
-/// hidden from a narrowed caller, as is an `asset` with no schema: nothing
-/// proves the grant covers it (fail closed).
+/// dotted `id`, while a quality or classification row's key is its `asset`
+/// (an authored rule's `id` is a UUID, an observed row's `q-<n>`). A row with
+/// no `asset` string is hidden from a narrowed caller, as is an `asset` with
+/// no schema: nothing proves the grant covers it (fail closed). The test is
+/// [`crate::routes::quality::asset_readable`], the one predicate all six
+/// narrowed readers share.
 ///
 /// The ids of the rows that are left are not renumbered here: this filter is
 /// one of the two that hide rows, and a row the other one drops would leave a
 /// gap in them. [`renumber_observed_quality_rows`] numbers them once both
 /// have run.
-fn retain_readable_rules(access: &crate::table_access::TableAccess, body: &mut Value) {
+fn retain_readable_rows(
+    access: &crate::table_access::TableAccess,
+    body: &mut Value,
+    rows_key: &str,
+) {
     if access.is_all() {
         return;
     }
-    let Some(rows) = body.get_mut("quality").and_then(Value::as_array_mut) else {
+    let Some(rows) = body.get_mut(rows_key).and_then(Value::as_array_mut) else {
         return;
     };
     rows.retain(|row| {
-        row.get("asset")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .is_some_and(|asset| access.allows_key(asset))
+        crate::routes::quality::asset_readable(access, row.get("asset").and_then(Value::as_str))
     });
 }
 
@@ -2573,6 +2600,45 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// GOV-16: the same row filter narrows the quality list and the
+    /// classification list; an unrestricted caller's body is left alone.
+    #[test]
+    fn retain_readable_rows_narrows_both_quality_and_classification_lists() {
+        let access = crate::table_access::TableAccess::Listed(
+            [("silver".to_owned(), "orders".to_owned())]
+                .into_iter()
+                .collect(),
+            std::collections::HashSet::new(),
+        );
+        let mut body = json!({
+            "quality": [
+                {"asset": "silver.orders"}, {"asset": "silver.customers"}, {"asset": "orders"}
+            ],
+            "classifications": [
+                {"asset": "silver.orders"}, {"asset": "silver.customers"}, {"asset": "orders"}
+            ],
+        });
+        retain_readable_rows(&access, &mut body, "quality");
+        retain_readable_rows(&access, &mut body, "classifications");
+        for key in ["quality", "classifications"] {
+            let assets: Vec<&str> = body[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|row| row["asset"].as_str())
+                .collect();
+            assert_eq!(assets, ["silver.orders"], "{key}: {body}");
+        }
+
+        let mut whole = json!({"quality": [{"asset": "silver.customers"}]});
+        retain_readable_rows(
+            &crate::table_access::TableAccess::All,
+            &mut whole,
+            "quality",
+        );
+        assert_eq!(whole["quality"].as_array().unwrap().len(), 1);
+    }
 
     // QA `LH-DATA-12-15` (`DATA-54`): the refusal names up to three tables
     // and counts the rest; with no table to name it says which forms to
