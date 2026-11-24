@@ -28,8 +28,8 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react"
-import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { afterEach, describe, expect, it, jest, mock, spyOn } from "bun:test"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import type { PipelineDetail, PipelineRun } from "@/services/contracts/pipelines"
 import { PipelineDetailPage } from "./pipeline-detail-page"
@@ -120,15 +120,52 @@ type Stub = {
   logLines?: { ts: number; level: string; stepKey: string | null; message: string }[]
   /** The pipeline the detail read answers; the test swaps its definition. */
   pipeline?: PipelineDetail
+  /** Successive detail reads (the last repeats) — the job-load poll test. */
+  details?: PipelineDetail[]
+  /** A refused Run now: the 409 error text the trigger POST answers. */
+  triggerError?: string
+  /** The detail read after a status POST (Mark ready). */
+  readyPipeline?: PipelineDetail
+  /** Pipeline ids sent to the pause/resume routes (BLD-18). */
+  paused?: string[]
+  resumed?: string[]
 }
 
 function stubApi(stub: Stub) {
-  return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
+  let detailIndex = 0
+  let current = stub.pipeline ?? PIPELINE
+  return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
+    const method = init?.method ?? "GET"
     if (path.includes("/api/auth/me")) {
       return json({ id: "u1", name: "Operator", email: null, roles: [], permissions: ["pipeline:read"], tenants: [] })
     }
-    if (path.endsWith("/api/pipelines/pl-connector-1")) return json(stub.pipeline ?? PIPELINE)
+    if (path.endsWith("/api/pipelines/pl-connector-1/status") && method === "POST") {
+      current = stub.readyPipeline ?? { ...current, status: "ready" }
+      return json(current)
+    }
+    if (path.endsWith("/api/pipelines/pl-connector-1/pause") && method === "POST") {
+      stub.paused?.push("pl-connector-1")
+      current = { ...current, status: "paused" }
+      return json(current)
+    }
+    if (path.endsWith("/api/pipelines/pl-connector-1/resume") && method === "POST") {
+      stub.resumed?.push("pl-connector-1")
+      current = { ...current, status: "ready" }
+      return json(current)
+    }
+    if (path.endsWith("/api/pipelines/pl-connector-1")) {
+      if (stub.details?.length) {
+        const next = stub.details[Math.min(detailIndex, stub.details.length - 1)]
+        detailIndex += 1
+        return json(next)
+      }
+      return json(current)
+    }
+    if (path.endsWith("/api/pipelines/pl-connector-1/trigger") && method === "POST") {
+      if (stub.triggerError) return json({ error: stub.triggerError }, 409)
+      return json(run("running"))
+    }
     if (path.endsWith("/api/pipelines/pl-connector-1/runs")) return json({ runs: [run(stub.status())], unavailable: null })
     if (path.includes("/runs/run-0001/logs")) {
       return json({ lines: stub.logLines ?? [], cursor: "0", truncated: false })
@@ -220,6 +257,122 @@ describe("the pipeline page's run state (BLD-8)", () => {
     expect(callout.textContent).not.toContain("Code: 60")
     expect(screen.getByRole("button", { name: /show errors in the log/i })).toBeTruthy()
   }, 20_000)
+})
+
+// BLD-11 F2/D3: the target lag is the trigger when one is set, whatever the
+// stored `schedule` says. BLD-18 adds the other half: a lag-driven pipeline
+// is pausable (and visibly paused), because the API now stops its freshness
+// sensor instead of only pausing a cron that never fires.
+describe("the pipeline page's trigger (BLD-11 / BLD-18)", () => {
+  it("a pipeline with a target lag and no schedule never says 'Manual only'", async () => {
+    const pipeline: PipelineDetail = {
+      ...PIPELINE,
+      schedule: "manual",
+      targetLag: { kind: "lag", minutes: 10 },
+    }
+    stubApi({ status: () => "completed", pipeline })
+    renderPage()
+
+    expect(await screen.findByText("Within 10 min of its inputs")).toBeTruthy()
+    expect(screen.queryByText("Manual only")).toBeNull()
+    expect(screen.getByText("Runs when an input changes")).toBeTruthy()
+  })
+
+  it("a ready target-lag pipeline offers Pause and clicking it calls the pause route", async () => {
+    const paused: string[] = []
+    const pipeline: PipelineDetail = {
+      ...PIPELINE,
+      schedule: "cron: 0 * * * * (RUNNING)",
+      targetLag: { kind: "lag", minutes: 120 },
+    }
+    stubApi({ status: () => "completed", pipeline, paused })
+    renderPage()
+
+    expect(await screen.findByText("Within 2 h of its inputs")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }))
+    const dialog = await screen.findByRole("dialog")
+    fireEvent.click(within(dialog).getByRole("button", { name: "Pause" }))
+
+    await waitFor(() => expect(paused).toEqual(["pl-connector-1"]))
+    // The page reflects the pause with the same `· paused` cue as a cron.
+    expect(await screen.findByRole("button", { name: "Resume" })).toBeTruthy()
+    expect(screen.getAllByText(/· paused/).length).toBeGreaterThan(0)
+  })
+
+  it("a paused target-lag pipeline shows a paused chip and offers Resume", async () => {
+    const resumed: string[] = []
+    const pipeline: PipelineDetail = {
+      ...PIPELINE,
+      schedule: "cron: 0 * * * * (PAUSED)",
+      status: "paused",
+      targetLag: { kind: "lag", minutes: 10 },
+    }
+    stubApi({ status: () => "completed", pipeline, resumed })
+    renderPage()
+
+    expect(await screen.findByText("Within 10 min of its inputs")).toBeTruthy()
+    expect(screen.getAllByText(/· paused/).length).toBeGreaterThan(0)
+    const button = await screen.findByRole("button", { name: "Resume" })
+    fireEvent.click(button)
+    await waitFor(() => expect(resumed).toEqual(["pl-connector-1"]))
+  })
+
+  it("a refused Run now shows the API's reason under the masthead", async () => {
+    stubApi({
+      status: () => "completed",
+      triggerError: "the orchestrator has not loaded this pipeline's job yet; try again in a minute.",
+    })
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: /run now/i }))
+    const alert = await screen.findByRole("alert", undefined, { timeout: 8000 })
+    expect(alert.textContent).toContain("try again in a minute")
+  })
+
+  it("a ready pipeline whose job is loading reloads its detail until the job is there", async () => {
+    // The poll is on a 4 s timer: drive it with fake timers so the second
+    // detail read is deterministic, then let React flush inside act().
+    jest.useFakeTimers()
+    try {
+      const loading: PipelineDetail = { ...PIPELINE, orchestratorJob: null }
+      const loaded: PipelineDetail = { ...PIPELINE, orchestratorJob: "authored__pl_connector_1" }
+      // The harness double-mounts (StrictMode), so the first two reads are
+      // still loading; only the bounded poll's read sees the job loaded.
+      stubApi({ status: () => "completed", details: [loading, loading, loaded] })
+      renderPage()
+
+      await act(async () => {})
+      expect(screen.getByText("The orchestrator is loading this pipeline's job.")).toBeTruthy()
+      // Two separate act() flushes: one poll look per 4 s tick.
+      await act(async () => {
+        jest.advanceTimersByTime(4500)
+      })
+      await act(async () => {
+        jest.advanceTimersByTime(4500)
+      })
+      // The detail poll saw the job load; no manual reload was needed.
+      expect(screen.queryByText("The orchestrator is loading this pipeline's job.")).toBeNull()
+    } finally {
+      jest.useRealTimers()
+    }
+  }, 20_000)
+
+  it("after Mark ready the page shows the pipeline as ready without a reload", async () => {
+    const draft: PipelineDetail = { ...PIPELINE, status: "draft", orchestratorJob: null }
+    const ready: PipelineDetail = { ...draft, status: "ready" }
+    stubApi({ status: () => "completed", pipeline: draft, readyPipeline: ready })
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: /mark ready/i }))
+    // The button's label flips to "Marking ready…" while pending, so wait for
+    // the post-reload banner rather than for the label to disappear.
+    expect(
+      await screen.findByText("The orchestrator is loading this pipeline's job.", undefined, {
+        timeout: 8000,
+      })
+    ).toBeTruthy()
+    expect(screen.queryByRole("button", { name: /mark ready/i })).toBeNull()
+  })
 })
 
 // BLD-10 D3: the definition page says the same as the form -- FBIC is not

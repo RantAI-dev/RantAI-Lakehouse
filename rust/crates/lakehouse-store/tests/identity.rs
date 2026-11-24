@@ -247,7 +247,8 @@ async fn setting_the_roles_replaces_the_whole_set(pool: PgPool) -> sqlx::Result<
     assert_eq!(resolved[0].name, "Approver");
     assert_eq!(
         resolved[0].permissions,
-        "agent:approve, policy:review,assistant:use,ops:read,alert:read,governance:read",
+        // SEC-66: 0153 appends the two read grants to every working role.
+        "agent:approve, policy:review,assistant:use,ops:read,alert:read,governance:read,gold:read,agent:read",
         "the role's own grant travels with it, so the caller can judge it"
     );
 

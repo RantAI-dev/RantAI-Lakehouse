@@ -67,6 +67,7 @@ const table: LakehouseTableDetail = {
     snapshotCount: 1,
     metadataLogCount: 0,
   },
+  compactionAvailable: false,
 }
 
 const queryOf = (href: string | null) => new URL(href ?? "", "http://x").searchParams

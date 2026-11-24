@@ -1703,6 +1703,34 @@ fn duration_seconds(start: Option<f64>, end: Option<f64>) -> Option<i64> {
     }
 }
 
+/// `Dagster`'s `startTime` (unix seconds) as an `OffsetDateTime` (BLD-11 F1,
+/// D1). A missing or out-of-range time writes no `last_run_at` — never a
+/// fabricated `now`. The fractional second is dropped, the same conversion
+/// `pipeline_lag::settle_request` applies to this field when it records a
+/// consumed run's start.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "Dagster run start times are unix seconds; the fractional part is dropped on purpose, matching pipeline_lag::settle_request"
+)]
+fn run_started_at(start: Option<f64>) -> Option<OffsetDateTime> {
+    start.and_then(|seconds| OffsetDateTime::from_unix_timestamp(seconds as i64).ok())
+}
+
+/// Record a confirmed run's start as the pipeline's `last_run_at` (BLD-11 F1,
+/// D1, D2). A store failure is reported through `upstream_error` and
+/// deliberately does not fail the run event: alerts are the event's job, the
+/// timestamp is a by-product. A missing `start_time` writes nothing.
+async fn note_last_run(pool: &PgPool, pipeline_id: &str, start: Option<f64>) {
+    let Some(started_at) = run_started_at(start) else {
+        return;
+    };
+    if let Err(err) = pipelines::record_last_run(pool, pipeline_id, started_at).await {
+        // BLD-11 F1: a timestamp by-product must never fail a run event that
+        // has already confirmed the run with Dagster; log it with a reference.
+        let _ = crate::upstream_error::store(&crate::upstream_error::STORE, &err);
+    }
+}
+
 /// Pipeline SLA "late" decision (plan 1f). Re-exported from
 /// `lakehouse_alerts::late` so the runs/detail routes and the alerts
 /// crate's `evaluate_pipeline_late` share one implementation. The
@@ -2648,6 +2676,10 @@ pub async fn run_failed_event(
         ))
         .into());
     }
+    // BLD-11 F1 (D1, D2): the failure is confirmed, so record its start as
+    // the pipeline's last run. Before the dedupe return on purpose — a sensor
+    // retry still carries the same start, and the monotonic write is a no-op.
+    note_last_run(pool, &pipeline_id, info.start_time).await;
     let failed_step_keys: Vec<String> = info
         .steps
         .iter()
@@ -2838,6 +2870,10 @@ pub async fn run_finished_event(
         ))
         .into());
     }
+    // BLD-11 F1 (D1, D2): the success is confirmed, so record its start as
+    // the pipeline's last run. The write is monotonic and never fails this
+    // event — see `note_last_run`.
+    note_last_run(pool, &pipeline_id, info.start_time).await;
     // DATA-13 (F2): the run is confirmed SUCCESS, so the SQL it ran becomes
     // the pipeline's column lineage. A failed run was refused above and
     // writes nothing.
@@ -2921,6 +2957,57 @@ pub async fn run_finished_event(
     Ok(ApiJson(json!({ "matched": matched })))
 }
 
+/// BLD-11 D9 (F6): a bound on how long `Run now` waits for the orchestrator
+/// to finish loading a just-marked-ready job. Ten two-second looks (20 s)
+/// bound a request a person is waiting on — this is NOT a measured reload
+/// time; the handoff reports the real first-Run-now time on the compose
+/// stack. The first attempt IS that fresh look after the reload, not an
+/// extra one before the ten attempts (BLD-11 review R3).
+const LAUNCH_JOB_WAIT_ATTEMPTS: u32 = 10;
+const LAUNCH_JOB_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// BLD-11 review R3: a hard wall-clock bound on the whole wait. Sleeps alone
+/// are not a bound — an untimed `list_jobs` that stalls can run the request
+/// into the route deadline and answer a 408 instead of the try-again 409.
+const LAUNCH_JOB_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Look for a loaded job up to `attempts` times, `interval` apart (BLD-11
+/// D9). A job that appears on a later look is found; exhausting the looks
+/// returns `false` so the caller can refuse with the try-again 409.
+// BLD-11 review R2: this helper and its constants sit above
+// `authored_launch_target`'s doc block so that doc stays attached to the
+// function it describes, not to the first item that followed it.
+async fn wait_for_job(
+    state: &AppState,
+    id: &str,
+    attempts: u32,
+    interval: std::time::Duration,
+) -> bool {
+    for attempt in 0..attempts {
+        if authored_pipelines::job_is_loaded(state, id).await {
+            return true;
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(interval).await;
+        }
+    }
+    false
+}
+
+/// BLD-11 review R3: put a wall-clock deadline around the bounded looks so
+/// that a stalled `job_is_loaded` call cannot turn the try-again 409 into the
+/// route's generic 408. A timed-out wait is the same "job not loaded" answer.
+async fn wait_for_job_within(
+    state: &AppState,
+    id: &str,
+    attempts: u32,
+    interval: std::time::Duration,
+    budget: std::time::Duration,
+) -> bool {
+    tokio::time::timeout(budget, wait_for_job(state, id, attempts, interval))
+        .await
+        .unwrap_or(false)
+}
+
 /// The job to launch for authored pipeline `id`, or the response that
 /// explains why there is none. A draft is refused (409) before the
 /// orchestrator is asked. A ready pipeline whose job the orchestrator has
@@ -2951,10 +3038,24 @@ async fn authored_launch_target(state: &AppState, id: &str) -> Result<String, Re
     }
     if !authored_pipelines::job_is_loaded(state, id).await {
         authored_pipelines::reload_orchestrator(state).await;
-        if !authored_pipelines::job_is_loaded(state, id).await {
+        // BLD-11 D9 (F6) / review R3: a job the reload has not loaded yet is
+        // often there a moment later. Give it bounded looks under a 20 s
+        // wall-clock deadline before answering 409, so the first Run now
+        // after Mark ready is not refused by a race and a stalled Dagster
+        // cannot turn the 409 into the route deadline's 408.
+        if !wait_for_job_within(
+            state,
+            id,
+            LAUNCH_JOB_WAIT_ATTEMPTS,
+            LAUNCH_JOB_WAIT_INTERVAL,
+            LAUNCH_JOB_WAIT_TIMEOUT,
+        )
+        .await
+        {
             return Err(ApiRejection(ApiError::Conflict(
-                "the orchestrator has not loaded this pipeline's job; check that \
-                 PIPELINE_RUN_TOKEN is set for both the API and the Dagster code location"
+                "the orchestrator has not loaded this pipeline's job yet; try again in a minute. \
+                 If it never loads, check that PIPELINE_RUN_TOKEN is set for both the API and the \
+                 Dagster code location"
                     .to_owned(),
             ))
             .into_response());
@@ -3113,13 +3214,26 @@ pub async fn create(
     // so the new pipeline is on the list the create form returns to. It
     // used to be inserted unassigned, which no tenant-scoped read shows.
     let tenant_id = crate::tenant_scope::resolve(&principal, &headers)?;
-    let body: CreatePipelineBody = parse_body(&body)?;
+    let mut body: CreatePipelineBody = parse_body(&body)?;
+    // BLD-19: a legacy `gold` target is written as `serving` — the Gold
+    // database `routes::catalog` lists and `routes::lineage` names. This is
+    // the one door the console, an older script and the assistant's
+    // `create_pipeline` tool all come through, so no caller can persist an
+    // orphan `gold` target. Input zones are normalised by `definition_form`
+    // below; `bronze` is left alone for the refusal that follows.
+    body.target_zone =
+        crate::routes::authored_pipelines::canonical_clickhouse_zone(&body.target_zone).to_owned();
     // BLD-3 / D4: refuse a `bronze` target before anything is written.
     // Same validator (and same message) as `authored_pipelines::update`
     // and `authored_pipelines::restore_version` run; the assistant's
     // `create_pipeline` tool lands here too, so it is refused with the
     // same wording its schema enum no longer offers.
     crate::routes::authored_pipelines::validate_target_zone(&body.target_zone)?;
+    // BLD-21: the output table is held to the same name rule the compiler
+    // applies to inputs and steps, before the store is touched. The
+    // assistant's `create_pipeline` tool lands here too, so it gets the
+    // same 400 and the same message as a console save.
+    crate::routes::authored_pipelines::validate_target_table(&body.target_table)?;
     // BLD-1 part 1 / D3: whichever of the two body forms this is, one
     // function turns it into D1's shape. A body that sends both is refused
     // here, before anything else reads them.
@@ -3306,8 +3420,14 @@ pub struct GeneratePipelineBody {
 /// words, non-alnum stripped, lowercased) — used both as the final
 /// fallback when the LLM is unavailable/returns nothing usable, and to
 /// sanitize whatever name the LLM does propose.
+///
+/// BLD-21: the fallback `target_table` is `<name>_out`, so the derived name
+/// must itself satisfy `crate::pipeline_compile::valid_name` with room for
+/// that suffix. A prompt beginning with a digit or made of four long words
+/// would otherwise author a pipeline the engine refuses on its next run —
+/// a valid prompt must still produce a saveable pipeline.
 fn derive_pipeline_name(text: &str) -> String {
-    let name: String = text
+    let mut name: String = text
         .split_whitespace()
         .take(4)
         .collect::<Vec<_>>()
@@ -3317,9 +3437,23 @@ fn derive_pipeline_name(text: &str) -> String {
         .collect::<String>()
         .to_lowercase();
     if name.is_empty() {
-        "agentic_pipeline".to_owned()
-    } else {
+        return "agentic_pipeline".to_owned();
+    }
+    // Strip the reserved `__` prefix and a leading digit, then leave room
+    // for `_out` within `MAX_NAME_CHARS`. The guard below is the defence in
+    // depth: an unexpected shape falls back to a name known to be valid.
+    name = name.trim_start_matches("__").to_owned();
+    if name.starts_with(|c: char| c.is_ascii_digit()) {
+        name.insert(0, 'p');
+    }
+    let name: String = name
+        .chars()
+        .take(crate::pipeline_compile::MAX_NAME_CHARS - 4)
+        .collect();
+    if crate::pipeline_compile::valid_name(&name) {
         name
+    } else {
+        "agentic_pipeline".to_owned()
     }
 }
 
@@ -3344,8 +3478,10 @@ fn derive_pipeline_name(text: &str) -> String {
 ///
 /// # Errors
 ///
-/// 400 on a malformed body; 409 if the derived name collides; 503/500 as
-/// above.
+/// 400 on a malformed body, a Bronze `database`, or a transform the model
+/// proposed that is outside the grammar; 422 when the compiled draft names a
+/// table its author may not read; 409 if the derived name collides; 503/500
+/// as above. BLD-13: all of these happen before any row is stored.
 pub async fn generate(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -3355,12 +3491,17 @@ pub async fn generate(
     // Same tenant rule as `create`: the draft lands in the caller's tenant.
     let tenant_id = crate::tenant_scope::resolve(&principal, &headers)?;
     let body: GeneratePipelineBody = parse_body(&body)?;
+    // BLD-19: the draft's source and target are the same zone, so both
+    // spellings must name `serving` for a Gold draft — the catalog only
+    // lists `silver` and `serving`.
+    let database =
+        crate::routes::authored_pipelines::canonical_clickhouse_zone(&body.database).to_owned();
     // The draft used to be a name and nothing else: every generated
     // pipeline arrived reading `source_table` → `target_table`, kind
     // "incremental", schedule "On demand", whatever had been asked for.
     // The model now proposes the shape too, and every field it does not
     // give falls back to something derived rather than invented.
-    let draft = llm_pipeline_draft(&state, &body.instruction, &body.database).await;
+    let draft = llm_pipeline_draft(&state, &body.instruction, &database).await;
     let fallback_name = derive_pipeline_name(&body.instruction);
     let name = draft
         .as_ref()
@@ -3379,28 +3520,79 @@ pub async fn generate(
         .as_ref()
         .and_then(|d| d.target_table.clone())
         .unwrap_or_else(|| format!("{fallback_name}_out"));
+    // BLD-21: a model may propose any string for `targetTable`, so the same
+    // guard a person's save goes through runs here too. The derived
+    // fallback is already a valid name (see `derive_pipeline_name`), so a
+    // valid prompt is never refused for a name this route made up.
+    crate::routes::authored_pipelines::validate_target_table(&target_table)?;
     let schedule = draft
         .as_ref()
         .and_then(|d| d.schedule.clone())
         .unwrap_or_else(|| "On demand".to_owned());
+    // BLD-13: a drafted pipeline must pass the SAME checks `create` runs
+    // before a row is written. The canonicalised zone (`database`, BLD-19)
+    // is both the source and the target zone of a generated draft, so
+    // Bronze is refused here with the same message `create` answers:
+    // Bronze is written by ingestion and by nothing else.
+    crate::routes::authored_pipelines::validate_target_zone(&database)?;
+    // BLD-13: parse and normalize whatever the model proposed into D1's
+    // shape through the very same form `create` uses. A transform the model
+    // invented that is outside the grammar is refused with the same 400
+    // (naming its index); a valid draft now stores populated inputs/steps
+    // instead of two empty arrays that would compile into a bare copy.
+    let transforms = draft
+        .as_ref()
+        .map(|d| d.transforms.clone())
+        .unwrap_or_default();
+    let form = crate::routes::authored_pipelines::definition_form(
+        None,
+        None,
+        Some(database.as_str()),
+        Some(source_table.as_str()),
+        Some(&transforms),
+    )?;
+    // BLD-13: the first-input guard `create` runs. `generate` never wires
+    // upstreams, names a connector or sets a target lag, so the other
+    // `create` checks (`validate_per_table_upstream`, `validate_upstreams`,
+    // `check_connector_for_definition`, `validate_target_lag`, `max_retries`)
+    // have nothing to act on here — a comment, not a silently dropped check.
+    let first = crate::routes::authored_pipelines::first_input(&form)?;
+    crate::routes::authored_pipelines::validate_per_table_upstream(&first.zone, Some(&[]))?;
+    // BLD-13: compile, gate and rewrite as the author BEFORE the row exists,
+    // exactly as `create` does. A model that names a table its author may
+    // not read is refused now, not when someone tries to run the draft.
+    crate::routes::authored_pipelines::compile_and_save_check(
+        &state,
+        tenant_id,
+        author_id(&principal),
+        &form.inputs,
+        &form.steps,
+        (&database, &target_table),
+    )
+    .await?;
     let input = CreatePipelineInput {
-        inputs: Vec::new(),
-        steps: Vec::new(),
+        inputs: form.inputs,
+        steps: form.steps,
         name,
         kind,
-        source_zone: body.database.clone(),
-        source_table,
+        // BLD-13: the source is the form's first input (the legacy shape
+        // `generate` builds carries `database`/`source_table`, so this is
+        // the same value `create`-era code stored), read from the parsed
+        // form rather than re-derived, so the stored row and the compiled
+        // definition cannot disagree. BLD-19: the zone is the canonical
+        // `serving` for a Gold draft, because the form was built from it.
+        source_zone: first.zone.clone(),
+        source_table: first.table.clone(),
         // The draft LLM call proposes an incremental column/transforms too
         // (see `PipelineDraft` below); nothing asks it for FBIC, so that
         // stays the same honest "not configured" default `create` uses
         // when a human author leaves it unset.
         incremental_column: draft.as_ref().and_then(|d| d.incremental_column.clone()),
-        transforms: draft
-            .as_ref()
-            .map(|d| d.transforms.clone())
-            .unwrap_or_default(),
+        // BLD-13: the grammar-checked transforms from the form, so the
+        // stored legacy strings and the stored steps say the same thing.
+        transforms: form.legacy_transforms.unwrap_or_default(),
         fbic_enabled: false,
-        target_zone: body.database,
+        target_zone: database,
         target_table,
         schedule,
         owner: Some("Agentic Builder".to_owned()),
@@ -3592,9 +3784,12 @@ struct SetStatusBody {
 /// [`ALLOWED_TRANSITIONS`] (checked before any store call — no read, no
 /// write); 409 if `status` is a known target but the pipeline's CURRENT
 /// status is not an allowed source for it (checked after a read, before any
-/// WRITE). A genuine store failure below that point (e.g. a database
-/// outage) keeps `StoreError`'s existing classification via `?` — it is
-/// never folded into 400, since an outage is not a caller error.
+/// WRITE); BLD-13: on a `ready` target, 400/422 when the stored definition
+/// fails the same checks `create` runs (Bronze target, a bad transform, an
+/// unauthorized source, …), with the status left untouched. A genuine store
+/// failure below that point (e.g. a database outage) keeps `StoreError`'s
+/// existing classification via `?` — it is never folded into 400, since an
+/// outage is not a caller error.
 pub async fn set_status_route(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -3642,6 +3837,66 @@ pub async fn set_status_route(
         .into());
     }
 
+    // BLD-13: `draft -> ready` is where a stored row becomes runnable, so it
+    // must carry the same checks `create` applied when the row was written.
+    // A legacy/corrupt draft (Bronze target, bad transform, a source its
+    // author may not read) is refused here instead of failing at run time.
+    // Only the `"ready"` target is gated: pausing or demoting a broken
+    // pipeline goes through `pause`/`authored_status` and must still work.
+    if body.status == "ready" {
+        let pool = pool(&state)?;
+        // `get_definition` does the same legacy conversion as the store's
+        // migration `0140`: an old row with empty inputs/steps is rebuilt
+        // from its source zone/table and transforms, so the checks below
+        // see the definition the row actually means.
+        let stored = pipelines::get_definition(pool, &id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
+        crate::routes::authored_pipelines::validate_target_zone(&stored.target_zone)?;
+        let first = crate::routes::authored_pipelines::first_of(&stored.inputs)?;
+        crate::routes::authored_pipelines::validate_per_table_upstream(
+            &first.zone,
+            Some(&current.depends_on),
+        )?;
+        // `depends_on` is checked against the authored graph and Dagster
+        // exactly as `create` checks it; an unreachable Dagster degrades to
+        // "no Dagster upstreams", never a 500. An empty chain is a no-op.
+        crate::routes::authored_pipelines::validate_upstreams(
+            &state,
+            &id,
+            &current.depends_on,
+            "ready",
+        )
+        .await?;
+        crate::routes::authored_pipelines::validate_target_lag(current.target_lag)?;
+        // The connector was checked for tenant and source when it was set;
+        // `Keep` re-checks the source rule against today's inputs without
+        // re-running the tenant check (`update` does the same on a kept one).
+        if let Some(connector_id) = current.connector_id.as_deref() {
+            crate::routes::authored_pipelines::check_connector_for_definition(
+                pool,
+                &lakehouse_store::pipelines::ConnectorChange::Keep,
+                Some(connector_id),
+                current.tenant_id,
+                &stored.inputs,
+            )
+            .await?;
+        }
+        // BLD-13: compile, gate and rewrite as the stored author, the same
+        // save-time check `create` ran. `run_as = None` is an honest "no
+        // author" (D2): the check stores nothing new about the identity and
+        // does not block the promotion, exactly as it does not block create.
+        crate::routes::authored_pipelines::compile_and_save_check(
+            &state,
+            current.tenant_id,
+            current.run_as,
+            &stored.inputs,
+            &stored.steps,
+            (&stored.target_zone, &stored.target_table),
+        )
+        .await?;
+    }
+
     // Only NOW, after both checks pass, does a write happen. A StoreError
     // here (a real database failure, or — belt-and-suspenders — the CHECK
     // constraint rejecting something this route's own checks already
@@ -3652,10 +3907,15 @@ pub async fn set_status_route(
     let updated = pipelines::set_status(pool(&state)?, &id, &body.status)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
-    // A pipeline that just became ready needs a job: the orchestrator
-    // builds it on reload. Best effort; `trigger` reloads again if the job
-    // is still missing when someone runs it.
-    authored_pipelines::reload_orchestrator(&state).await;
+    // A pipeline that just became ready needs a job: the orchestrator builds
+    // it on reload. BLD-11 D8 (F6): the status write has already committed,
+    // so answer now and let the best-effort reload finish in the background.
+    // Waiting here made "Mark ready" hang for the whole reload; `Run now`
+    // waits briefly for the job instead (see `authored_launch_target`).
+    let bg = state.clone();
+    tokio::spawn(async move {
+        let _ = authored_pipelines::reload_orchestrator(&bg).await;
+    });
     Ok(ApiJson(updated))
 }
 
@@ -3750,48 +4010,92 @@ async fn authored_status(
 ) -> Result<Option<pipelines::Pipeline>, ApiError> {
     let status = if paused { "paused" } else { "ready" };
     let updated = pipelines::set_status(pool(state)?, id, status).await?;
-    if updated.is_some() {
-        // The status is the record; the orchestrator's schedule is what
-        // actually fires. Its stored on/off state outlives a reload, so it
-        // is switched directly as well as rebuilt. An authored pipeline
-        // with no cron schedule has none to switch, which is not an error.
-        let schedule = authored_pipelines::schedule_name(id);
-        let switched = if paused {
-            state.dagster.stop_schedule(&schedule).await
+    if let Some(pipeline) = updated.as_ref() {
+        // Only `kind: "lag"` builds a polling freshness sensor; a
+        // `downstream` target is refreshed by its readers' checks and is
+        // guarded at the lag-check choke point instead (BLD-18).
+        let has_lag_sensor = matches!(pipeline.target_lag, Some(pipelines::TargetLag::Lag { .. }));
+        if paused {
+            // Stop BEFORE the reload: the sensors and schedule still exist
+            // in the current code location, so their stored instigation
+            // state really moves to STOPPED. Stopping after the reload
+            // would find no sensor (the Python factory omits it for a
+            // `paused` row) and leave the old RUNNING state stored.
+            toggle_authored_automation(state, id, false, has_lag_sensor).await;
+            authored_pipelines::reload_orchestrator(state).await;
         } else {
-            state.dagster.start_schedule(&schedule).await
-        };
-        if let Ok(ScheduleOutcome {
-            error: Some(err), ..
-        }) = switched
-        {
-            tracing::info!(%err, pipeline_id = id, "authored schedule not switched");
+            // Reload BEFORE starting: a paused pipeline's `_lag` sensor has
+            // no definition in the current code location. Dagster preserves
+            // the stored STOPPED state when the factory re-emits it, and
+            // `default_status=RUNNING` applies only to freshly created
+            // sensors, not to one whose state survived a reload. Starting
+            // first would hit `SensorNotFoundError` and leave it stopped.
+            authored_pipelines::reload_orchestrator(state).await;
+            toggle_authored_automation(state, id, true, has_lag_sensor).await;
         }
-        // F1.2 (#57): chained pipelines ALSO ship an
-        // `authored__<id>_after` run-status sensor. Like the schedule,
-        // its stored RUNNING/STOPPED state outlives a code-location
-        // reload, so a `paused` pipeline keeps firing the chain
-        // unless the sensor is switched explicitly. `default_status`
-        // on the Python side does NOT apply to stored state -- only
-        // to freshly created ones. A pipeline with no `dependsOn`
-        // has no sensor to switch; the `set_sensor_running` method
-        // treats that as already-stopped (SensorNotFoundError
-        // tolerated on `running=false`).
-        let sensor = authored_pipelines::sensor_name(id);
-        let sensor_switched = if paused {
-            state.dagster.set_sensor_running(&sensor, false).await
-        } else {
-            state.dagster.set_sensor_running(&sensor, true).await
-        };
-        if let Ok(SensorOutcome {
-            error: Some(err), ..
-        }) = &sensor_switched
-        {
-            tracing::info!(%err, pipeline_id = id, "authored sensor not switched");
-        }
-        authored_pipelines::reload_orchestrator(state).await;
     }
     Ok(updated)
+}
+
+/// Switch the stored Dagster state of every automation that can launch an
+/// authored pipeline: its cron schedule, its dependency `_after` sensor and
+/// — for `targetLag.kind == "lag"` — its freshness `_lag` sensor (BLD-18).
+///
+/// Each flip is best effort: the status is the record, and a definition that
+/// was never built (no cron schedule, no `dependsOn`, no target lag) is not
+/// an error. [`lakehouse_dagster::DgClient::set_sensor_running`] already
+/// treats a missing sensor on `running=false` as already stopped; a missing
+/// schedule or a `startSensor` on an undefined sensor comes back as an
+/// `Ok` outcome with `error` set, which is logged here and never surfaced.
+async fn toggle_authored_automation(
+    state: &AppState,
+    id: &str,
+    running: bool,
+    has_lag_sensor: bool,
+) {
+    // The status is the record; the orchestrator's schedule is what
+    // actually fires. Its stored on/off state outlives a reload, so it
+    // is switched directly as well as rebuilt. An authored pipeline
+    // with no cron schedule has none to switch, which is not an error.
+    let schedule = authored_pipelines::schedule_name(id);
+    let switched = if running {
+        state.dagster.start_schedule(&schedule).await
+    } else {
+        state.dagster.stop_schedule(&schedule).await
+    };
+    if let Ok(ScheduleOutcome {
+        error: Some(err), ..
+    }) = switched
+    {
+        tracing::info!(%err, pipeline_id = id, "authored schedule not switched");
+    }
+    // F1.2 (#57): chained pipelines ALSO ship an
+    // `authored__<id>_after` run-status sensor. Like the schedule,
+    // its stored RUNNING/STOPPED state outlives a code-location
+    // reload, so a `paused` pipeline keeps firing the chain
+    // unless the sensor is switched explicitly.
+    let sensor = authored_pipelines::sensor_name(id);
+    let sensor_switched = state.dagster.set_sensor_running(&sensor, running).await;
+    if let Ok(SensorOutcome {
+        error: Some(err), ..
+    }) = &sensor_switched
+    {
+        tracing::info!(%err, pipeline_id = id, "authored sensor not switched");
+    }
+    // BLD-18: the freshness sensor is a THIRD automation. The Python
+    // factory omits it for a `paused` row but keeps its stored instigation
+    // state across reloads, so only an explicit stop here truly stops a
+    // target-lag pipeline's automatic runs.
+    if has_lag_sensor {
+        let lag_sensor = authored_pipelines::lag_sensor_name(id);
+        let lag_switched = state.dagster.set_sensor_running(&lag_sensor, running).await;
+        if let Ok(SensorOutcome {
+            error: Some(err), ..
+        }) = &lag_switched
+        {
+            tracing::info!(%err, pipeline_id = id, "authored lag sensor not switched");
+        }
+    }
 }
 
 async fn dagster_schedule_toggle(state: &AppState, job_name: &str, paused: bool) -> Response {
@@ -4826,6 +5130,84 @@ mod tests {
             err.0.to_string(),
             crate::routes::authored_pipelines::BRONZE_TARGET_REFUSED
         );
+    }
+
+    /// BLD-21: `POST /api/pipelines` refuses an output table name the
+    /// compiler would refuse on an input or a step, with the shared message.
+    /// `state_without_pool()` proves the guard runs before any store,
+    /// orchestrator or tenant lookup decides anything. The assistant's
+    /// `create_pipeline` tool calls this same handler, so it is refused too.
+    #[tokio::test]
+    async fn create_with_an_invalid_target_table_is_refused_before_the_store() {
+        let body = Bytes::from_static(
+            br#"{"name":"pl-bad-target-table","kind":"batch","sourceZone":"silver","sourceTable":"s","targetZone":"gold","targetTable":"a; DROP TABLE b","schedule":"manual","transforms":[]}"#,
+        );
+        let err = create(
+            State(state_without_pool()),
+            Extension(fixture_user_principal()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect_err("an invalid target table must be refused");
+        assert_eq!(err.0.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.0.to_string(),
+            crate::routes::authored_pipelines::TARGET_TABLE_REFUSED
+        );
+    }
+
+    /// BLD-21 positive control: a valid `targetTable` passes the new guard
+    /// and reaches the store, which without a pool answers 503. Without this
+    /// test a guard that refused every name would still make the negative
+    /// test green. The closed local port keeps the unit test off any real
+    /// `Dagster` host.
+    #[tokio::test]
+    async fn create_with_a_valid_target_table_passes_the_guard_and_reaches_the_store() {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+        env.insert(
+            "DAGSTER_URL".to_owned(),
+            "http://127.0.0.1:1/graphql".to_owned(),
+        );
+        let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        let body = Bytes::from_static(
+            br#"{"name":"pl-good-target-table","kind":"batch","sourceZone":"silver","sourceTable":"s","targetZone":"gold","targetTable":"orders_clean","schedule":"manual","transforms":[]}"#,
+        );
+        let err = create(
+            State(state),
+            Extension(fixture_user_principal()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect_err("no pool configured: the store answers 503");
+        assert_eq!(err.0.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// BLD-21: `generate` derives its fallback target table from this name,
+    /// so a leading digit, a reserved `__` prefix, four very long words or
+    /// an empty result must all still yield a name the compiler accepts —
+    /// with room for the `_out` suffix.
+    #[test]
+    fn derive_pipeline_name_always_yields_a_name_the_compiler_accepts() {
+        for text in [
+            "2026 sales report build",
+            "a_very_long_word another_very_long_word third_very_long_word fourth_very_long_word",
+            "__internal secret data",
+            "!!!",
+            "orders by country",
+        ] {
+            let name = derive_pipeline_name(text);
+            assert!(
+                crate::pipeline_compile::valid_name(&name),
+                "{text:?} derived {name:?}, which the compiler would refuse"
+            );
+            assert!(
+                crate::pipeline_compile::valid_name(&format!("{name}_out")),
+                "{text:?} derived a fallback target table {name:?}_out that is too long"
+            );
+        }
     }
 
     /// WS5 item D4, failing-test-first: `pipeline_audit_event` did not
@@ -8007,7 +8389,333 @@ mod tests {
                 "an invalid transform must write nothing to pipeline_definition"
             );
         }
+
+        /// BLD-19: `serving` is the Gold zone the catalog lists, so a
+        /// pipeline created with that target is stored verbatim. The stored
+        /// `pipeline_definition.target` is what Dagster reads to pick the
+        /// `ClickHouse` database, so this is the value that matters.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_stores_a_serving_target_as_serving(pool: sqlx::PgPool) {
+            lakehouse_store::uploads::claim_table(
+                &pool,
+                super::SEED_TENANT.parse().unwrap(),
+                "orders",
+                "upload-bld19-serving",
+            )
+            .await
+            .expect("claim the bronze source table");
+            let name = format!("create-serving-test-{}", uuid::Uuid::new_v4());
+            let body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "name": name,
+                    "kind": "batch",
+                    "sourceZone": "bronze",
+                    "sourceTable": "orders",
+                    "transforms": [],
+                    "targetZone": "serving",
+                    "targetTable": "mart_bld19_serving",
+                    "schedule": "manual",
+                }))
+                .expect("serialize"),
+            );
+            let (_, ApiJson(created)) = create(
+                State(state_for(&pool)),
+                Extension(super::fixture_member_principal()),
+                HeaderMap::new(),
+                body,
+            )
+            .await
+            .expect("a serving target is accepted");
+            assert_eq!(created.target, "serving.mart_bld19_serving");
+            let row: (String,) =
+                sqlx::query_as("SELECT target FROM pipeline_definition WHERE id = $1")
+                    .bind(&created.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("query the stored target");
+            assert_eq!(row.0, "serving.mart_bld19_serving");
+        }
+
+        /// BLD-19: an older client (or script) still sending `gold` gets
+        /// its pipeline stored as `serving` — never as an orphan `gold`
+        /// database that the catalog and lineage do not list.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_normalizes_a_legacy_gold_target_to_serving(pool: sqlx::PgPool) {
+            lakehouse_store::uploads::claim_table(
+                &pool,
+                super::SEED_TENANT.parse().unwrap(),
+                "orders",
+                "upload-bld19-gold",
+            )
+            .await
+            .expect("claim the bronze source table");
+            let name = format!("create-gold-test-{}", uuid::Uuid::new_v4());
+            let body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "name": name,
+                    "kind": "batch",
+                    "sourceZone": "bronze",
+                    "sourceTable": "orders",
+                    "transforms": [],
+                    "targetZone": "gold",
+                    "targetTable": "mart_bld19_gold",
+                    "schedule": "manual",
+                }))
+                .expect("serialize"),
+            );
+            let (_, ApiJson(created)) = create(
+                State(state_for(&pool)),
+                Extension(super::fixture_member_principal()),
+                HeaderMap::new(),
+                body,
+            )
+            .await
+            .expect("a legacy gold target must be accepted as serving");
+            assert_eq!(created.target, "serving.mart_bld19_gold");
+            let row: (String,) =
+                sqlx::query_as("SELECT target FROM pipeline_definition WHERE id = $1")
+                    .bind(&created.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("query the stored target");
+            assert_eq!(row.0, "serving.mart_bld19_gold");
+        }
     }
+
+    /// BLD-13 — `POST /api/pipelines/generate` now runs the same checks
+    /// `create` runs. A draft is refused before a row is written, and a
+    /// valid one stores the compiled definition, not two empty arrays.
+    mod generate_route {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use lakehouse_test_support as _;
+
+        use crate::config::Config;
+        use crate::state::AppState;
+
+        use super::*;
+
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database"),
+            )
+        }
+
+        /// An [`AppState`] on the test database. `catalog_tenant`, when
+        /// given, is the tenant that owns the shared catalog: a generated
+        /// draft reads an unclaimed Silver table, which only that tenant
+        /// may reach. Leaving it out makes the author's own tenant (a
+        /// non-catalog one) unable to read that table — the save-time gate
+        /// then refuses the draft.
+        fn state_for(pool: &sqlx::PgPool, catalog_tenant: Option<&str>) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
+            if let Some(catalog_tenant) = catalog_tenant {
+                env.insert("CATALOG_TENANT_ID".to_owned(), catalog_tenant.to_owned());
+            }
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        /// Same state, with the model pointed at a mock that answers every
+        /// chat completion with `draft` as its content.
+        async fn state_with_draft(
+            pool: &sqlx::PgPool,
+            catalog_tenant: Option<&str>,
+            draft: serde_json::Value,
+        ) -> AppState {
+            let llm = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "choices": [{ "message": {
+                        "role": "assistant",
+                        "content": draft.to_string(),
+                    } }],
+                })))
+                .mount(&llm)
+                .await;
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
+            env.insert("LLM_URL".to_owned(), llm.uri());
+            if let Some(catalog_tenant) = catalog_tenant {
+                env.insert("CATALOG_TENANT_ID".to_owned(), catalog_tenant.to_owned());
+            }
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        fn generate_body(instruction: &str, database: &str) -> Bytes {
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "instruction": instruction,
+                    "database": database,
+                }))
+                .expect("serialize"),
+            )
+        }
+
+        async fn row_named(pool: &sqlx::PgPool, name: &str) -> Option<(String,)> {
+            sqlx::query_as("SELECT id FROM pipeline_definition WHERE name = $1")
+                .bind(name)
+                .fetch_optional(pool)
+                .await
+                .expect("query should succeed")
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn generate_refuses_a_bronze_database_and_stores_nothing(pool: sqlx::PgPool) {
+            let state = state_for(&pool, None);
+            let instruction = "load the daily sales files";
+
+            let err = generate(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                generate_body(instruction, "bronze"),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.0.status(), 400, "the Bronze refusal is a caller error");
+            assert!(
+                err.0
+                    .to_string()
+                    .contains(authored_pipelines::BRONZE_TARGET_REFUSED),
+                "the same message `create` uses: {err:?}"
+            );
+            assert!(
+                row_named(&pool, &derive_pipeline_name(instruction))
+                    .await
+                    .is_none(),
+                "a refused draft must not be stored"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn generate_refuses_an_unparseable_transform_and_stores_nothing(pool: sqlx::PgPool) {
+            // The model invented a transform outside the grammar — the
+            // dangerous shape is one that carries SQL inside an argument.
+            let state = state_with_draft(
+                &pool,
+                Some(SEED_TENANT),
+                json!({
+                    "name": "bad_transform",
+                    "kind": "batch",
+                    "sourceTable": "sales",
+                    "targetTable": "sales_out",
+                    "schedule": "On demand",
+                    "incrementalColumn": null,
+                    "transforms": ["filter(1=1; DROP TABLE x)"],
+                }),
+            )
+            .await;
+
+            let err = generate(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                generate_body("load the daily sales files", "silver"),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.0.status(), 400);
+            let message = err.0.to_string();
+            assert!(
+                message.contains("transforms[0]"),
+                "the refusal names the entry by index: {message:?}"
+            );
+            assert!(
+                !message.contains("DROP TABLE"),
+                "the model's text is never echoed into a response: {message:?}"
+            );
+            assert!(
+                row_named(&pool, "bad_transform").await.is_none(),
+                "a refused draft must not be stored"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn generate_refuses_a_draft_the_author_may_not_read_and_stores_nothing(
+            pool: sqlx::PgPool,
+        ) {
+            // CATALOG_TENANT_ID names a DIFFERENT tenant, so the author's
+            // own tenant owns no shared table and the save-time gate (D9)
+            // refuses the unclaimed Silver source before the row exists.
+            let other_tenant = "11111111-1111-4111-8111-000000000002";
+            let state = state_for(&pool, Some(other_tenant));
+            let instruction = "load the daily sales files";
+
+            let err = generate(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                generate_body(instruction, "silver"),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(
+                err.0.status(),
+                422,
+                "the save-time gate's refusal is an unprocessable definition: {err:?}"
+            );
+            assert!(
+                row_named(&pool, &derive_pipeline_name(instruction))
+                    .await
+                    .is_none(),
+                "a refused draft must not be stored"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn generate_stores_a_compiled_definition_for_a_valid_draft(pool: sqlx::PgPool) {
+            let state = state_with_draft(
+                &pool,
+                Some(SEED_TENANT),
+                json!({
+                    "name": "generated_sales",
+                    "kind": "incremental",
+                    "sourceTable": "sales",
+                    "targetTable": "sales_out",
+                    "schedule": "On demand",
+                    "incrementalColumn": null,
+                    "transforms": ["filter(status = 'active')"],
+                }),
+            )
+            .await;
+
+            let (status, ApiJson(created)) = generate(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                generate_body("load the daily sales files", "silver"),
+            )
+            .await
+            .expect("a valid draft succeeds");
+
+            assert_eq!(status, StatusCode::CREATED);
+            let definition = pipelines::get_definition(&pool, &created.id)
+                .await
+                .expect("read the stored definition")
+                .expect("the row exists");
+            assert_eq!(definition.inputs.len(), 1, "the form's input is stored");
+            assert_eq!(definition.steps.len(), 1, "the form's step is stored");
+            assert_eq!(definition.inputs[0].table, "sales");
+            assert_eq!(definition.target_zone, "silver");
+            assert_eq!(definition.transforms, vec!["filter(status = 'active')"]);
+        }
+    }
+
     /// WS4 item D4 — `POST /api/pipelines/{id}/status`'s
     /// `ALLOWED_TRANSITIONS` table, exercised against a real Postgres.
     mod status_route {
@@ -8054,6 +8762,31 @@ mod tests {
             env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             let config = Config::from_map(&env).expect("a valid test Config");
             AppState::new(config)
+        }
+
+        /// The same state with `DAGSTER_URL` pointed at a wiremock, for the
+        /// BLD-11 D8/D9 tests that exercise the reload and job-load probes.
+        fn state_with_dagster(pool: &sqlx::PgPool, dagster_uri: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
+            env.insert("DAGSTER_URL".to_owned(), format!("{dagster_uri}/graphql"));
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        /// A Dagster GraphQL job list, with or without the authored job.
+        fn job_list_response(with_job: bool) -> serde_json::Value {
+            let jobs = if with_job {
+                vec![json!({ "name": "authored__pl_wait" })]
+            } else {
+                Vec::new()
+            };
+            json!({
+                "data": { "repositoriesOrError": {
+                    "__typename": "RepositoryConnection",
+                    "nodes": [{ "jobs": jobs }]
+                } }
+            })
         }
 
         /// R1-B9: a service identity can create a pipeline, and it has no
@@ -8150,6 +8883,206 @@ mod tests {
             assert_eq!(updated.status, "ready");
         }
 
+        /// BLD-11 D8 (F6): Mark ready answers as soon as the status is
+        /// written, not after the orchestrator's (here 5-second) reload.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn marking_ready_answers_before_the_orchestrator_reload_finishes(pool: sqlx::PgPool) {
+            use wiremock::matchers::{body_string_contains, method};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let dagster = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("reloadRepositoryLocation"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(std::time::Duration::from_secs(5))
+                        .set_body_json(json!({
+                            "data": { "reloadRepositoryLocation": {
+                                "__typename": "WorkspaceLocationEntry",
+                                "locationOrLoadError": { "__typename": "Loaded" }
+                            } }
+                        })),
+                )
+                .mount(&dagster)
+                .await;
+            let state = state_with_dagster(&pool, &dagster.uri());
+            let pipeline = create_draft(&state).await;
+
+            let ApiJson(updated) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                set_status_route(
+                    State(state),
+                    Some(Extension(fixture_unrestricted_principal())),
+                    HeaderMap::new(),
+                    Path(pipeline.id.clone()),
+                    status_body("ready"),
+                ),
+            )
+            .await
+            .expect("the route answers before the 5 s reload finishes")
+            .expect("draft -> ready succeeds");
+            assert_eq!(updated.status, "ready");
+            let stored = pipelines::get_pipeline(&pool, &pipeline.id)
+                .await
+                .expect("read the pipeline")
+                .expect("the row exists");
+            assert_eq!(stored.status, "ready");
+            // Let the best-effort background reload settle before the mock drops.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+
+        /// BLD-11 D9 (F6): a job that is not loaded on the first look but is
+        /// on the second is found before the attempts run out.
+        #[tokio::test]
+        async fn wait_for_job_finds_a_job_that_appears_on_the_second_look() {
+            use wiremock::matchers::{body_string_contains, method};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("repositoriesOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(job_list_response(false)))
+                .up_to_n_times(1)
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("repositoriesOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(job_list_response(true)))
+                .with_priority(2)
+                .mount(&server)
+                .await;
+            let state = AppState::new(
+                Config::from_map(&HashMap::from([(
+                    "DAGSTER_URL".to_owned(),
+                    format!("{}/graphql", server.uri()),
+                )]))
+                .expect("a valid test Config"),
+            );
+
+            assert!(wait_for_job(&state, "pl-wait", 3, std::time::Duration::from_millis(50)).await);
+        }
+
+        /// BLD-11 D9: when the job never appears, `wait_for_job` gives up
+        /// after its attempts instead of waiting forever.
+        #[tokio::test]
+        async fn wait_for_job_gives_up_after_its_attempts() {
+            use wiremock::matchers::{body_string_contains, method};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("repositoriesOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(job_list_response(false)))
+                .mount(&server)
+                .await;
+            let state = AppState::new(
+                Config::from_map(&HashMap::from([(
+                    "DAGSTER_URL".to_owned(),
+                    format!("{}/graphql", server.uri()),
+                )]))
+                .expect("a valid test Config"),
+            );
+
+            assert!(
+                !wait_for_job(&state, "pl-wait", 3, std::time::Duration::from_millis(50)).await
+            );
+        }
+
+        /// BLD-11 D9 (F6): a Run now on a job that never loads answers 409
+        /// with the try-again text, not the old bare token-check sentence.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn run_now_on_a_job_that_never_loads_says_to_try_again(pool: sqlx::PgPool) {
+            use wiremock::matchers::{body_string_contains, method};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let dagster = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("repositoriesOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(job_list_response(false)))
+                .mount(&dagster)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("reloadRepositoryLocation"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "reloadRepositoryLocation": {
+                        "__typename": "WorkspaceLocationEntry",
+                        "locationOrLoadError": { "__typename": "Loaded" }
+                    } }
+                })))
+                .mount(&dagster)
+                .await;
+            let state = state_with_dagster(&pool, &dagster.uri());
+            let pipeline = create_draft(&state).await;
+            sqlx::query("UPDATE pipeline_definition SET status = 'ready' WHERE id = $1")
+                .bind(&pipeline.id)
+                .execute(&pool)
+                .await
+                .expect("mark the pipeline ready");
+
+            let response = authored_launch_target(&state, &pipeline.id)
+                .await
+                .expect_err("a job that never loads is refused");
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read the response body");
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                text.contains("try again in a minute"),
+                "the 409 says to try again: {text}"
+            );
+        }
+
+        /// BLD-11 review R3: the wait is bounded by wall-clock time, not by
+        /// sleeps plus however long `list_jobs` takes. A probe that stalls for
+        /// 25 s cannot outlive a 100 ms budget; before the fix there was no
+        /// bounded helper, and the same mock hung the whole request past the
+        /// route deadline instead of answering the try-again 409.
+        #[tokio::test]
+        async fn a_stalled_job_probe_stops_at_the_wall_clock_budget() {
+            use wiremock::matchers::{body_string_contains, method};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            assert_eq!(
+                super::super::LAUNCH_JOB_WAIT_TIMEOUT,
+                std::time::Duration::from_secs(20),
+                "the route's hard bound is 20 s"
+            );
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("repositoriesOrError"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(std::time::Duration::from_secs(25))
+                        .set_body_json(job_list_response(false)),
+                )
+                .mount(&server)
+                .await;
+            let state = AppState::new(
+                Config::from_map(&HashMap::from([(
+                    "DAGSTER_URL".to_owned(),
+                    format!("{}/graphql", server.uri()),
+                )]))
+                .expect("a valid test Config"),
+            );
+            let started = std::time::Instant::now();
+            let loaded = wait_for_job_within(
+                &state,
+                "pl-wait",
+                10,
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_millis(100),
+            )
+            .await;
+            assert!(!loaded, "a stalled probe is a job that did not load");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "the stall was cut off at the budget, not left to run: {:?}",
+                started.elapsed()
+            );
+        }
+
         #[sqlx::test(migrations = "../../migrations")]
         async fn status_route_refuses_a_run_derived_target_status_with_400_and_writes_nothing(
             pool: sqlx::PgPool,
@@ -8228,6 +9161,412 @@ mod tests {
                 err.0.status(),
                 404,
                 "a non-pl- id has no from-state to look up"
+            );
+        }
+
+        /// BLD-13: a stored draft can predate the Bronze-target refusal.
+        /// Promoting it must run the same target-zone check `create` runs,
+        /// and leave the status alone when the check refuses.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn ready_refuses_a_legacy_draft_with_a_bronze_target(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let pipeline = create_draft(&state).await;
+            sqlx::query(
+                "UPDATE pipeline_definition SET target = 'bronze.corrupt_out' WHERE id = $1",
+            )
+            .bind(&pipeline.id)
+            .execute(&pool)
+            .await
+            .expect("seed a legacy Bronze-target draft");
+
+            let err = set_status_route(
+                State(state),
+                Some(Extension(fixture_unrestricted_principal())),
+                HeaderMap::new(),
+                Path(pipeline.id.clone()),
+                status_body("ready"),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.0.status(), 400);
+            assert!(
+                err.0
+                    .to_string()
+                    .contains(authored_pipelines::BRONZE_TARGET_REFUSED)
+            );
+            let current = pipelines::get_pipeline(&pool, &pipeline.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row exists");
+            assert_eq!(current.status, "draft", "the refusal wrote nothing");
+        }
+
+        /// BLD-13: a legacy row whose transforms cannot be parsed is rebuilt
+        /// into a step by `get_definition` and refused by the compiler the
+        /// same way `create` refuses a bad transform at write time.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn ready_refuses_a_draft_with_an_unparseable_transform(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let pipeline = create_draft(&state).await;
+            sqlx::query(
+                "UPDATE pipeline_definition SET inputs = '[]', steps = '[]', \
+                 transforms = '[\"filter(1=1; DROP TABLE x)\"]' WHERE id = $1",
+            )
+            .bind(&pipeline.id)
+            .execute(&pool)
+            .await
+            .expect("seed a draft with a bad legacy transform");
+
+            let err = set_status_route(
+                State(state),
+                Some(Extension(fixture_unrestricted_principal())),
+                HeaderMap::new(),
+                Path(pipeline.id.clone()),
+                status_body("ready"),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.0.status(), 400);
+            assert!(
+                !err.0.to_string().contains("DROP TABLE"),
+                "the bad transform's own text is never echoed"
+            );
+            let current = pipelines::get_pipeline(&pool, &pipeline.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row exists");
+            assert_eq!(current.status, "draft", "the refusal wrote nothing");
+        }
+
+        /// BLD-13: a draft whose source table belongs to another tenant is
+        /// refused by the same save-time gate `create` runs. The caller is
+        /// unrestricted; the check deliberately uses the STORED author, so
+        /// an admin cannot promote a pipeline whose author may not read its
+        /// own source.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn ready_refuses_a_draft_whose_source_is_not_its_authors_table(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let pipeline = create_draft(&state).await;
+            lakehouse_store::uploads::claim_table(
+                &pool,
+                "11111111-1111-4111-8111-000000000002".parse().unwrap(),
+                "foreign_table",
+                "upload-bld13",
+            )
+            .await
+            .expect("claim the table to another tenant");
+            sqlx::query(
+                "UPDATE pipeline_definition SET source = 'bronze.foreign_table', \
+                 inputs = '[{\"name\":\"foreign_table\",\"zone\":\"bronze\",\"table\":\"foreign_table\"}]', \
+                 steps = '[]', transforms = '[]' WHERE id = $1",
+            )
+            .bind(&pipeline.id)
+            .execute(&pool)
+            .await
+            .expect("seed a draft reading another tenant's table");
+
+            let err = set_status_route(
+                State(state),
+                Some(Extension(fixture_unrestricted_principal())),
+                HeaderMap::new(),
+                Path(pipeline.id.clone()),
+                status_body("ready"),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(
+                err.0.status(),
+                422,
+                "the save-time gate refuses an unreadable source: {err:?}"
+            );
+            let current = pipelines::get_pipeline(&pool, &pipeline.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row exists");
+            assert_eq!(current.status, "draft", "the refusal wrote nothing");
+        }
+
+        /// BLD-13: a draft whose definition passes every check still moves
+        /// to `ready`, and the stored definition is the one that was checked.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn ready_accepts_a_valid_draft_and_stores_its_checked_definition(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let pipeline = create_draft(&state).await;
+            let definition = pipelines::get_definition(&pool, &pipeline.id)
+                .await
+                .expect("read the definition")
+                .expect("the row exists");
+            assert_eq!(definition.inputs.len(), 1);
+
+            let ApiJson(updated) = set_status_route(
+                State(state),
+                Some(Extension(fixture_unrestricted_principal())),
+                HeaderMap::new(),
+                Path(pipeline.id.clone()),
+                status_body("ready"),
+            )
+            .await
+            .expect("a valid draft is promoted");
+
+            assert_eq!(updated.status, "ready");
+            let current = pipelines::get_pipeline(&pool, &pipeline.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row exists");
+            assert_eq!(current.status, "ready");
+        }
+
+        /// BLD-13: gating only the `"ready"` target keeps the escape hatch
+        /// open — a broken pipeline that is already running can still be
+        /// paused through `pause`/`authored_status`, which never runs the
+        /// write-time checks.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn pausing_a_broken_ready_pipeline_still_succeeds(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let pipeline = create_draft(&state).await;
+            // Bypass the route the way an old row would have been written:
+            // a Bronze target that `ready` now refuses, and a ready status.
+            sqlx::query(
+                "UPDATE pipeline_definition SET target = 'bronze.corrupt_out', \
+                 status = 'ready' WHERE id = $1",
+            )
+            .bind(&pipeline.id)
+            .execute(&pool)
+            .await
+            .expect("seed a broken ready pipeline");
+
+            let response = pause(
+                State(state),
+                Some(Extension(fixture_unrestricted_principal())),
+                HeaderMap::new(),
+                Path(pipeline.id.clone()),
+            )
+            .await;
+
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a broken pipeline can still be paused"
+            );
+            let current = pipelines::get_pipeline(&pool, &pipeline.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row exists");
+            assert_eq!(current.status, "paused");
+        }
+
+        // ── BLD-18: Pause must stop a target-lag pipeline ───────────────
+        // The Python factory drops a `paused` row's `_lag` sensor on the
+        // next reload, but Dagster preserves a sensor's stored
+        // RUNNING/STOPPED state across that reload. These tests pin both
+        // halves of the fix: an explicit stop BEFORE the reload on pause,
+        // and a reload BEFORE an explicit start on resume.
+
+        /// A ready authored pipeline with `targetLag.kind == "lag"` and no
+        /// cron schedule (a lag replaces the schedule, BLD-2 D3).
+        async fn create_lag_pipeline(state: &AppState) -> pipelines::Pipeline {
+            let pool = state.pg.as_deref().expect("DATABASE_URL was set");
+            let pipeline = lakehouse_store::pipelines::create_pipeline(
+                pool,
+                &CreatePipelineInput {
+                    inputs: Vec::new(),
+                    steps: Vec::new(),
+                    name: format!("bld18-lag-{}", uuid::Uuid::new_v4()),
+                    kind: "batch".to_owned(),
+                    source_zone: "bronze".to_owned(),
+                    source_table: "t".to_owned(),
+                    incremental_column: None,
+                    transforms: Vec::new(),
+                    fbic_enabled: false,
+                    target_zone: "silver".to_owned(),
+                    target_table: "t".to_owned(),
+                    schedule: "manual".to_owned(),
+                    owner: None,
+                    description: None,
+                    max_retries: None,
+                    tenant_id: None,
+                    depends_on: Vec::new(),
+                    connector_id: None,
+                    id: None,
+                    target_lag: Some(pipelines::TargetLag::Lag { minutes: 15 }),
+                    run_as: None,
+                },
+                None,
+            )
+            .await
+            .expect("create a target-lag pipeline");
+            pipelines::set_status(pool, &pipeline.id, "ready")
+                .await
+                .expect("mark the pipeline ready");
+            pipeline
+        }
+
+        /// The Dagster answers the three automation mutations need. The
+        /// schedule mutations deliberately say `ScheduleNotFoundError`:
+        /// a target-lag pipeline has no cron schedule, and stopping/starting
+        /// one must not fail the pause or the resume (BLD-18).
+        async fn mount_lag_automation_mocks(server: &wiremock::MockServer) {
+            use wiremock::matchers::{body_string_contains, method};
+            use wiremock::{Mock, ResponseTemplate};
+
+            for mutation in ["stopRunningSchedule", "startSchedule"] {
+                Mock::given(method("POST"))
+                    .and(body_string_contains(mutation))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "data": { mutation: {
+                            "__typename": "ScheduleNotFoundError",
+                            "message": "a target-lag pipeline has no cron schedule"
+                        } }
+                    })))
+                    .mount(server)
+                    .await;
+            }
+            Mock::given(method("POST"))
+                .and(body_string_contains("sensorOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "sensorOrError": {
+                        "__typename": "Sensor",
+                        "sensorState": { "id": "sensor-state-id", "status": "RUNNING" }
+                    } }
+                })))
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("stopSensor"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "stopSensor": {
+                        "__typename": "StopSensorMutationResult",
+                        "instigationState": { "id": "sensor-state-id", "status": "STOPPED" }
+                    } }
+                })))
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("startSensor"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "startSensor": {
+                        "__typename": "Sensor",
+                        "sensorState": { "status": "RUNNING" }
+                    } }
+                })))
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("reloadRepositoryLocation"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "reloadRepositoryLocation": {
+                        "__typename": "WorkspaceLocationEntry",
+                        "locationOrLoadError": { "__typename": "Loaded" }
+                    } }
+                })))
+                .mount(server)
+                .await;
+        }
+
+        fn request_bodies(requests: &[wiremock::Request]) -> Vec<String> {
+            requests
+                .iter()
+                .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+                .collect()
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn pausing_a_target_lag_pipeline_stops_its_freshness_sensor_before_the_reload(
+            pool: sqlx::PgPool,
+        ) {
+            let dagster = wiremock::MockServer::start().await;
+            mount_lag_automation_mocks(&dagster).await;
+            let state = state_with_dagster(&pool, &dagster.uri());
+            let pipeline = create_lag_pipeline(&state).await;
+            let lag_sensor = authored_pipelines::lag_sensor_name(&pipeline.id);
+
+            let response = pause(
+                State(state),
+                Some(Extension(fixture_unrestricted_principal())),
+                HeaderMap::new(),
+                Path(pipeline.id.clone()),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a missing cron schedule must not fail a target-lag pause"
+            );
+            let stored = pipelines::get_pipeline(&pool, &pipeline.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row exists");
+            assert_eq!(stored.status, "paused");
+
+            let requests = dagster.received_requests().await.expect("read requests");
+            let bodies = request_bodies(&requests);
+            assert!(
+                bodies
+                    .iter()
+                    .any(|b| b.contains("sensorOrError") && b.contains(&lag_sensor)),
+                "the freshness sensor {lag_sensor} must be looked up for the stop: {bodies:?}"
+            );
+            let stop = bodies
+                .iter()
+                .position(|b| b.contains("stopSensor"))
+                .expect("stopSensor was called");
+            let reload = bodies
+                .iter()
+                .position(|b| b.contains("reloadRepositoryLocation"))
+                .expect("the code location was reloaded");
+            assert!(
+                stop < reload,
+                "stop the live sensor before the reload removes its definition: {bodies:?}"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn resuming_a_target_lag_pipeline_reloads_then_starts_its_freshness_sensor(
+            pool: sqlx::PgPool,
+        ) {
+            let dagster = wiremock::MockServer::start().await;
+            mount_lag_automation_mocks(&dagster).await;
+            let state = state_with_dagster(&pool, &dagster.uri());
+            let pipeline = create_lag_pipeline(&state).await;
+            pipelines::set_status(&pool, &pipeline.id, "paused")
+                .await
+                .expect("the pipeline starts paused");
+            let lag_sensor = authored_pipelines::lag_sensor_name(&pipeline.id);
+
+            let response = resume(
+                State(state),
+                Some(Extension(fixture_unrestricted_principal())),
+                HeaderMap::new(),
+                Path(pipeline.id.clone()),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a missing cron schedule must not fail a target-lag resume"
+            );
+            let stored = pipelines::get_pipeline(&pool, &pipeline.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row exists");
+            assert_eq!(stored.status, "ready");
+
+            let requests = dagster.received_requests().await.expect("read requests");
+            let bodies = request_bodies(&requests);
+            let reload = bodies
+                .iter()
+                .position(|b| b.contains("reloadRepositoryLocation"))
+                .expect("the code location was reloaded");
+            let start = bodies
+                .iter()
+                .position(|b| b.contains("startSensor") && b.contains(&lag_sensor))
+                .expect("the freshness sensor was started");
+            assert!(
+                reload < start,
+                "the sensor has no definition until the reload re-emits it: {bodies:?}"
             );
         }
     }
@@ -9827,6 +11166,118 @@ mod tests {
                 .await
                 .expect("mark the fixture runnable");
             pipeline.id
+        }
+
+        /// BLD-11 F1 (D1, D2): a confirmed SUCCESS writes the run's start as
+        /// the pipeline's `last_run_at`. Before the fix nothing wrote the
+        /// column, so the list/masthead always said "Never". A store failure
+        /// here is a by-product and never fails the event.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_successful_run_event_writes_the_runs_start_as_last_run_at(pool: sqlx::PgPool) {
+            let dagster = MockServer::start().await;
+            let ch = MockServer::start().await;
+            let state = state_for(&pool, &dagster.uri(), &ch.uri());
+            let pipeline_id = seed_runnable_pipeline(&state, "Last Run Success Flow").await;
+            let job = super::super::authored_pipelines::job_name(&pipeline_id);
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("pipelineRunOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineRunOrError": {
+                        "__typename": "Run", "status": "SUCCESS",
+                        "startTime": 1_700_000_000.0, "endTime": null, "stepStats": []
+                    } }
+                })))
+                .mount(&dagster)
+                .await;
+            // No alert rules — the event still succeeds and the timestamp is written.
+            Mock::given(method("POST"))
+                .and(body_string_contains("FROM console.alert_rule"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [], "rows": 0, "data": []
+                })))
+                .mount(&ch)
+                .await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&ch)
+                .await;
+
+            let before = pipelines::get_pipeline(&pool, &pipeline_id)
+                .await
+                .expect("read the pipeline")
+                .expect("the pipeline exists");
+            assert_eq!(before.last_run_at, None, "a fresh pipeline never ran");
+
+            run_finished_event(
+                State(state),
+                Extension(fixture_service_principal()),
+                body_for("run-last-run-success", &job),
+            )
+            .await
+            .expect("the success event is accepted");
+
+            let after = pipelines::get_pipeline(&pool, &pipeline_id)
+                .await
+                .expect("read the pipeline")
+                .expect("the pipeline exists");
+            assert_eq!(
+                after.last_run_at,
+                Some(iso_from_unix_seconds(1_700_000_000.0)),
+                "the run's start is recorded as the last run"
+            );
+        }
+
+        /// BLD-11 F1 (D1, D2): a confirmed FAILURE also writes the run's
+        /// start. The write sits before the dedupe return so a retried event
+        /// still records it (the monotonic `WHERE` makes retries no-ops).
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_failed_run_event_writes_the_runs_start_as_last_run_at(pool: sqlx::PgPool) {
+            let dagster = MockServer::start().await;
+            let ch = MockServer::start().await;
+            let state = state_for(&pool, &dagster.uri(), &ch.uri());
+            let pipeline_id = seed_runnable_pipeline(&state, "Last Run Failure Flow").await;
+            let job = super::super::authored_pipelines::job_name(&pipeline_id);
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("pipelineRunOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineRunOrError": {
+                        "__typename": "Run", "status": "FAILURE",
+                        "startTime": 1_700_000_000.0, "endTime": null, "stepStats": []
+                    } }
+                })))
+                .mount(&dagster)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("FROM console.alert_rule"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [], "rows": 0, "data": []
+                })))
+                .mount(&ch)
+                .await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&ch)
+                .await;
+
+            run_failed_event(
+                State(state),
+                Extension(fixture_service_principal()),
+                body_for("run-last-run-failure", &job),
+            )
+            .await
+            .expect("the failure event is accepted");
+
+            let after = pipelines::get_pipeline(&pool, &pipeline_id)
+                .await
+                .expect("read the pipeline")
+                .expect("the pipeline exists");
+            assert_eq!(
+                after.last_run_at,
+                Some(iso_from_unix_seconds(1_700_000_000.0)),
+                "the failed run's start is recorded as the last run"
+            );
         }
 
         /// A sensor retry must not re-deliver: the first

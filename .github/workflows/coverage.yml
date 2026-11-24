@@ -140,6 +140,24 @@ jobs:
           sudo docker image prune --all --force
           df -h /
 
+      # REL-14: this job runs the same ClickHouse-backed tests as ci.yml's
+      # `Rust · test` job. Pull their images once here, after the disk prune
+      # above, with the same bounded retry: a truncated registry stream then
+      # fails this step instead of whichever test started first. A tag that
+      # drifts only loses the retry — the test still pulls its own image, and
+      # `lakehouse-test-support::clickhouse` retries that start too. The step
+      # ends with `docker images`, so it cannot fail the job.
+      - name: Pull the test images (the pull is retried, a test never is)
+        run: |
+          for image in postgres:16-alpine clickhouse/clickhouse-server:26.8 axllent/mailpit:v1.33.0; do
+            for attempt in 1 2 3; do
+              if timeout 180 docker pull --quiet "$image"; then break; fi
+              echo "pull of $image failed (attempt $attempt of 3)"
+              if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
+            done
+          done
+          docker images --format '{{.Repository}}:{{.Tag}}' | sort
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:

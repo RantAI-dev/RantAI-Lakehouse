@@ -2369,6 +2369,19 @@ pub struct FieldsQuery {
 
 /// `GET /api/dashboard/fields` — mart list, or one mart's columns split
 /// into dimensions/measures.
+///
+/// # Shared catalog names (SEC-58)
+///
+/// The mart list and every mart's columns come from `serving` tables of the
+/// deployment's single shared catalog. `SEC-20`/`SEC-50` gate ROWS; the names
+/// of those tables and columns are gated here by the exact
+/// [`crate::routes::catalog::catalog_tenant_refusal`] check the catalog uses.
+/// A caller whose tenant does not own the shared catalog gets the empty mart
+/// list (the shape `fields_body(…, None)` returns) or, when it names a mart,
+/// the same `404` a hidden mart answers — so neither a name nor the existence
+/// of a mart is confirmed. The `?source=` branch reads a saved SQL source, not
+/// shared catalog metadata: it is scoped by `viewer_for` (folder ACL and the
+/// GOV-17 hidden-source resolver), so it keeps its existing behaviour.
 pub async fn fields(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -2380,6 +2393,14 @@ pub async fn fields(
     if let Err(err) = require_entitled(&state, &principal).await {
         return crate::error::ApiRejection(err).into_response();
     }
+    // SEC-58: decide this once, before any `system.tables`/`system.columns`
+    // read behind the mart branches. An error is returned unchanged (fail
+    // closed: an invalid `X-Tenant` or a store failure is never softened).
+    let catalog_refusal =
+        match crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await {
+            Ok(refusal) => refusal,
+            Err(err) => return crate::error::ApiRejection(err).into_response(),
+        };
     // `GOV-7` D6: which tables the caller's roles hide, asked once per
     // request and applied to every list and detail below.
     let access = match crate::routes::catalog::table_access_for(&state, &principal).await {
@@ -2396,6 +2417,16 @@ pub async fn fields(
         return match source_fields_body(&state.clickhouse, &viewer, id).await {
             Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
             Err(err) => crate::error::ApiRejection(err).into_response(),
+        };
+    }
+    // SEC-58: a caller that does not own the shared catalog learns none of
+    // its names. The unqualified list is the empty list the builder already
+    // handles; a named mart (with or without joins) is the GOV-7 404, so an
+    // outsider cannot confirm the mart exists either.
+    if catalog_refusal.is_some() {
+        return match q.mart.as_deref() {
+            None => (StatusCode::OK, ApiJson(json!({ "marts": [] }))).into_response(),
+            Some(mart) => crate::error::ApiRejection(mart_not_found(mart)).into_response(),
         };
     }
     if let (Some(mart), Some(raw)) = (
@@ -2416,14 +2447,10 @@ pub async fn fields(
         Ok(mut body) => {
             retain_visible_marts(&access, &mut body);
             if q.mart.is_none() {
-                // PR #106 review R1 BLOCKER 2, SHOULD-FIX DATA-12 2:
-                // Only decorate marts if catalog_tenant_refusal allows it:
-                if let Ok(None) =
-                    crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers)
-                        .await
-                {
-                    mark_marts(&state, &mut body).await;
-                }
+                // PR #106 review R1 BLOCKER 2, SHOULD-FIX DATA-12 2: the
+                // tenant gate above already proved `catalog_refusal` is
+                // `None`, so decoration is safe without a second read.
+                mark_marts(&state, &mut body).await;
             }
             (StatusCode::OK, ApiJson(body)).into_response()
         }
@@ -2762,12 +2789,25 @@ pub struct JoinSuggestionsQuery {
 pub async fn join_suggestions(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Query(q): Query<JoinSuggestionsQuery>,
 ) -> Response {
     // BI-19 B2 (plan D8): "signed in" at the router; a person with neither
     // `dashboard:read` nor a rule is refused here, as the router refused them.
     if let Err(err) = crate::routes::dashboard_access::require_entitled(&state, &principal).await {
         return crate::error::ApiRejection(err).into_response();
+    }
+    // SEC-58: `system.columns` here names the columns of two `serving`
+    // marts — exactly the names `GET /api/dashboard/fields` lists. Gate them
+    // with the same SEC-20/SEC-50 check; an outsider gets the unknown-mart
+    // 404 (no column name, no confirmation that the mart exists).
+    match crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await {
+        Ok(Some(_)) => {
+            let name = q.left.as_deref().unwrap_or("");
+            return crate::error::ApiRejection(mart_not_found(name)).into_response();
+        }
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+        Ok(None) => {}
     }
     let access = match crate::routes::catalog::table_access_for(&state, &principal).await {
         Ok(access) => access,
@@ -3817,12 +3857,23 @@ pub(crate) fn file_slug(title: &str, fallback: &str) -> String {
 
 /// A file name from a tile's title (see [`file_slug`]). A file that was cut at
 /// the row cap says so in its name (feature decision 8).
-pub(crate) fn export_file_name(title: &str, extension: &str, cut_at: Option<u32>) -> String {
+///
+/// `BI-28`: a file made while an active filter did not apply to the tile ends
+/// its name with `-filters-not-applied`, so the reader sees it outside the
+/// file; the body of a CSV or TSV is not changed.
+pub(crate) fn export_file_name(
+    title: &str,
+    extension: &str,
+    (cut_at, filters_skipped): (Option<u32>, bool),
+) -> String {
     let slug = file_slug(title, "table");
-    match cut_at {
-        Some(rows) => format!("{slug}-first-{rows}-rows.{extension}"),
-        None => format!("{slug}.{extension}"),
-    }
+    let cut = cut_at.map_or_else(String::new, |rows| format!("-first-{rows}-rows"));
+    let note = if filters_skipped {
+        "-filters-not-applied"
+    } else {
+        ""
+    };
+    format!("{slug}{cut}{note}.{extension}")
 }
 
 /// What one download did, for the audit record.
@@ -3830,9 +3881,13 @@ struct ExportOutcome {
     action: &'static str,
     rows: usize,
     cut: bool,
+    /// Which limit cut the file (`rows` or `bytes`), `None` when it was whole.
+    cut_by: Option<&'static str>,
     cap: u32,
     format: crate::export::FileFormat,
     values: crate::export::Values,
+    /// `BI-28`: a dashboard filter was left out of the file.
+    filters_skipped: bool,
 }
 
 /// The audit entry of one download (a chart's file or a dashboard's PDF),
@@ -3884,9 +3939,16 @@ async fn record_export_audit(
             "tile": chart.spec.id,
             "rows": outcome.rows,
             "cut": outcome.cut,
+            // BI-27: a file the byte cap cut says so in the audit row, with
+            // the cap it met, as the row cap does.
+            "cutBy": outcome.cut_by,
             "cap": outcome.cap,
+            "byteCap": crate::export::EXPORT_BYTE_CAP,
             "format": outcome.format.extension(),
             "values": if outcome.values == crate::export::Values::Raw { "raw" } else { "formatted" },
+            // BI-28: the same sentence the file carries, so the record says
+            // what the file did not apply.
+            "note": outcome.filters_skipped.then_some(crate::export::FILTERS_NOT_APPLIED),
         }),
     )
     .await
@@ -3935,7 +3997,7 @@ fn export_statement(
     q: &ChartExportQuery,
     (shown, filters): (&[String], &[FilterDef]),
     time: &TimeContext,
-) -> Result<String, ApiError> {
+) -> Result<(String, bool), ApiError> {
     let chosen_sort = q.sort_column.clone().filter(|c| !c.is_empty());
     let fields = lakehouse_bi::tables::TableFields {
         columns: Some(shown.to_vec()),
@@ -3951,15 +4013,15 @@ fn export_statement(
     };
     let known: HashSet<String> = relation.cols.keys().cloned().collect();
     let plan = lakehouse_bi::tables::plan_rows(&fields, &known).map_err(ApiError::BadRequest)?;
-    Ok(lakehouse_bi::builder::rows_page_sql(
+    let page = lakehouse_bi::builder::rows_page_sql(
         &relation.from,
         &relation.cols,
         filters,
         &plan,
         (crate::export::EXPORT_ROW_CAP + 1, 0),
         time,
-    )
-    .rows)
+    );
+    Ok((page.rows, !page.skipped.is_empty()))
 }
 
 /// The statement of a raw table's rows, with the labels of its columns.
@@ -3969,10 +4031,21 @@ async fn rows_export_statement(
     q: &ChartExportQuery,
     dashboard_filters: Vec<FilterDef>,
     time: &TimeContext,
-) -> Result<(String, HashMap<String, String>), ApiError> {
+) -> Result<(String, HashMap<String, String>, bool), ApiError> {
+    let (shown, labels) = export_columns(chart);
+    // BI-28: the columns the file shows and the one it sorts by go into the
+    // relation's query, so a calculated field among them is added to the
+    // relation as it is for the records list (it is not a column of the mart).
+    let sort_column = q
+        .sort_column
+        .clone()
+        .filter(|c| !c.is_empty())
+        .or_else(|| chart.def.tables.sort_column.clone());
     let relation_query = RecordsQuery {
         mart: Some(chart.def.mart.clone()),
         sql_source: chart.def.sql_source.clone(),
+        columns: Some(shown.join(",")),
+        sort_column,
         ..RecordsQuery::default()
     };
     let relation = records_relation(ch, &relation_query, chart.def.shape.joins_list()).await?;
@@ -3988,9 +4061,8 @@ async fn rows_export_statement(
     let own = own.as_slice();
     let relation = with_calculated_columns(ch, relation, (&relation_query, own), time).await?;
     let filters = with_chart_filters(own, dashboard_filters, &relation.cols, time)?;
-    let (shown, labels) = export_columns(chart);
-    let statement = export_statement(chart, &relation, q, (&shown, &filters), time)?;
-    Ok((statement, shown.into_iter().zip(labels).collect()))
+    let (statement, skipped) = export_statement(chart, &relation, q, (&shown, &filters), time)?;
+    Ok((statement, shown.into_iter().zip(labels).collect(), skipped))
 }
 
 /// The statement a grouped tile (a chart, a pivot, a summary table, a KPI)
@@ -4003,7 +4075,7 @@ async fn grouped_export_statement(
     q: &ChartExportQuery,
     filters: &[FilterDef],
     time: &TimeContext,
-) -> Result<String, ApiError> {
+) -> Result<(String, bool), ApiError> {
     let years: Vec<i64> = q
         .year
         .as_deref()
@@ -4046,7 +4118,7 @@ async fn grouped_export_statement(
     };
     let effective = effective_chart(chart, &cols, &sources, &read).map_err(ApiError::BadRequest)?;
     stored_chart_sql(&effective, &years, filters, &cols, &sources, &read)
-        .map(|filtered| filtered.sql)
+        .map(|filtered| (filtered.sql, !filtered.skipped.is_empty()))
         .map_err(|message| ApiError::Unprocessable(message.to_owned()))
 }
 
@@ -4088,7 +4160,7 @@ fn export_response(
     written: crate::export::Written,
     file_name: &str,
     format: crate::export::FileFormat,
-    cap: u32,
+    (cap, cut_by): (u32, Option<&'static str>),
 ) -> Response {
     let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(written.file));
     (
@@ -4112,10 +4184,25 @@ fn export_response(
                 header::HeaderName::from_static("x-export-cap"),
                 cap.to_string(),
             ),
+            (
+                header::HeaderName::from_static("x-export-cut-by"),
+                cut_by.unwrap_or("none").to_owned(),
+            ),
         ],
         body,
     )
         .into_response()
+}
+
+/// The row count a cut file names: the row cap when that cut it, the rows it
+/// holds when the byte cap did (`BI-27`), so "first N rows" is always true of
+/// the file and the console's sentence stays right. `X-Export-Cap` carries
+/// the same number.
+pub(crate) fn cut_rows(written: &crate::export::Written, row_cap: u32) -> u32 {
+    match written.cut_by(row_cap as usize) {
+        Some("bytes") => u32::try_from(written.rows).unwrap_or(row_cap),
+        _ => row_cap,
+    }
 }
 
 /// `GET /api/dashboard/chart-export?chart=&format=&values=` — the whole result
@@ -4140,8 +4227,9 @@ fn export_response(
 /// data, bad filters or sort; with `format=png` see
 /// [`crate::routes::pdf_export::export_chart_png`]; 403 when every role of the person is switched
 /// off from downloading; 404 for an unknown tile; 422 when the role rewrite
-/// refuses or the engine rejects the statement; 503 when the engine or the
-/// audit store is unavailable.
+/// refuses or the engine rejects the statement; 429 when two downloads are
+/// already running in this process (`BI-34`, PR #527 review SHOULD-FIX 1);
+/// 503 when the engine or the audit store is unavailable.
 pub async fn chart_export(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -4151,7 +4239,7 @@ pub async fn chart_export(
     // BI-19 part D (plan D13): an image is made by the renderer, not by a row
     // stream, so it has its own path (and its own audit action).
     if q.format.as_deref() == Some("png") {
-        return crate::routes::pdf_export::export_chart_png(&state, &principal, &q).await;
+        return crate::routes::pdf_export::export_chart_png(&state, &principal, &q, &headers).await;
     }
     export_chart(
         &state,
@@ -4177,7 +4265,9 @@ pub async fn chart_export(
 ///
 /// # Errors
 ///
-/// As [`chart_export`]; 400 also for a tile that is not a raw table.
+/// As [`chart_export`], including its 429 when two downloads are already
+/// running in this process (`BI-34`); 400 also for a tile that is not a raw
+/// table.
 pub async fn table_export(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -4212,7 +4302,7 @@ async fn export_tile_statement(
     principal: &Principal,
     q: &ChartExportQuery,
     rows_only: bool,
-) -> Result<(StoredChartSpec, String, HashMap<String, String>), ApiError> {
+) -> Result<TileStatement, ApiError> {
     let ch = &state.clickhouse;
     let chart_id = q
         .chart
@@ -4250,12 +4340,12 @@ async fn export_tile_statement(
     )
     .await?;
     let time = time.with_params(loaded.values);
-    let (statement, labels) = if rows_mode {
+    let (statement, labels, filters_skipped) = if rows_mode {
         rows_export_statement(ch, &chart, q, dashboard_filters, &time).await?
     } else {
-        let statement =
+        let (statement, skipped) =
             grouped_export_statement(ch, (&viewer, &chart), q, &dashboard_filters, &time).await?;
-        (statement, HashMap::new())
+        (statement, HashMap::new(), skipped)
     };
     // BI-5 review S4: a grouped file holds what the tile shows, so it runs under
     // the same limits the tile ran under. An unreadable setting leaves the text.
@@ -4263,11 +4353,22 @@ async fn export_tile_statement(
         .limits()
         .await
         .ok();
-    Ok((
+    Ok(TileStatement {
         chart,
-        export_statement_settings(rows_mode, statement, limits.as_ref()),
+        statement: export_statement_settings(rows_mode, statement, limits.as_ref()),
         labels,
-    ))
+        filters_skipped,
+    })
+}
+
+/// What a download reads: the tile, its statement, the header label of each
+/// column, and whether an active dashboard filter did not apply to the tile's
+/// data and was left out (`BI-28`).
+struct TileStatement {
+    chart: StoredChartSpec,
+    statement: String,
+    labels: HashMap<String, String>,
+    filters_skipped: bool,
 }
 
 /// The statement as the download sends it. A raw table's rows lift a SQL
@@ -4299,6 +4400,10 @@ pub(crate) struct ChartFile {
     pub written: crate::export::Written,
     pub format: crate::export::FileFormat,
     pub values: crate::export::Values,
+    /// An active dashboard filter did not apply to this tile's data, so the
+    /// file is not narrowed by it (`BI-28`). The routes say so; see
+    /// [`crate::export::FILTERS_NOT_APPLIED`].
+    pub filters_skipped: bool,
 }
 
 /// Read the chart's rows as `principal` and write them to a file: the one
@@ -4309,6 +4414,12 @@ pub(crate) struct ChartFile {
 /// The caller has checked that the person may download (the routes call
 /// `require_download`, the runner checks the owner's rights) and records the
 /// audit entry before the file is handed over.
+///
+/// This does not take a download slot (`BI-34`, plan D5 decision 5): the
+/// routes take one in [`take_export_slot`] before they call it, and a
+/// scheduled report never does, so a send is never refused for concurrency.
+/// The report has the byte cap, the engine's time and memory limits like any
+/// download.
 ///
 /// # Errors
 ///
@@ -4332,7 +4443,12 @@ pub(crate) async fn build_chart_file(
         .as_deref()
         .map_or(Some(Values::Formatted), Values::parse)
         .ok_or_else(|| ApiError::BadRequest("values must be formatted or raw.".to_owned()))?;
-    let (chart, statement, labels) = export_tile_statement(state, principal, q, rows_only).await?;
+    let TileStatement {
+        chart,
+        statement,
+        labels,
+        filters_skipped,
+    } = export_tile_statement(state, principal, q, rows_only).await?;
 
     let placeholders = crate::sql_rewrite::PlaceholderValues {
         principal_id: Some(principal.id.uuid().to_string()),
@@ -4359,9 +4475,18 @@ pub(crate) async fn build_chart_file(
     // GOV-7 D5: one mapping for every refusal (BI-16 C3's `RegionOf`
     // sentence is inside it), so a hidden table answers 404.
     .map_err(|err| crate::routes::support::enforcement_refusal(&statement, &err))?;
+    // BI-27 (plan D3): the engine stops the statement at its own time limit,
+    // also over a mart, which carries no limit in its text. A statement-level
+    // `SETTINGS` (a SQL source's, a grouped tile's) still wins.
+    let options = lakehouse_clickhouse::QueryOptions {
+        max_execution_time: Some(crate::export::EXPORT_ENGINE_TIME),
+        // BI-34 (plan D3): the engine's own memory limit for the statement.
+        max_memory_usage: Some(crate::export::EXPORT_MEMORY_BYTES),
+        ..lakehouse_clickhouse::QueryOptions::default()
+    };
     let mut stream = state
         .clickhouse
-        .query_stream(&rewritten, crate::export::EXPORT_TIMEOUT)
+        .query_stream_with_options(&rewritten, crate::export::EXPORT_TIMEOUT, &options)
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?;
     let (labels, formats) =
@@ -4369,7 +4494,7 @@ pub(crate) async fn build_chart_file(
     let locale = crate::routes::settings::format_settings(state)
         .await?
         .number_locale;
-    let written = crate::export::write_export(
+    let written = crate::export::write_export_with_byte_cap(
         &mut stream,
         &crate::export::ExportOptions {
             format,
@@ -4378,7 +4503,9 @@ pub(crate) async fn build_chart_file(
             locale: &locale,
             labels: &labels,
             formats: &formats,
+            note: filters_skipped.then_some(crate::export::FILTERS_NOT_APPLIED),
         },
+        Some(crate::export::EXPORT_BYTE_CAP),
     )
     .await
     .map_err(|err| super::export_failure(&DASHBOARD_QUERY, &err))?;
@@ -4387,7 +4514,23 @@ pub(crate) async fn build_chart_file(
         written,
         format,
         values,
+        filters_skipped,
     })
+}
+
+/// One of the process's download slots, or the 429 a person is told
+/// (`BI-34`, plan D3). Try-acquire: a download that cannot start now is
+/// refused with a fixed sentence, it does not queue behind a long one.
+fn take_export_slot(
+    slots: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
+    slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::TooManyRequests {
+            message: crate::export::EXPORT_BUSY.to_owned(),
+            retry_after_secs: 10,
+        })
 }
 
 async fn export_chart(
@@ -4399,13 +4542,18 @@ async fn export_chart(
     gate: &crate::routes::query::StatementGate<'_>,
 ) -> ApiResult<Response> {
     crate::routes::settings::require_download(state, principal).await?;
+    // Held until the file is written; the stream to the client that follows
+    // reads a file on disk and holds no memory on the engine.
+    let _slot = take_export_slot(&state.export_slots)?;
     let ChartFile {
         chart,
         written,
         format,
         values,
+        filters_skipped,
     } = build_chart_file(state, principal, q, rows_only, gate).await?;
     let cap = crate::export::EXPORT_ROW_CAP;
+    let cut_by = written.cut_by(cap as usize);
 
     record_export_audit(
         state,
@@ -4415,19 +4563,29 @@ async fn export_chart(
             action,
             rows: written.rows,
             cut: written.cut,
+            cut_by,
             cap,
             format,
             values,
+            filters_skipped,
         },
     )
     .await?;
 
+    let shown = cut_rows(&written, cap);
     let file_name = export_file_name(
         &chart.spec.title,
         format.extension(),
-        written.cut.then_some(cap),
+        (written.cut.then_some(shown), filters_skipped),
     );
-    Ok(export_response(written, &file_name, format, cap))
+    let mut response = export_response(written, &file_name, format, (shown, cut_by));
+    if filters_skipped {
+        response.headers_mut().insert(
+            header::HeaderName::from_static("x-export-note"),
+            header::HeaderValue::from_static(crate::export::FILTERS_NOT_APPLIED),
+        );
+    }
+    Ok(response)
 }
 
 // ── /api/dashboard/values ───────────────────────────────────────────────
@@ -5722,6 +5880,108 @@ mod tests {
             serde_json::from_str(r#"{"id":"default","refreshSeconds":300}"#).unwrap();
         assert!(board_edit_allowed(&body));
         assert_eq!(body.refresh_seconds, Some(300));
+    }
+
+    /// `BI-34`: a third concurrent download is refused with a 429 and a fixed
+    /// sentence, and a slot freed by a finished one is taken again.
+    #[test]
+    fn a_third_concurrent_download_is_refused_with_a_429() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(crate::state::EXPORT_AT_ONCE));
+        let held: Vec<_> = (0..crate::state::EXPORT_AT_ONCE)
+            .map(|_| take_export_slot(&slots).unwrap())
+            .collect();
+        let refused = take_export_slot(&slots).unwrap_err();
+        assert_eq!(refused.status(), 429);
+        assert_eq!(refused.to_string(), crate::export::EXPORT_BUSY);
+        drop(held);
+        assert!(take_export_slot(&slots).is_ok());
+    }
+
+    /// `BI-27`: the file name and the headers of a download the byte cap cut
+    /// name the rows the file holds, not the row cap it never reached.
+    #[tokio::test]
+    async fn a_download_cut_by_bytes_names_the_rows_it_holds() {
+        use crate::export::{
+            ExportOptions, FileFormat, RowSource, Values, write_export_with_byte_cap,
+        };
+
+        struct Rows(usize);
+        impl RowSource for Rows {
+            fn names(&self) -> &[String] {
+                static NAMES: std::sync::LazyLock<Vec<String>> =
+                    std::sync::LazyLock::new(|| vec!["n".to_owned()]);
+                &NAMES
+            }
+            fn types(&self) -> &[String] {
+                static TYPES: std::sync::LazyLock<Vec<String>> =
+                    std::sync::LazyLock::new(|| vec!["String".to_owned()]);
+                &TYPES
+            }
+            fn next_row(
+                &mut self,
+            ) -> impl std::future::Future<
+                Output = Result<Option<Vec<Value>>, lakehouse_clickhouse::ChError>,
+            > + Send {
+                let row = (self.0 > 0).then(|| {
+                    self.0 -= 1;
+                    vec![json!("xxxx")]
+                });
+                std::future::ready(Ok(row))
+            }
+        }
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let options = ExportOptions {
+            format: FileFormat::Csv,
+            values: Values::Raw,
+            cap: 100,
+            locale: "en-US",
+            labels: &labels,
+            formats: &formats,
+            note: None,
+        };
+        // The byte-order mark and "n\r\n" are 6 bytes, a row 6: room for two.
+        let written = write_export_with_byte_cap(&mut Rows(10), &options, Some(18))
+            .await
+            .unwrap();
+        assert_eq!((written.rows, written.cut), (2, true));
+        assert_eq!(cut_rows(&written, 100), 2);
+        assert_eq!(written.cut_by(100), Some("bytes"));
+        assert_eq!(
+            export_file_name(
+                "Visits",
+                "csv",
+                (written.cut.then_some(cut_rows(&written, 100)), false)
+            ),
+            "Visits-first-2-rows.csv"
+        );
+        let response = export_response(
+            written,
+            "Visits-first-2-rows.csv",
+            FileFormat::Csv,
+            (2, Some("bytes")),
+        );
+        let headers = response.headers();
+        assert_eq!(headers["x-export-cut"], "true");
+        assert_eq!(headers["x-export-cap"], "2");
+        assert_eq!(headers["x-export-cut-by"], "bytes");
+    }
+
+    /// BI-28: a file made while a dashboard filter did not apply says so in its
+    /// name, after the cut, and a file with no skipped filter is named as before.
+    #[test]
+    fn a_file_name_says_when_a_filter_was_not_applied() {
+        assert_eq!(
+            export_file_name("Visits", "csv", (None, false)),
+            "Visits.csv"
+        );
+        assert_eq!(
+            export_file_name("Visits", "xlsx", (None, true)),
+            "Visits-filters-not-applied.xlsx"
+        );
+        assert_eq!(
+            export_file_name("Visits", "csv", (Some(50), true)),
+            "Visits-first-50-rows-filters-not-applied.csv"
+        );
     }
 
     /// BI-6: the export lists a chart's own filters, sort, "Other", groupings
@@ -9336,6 +9596,336 @@ mod table_tiles {
         assert_eq!(tile["grain"], json!("month"));
         assert_eq!(tile["rows"].as_array().unwrap().len(), 2);
         assert_eq!(tile["rows"][1]["v"], json!("7"));
+    }
+}
+
+#[cfg(test)]
+mod sec58_mart_name_gate {
+    //! SEC-58: the shared `serving` catalog's table and column names must not
+    //! be listed to a tenant that does not own it. The gate is
+    //! `catalog::catalog_tenant_refusal` (SEC-20/SEC-50), already the one
+    //! catalog and pipelines use. These tests use the same two-harness shape
+    //! as `catalog::tenant_scoping`: a real seeded Postgres for the tenant
+    //! count and a wiremock `ClickHouse` for the `system.tables`/`system.columns`
+    //! reads that must never happen for an outsider.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use axum::Extension;
+    use axum::extract::{Query, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::Response;
+    use lakehouse_auth::{PermissionSet, Principal, PrincipalId};
+    use lakehouse_store::PgPool;
+    // Force-links the `#[ctor]` Postgres testcontainer bootstrap.
+    use lakehouse_test_support as _;
+    use uuid::Uuid;
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{FieldsQuery, JoinSuggestionsQuery, fields, join_suggestions};
+    use crate::config::Config;
+    use crate::state::AppState;
+
+    const TENANT_A: &str = "11111111-1111-4111-8111-000000000001";
+    const TENANT_B: &str = "11111111-1111-4111-8111-000000000002";
+
+    fn state_for(pool: &PgPool, ch_url: &str, catalog_tenant_id: Option<&str>) -> AppState {
+        let options = pool.connect_options();
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "DATABASE_URL".to_owned(),
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options.get_database().expect("a named test database"),
+            ),
+        );
+        env.insert("CH_URL".to_owned(), ch_url.to_owned());
+        if let Some(id) = catalog_tenant_id {
+            env.insert("CATALOG_TENANT_ID".to_owned(), id.to_owned());
+        }
+        AppState::new(Config::from_map(&env).expect("a valid test Config"))
+    }
+
+    fn principal(tenant_ids: &[Uuid], permissions: &str) -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::new_v4()),
+            tenant_ids: tenant_ids.to_vec(),
+            display_name: "Test Principal".to_owned(),
+            permissions: PermissionSet::parse(permissions),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// A `ClickHouse` that reports two `serving` marts and their columns, and
+    /// answers every other read (calculated fields, BI table setup) with an
+    /// empty but well-formed result.
+    async fn mock_serving_catalog() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM system.tables"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "name", "type": "String"},
+                    {"name": "total_rows", "type": "String"},
+                ],
+                "data": [
+                    {"name": "sales", "total_rows": "42"},
+                    {"name": "stock", "total_rows": "7"},
+                ],
+                "rows": 2,
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM system.columns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "name", "type": "String"},
+                    {"name": "type", "type": "String"},
+                    {"name": "position", "type": "UInt64"},
+                    {"name": "table", "type": "String"},
+                    {"name": "key", "type": "String"},
+                ],
+                "data": [
+                    {"name": "amount", "type": "UInt64", "position": "1", "table": "sales", "key": "0"},
+                    {"name": "region", "type": "String", "position": "2", "table": "sales", "key": "0"},
+                    {"name": "qty", "type": "UInt64", "position": "1", "table": "stock", "key": "0"},
+                ],
+                "rows": 3,
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [], "data": [], "rows": 0,
+            })))
+            .with_priority(10)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn json_of(resp: Response) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    async fn no_metadata_was_read(server: &MockServer) {
+        let queries: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert!(
+            !queries.iter().any(|q| q.contains("system.tables")),
+            "an outsider must not read system.tables: {queries:?}"
+        );
+        assert!(
+            !queries.iter().any(|q| q.contains("system.columns")),
+            "an outsider must not read system.columns: {queries:?}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_outsider_tenant_gets_an_empty_mart_list_and_no_metadata_query(pool: PgPool) {
+        let ch = mock_serving_catalog().await;
+        let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+        let outsider = principal(&[TENANT_B.parse().unwrap()], "dashboard:read");
+
+        let (status, body) = json_of(
+            fields(
+                State(state),
+                Extension(outsider),
+                HeaderMap::new(),
+                Query(FieldsQuery {
+                    mart: None,
+                    source: None,
+                    joins: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({ "marts": [] }));
+        no_metadata_was_read(&ch).await;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_outsider_naming_a_mart_or_joins_gets_the_hidden_mart_404(pool: PgPool) {
+        let ch = mock_serving_catalog().await;
+        let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+
+        for query in [
+            FieldsQuery {
+                mart: Some("sales".to_owned()),
+                source: None,
+                joins: None,
+            },
+            FieldsQuery {
+                mart: Some("sales".to_owned()),
+                source: None,
+                joins: Some(
+                    r#"[{"mart":"stock","type":"left","on":[{"left":"amount","op":"=","right":"qty"}]}]"#
+                        .to_owned(),
+                ),
+            },
+        ] {
+            let (status, body) = json_of(
+                fields(
+                    State(state.clone()),
+                    Extension(principal(&[TENANT_B.parse().unwrap()], "dashboard:read")),
+                    HeaderMap::new(),
+                    Query(query),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert!(
+                !body.to_string().contains("amount"),
+                "no column name may leak: {body}"
+            );
+            assert!(
+                !body.to_string().contains("qty"),
+                "no joined column name may leak: {body}"
+            );
+        }
+        no_metadata_was_read(&ch).await;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_forged_x_tenant_header_is_refused_before_any_metadata_query(pool: PgPool) {
+        let ch = mock_serving_catalog().await;
+        let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-tenant", TENANT_B.parse().unwrap());
+
+        let (status, _) = json_of(
+            fields(
+                State(state),
+                Extension(principal(&[TENANT_A.parse().unwrap()], "dashboard:read")),
+                headers,
+                Query(FieldsQuery {
+                    mart: None,
+                    source: None,
+                    joins: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        no_metadata_was_read(&ch).await;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_catalog_tenant_member_and_an_admin_still_see_marts_and_columns(pool: PgPool) {
+        let ch = mock_serving_catalog().await;
+        let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+        let callers = [
+            principal(&[TENANT_A.parse().unwrap()], "dashboard:read"),
+            principal(&[], "*:*"),
+        ];
+        for caller in callers {
+            let (status, body) = json_of(
+                fields(
+                    State(state.clone()),
+                    Extension(caller.clone()),
+                    HeaderMap::new(),
+                    Query(FieldsQuery {
+                        mart: None,
+                        source: None,
+                        joins: None,
+                    }),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let names: Vec<&str> = body["marts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(names, vec!["sales", "stock"]);
+
+            let (status, body) = json_of(
+                fields(
+                    State(state.clone()),
+                    Extension(caller.clone()),
+                    HeaderMap::new(),
+                    Query(FieldsQuery {
+                        mart: Some("sales".to_owned()),
+                        source: None,
+                        joins: None,
+                    }),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                body["columns"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c["name"] == "amount")
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_outsider_gets_no_join_suggestions_but_a_catalog_member_does(pool: PgPool) {
+        let ch = mock_serving_catalog().await;
+        let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+        let query = || {
+            Query(JoinSuggestionsQuery {
+                left: Some("sales".to_owned()),
+                right: Some("stock".to_owned()),
+            })
+        };
+
+        let (status, body) = json_of(
+            join_suggestions(
+                State(state.clone()),
+                Extension(principal(&[TENANT_B.parse().unwrap()], "dashboard:read")),
+                HeaderMap::new(),
+                query(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        let (status, body) = json_of(
+            join_suggestions(
+                State(state),
+                Extension(principal(&[TENANT_A.parse().unwrap()], "dashboard:read")),
+                HeaderMap::new(),
+                query(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["pairs"].is_array());
     }
 }
 

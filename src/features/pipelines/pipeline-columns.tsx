@@ -13,6 +13,7 @@ import {
   GitBranch,
   Layers,
   MoreHorizontal,
+  Pause,
   Play,
   Timer,
   User,
@@ -37,7 +38,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { ENTITY_STATUS_LABEL, type EntityStatus } from "@/lib/status"
 import type { Pipeline, PipelineKind } from "@/services/contracts/pipelines"
 import { knownStatus } from "./pipeline-detail-header"
-import { describeCron, isScheduleRunning, parseSchedule } from "./pipeline-schedule"
+import { describeCron, isLagTrigger, isScheduleRunning, parseSchedule, triggerSummary } from "./pipeline-schedule"
 
 // `PipelineKind` widens to `string` on `Pipeline.kind` (rows authored
 // before WS1 may still carry `"document"`/`"vector"`, which the database
@@ -70,9 +71,15 @@ function pipelineOrigin(pipeline: Pipeline): "orchestrator" | "authored" {
 export function getPipelineColumns({
   onView,
   onTrigger,
+  onPause,
+  onResume,
 }: {
   onView?: (pipeline: Pipeline) => void
   onTrigger?: (pipeline: Pipeline) => void
+  /** BLD-18: pause an authored pipeline's automatic runs (cron, chain or freshness sensor). */
+  onPause?: (pipeline: Pipeline) => void
+  /** BLD-18: turn automatic runs back on after a pause. */
+  onResume?: (pipeline: Pipeline) => void
 } = {}): ColumnDef<Pipeline>[] {
   return [
     {
@@ -155,7 +162,9 @@ export function getPipelineColumns({
           <TooltipContent>
             {pipelineOrigin(row.original) === "orchestrator"
               ? "A job in the orchestrator: it runs, and its history is here."
-              : "Authored in the console. No engine is attached yet, so it cannot run."}
+              : // BLD-11 F9/D12: an authored pipeline DOES run — the trigger
+                // route launches it. The old "no engine attached" was a lie.
+                "Authored in the console; the orchestrator runs it."}
           </TooltipContent>
         </Tooltip>
       ),
@@ -269,6 +278,21 @@ export function getPipelineColumns({
       ),
       cell: ({ row }) => {
         const parsed = parseSchedule(row.original.schedule)
+        // BLD-11 F2/D3: a target-lag row is not "On demand" and its stored
+        // cron never fires — name the lag, which is the real trigger.
+        const trigger = triggerSummary(parsed, row.original.targetLag)
+        if (isLagTrigger(trigger)) {
+          // BLD-18: the lag sensor, not the stored cron, is what can run this
+          // row — say `paused` here too, not only in the status column.
+          return (
+            <span className="text-xs text-foreground">
+              {trigger.label}
+              {row.original.status === "paused" ? (
+                <span className="text-amber-600 dark:text-amber-400"> · paused</span>
+              ) : null}
+            </span>
+          )
+        }
         if (parsed.kind === "manual") return <span className="text-xs text-muted-foreground">On demand</span>
         if (parsed.kind === "other") {
           return <span className="font-mono text-xs text-muted-foreground">{parsed.raw}</span>
@@ -389,8 +413,15 @@ export function getPipelineColumns({
       header: ({ column }) => (
         <DataTableColumnHeader column={column} label="SLA" />
       ),
-      cell: ({ row }) =>
-        row.original.slaOk ? (
+      cell: ({ row }) => {
+        // BLD-11 F8/D12: `slaOk` is null for EVERY authored row (no SLA is
+        // defined per pipeline), so a falsy check labelled them all
+        // "Breached" — a false alarm. Null is "not defined", neutral.
+        const sla = row.original.slaOk
+        if (sla === null) {
+          return <span className="text-xs text-muted-foreground">Not defined</span>
+        }
+        return sla ? (
           <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">
             <CheckCircle2 className="size-3.5" />
             OK
@@ -400,7 +431,8 @@ export function getPipelineColumns({
             <XCircle className="size-3.5" />
             Breached
           </span>
-        ),
+        )
+      },
       enableColumnFilter: true,
       enableSorting: true,
       meta: {
@@ -445,12 +477,42 @@ export function getPipelineColumns({
                   </DropdownMenuItem>
                 ) : null}
                 {onTrigger && pipelineOrigin(pipeline) === "authored" ? (
-                  // Shown but disabled, with the reason: hiding it makes
-                  // the menu look inconsistent between rows.
-                  <DropdownMenuItem disabled>
-                    <Play className="size-4" />
-                    <span>Trigger run — no engine attached</span>
-                  </DropdownMenuItem>
+                  // BLD-11 F9/D12 / review R4: an authored row CAN be
+                  // triggered whenever it is not a draft — the trigger route
+                  // launches ready AND paused pipelines; only drafts are
+                  // refused. A draft is offered disabled with that next step.
+                  pipeline.status !== "draft" ? (
+                    <DropdownMenuItem onClick={() => onTrigger(pipeline)}>
+                      <Play className="size-4" />
+                      <span>Trigger run</span>
+                    </DropdownMenuItem>
+                  ) : (
+                    <DropdownMenuItem disabled>
+                      <Play className="size-4" />
+                      <span>Trigger run — mark it ready first</span>
+                    </DropdownMenuItem>
+                  )
+                ) : null}
+                {pipelineOrigin(pipeline) === "authored" && pipeline.status !== "draft" ? (
+                  // BLD-18: Pause/Resume are no longer hidden for a row whose
+                  // trigger is a target lag. The API stops the freshness
+                  // sensor next to the cron schedule and dependency sensor,
+                  // so the action is real for every automated authored row.
+                  pipeline.status === "paused" ? (
+                    onResume ? (
+                      <DropdownMenuItem onClick={() => onResume(pipeline)}>
+                        <Play className="size-4" />
+                        <span>Resume</span>
+                      </DropdownMenuItem>
+                    ) : null
+                  ) : pipeline.targetLag != null || parseSchedule(pipeline.schedule).kind === "cron" ? (
+                    onPause ? (
+                      <DropdownMenuItem onClick={() => onPause(pipeline)}>
+                        <Pause className="size-4" />
+                        <span>Pause</span>
+                      </DropdownMenuItem>
+                    ) : null
+                  ) : null
                 ) : null}
                 <DropdownMenuSeparator />
                 <DropdownMenuItem

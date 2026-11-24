@@ -46,10 +46,15 @@
 //! 2. **Bounded batches, not one whole-mart materialization.** Rows are
 //!    read `GOLD_EXPORT_BATCH_SIZE`
 //!    (`crate::config::Config::gold_export_batch_size`) at a time
-//!    (`SELECT ... LIMIT n OFFSET n FORMAT JSON`) and appended to Iceberg
-//!    per batch (one `GoldTable::append` — one new Parquet file/snapshot —
-//!    per batch), so peak memory is bounded by one batch, not the whole
-//!    mart. This is `LIMIT`/`OFFSET` pagination over repeated HTTP
+//!    (`SELECT ... LIMIT n OFFSET n FORMAT JSON`) and written to Parquet
+//!    one batch at a time with `GoldTable::stage_batch`. All the staged
+//!    Parquet files are then committed in ONE `GoldTable::commit_staged`
+//!    transaction after the loop (DATA-63): only the small `Vec<DataFile>`
+//!    descriptors survive between batches, never the `RecordBatch` data,
+//!    so peak memory is bounded by one batch, not the whole mart. An
+//!    outside reader therefore sees either none of the new copy or ALL of
+//!    it in one atomic snapshot, never a prefix of it. This is
+//!    `LIMIT`/`OFFSET` pagination over repeated HTTP
 //!    requests, not a single streaming response — a true single-pass
 //!    streaming rewrite (reading `ClickHouse`'s `FORMAT JSONEachRow` as an
 //!    incremental byte stream) would remove the pagination-stability
@@ -73,7 +78,7 @@ use arrow_array::{
     ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, RecordBatch,
     StringArray, TimestampMicrosecondArray,
 };
-use iceberg::spec::{NestedField, PrimitiveType, Type};
+use iceberg::spec::{DataFile, NestedField, PrimitiveType, Type};
 use lakehouse_clickhouse::{ChClient, ChColumn, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_core::secret::SecretValue;
@@ -168,6 +173,21 @@ pub enum GoldExportError {
     /// wraps its error explicitly (`PR #281` review round 1, NIT).
     #[error("{0}")]
     TenantGateRefused(ApiError),
+    /// `DATA-6` D7: the mart's own Iceberg table name is the latest-copy
+    /// table of ANOTHER published table (it carries the
+    /// `rantai.latest-copy-of` marker the Dagster op writes). Publishing
+    /// into it would make the two features fight over one table, so the
+    /// export refuses before it appends anything. The `Display` is a
+    /// fixed sentence naming the mart — safe for a response, no upstream
+    /// words — and the route maps it to a 422.
+    #[error(
+        "the Iceberg table for mart {mart:?} is the latest-copy table of another \
+         published table; rename the mart"
+    )]
+    TargetIsLatestCopy {
+        /// The mart whose sanitized name collides with a latest-copy table.
+        mart: String,
+    },
 }
 
 /// One column's resolved Iceberg + Arrow shape, plus enough to parse a
@@ -808,6 +828,25 @@ fn build_array(
     })
 }
 
+/// Builds one publish batch's Arrow [`RecordBatch`] from `rows`, stamping
+/// every row with the publish's single `_exported_at` value (`DATA-6` M2).
+/// Split out of [`export_mart`] so its stage-accumulate-commit loop stays
+/// small enough to review in one screen.
+fn build_publish_batch(
+    plan: &[ColumnPlan],
+    arrow_schema: &Arc<arrow_schema::Schema>,
+    copy_exported_at: i64,
+    rows: &[Map<String, Value>],
+) -> Result<RecordBatch, GoldExportError> {
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(plan.len() + 1);
+    arrays.push(exported_at_column(copy_exported_at, rows.len()));
+    for column in plan {
+        arrays.push(build_array(column, rows)?);
+    }
+    RecordBatch::try_new(arrow_schema.clone(), arrays)
+        .map_err(|e| GoldExportError::Batch(format!("RecordBatch::try_new failed: {e}")))
+}
+
 /// The result of one export run.
 pub struct GoldExportResult {
     /// The Gold namespace exported into (always [`gold::GOLD_NAMESPACE`]).
@@ -827,6 +866,44 @@ pub struct GoldExportResult {
     /// When that snapshot was committed (Unix ms) — `None` under the same
     /// condition as `snapshot_id`.
     pub exported_at_ms: Option<i64>,
+    /// The ONE `_exported_at` value (microseconds, UTC) this publish
+    /// stamped on every row it wrote (`DATA-6` M2) — `None` only when
+    /// `rows_exported == 0`, where no copy exists to identify. One value
+    /// per publish, not per batch, so "the rows of this one publish" can
+    /// be picked out of the table (the latest-copy op filters on it), and
+    /// so `DATA-2`'s trim counts copies, not batches: a mart over
+    /// `GOLD_EXPORT_BATCH_SIZE` rows used to carry one value per batch,
+    /// and `run_trim_for_mart` counted distinct values, keeping 7
+    /// *batches* instead of 7 copies.
+    pub copy_exported_at_micros: Option<i64>,
+}
+
+/// The `_exported_at` value (microseconds, UTC) one publish stamps on
+/// every row it writes — computed ONCE per publish, not per batch
+/// (`DATA-6` M2), so the rows of one publish are identifiable in the
+/// Iceberg table and `DATA-2`'s trim counts copies, not batches. The
+/// nanosecond clock is truncated to microseconds because that is the
+/// column's Iceberg/Arrow precision; a value that overflows `i64`
+/// micros (year ~294 million) saturates rather than panicking — the
+/// caller treats it as an opaque stamp, never does arithmetic on it.
+pub(crate) fn copy_exported_at_micros(now: time::OffsetDateTime) -> i64 {
+    i64::try_from(now.unix_timestamp_nanos() / 1_000).unwrap_or(i64::MAX)
+}
+
+/// Builds the `_exported_at` column for one batch: the publish's ONE stamp
+/// (`copy_exported_at_micros`, computed once before the loop, `DATA-6` M2)
+/// repeated for every row of the batch — one value per publish, so a copy
+/// is identifiable (the latest-copy op filters on it) and the trim's
+/// distinct-value count is a copy count, not a batch count. It still
+/// matches the "one partition value per batch" assumption
+/// `gold::partition_key_for` documents (each batch is staged as one Parquet
+/// file, so each needs exactly one partition value derived from it; the
+/// whole publish's files are committed together afterward — DATA-63).
+fn exported_at_column(now_micros: i64, batch_rows: usize) -> ArrayRef {
+    Arc::new(TimestampMicrosecondArray::from(vec![
+        now_micros;
+        batch_rows
+    ]))
 }
 
 /// Reads every row of `source_table` (a fully-qualified `ClickHouse`
@@ -855,11 +932,12 @@ pub struct GoldExportResult {
 /// [`GoldExportError::PolicyRefused`] (WS7 item D2) is returned when
 /// [`export_batch_sql`] cannot resolve obligations for `roles` or the
 /// rewrite is refused — checked on every batch, so a refusal aborts
-/// before that batch's rows are read, but a refusal on any batch after
-/// the first means earlier, already-masked/filtered batches were already
-/// appended to Iceberg (see [`export_batch_sql`]'s own doc comment on why
-/// this is re-checked per batch rather than assumed stable for the whole
-/// export); and [`GoldExportError::TenantGateRefused`] (`SEC-50`) is
+/// before that batch's rows are read, and a refusal on any batch after
+/// the first discards the earlier staged batches without committing them:
+/// the single commit happens only after the loop, so no partial copy
+/// becomes visible (DATA-63; see [`export_batch_sql`]'s own doc comment
+/// on why this is re-checked per batch rather than assumed stable for the
+/// whole export); and [`GoldExportError::TenantGateRefused`] (`SEC-50`) is
 /// returned when the tenant gate refuses the export — before any row is
 /// read.
 ///
@@ -955,6 +1033,9 @@ pub(crate) async fn export_mart(
             rows_exported: 0,
             snapshot_id: None,
             exported_at_ms: None,
+            // No rows were written, so no copy exists to identify
+            // (`DATA-6` D6: a zero-row publish is a skip, not a copy).
+            copy_exported_at_micros: None,
         });
     }
 
@@ -972,6 +1053,20 @@ pub(crate) async fn export_mart(
     let mut table = client
         .create_or_load_gold_table(mart_name, domain_fields)
         .await?;
+    // DATA-6 D7: a mart whose own Iceberg table is ANOTHER mart's
+    // latest-copy table (the `rantai.latest-copy-of` marker the Dagster op
+    // writes) must never be published into — the two features would fight
+    // over one table (the op's overwrite would delete the publish's rows,
+    // the publish's appends would fake a copy). Refused before the grant
+    // and before any append: nothing has been written at this point.
+    // The check is on the LOADED table's marker, not on the mart's name,
+    // because the collision is about which Iceberg table the name lands
+    // on, and only the table itself knows whether it is a latest copy.
+    if table.latest_copy_of().is_some() {
+        return Err(GoldExportError::TargetIsLatestCopy {
+            mart: mart_name.to_owned(),
+        });
+    }
     // ADR 0016 point 3: the `outside-readers` principal must be able to
     // `select` in the `gold` namespace — and only there. The namespace
     // exists now (the export just created or loaded its table in it),
@@ -983,6 +1078,23 @@ pub(crate) async fn export_mart(
             .map_err(|e| GoldExportError::Batch(format!("schema_to_arrow_schema failed: {e}")))?,
     );
 
+    // DATA-6 M2: ONE `_exported_at` per publish, computed before the loop
+    // and reused by every batch. The batch loop below still stages one
+    // Parquet file per batch (all committed in one snapshot after it), but
+    // every row of this publish carries the same stamp, so "the rows of
+    // this one publish" can be picked
+    // out of the table (the latest-copy op filters on it). This also
+    // corrects DATA-2's trim: `run_trim_for_mart` counts DISTINCT
+    // `_exported_at` values as copies, and a mart over the batch size
+    // used to carry one value per batch, so the trim kept 7 *batches*
+    // rather than 7 copies.
+    let copy_exported_at = copy_exported_at_micros(time::OffsetDateTime::now_utc());
+
+    // DATA-63: stage each batch's Parquet file(s) into this accumulator but
+    // do NOT commit until every batch has succeeded. Only the small
+    // `DataFile` descriptors live across iterations; the `RecordBatch` data
+    // is dropped as soon as it is staged, keeping peak memory at one batch.
+    let mut staged_data_files: Vec<DataFile> = Vec::new();
     let mut offset = 0u64;
     let mut rows_exported = 0usize;
     loop {
@@ -1008,30 +1120,10 @@ pub(crate) async fn export_mart(
         }
         let batch_rows = batch_result.data.len();
 
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(plan.len() + 1);
-        // `_exported_at` is the same instant for every row within THIS
-        // batch — matches the "one partition value per batch" assumption
-        // `gold::partition_key_for` documents (each batch is one Parquet
-        // file/append, so each needs exactly one partition value derived
-        // from it). Recomputed per batch rather than once for the whole
-        // run: consecutive batches of one export may therefore carry
-        // microseconds-apart `_exported_at` values rather than one
-        // identical instant — an acceptable, cosmetic divergence from the
-        // pre-batching behavior (a caller filtering `max(_exported_at)`
-        // per day-partition still sees them as the same run).
-        let now_micros = time::OffsetDateTime::now_utc().unix_timestamp() * 1_000_000;
-        arrays.push(Arc::new(TimestampMicrosecondArray::from(vec![
-            now_micros;
-            batch_rows
-        ])));
-        for column in &plan {
-            arrays.push(build_array(column, &batch_result.data)?);
-        }
+        let record_batch =
+            build_publish_batch(&plan, &arrow_schema, copy_exported_at, &batch_result.data)?;
 
-        let record_batch = RecordBatch::try_new(arrow_schema.clone(), arrays)
-            .map_err(|e| GoldExportError::Batch(format!("RecordBatch::try_new failed: {e}")))?;
-
-        table.append(client.as_catalog(), record_batch).await?;
+        staged_data_files.extend(table.stage_batch(record_batch).await?);
         rows_exported += batch_rows;
 
         if (batch_rows as u64) < batch_size {
@@ -1042,6 +1134,15 @@ pub(crate) async fn export_mart(
         offset += batch_size;
     }
 
+    // DATA-63: ONE commit for the whole publish. Every staged Parquet file
+    // lands in the same fast-append snapshot, so an outside reader sees
+    // either none of the new copy (a failure above returned before here)
+    // or all of it — never a prefix of it. An empty accumulator (a publish
+    // that staged nothing) is a documented no-op in `commit_staged`.
+    table
+        .commit_staged(client.as_catalog(), staged_data_files)
+        .await?;
+
     Ok(GoldExportResult {
         namespace,
         table: sanitized_table,
@@ -1049,6 +1150,7 @@ pub(crate) async fn export_mart(
         rows_exported,
         snapshot_id: table.current_snapshot_id(),
         exported_at_ms: table.current_snapshot_timestamp_ms(),
+        copy_exported_at_micros: Some(copy_exported_at),
     })
 }
 
@@ -1194,6 +1296,8 @@ pub fn iceberg_config(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::collections::HashSet;
+
     use arrow_array::Array as _;
 
     use super::*;
@@ -1207,9 +1311,55 @@ mod tests {
             rows_exported: 7,
             snapshot_id: Some(123),
             exported_at_ms: Some(1_700_000_000_000),
+            copy_exported_at_micros: Some(1_763_632_800_123_456),
         };
         assert_eq!(result.snapshot_id, Some(123));
         assert_eq!(result.exported_at_ms, Some(1_700_000_000_000));
+        assert_eq!(result.copy_exported_at_micros, Some(1_763_632_800_123_456));
+    }
+
+    // DATA-6 M2: the copy stamp keeps microsecond precision, because two
+    // publishes can fall in one second and the latest-copy op must tell
+    // them apart (`run_config` carries this exact value). The asserted
+    // constant is the true epoch-micros of the stated datetime — the plan
+    // text wrote `1_763_632_800_123_456`, which is 2025-11-20; one year
+    // earlier than the datetime it named.
+    #[test]
+    fn copy_exported_at_micros_keeps_sub_second_precision() {
+        let now = time::macros::datetime!(2026-11-20 10:00:00.123456 UTC);
+        assert_eq!(copy_exported_at_micros(now), 1_795_168_800_123_456);
+    }
+
+    // DATA-6 review R4: the DATA-62 fix had no test that failed on the old
+    // code. The old loop recomputed the stamp for every batch at SECOND
+    // precision, so a mart over `batch_size` rows carried several distinct
+    // `_exported_at` values and DATA-2's trim kept 7 batches, not 7 copies.
+    // The stamp is now computed once, before the loop, and handed to every
+    // batch; this pins that invariant across three simulated batches.
+    #[test]
+    fn one_publish_stamps_every_batch_with_the_same_micros() {
+        let publish_stamp =
+            copy_exported_at_micros(time::macros::datetime!(2026-11-20 10:00:00.123456 UTC));
+        assert_ne!(
+            publish_stamp % 1_000_000,
+            0,
+            "the stamp keeps sub-second precision"
+        );
+        let batch_rows = [2usize, 1, 3];
+        let batches: Vec<ArrayRef> = batch_rows
+            .iter()
+            .map(|&rows| exported_at_column(publish_stamp, rows))
+            .collect();
+        let mut distinct: HashSet<i64> = HashSet::new();
+        for (batch, &rows) in batches.iter().zip(batch_rows.iter()) {
+            let stamps = batch
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("a timestamp-microsecond column");
+            assert_eq!(stamps.len(), rows);
+            distinct.extend(stamps.values().iter().copied());
+        }
+        assert_eq!(distinct, HashSet::from([publish_stamp]));
     }
 
     fn row_with(name: &str, value: Value) -> Map<String, Value> {
