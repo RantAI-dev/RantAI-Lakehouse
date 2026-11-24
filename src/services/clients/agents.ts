@@ -15,11 +15,13 @@ import { ServiceError, deniedFor } from "../errors"
  * `lakehouse-store`, Task 2.9).
  *
  * `WEB-3` slice 1 (D1/D2/D3) removed the employees list, employee detail and
- * runs list — and with them the employee create/suspend/resume/revoke/run
- * actions and the two list reads. What remains is what live pages read: a
- * run's own trace (`/agents/runs/[runId]`, reachable from an approval, D3)
- * and the approvals inbox. The backend routes stay registered (D2): the
- * assistant's tools still use them, and `WEB-4` retires them.
+ * runs list pages — and with them the employee create/suspend/resume/revoke
+ * actions and the two list reads. `WEB-4` retired those API routes: the
+ * workflows routes, employee create/lifecycle and the runs LIST had no
+ * caller left. What stays is what live consumers still use: `getEmployee`
+ * names the employee on a run's trace, `getRun` reads that trace (from an
+ * approval), and the approvals inbox. Dagster also reads the employee
+ * list/detail and calls the headless-run route directly.
  */
 
 function errorFor(status: number, body: { error?: string } | null, fallback: string): ServiceError {

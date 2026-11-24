@@ -48,7 +48,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lakehouse_clickhouse::ChClient;
@@ -159,7 +159,51 @@ fn render_unserved<'e>(entries: impl ExactSizeIterator<Item = &'e str>) -> Strin
 /// not after [`TTL`].
 type CacheEntry = (Instant, HashSet<String>, Arc<Pieces>);
 
-static CACHE: LazyLock<Mutex<Option<CacheEntry>>> = LazyLock::new(|| Mutex::new(None));
+/// The DATA MAP cache, owned by one [`crate::state::AppState`] (OPS-36).
+///
+/// This used to be a process-wide `static`: every test app in the
+/// `lakehouse-api --test it` binary shared the one slot, so a chat in one
+/// test could reuse the map another test's `ClickHouse` mock had built. That
+/// changed the system prompt's bytes and broke the pinned-hash test when the
+/// assistant tests ran in parallel. Owning the cache per state gives every
+/// app — and every deployment instance — its own map, so parallel tests
+/// cannot contaminate one another and no clearing between them is needed.
+#[derive(Default)]
+pub(crate) struct DataMapCache {
+    entry: Mutex<Option<CacheEntry>>,
+}
+
+impl DataMapCache {
+    /// Drop the cached map, so the next chat turn rebuilds it. A person's
+    /// confirmation calls this to show their text at once and not after
+    /// [`TTL`].
+    pub(crate) async fn clear(&self) {
+        *self.entry.lock().await = None;
+    }
+
+    /// Put a built map into this cache, as a chat turn would.
+    #[cfg(test)]
+    pub(crate) async fn seed_for_test(&self) {
+        let pieces = Pieces {
+            tables: Vec::new(),
+            unserved: "DATA MAP text".to_owned(),
+            ..Pieces::default()
+        };
+        *self.entry.lock().await = Some((Instant::now(), HashSet::new(), Arc::new(pieces)));
+    }
+
+    /// Put ready pieces into this cache as a build with no row-filtered table.
+    #[cfg(test)]
+    async fn seed_pieces_for_test(&self, pieces: Pieces) {
+        *self.entry.lock().await = Some((Instant::now(), HashSet::new(), Arc::new(pieces)));
+    }
+
+    /// Whether this cache holds no map.
+    #[cfg(test)]
+    pub(crate) async fn is_empty_for_test(&self) -> bool {
+        self.entry.lock().await.is_none()
+    }
+}
 
 /// What the authored policies say the map must not read from the data: the
 /// masked columns and the row-filtered tables. Both are read once per chat
@@ -196,8 +240,8 @@ fn reusable<'a>(
 /// map: [`assemble`] runs on every call, over the cached pieces or over
 /// freshly built ones, with this request's `query_words` (see
 /// [`question_words`]) and `relevant_enabled` (`AI_RELEVANT_TABLES`). The
-/// question and the caller's words differ per chat, and the cache is one
-/// for everybody.
+/// question and the caller's words differ per chat, while the cache is one
+/// per [`crate::state::AppState`] and shared by every chat in it.
 ///
 /// `withheld` is what [`Withheld::from_conditions`] read from the authored
 /// policies, or `None` when the policies could not be read: then no table
@@ -211,6 +255,7 @@ fn reusable<'a>(
 /// for one rebuild instead of each running the stats queries. An empty
 /// result (`ClickHouse` unreachable) is never cached.
 pub(crate) async fn data_map(
+    cache: &DataMapCache,
     ch: &ChClient,
     withheld: Option<&Withheld>,
     notes: &Notes,
@@ -220,7 +265,7 @@ pub(crate) async fn data_map(
     reach: Option<&super::tools::data::RegistryReach<'_>>,
 ) -> String {
     let cacheable = withheld.is_some_and(|w| w.masked.is_empty());
-    let mut guard = CACHE.lock().await;
+    let mut guard = cache.entry.lock().await;
     let pieces = if cacheable
         && let Some(w) = withheld
         && let Some(pieces) = reusable(guard.as_ref(), &w.row_filtered)
@@ -313,41 +358,6 @@ async fn entries_in_reach(
         unserved: render_unserved(kept.iter().map(|(_, entry)| entry.as_str())),
         unserved_rows: kept,
     })
-}
-
-/// Drop the cached map, so the next chat rebuilds it. A person's
-/// confirmation calls this to show their text at once and not after
-/// [`TTL`].
-pub(crate) async fn clear_cache() {
-    *CACHE.lock().await = None;
-}
-
-/// Held by every test that reads or writes [`CACHE`], so two of them never
-/// race on the one static.
-#[cfg(test)]
-pub(crate) static CACHE_TEST_LOCK: Mutex<()> = Mutex::const_new(());
-
-/// Put a built map into [`CACHE`], as a chat turn would.
-#[cfg(test)]
-pub(crate) async fn seed_cache_for_test() {
-    let pieces = Pieces {
-        tables: Vec::new(),
-        unserved: "DATA MAP text".to_owned(),
-        ..Pieces::default()
-    };
-    *CACHE.lock().await = Some((Instant::now(), HashSet::new(), Arc::new(pieces)));
-}
-
-/// Put ready pieces into [`CACHE`] as a build with no row-filtered table.
-#[cfg(test)]
-async fn seed_pieces_for_test(pieces: Pieces) {
-    *CACHE.lock().await = Some((Instant::now(), HashSet::new(), Arc::new(pieces)));
-}
-
-/// Whether [`CACHE`] holds no map.
-#[cfg(test)]
-pub(crate) async fn cache_is_empty_for_test() -> bool {
-    CACHE.lock().await.is_none()
 }
 
 /// `(database.table, column)` pairs a masking policy covers for anyone,
@@ -3025,13 +3035,13 @@ mod tests {
         assert_eq!(asked, ["orders", "customers", "shipments", "raw_events"]);
     }
 
-    /// The cache is one for every chat: two questions over the same cached
-    /// pieces each get their own text, and a third that names nothing gets
-    /// the whole map, whatever the first two named.
+    /// The cache is shared by every chat in one state: two questions over the
+    /// same cached pieces each get their own text, and a third that names
+    /// nothing gets the whole map, whatever the first two named.
     #[tokio::test]
     async fn the_question_is_applied_per_request_and_never_stored_in_the_cache() {
-        let _serial = CACHE_TEST_LOCK.lock().await;
-        seed_pieces_for_test(four_tables_pieces()).await;
+        let cache = DataMapCache::default();
+        cache.seed_pieces_for_test(four_tables_pieces()).await;
         // Never asked: every call below finds the pieces in the cache.
         let ch = ChClient::new(
             "http://127.0.0.1:1".to_owned(),
@@ -3041,6 +3051,7 @@ mod tests {
         let withheld = Withheld::default();
         let ask = async |words: &[&str]| {
             data_map(
+                &cache,
                 &ch,
                 Some(&withheld),
                 &Notes::default(),
@@ -3054,7 +3065,7 @@ mod tests {
         let shipments = ask(&["swiftpost"]).await;
         let customers = ask(&["northern"]).await;
         let nothing = ask(&["zebra"]).await;
-        clear_cache().await;
+        cache.clear().await;
         assert!(shipments.contains(SHIPMENTS_FULL), "{shipments}");
         assert!(
             !shipments.contains("    customer_id UInt32\n"),
@@ -3073,14 +3084,14 @@ mod tests {
         assert!(nothing.contains("    order_id UInt32\n"), "{nothing}");
     }
 
-    /// No other test in this crate's lib binary builds the map, so nothing
-    /// refills the cache between the call and the check.
+    /// Each state owns its cache, so no other test can refill this one
+    /// between the call and the check.
     #[tokio::test]
     async fn clearing_the_cache_drops_the_built_map() {
-        let _serial = CACHE_TEST_LOCK.lock().await;
-        seed_cache_for_test().await;
-        clear_cache().await;
-        assert!(cache_is_empty_for_test().await);
+        let cache = DataMapCache::default();
+        cache.seed_for_test().await;
+        cache.clear().await;
+        assert!(cache.is_empty_for_test().await);
     }
 
     // ── DATA-39 D1/D2: the column registry is read once per column. ──────

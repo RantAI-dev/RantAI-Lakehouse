@@ -207,6 +207,15 @@ class RealTemplateTest(unittest.TestCase):
                 "dagster-webserver",
                 "dagster-daemon",
                 "backup-job",
+                # REL-16: the offline init image; these four services are
+                # built from `ops/init` and published as one image.
+                "lakekeeper-warehouse-init",
+                "lakekeeper-authz-init",
+                "lakekeeper-warehouse-init-seaweedfs",
+                "lakekeeper-authz-init-seaweedfs",
+                # `mssql-g6-cert-init` also uses the init image, but it is a
+                # gate service and the renderer drops it, so it needs no
+                # published reference here.
             )
         }
         self.rendered = render_compose.render(self.template, self.images)
