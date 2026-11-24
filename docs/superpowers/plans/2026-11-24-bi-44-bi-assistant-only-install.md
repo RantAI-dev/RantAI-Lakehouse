@@ -489,3 +489,109 @@ Every command ran in `/tmp/wt-bi44-s3`; Rust used `CARGO_INCREMENTAL=0` and
 5. The Trino column probe is a `LIMIT 0` execution of the governed statement,
    not `DESCRIBE (SELECT …)`: Trino has no subquery form of `DESCRIBE`. It
    still happens only after the guard, tenant gate and policy rewrite.
+
+---
+
+## Slice 4 Handoff
+
+Developer: implementation sub-agent, 2026-11-25. Branch
+`feat/bi-44-console-and-installer`, stacked on
+`origin/feat/bi-44-in-place-assistant-and-bi` at `3f7127448`. Worktree
+`/tmp/wt-bi44-s4`. No PR opened or merged; the developer pushes the branch
+and hands off. No SQL migration, no `lakehouse-api` change and no root
+`docker-compose.yml` change.
+
+### Commits (plan order)
+
+- `0d94c1292` T1 `BI-44 slice 4: show install mode and query engine on Deployment`
+- `ea68765eb` T2 `BI-44 slice 4: hide warehouse pages and narrow Query Studio engines`
+- `9908c627a` T3 `BI-44 slice 4: lakehousectl install --mode and --engine`
+- this commit: the documentation and handoff.
+
+### What was built
+
+- **T1** `settings.ts` gains additive optional `installMode`, `queryEngine`
+  and `supportedInPlaceSources`, so an older server's `{ features: [] }` and
+  every full-mode mock are unchanged. `deployment-settings.tsx` draws an
+  installation summary from those fields only when one is present: Full vs
+  BI & Assistant only, the named engine, and, for a `bi-only` answer with a
+  source list, badges plus "read in place, nothing copied into the
+  lakehouse". An unknown value is shown as sent, never guessed. Five new
+  tests alongside the four existing ones.
+- **T2** `nav-config.ts` gains the pure `isHiddenInBiOnly` and
+  `filterNavSectionsForInstallMode`: full, absent, empty and unknown modes
+  return the ORIGINAL array; only `"bi-only"` drops Pipelines and the
+  warehouse-only hrefs including their child routes. A shared
+  `useDeploymentSettings(canRead)` hook fetches
+  `GET /api/settings/deployment` only for a `settings:write` holder — that
+  route is admin-gated in `policy.rs:960`, so a viewer fires no extra 403
+  (`WEB-11` / `ADM-13`). The sidebar filters the sections it already had;
+  Query Studio's pure `availableQueryEngines` narrows the engine picker to
+  the installed one and moves a stale `?engine=` tab onto it. Both-engine
+  behaviour is unchanged without an affirmative `bi-only` answer.
+- **T3** `cli.rs` adds `InstallModeArg` (`full`/`bi-only`) and
+  `QueryEngineArg` (`clickhouse`/`trino`) to `install --mode` / `--engine`,
+  with `validated_install` refusing `full` + `trino` before any file is
+  written. `install.rs` passes the parsed pair to a new
+  `write_layout_with_mode`; the old full-only entry point stays for the
+  existing tests. `secrets.rs` writes the two mode variables and exactly
+  one engine URL into the same 0600 `.env`, commenting out `TRINO_URL` for
+  a ClickHouse install and both `CH_URL` / `CLICKHOUSE_URL` for a Trino
+  install. A full install's `.env` is unchanged byte for byte.
+- **T4** `docs/core/features/bi-assistant-only-install.md` and
+  `ops/bi-only/README.md` document the flags, the console behaviour and the
+  honest limits; `docs/plans/BI-44-RESULT.md` records the memory gate as
+  **not verified** rather than inventing a figure; this handoff.
+
+### Verification (foreground, on the final code commit `9908c627a`)
+
+Every command ran in `/tmp/wt-bi44-s4`. Rust used `CARGO_INCREMENTAL=0`
+and `CARGO_TARGET_DIR=/home/shiro/rantai/RantAI-Lakehouse/rust/target`.
+
+| Command | Result |
+| --- | --- |
+| `bun run typecheck` | clean |
+| `bun run lint` | 0 errors, 13 warnings — the same 13 pre-existing warnings; none in a file this branch touched |
+| `bun run test` | **5089 pass**, 1 skip, 0 fail, 16978 `expect()` calls, 5090 tests across 468 files |
+| `bun test src/features/admin/deployment-settings.test.tsx` | **9 pass**, 0 fail |
+| `bun test src/lib/query-engines.test.ts src/components/app-shell/nav-config.test.ts src/components/app-shell/app-sidebar.test.tsx src/features/queries/query-studio-page.test.tsx` | **62 pass**, 0 fail |
+| `cd rust && cargo fmt --check -p lakehousectl` | clean (`FMT_CHECK_CLEAN`) |
+| `cargo clippy --manifest-path rust/Cargo.toml -p lakehousectl --all-targets -- -D warnings` | finished with no warnings |
+| `cargo test --manifest-path rust/Cargo.toml -p lakehousectl` | **211 passed**, 0 failed, 0 ignored |
+| `git diff --check` | clean (`DIFF_CHECK_CLEAN`) |
+
+### Skipped / not verified
+
+- **Not verified:** a live `docker compose up` of either standalone file
+  from a clean project name, a read query against a real in-place source,
+  and the peak-RSS comparison with `full`. `AC1`–`AC7` were not exercised on
+  a running installation. `docs/plans/BI-44-RESULT.md` says so by name; no
+  number is claimed as measured. This needs the clean-host Docker E2E gate.
+- **Not run:** the full workspace block (`cargo clippy --workspace`,
+  `cargo test --workspace`, Dagster pytest, `docker compose --profile '*'
+  config --quiet`). This slice touches only `src/`,
+  `rust/crates/lakehousectl/`, `ops/bi-only/README.md` and docs; the reviewer
+  runs the full block before merge (`AGENTS.md`, "Keep build time down").
+- **No migrations added.** `rust/crates/lakehouse-api/`, the root
+  `docker-compose.yml` and `policy.rs` were read but not changed.
+
+### Design notes for the reviewer
+
+1. The deployment route is `settings:write`-gated, so the console cannot
+   honestly learn the mode for a non-admin without a 403 on every page.
+   The pure helpers are still fully tested and wired for the principal who
+   may read the route; everyone else keeps the old menu and both engines,
+   and the API's own guard remains the second line of defence. This is a
+   limit, not a claim that every role sees the narrowed UI.
+2. `filterNavSectionsForInstallMode` returns the SAME array reference for
+   every mode other than `"bi-only"`. No extra render, no flash of a
+   shorter sidebar while loading, and no guess from a health probe.
+3. Full-mode `.env` bytes are protected by delegation: both
+   `write_env_with_mode(Full, ClickHouse)` and the production install path
+   run the original writer, and `with_install_mode` is the identity there.
+   The two full-only wrappers are `#[cfg(test)]` so the existing tests stay
+   untouched while clippy `-D warnings` sees no dead code in the binary.
+4. The installer writes the mode and engine variables; it does not swap the
+   release's root Compose file or start the standalone file. The seven-service
+   deployment still comes from `ops/bi-only/`; the docs say so instead of
+   implying that the flag alone removes warehouse containers.
