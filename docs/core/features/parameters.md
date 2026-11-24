@@ -20,6 +20,8 @@ visitors to revenue without an editor making a second chart.
 3. Put its control in a dashboard's filter row; a viewer changes the value and every chart that uses it follows. The value travels in the URL.
 4. Ask the assistant to add a parameter and use it.
 
+- 2026-11-24 (`AI-36`, `PR pending`): fixed — `create_parameter` now refuses a call with no `default` (a null default is refused the same way), so it never drafts a parameter with no value for when nobody chooses one.
+
 ## Not included
 
 - Parameters inside the SQL of a SQL source or saved query: that is `QS-5`, which does not exist yet. This slice waits for it and says so in the product.
