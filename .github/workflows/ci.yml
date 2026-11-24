@@ -1254,8 +1254,8 @@ jobs:
       # would fail on any service that has a `build:` block and no local
       # image, so it is built here, with the SAME `-p`/`--profile` flags as
       # the `up` below, which is what names the image the `up` will look for.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g3aci --profile dagster build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g3aci --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up lakehouse-api + Dagster + the G3a source table + the Iceberg query database
         run: >
@@ -1366,8 +1366,8 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g3ci --profile dagster build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g3ci --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up lakehouse-api + Dagster + the G3a source table
         run: >
@@ -1489,8 +1489,8 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster --profile cdc build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g4ci -f docker-compose.yml -f ops/g4/docker-compose.g4.override.yml --profile dagster --profile cdc build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, Kafka, Kafka Connect, and Dagster
         # SRC-9 task 6: the `-f` pair on every compose call of this job (the
@@ -1654,8 +1654,8 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g4myci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mysql.override.yml --profile g6-sql --profile dagster --profile cdc --profile g4-mysql build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g4myci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mysql.override.yml --profile g6-sql --profile dagster --profile cdc --profile g4-mysql build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, Kafka, Kafka Connect, and Dagster
         # SRC-9 task 6: the `-f` pair on every compose call of this job (the
@@ -1809,8 +1809,8 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g4mgci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mongo.override.yml --profile dagster --profile cdc --profile g4-mongo build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g4mgci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mongo.override.yml --profile dagster --profile cdc --profile g4-mongo build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, Kafka, Kafka Connect, and Dagster
         # SRC-9 task 6: the `-f` pair on every compose call of this job (the
@@ -1953,8 +1953,8 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g4oraci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml -f ops/g4/docker-compose.g4-oracle.override.yml --profile g6-oracle --profile dagster --profile cdc --profile g4-oracle build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g4oraci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml -f ops/g4/docker-compose.g4-oracle.override.yml --profile g6-oracle --profile dagster --profile cdc --profile g4-oracle build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, Kafka, Kafka Connect, and Dagster
         # SRC-9 task 6: the `-f` pair on every compose call of this job (the
@@ -2107,8 +2107,8 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g4msci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mssql.override.yml --profile g6-sql --profile dagster --profile cdc --profile g4-mssql build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g4msci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g4/docker-compose.g4-mssql.override.yml --profile g6-sql --profile dagster --profile cdc --profile g4-mssql build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, Kafka, Kafka Connect, and Dagster
         # SRC-9 task 6: the `-f` pair on every compose call of this job (the
@@ -2234,8 +2234,8 @@ jobs:
       # Fixture image, built here rather than shared (the API depends on
       # oidc-mock being healthy, so it must be up even though this gate signs
       # in through Keycloak, not the mock); see `g4-cdc`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p sec3ci -f docker-compose.yml -f ops/sso/docker-compose.keycloak.override.yml --profile sso build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p sec3ci -f docker-compose.yml -f ops/sso/docker-compose.keycloak.override.yml --profile sso build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up Postgres, ClickHouse, oidc-mock, the API and Keycloak
         run: >
@@ -2347,10 +2347,10 @@ jobs:
       # `rest-stub-g6` is in the `g6`/`g6-other` profiles and is built by
       # `g6-ingest-other`. Same `-f` pair and `--profile` flags as the "up"
       # step below.
-      - name: Build the oidc-mock fixture image
+      - name: Build the oidc-mock and init fixture images
         run: >
           docker compose -p g6ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
-          --profile g6-sql --profile dagster build oidc-mock
+          --profile g6-sql --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up the g6 SQL matrix (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, not a bare `up` on the activated
@@ -2500,10 +2500,10 @@ jobs:
       # `build:` block and no `image:`. Same `-f` pair and `--profile` flags
       # as the "up" step below (`rest-stub-g6` is invisible to `build`
       # without them).
-      - name: Build the oidc-mock and rest-stub-g6 fixture images
+      - name: Build the oidc-mock, init and rest-stub-g6 fixture images
         run: >
           docker compose -p g6otherci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
-          --profile g6-other --profile dagster build oidc-mock rest-stub-g6
+          --profile g6-other --profile dagster build oidc-mock lakekeeper-warehouse-init rest-stub-g6
 
       - name: Bring up the g6 files, APIs and streams matrix (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, as `g6-ingest` explains (the dagster profile
@@ -2551,10 +2551,10 @@ jobs:
       # A separate compose project has its own image names, so the fixture
       # it needs is built again here (`oidc-mock` only: the link-local stack
       # does not start `rest-stub-g6`).
-      - name: Build the oidc-mock fixture image for the link-local project
+      - name: Build the oidc-mock and init fixture images for the link-local project
         run: >
           docker compose -p g6ci-linklocal -f docker-compose.yml -f ops/g6/docker-compose.g6-linklocal-secrets.override.yml
-          --profile g6-linklocal --profile dagster build oidc-mock
+          --profile g6-linklocal --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up a SEPARATE, override-free (for INGEST_ALLOW_INTERNAL_HOSTS) project for the link-local assertion
         # "Override-free" means no `ops/g6/docker-compose.g6.override.yml`
@@ -2658,10 +2658,10 @@ jobs:
       # `oracle-g6` is a pinned upstream image (pulled, not built) and
       # `g6-oracle-test-runner` uses the shared Dagster image (the override
       # gives it the same `image:` key), so `oidc-mock` is the only build.
-      - name: Build the oidc-mock fixture image
+      - name: Build the oidc-mock and init fixture images
         run: >
           docker compose -p g6oracleci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml
-          --profile g6-oracle --profile dagster build oidc-mock
+          --profile g6-oracle --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up the Oracle gate stack (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, as g6-ingest explains (the dagster profile
@@ -2774,8 +2774,8 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g9ci --profile dagster build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g9ci --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up lakehouse-api, Dagster and the API's Iceberg query database
         # Explicit service list, as g6-ingest explains: a bare `up` on the
@@ -2885,10 +2885,10 @@ jobs:
       # uses the shared Dagster image (the override gives it the same
       # `image:` key), so `oidc-mock` is the only build. Same `-f` pair and
       # `--profile` flags as the "up" step below.
-      - name: Build the oidc-mock fixture image
+      - name: Build the oidc-mock and init fixture images
         run: >
           docker compose -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
-          --profile g6-sql --profile g6-alerts --profile dagster build oidc-mock
+          --profile g6-sql --profile g6-alerts --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up the alert delivery stack (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, as g6-ingest explains (the dagster profile
@@ -3031,10 +3031,10 @@ jobs:
       # Fixture image, built here rather than shared; see `g6-alerts`.
       # `g6-ops-test-runner` uses the shared Dagster image, so `oidc-mock`
       # is the only build.
-      - name: Build the oidc-mock fixture image
+      - name: Build the oidc-mock and init fixture images
         run: >
           docker compose -p g6opsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
-          --profile g6-sql --profile g6-ops --profile dagster build oidc-mock
+          --profile g6-sql --profile g6-ops --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up the connector operations stack (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
         # Explicit service list, as g6-alerts and g6-ingest explain. The
@@ -3173,9 +3173,9 @@ jobs:
           echo "refused, naming the variable:"
           cat "$RUNNER_TEMP/no-key.err"
 
-      - name: Build the oidc-mock fixture image
+      - name: Build the oidc-mock and init fixture images
         run: >
-          docker compose -p src12ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g6/docker-compose.src12.override.yml --profile g6-sql --profile g6-ops --profile dagster build oidc-mock
+          docker compose -p src12ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g6/docker-compose.src12.override.yml --profile g6-sql --profile g6-ops --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up the stack
         run: >
@@ -3321,8 +3321,8 @@ jobs:
           # SEC-36: generated per run; no key-shaped literal in the repository.
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
-      - name: Build the oidc-mock fixture image
-        run: $COMPOSE build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: $COMPOSE build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up the stack and the two secret-manager fixtures
         run: >
@@ -3450,8 +3450,8 @@ jobs:
           # SEC-36: generated per run; no key-shaped literal in the repository.
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
-      - name: Build the oidc-mock fixture image
-        run: $COMPOSE build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: $COMPOSE build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up the stack
         run: >
@@ -3558,10 +3558,10 @@ jobs:
           # SEC-36: generated per run; no key-shaped literal in the repository.
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
-      - name: Build the oidc-mock fixture image
+      - name: Build the oidc-mock and init fixture images
         run: >
           docker compose -p src13scaleci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
-          --profile src13-scale build oidc-mock
+          --profile src13-scale build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up the API and its PostgreSQL
         # Explicit service list: the API starts its own `depends_on` (postgres,
@@ -3683,7 +3683,7 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       - name: Build the fixture images (oidc-mock, saas-stub-g6)
-        run: $COMPOSE build oidc-mock saas-stub-g6
+        run: $COMPOSE build oidc-mock lakekeeper-warehouse-init saas-stub-g6
 
       - name: Bring up the API, Dagster and the mock vendor server
         run: $COMPOSE up -d --no-build lakehouse-api dagster-code-location dagster-webserver dagster-daemon saas-stub-g6
@@ -3783,7 +3783,7 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       - name: Build the fixture images (oidc-mock, saas-stub-g6)
-        run: $COMPOSE build oidc-mock saas-stub-g6
+        run: $COMPOSE build oidc-mock lakekeeper-warehouse-init saas-stub-g6
 
       - name: Bring up the API, Dagster and the mock vendor server
         run: $COMPOSE up -d --no-build lakehouse-api dagster-code-location dagster-webserver dagster-daemon saas-stub-g6
@@ -3906,8 +3906,8 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p goldci --profile dagster build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p goldci --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       - name: Bring up lakehouse-api + Dagster (and the full Lakekeeper/authz chain)
         run: >
@@ -4016,8 +4016,8 @@ jobs:
           fi
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g8ci build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g8ci build oidc-mock lakekeeper-warehouse-init
 
       # DATA-21 S2: the `trino` leg needs the Trino coordinator (the
       # `trino` profile, whose own `depends_on` brings up the Lakekeeper
@@ -4203,8 +4203,8 @@ jobs:
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
-      - name: Build the oidc-mock fixture image
-        run: docker compose -p g8ttci --profile dagster build oidc-mock
+      - name: Build the oidc-mock and init fixture images
+        run: docker compose -p g8ttci --profile dagster build oidc-mock lakekeeper-warehouse-init
 
       # DATA-21 S2: the `trino` leg adds the Trino coordinator, which
       # reads the Bronze table through Lakekeeper's Iceberg catalog. The
