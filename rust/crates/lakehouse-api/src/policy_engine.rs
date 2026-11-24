@@ -548,7 +548,10 @@ impl<'a> PolicyEngineObligations<'a> {
     /// from another.
     #[must_use]
     pub fn from_state(state: &'a AppState) -> Self {
-        let engine = state.config.is_bi_only().then_some(state.config.query_engine);
+        let engine = state
+            .config
+            .is_bi_only()
+            .then_some(state.config.query_engine);
         let trino = (engine == Some(QueryEngine::Trino)).then_some(state.trino.as_ref());
         Self::new(state.pg.as_deref(), &state.clickhouse)
             .with_iceberg_db(state.config.iceberg_query_db.as_ref())
@@ -699,11 +702,10 @@ impl<'a> PolicyEngineObligations<'a> {
                     return None;
                 }
                 let client = self.trino?;
-                let columns = crate::in_place::introspect_trino_columns(
-                    client, parts[0], parts[1], parts[2],
-                )
-                .await
-                .ok()?;
+                let columns =
+                    crate::in_place::introspect_trino_columns(client, parts[0], parts[1], parts[2])
+                        .await
+                        .ok()?;
                 // The rewrite needs names only; no computed-column
                 // defaults exist on an external table, so both default
                 // slots stay empty and the mask closure has nothing to
@@ -1610,7 +1612,11 @@ mod external_catalog_columns {
         ));
         // A dead `ClickHouse`: if the resolver dialed it, this test would
         // fail with `real_columns: None` instead of the introspected list.
-        let ch = ChClient::new("http://127.0.0.1:1".to_owned(), "test".to_owned(), String::new());
+        let ch = ChClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            "test".to_owned(),
+            String::new(),
+        );
         let source = PolicyEngineObligations::new(Some(&pool), &ch)
             .with_in_place_engine(Some(QueryEngine::Trino), Some(&trino));
         let roles = ["Analyst".to_owned()];
@@ -1621,7 +1627,11 @@ mod external_catalog_columns {
             .expect("governed");
         assert_eq!(
             obl.real_columns,
-            Some(vec!["id".to_owned(), "email".to_owned(), "tenant_id".to_owned()])
+            Some(vec![
+                "id".to_owned(),
+                "email".to_owned(),
+                "tenant_id".to_owned()
+            ])
         );
         assert_eq!(obl.mask, vec!["email".to_owned()]);
         assert_eq!(obl.row_filter.as_deref(), Some("(id <= 4)"));
@@ -1636,7 +1646,11 @@ mod external_catalog_columns {
     ) -> sqlx::Result<()> {
         seed(&pool, "public.customers", "short-scope-mask").await;
         seed(&pool, "erp_pg.public.customers", "catalog-scope-mask").await;
-        let ch = ChClient::new("http://127.0.0.1:1".to_owned(), "test".to_owned(), String::new());
+        let ch = ChClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            "test".to_owned(),
+            String::new(),
+        );
         let source = PolicyEngineObligations::new(Some(&pool), &ch);
         let roles = ["Analyst".to_owned()];
         let keys = vec![

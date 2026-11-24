@@ -110,10 +110,18 @@ async fn get(app: &axum::Router, route: &str, cookie: &str) -> (StatusCode, Valu
         .unwrap();
     let status = resp.status();
     let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
-async fn post_json(app: &axum::Router, route: &str, cookie: &str, body: Value) -> (StatusCode, Value) {
+async fn post_json(
+    app: &axum::Router,
+    route: &str,
+    cookie: &str,
+    body: Value,
+) -> (StatusCode, Value) {
     let resp = app
         .clone()
         .oneshot(
@@ -129,7 +137,10 @@ async fn post_json(app: &axum::Router, route: &str, cookie: &str, body: Value) -
         .unwrap();
     let status = resp.status();
     let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 /// In `bi-only+trino`, `GET /api/catalog` is answered by wiremock `Trino`'s
@@ -168,8 +179,14 @@ async fn a_bi_only_trino_catalog_lists_only_the_active_engines_tables() {
     assert_eq!(assets.len(), 1, "{body}");
     assert_eq!(assets[0]["id"], json!("erp_pg.public.customers"));
     assert_eq!(assets[0]["zone"], json!("external"));
-    assert!(assets[0]["rows"].is_null(), "no fabricated row count: {body}");
-    assert!(assets[0]["sizeBytes"].is_null(), "no fabricated size: {body}");
+    assert!(
+        assets[0]["rows"].is_null(),
+        "no fabricated row count: {body}"
+    );
+    assert!(
+        assets[0]["sizeBytes"].is_null(),
+        "no fabricated size: {body}"
+    );
     assert_eq!(body["namespaces"][0]["id"], json!("erp_pg.public"));
 
     let statements: Vec<String> = server
@@ -180,8 +197,16 @@ async fn a_bi_only_trino_catalog_lists_only_the_active_engines_tables() {
         .map(|request| String::from_utf8_lossy(&request.body).into_owned())
         .collect();
     assert!(statements.iter().any(|s| s.contains("SHOW CATALOGS")));
-    assert!(statements.iter().any(|s| s.contains("SHOW SCHEMAS FROM \"erp_pg\"")));
-    assert!(statements.iter().any(|s| s.contains("SHOW TABLES FROM \"erp_pg\".\"public\"")));
+    assert!(
+        statements
+            .iter()
+            .any(|s| s.contains("SHOW SCHEMAS FROM \"erp_pg\""))
+    );
+    assert!(
+        statements
+            .iter()
+            .any(|s| s.contains("SHOW TABLES FROM \"erp_pg\".\"public\""))
+    );
 
     let (settings_status, _) = get(&router, "/api/settings/deployment", &cookie).await;
     // `catalog:read` alone cannot read settings; use an admin for the
@@ -192,7 +217,10 @@ async fn a_bi_only_trino_catalog_lists_only_the_active_engines_tables() {
     let (status, deployment) = get(&router, "/api/settings/deployment", &admin_cookie).await;
     assert_eq!(status, StatusCode::OK, "{deployment}");
     assert_eq!(deployment["installMode"], json!("bi-only"));
-    assert_eq!(deployment["supportedInPlaceSources"][0], json!("postgresql"));
+    assert_eq!(
+        deployment["supportedInPlaceSources"][0],
+        json!("postgresql")
+    );
 }
 
 /// A mask and a row filter authored on a 3-part external table are enforced
@@ -281,7 +309,10 @@ async fn a_bi_only_trino_query_masks_and_filters_a_three_part_external_table() {
         .iter()
         .find(|s| s.contains("FROM (SELECT"))
         .unwrap_or_else(|| panic!("the governed query was not sent to Trino: {statements:?}"));
-    assert!(query.contains("\"erp_pg\".\"public\".\"customers\""), "{query}");
+    assert!(
+        query.contains("\"erp_pg\".\"public\".\"customers\""),
+        "{query}"
+    );
     assert!(
         query.contains("CASE WHEN \"email\" IS NULL THEN NULL ELSE '***' END AS \"email\""),
         "{query}"

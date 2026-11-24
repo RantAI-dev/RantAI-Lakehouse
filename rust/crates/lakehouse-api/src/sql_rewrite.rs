@@ -2181,8 +2181,7 @@ fn obligations_for_keys(
                 table: full.to_owned(),
             });
         }
-        (Some(columns), _) => Some(columns.clone()),
-        (None, Some(columns)) => Some(columns.clone()),
+        (Some(columns), _) | (None, Some(columns)) => Some(columns.clone()),
         (None, None) => None,
     };
     Ok(Some(TableObligations {
@@ -6209,11 +6208,7 @@ mod external_catalog_substitution {
         substitute_governed_tables,
     };
 
-    fn obligation(
-        mask: &[&str],
-        filter: Option<&str>,
-        columns: &[&str],
-    ) -> TableObligations {
+    fn obligation(mask: &[&str], filter: Option<&str>, columns: &[&str]) -> TableObligations {
         TableObligations {
             mask: mask.iter().map(|c| (*c).to_owned()).collect(),
             row_filter: filter.map(str::to_owned),
@@ -6293,7 +6288,10 @@ mod external_catalog_substitution {
     fn a_three_part_policy_does_not_leak_onto_another_catalog() {
         for (dialect, engine) in [
             (&ClickHouseDialect {} as &dyn Dialect, Engine::ClickHouse),
-            (&super::TrinoDialect::default() as &dyn Dialect, Engine::Trino),
+            (
+                &super::TrinoDialect::default() as &dyn Dialect,
+                Engine::Trino,
+            ),
         ] {
             let out = rewrite(
                 "SELECT * FROM crm_pg.public.customers",
@@ -6318,7 +6316,10 @@ mod external_catalog_substitution {
         )]);
         for (dialect, engine) in [
             (&ClickHouseDialect {} as &dyn Dialect, Engine::ClickHouse),
-            (&super::TrinoDialect::default() as &dyn Dialect, Engine::Trino),
+            (
+                &super::TrinoDialect::default() as &dyn Dialect,
+                Engine::Trino,
+            ),
         ] {
             let out = rewrite(
                 "SELECT * FROM erp_pg.public.customers",
@@ -6338,11 +6339,19 @@ mod external_catalog_substitution {
         let obligations = HashMap::from([
             (
                 "public.customers".to_owned(),
-                obligation(&["phone"], Some("region = 'east'"), &["id", "email", "phone", "region", "tenant_id"]),
+                obligation(
+                    &["phone"],
+                    Some("region = 'east'"),
+                    &["id", "email", "phone", "region", "tenant_id"],
+                ),
             ),
             (
                 "erp_pg.public.customers".to_owned(),
-                obligation(&["email"], Some("tenant_id = 'tenant-a'"), &["id", "email", "phone", "region", "tenant_id"]),
+                obligation(
+                    &["email"],
+                    Some("tenant_id = 'tenant-a'"),
+                    &["id", "email", "phone", "region", "tenant_id"],
+                ),
             ),
         ]);
         let out = rewrite(
@@ -6377,7 +6386,11 @@ mod external_catalog_substitution {
         assert_eq!(keys[0].short, "public.customers");
         assert_eq!(keys[0].full, "erc_pg.public.customers");
         assert_eq!(
-            canonicalize_full(&["ERC_PG".to_owned(), "Public".to_owned(), "Customers".to_owned()]),
+            canonicalize_full(&[
+                "ERC_PG".to_owned(),
+                "Public".to_owned(),
+                "Customers".to_owned()
+            ]),
             "erc_pg.public.customers"
         );
     }
@@ -6386,16 +6399,21 @@ mod external_catalog_substitution {
     fn unparseable_sql_over_a_three_part_external_table_fails_closed() {
         for (dialect, engine) in [
             (&ClickHouseDialect {} as &dyn Dialect, Engine::ClickHouse),
-            (&super::TrinoDialect::default() as &dyn Dialect, Engine::Trino),
+            (
+                &super::TrinoDialect::default() as &dyn Dialect,
+                Engine::Trino,
+            ),
         ] {
-            assert!(substitute_governed_tables(
-                "SELCT * FROM erp_pg.public.customers",
-                dialect,
-                engine,
-                &catalog_obligation(),
-                &PlaceholderValues::none(),
-            )
-            .is_err());
+            assert!(
+                substitute_governed_tables(
+                    "SELCT * FROM erp_pg.public.customers",
+                    dialect,
+                    engine,
+                    &catalog_obligation(),
+                    &PlaceholderValues::none(),
+                )
+                .is_err()
+            );
         }
     }
 
@@ -6411,13 +6429,15 @@ mod external_catalog_substitution {
                 obligation(&["email"], None, &["id", "email", "phone"]),
             ),
         ]);
-        assert!(substitute_governed_tables(
-            "SELECT * FROM erp_pg.public.customers",
-            &ClickHouseDialect {},
-            Engine::ClickHouse,
-            &obligations,
-            &PlaceholderValues::none(),
-        )
-        .is_err());
+        assert!(
+            substitute_governed_tables(
+                "SELECT * FROM erp_pg.public.customers",
+                &ClickHouseDialect {},
+                Engine::ClickHouse,
+                &obligations,
+                &PlaceholderValues::none(),
+            )
+            .is_err()
+        );
     }
 }

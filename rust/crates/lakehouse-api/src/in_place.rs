@@ -186,7 +186,11 @@ impl IntrospectionError {
             }
             TrinoError::Transport(_) | TrinoError::Timeout => Class::Unavailable,
         };
-        Self(upstream_error::report(&INTROSPECTION, class, &err.to_string()))
+        Self(upstream_error::report(
+            &INTROSPECTION,
+            class,
+            &err.to_string(),
+        ))
     }
 
     /// Classifies a `ClickHouse` error with this crate's one classifier.
@@ -214,7 +218,13 @@ const INTROSPECTION_USER: &str = "catalog-introspection";
 /// `system`'s or `jmx`'s tables as sources would fabricate an external
 /// catalog that is not one.
 const TRINO_INTERNAL_CATALOGS: &[&str] = &[
-    "system", "jmx", "memory", "tpch", "tpcds", "iceberg", "information_schema",
+    "system",
+    "jmx",
+    "memory",
+    "tpch",
+    "tpcds",
+    "iceberg",
+    "information_schema",
 ];
 
 /// Schemas every SQL engine reserves. They hold metadata, not external
@@ -556,7 +566,10 @@ mod tests {
             ]
         );
         for source in supported_source_types(QueryEngine::Trino) {
-            assert!(source_support(QueryEngine::Trino, source).supported, "{source}");
+            assert!(
+                source_support(QueryEngine::Trino, source).supported,
+                "{source}"
+            );
         }
         for source in ["mongodb", "sftp", "kafka"] {
             let answer = source_support(QueryEngine::Trino, source);
@@ -583,11 +596,17 @@ mod tests {
 
     #[test]
     fn an_unsupported_source_serializes_with_camel_case_and_a_reason() {
-        let value = serde_json::to_value(source_support(QueryEngine::ClickHouse, "oracle")).unwrap();
+        let value =
+            serde_json::to_value(source_support(QueryEngine::ClickHouse, "oracle")).unwrap();
         assert_eq!(value["supported"], json!(false));
         assert_eq!(value["engine"], json!("clickhouse"));
         assert_eq!(value["sourceType"], json!("oracle"));
-        assert!(value["reason"].as_str().unwrap().contains("not supported in place"));
+        assert!(
+            value["reason"]
+                .as_str()
+                .unwrap()
+                .contains("not supported in place")
+        );
     }
 
     #[test]
@@ -612,7 +631,10 @@ mod tests {
         mount_trino(
             &server,
             "SHOW CATALOGS",
-            trino_page(&["Catalog"], &[vec!["system"], vec!["jmx"], vec!["iceberg"], vec!["erp_pg"]]),
+            trino_page(
+                &["Catalog"],
+                &[vec!["system"], vec!["jmx"], vec!["iceberg"], vec!["erp_pg"]],
+            ),
         )
         .await;
         mount_trino(
@@ -620,7 +642,11 @@ mod tests {
             "SHOW SCHEMAS FROM \"erp_pg\"",
             trino_page(
                 &["Schema"],
-                &[vec!["information_schema"], vec!["pg_catalog"], vec!["public"]],
+                &[
+                    vec!["information_schema"],
+                    vec!["pg_catalog"],
+                    vec!["public"],
+                ],
             ),
         )
         .await;
@@ -631,7 +657,9 @@ mod tests {
         )
         .await;
 
-        let tables = introspect_trino_tables(&trino_client(&server), 10).await.unwrap();
+        let tables = introspect_trino_tables(&trino_client(&server), 10)
+            .await
+            .unwrap();
         assert_eq!(
             tables,
             vec![
@@ -675,7 +703,9 @@ mod tests {
         )
         .await;
 
-        let tables = introspect_trino_tables(&trino_client(&server), 2).await.unwrap();
+        let tables = introspect_trino_tables(&trino_client(&server), 2)
+            .await
+            .unwrap();
         assert_eq!(tables.len(), 2);
     }
 
@@ -687,19 +717,29 @@ mod tests {
             "DESCRIBE \"erp_pg\".\"public\".\"customers\"",
             trino_page(
                 &["Column", "Type", "Extra", "Comment"],
-                &[vec!["id", "bigint", "", ""], vec!["email", "varchar", "", ""]],
+                &[
+                    vec!["id", "bigint", "", ""],
+                    vec!["email", "varchar", "", ""],
+                ],
             ),
         )
         .await;
 
-        let columns = introspect_trino_columns(&trino_client(&server), "erp_pg", "public", "customers")
-            .await
-            .unwrap();
+        let columns =
+            introspect_trino_columns(&trino_client(&server), "erp_pg", "public", "customers")
+                .await
+                .unwrap();
         assert_eq!(
             columns,
             vec![
-                InPlaceColumn { name: "id".to_owned(), data_type: "bigint".to_owned() },
-                InPlaceColumn { name: "email".to_owned(), data_type: "varchar".to_owned() },
+                InPlaceColumn {
+                    name: "id".to_owned(),
+                    data_type: "bigint".to_owned()
+                },
+                InPlaceColumn {
+                    name: "email".to_owned(),
+                    data_type: "varchar".to_owned()
+                },
             ]
         );
     }
@@ -723,7 +763,7 @@ mod tests {
         assert!(message.contains("could not be inspected"), "{message}");
     }
 
-    fn ch_page(data: Value) -> Value {
+    fn ch_page(data: &Value) -> Value {
         json!({ "meta": [], "data": data, "rows": data.as_array().map_or(0, Vec::len) })
     }
 
@@ -732,7 +772,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("FROM system.tables"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(ch_page(json!([
+            .respond_with(ResponseTemplate::new(200).set_body_json(ch_page(&json!([
                 {"database": "system", "name": "hidden", "engine": "Memory"},
                 {"database": "erp_pg", "name": "customers", "engine": "PostgreSQL"},
                 {"database": "shop", "name": "orders", "engine": "MaterializedMySQL"},
@@ -758,16 +798,18 @@ mod tests {
         Mock::given(method("POST"))
             .and(body_string_contains("FROM system.tables"))
             .respond_with(move |req: &wiremock::Request| {
-                seen.lock().unwrap().push(String::from_utf8_lossy(&req.body).into_owned());
-                ResponseTemplate::new(200).set_body_json(ch_page(json!([])))
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&req.body).into_owned());
+                ResponseTemplate::new(200).set_body_json(ch_page(&json!([])))
             })
             .mount(&server)
             .await;
 
-        assert!(introspect_clickhouse_external_tables(&ch_client(&server), 5)
+        let listed = introspect_clickhouse_external_tables(&ch_client(&server), 5)
             .await
-            .unwrap()
-            .is_empty());
+            .unwrap();
+        assert_eq!(listed, Vec::new());
         let statements = received.lock().unwrap();
         assert_eq!(statements.len(), 1);
         assert!(statements[0].contains("LIMIT 5"));
@@ -778,7 +820,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("FROM system.columns"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(ch_page(json!([
+            .respond_with(ResponseTemplate::new(200).set_body_json(ch_page(&json!([
                 {"name": "id", "type": "UInt64"},
                 {"name": "email", "type": "String"},
             ]))))
