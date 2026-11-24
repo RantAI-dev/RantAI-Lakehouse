@@ -116,6 +116,7 @@ from dagster import (
     DefaultScheduleStatus,
     DefaultSensorStatus,
     Failure,
+    Field,
     JobSelector,
     RetryPolicy,
     RunRequest,
@@ -131,6 +132,7 @@ from dagster import (
 from dispar_orchestrate import op_metadata
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, _ch_exec, _ch_query_json
 from dispar_orchestrate.file_ingest import JOB_NAME as FILE_INGEST_JOB
+from dispar_orchestrate.incremental_write import IncrementalConfig, write_incrementally
 from dispar_orchestrate.ingest_factory import job_tags
 
 # How long one run of an authored job may run, in seconds. An authored
@@ -623,6 +625,13 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
     @op(
         name=f"authored_{safe_name}",
         retry_policy=per_pipeline_retry,
+        # BLD-12: `POST /api/pipelines/{id}/trigger` with `fullRefresh: true`
+        # launches with `{"ops": {"authored_<safe id>": {"config":
+        # {"full_refresh": true}}}}`; the Rust route and this helper use the
+        # same `_dagster_safe_name` rule, so the key resolves to THIS op.
+        config_schema={
+            "full_refresh": Field(bool, default_value=False, is_required=False)
+        },
         tags=op_metadata.source_metadata(
             "dispar_orchestrate/authored_factory.py::_op_for_pipeline",
             reads=[
@@ -711,9 +720,28 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
                 description=f"authored pipeline {pipeline['id']!r} refused: {exc}",
                 allow_retries=False,
             ) from exc
-        written = _write_clickhouse_table(
-            ch, target_zone, target_table, compiled_sql, reads_iceberg
-        )
+        # BLD-12: the same statement, but the write strategy now comes from
+        # the stored definition (or the full-refresh op config). A config this
+        # build cannot execute raises AuthoredJobError inside the writer and is
+        # wrapped in the same non-retryable Failure as the guards above.
+        try:
+            materialization = write_incrementally(
+                ch,
+                target_zone,
+                target_table,
+                compiled_sql,
+                reads_iceberg,
+                IncrementalConfig.from_payload(
+                    definition,
+                    bool(context.op_config.get("full_refresh", False)),
+                ),
+            )
+        except AuthoredJobError as exc:
+            raise Failure(
+                description=f"authored pipeline {pipeline['id']!r} config rejected: {exc}",
+                allow_retries=False,
+            ) from exc
+        written = materialization.rows
 
         if definition.get("fbicEnabled"):
             context.log.info(FBIC_UNSUPPORTED_REASON)
@@ -724,7 +752,7 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
         context.log_event(
             AssetMaterialization(
                 asset_key=f"{target_zone}.{target_table}",
-                metadata={"rows": written},
+                metadata={"rows": written, **materialization.metadata()},
             )
         )
         return {"rows": written, "skipped_verbs": skipped_verbs}
