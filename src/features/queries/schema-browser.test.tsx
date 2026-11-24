@@ -80,6 +80,7 @@ const ICEBERG_TABLE = {
     snapshotCount: 0,
     metadataLogCount: 0,
   },
+  compactionAvailable: false,
 } as unknown as LakehouseTableDetail
 
 /** The page's two halves that matter here: the editor with its toolbar, and the browser. */

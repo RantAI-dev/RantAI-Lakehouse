@@ -823,8 +823,10 @@ async fn is_empty_report(
     let query = DashboardQuery::for_render(&sub.board, values.filters, values.params, values.grain)
         .fresh_all();
     // `SEC-50` slice 2 S6: the report runner acts as the subscription's
-    // owner, so the report shows the owner's own data — their first tenant,
-    // because the runner sends no `X-Tenant` header.
+    // owner, so the report shows the owner's own data — their first tenant.
+    // `SEC-54`: a subscription stores no acting tenant, so there is no
+    // scheduled tenant to carry; an empty header map keeps that first-tenant
+    // rule and the same gate the interactive export uses.
     let payload = payload_for(state, owner, &query, &HeaderMap::new())
         .await
         .map_err(|_| stop(DASHBOARD_UNREADABLE))?;
@@ -986,6 +988,9 @@ impl Collected<'_> {
             &PdfJob {
                 board: &self.sub.board,
                 person: self.owner.id.uuid(),
+                // SEC-54: no stored scheduled tenant, so the token omits
+                // `tenant` and the print view reads the owner's first one.
+                tenant: None,
                 values: *self.values,
                 paper,
                 orientation,

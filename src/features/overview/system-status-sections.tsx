@@ -23,7 +23,12 @@ import {
   formatPercent,
   formatRelativeTime,
 } from "@/lib/format"
-import { formatSignedBytes, lakehouseTableHref } from "@/lib/lakehouse-view"
+import {
+  formatSignedBytes,
+  lakehouseTableHref,
+  systemCompactionWarningMessage,
+  tablesNeedingCompaction,
+} from "@/lib/lakehouse-view"
 import type { Measured } from "@/lib/measured"
 import {
   icebergTablesWithoutRuns,
@@ -140,6 +145,53 @@ function OpenAlertsLink({ count }: { count: number }) {
       <BellRing className="size-4" aria-hidden />
       {count === 0 ? "No open alerts" : count === 1 ? "1 open alert" : `${count} open alerts`}
     </Button>
+  )
+}
+
+/**
+ * OPS-21: the deployment-wide compaction warning, rendered at the top of
+ * System status. It fires only from MEASURED small-file counts on tables that
+ * need compaction while Trino cannot do it (`checked && ok` false on the same
+ * probe set Services reports — `compactionAvailable` in the response). A
+ * failed/unavailable summary, an unmeasured row, a below-threshold count, and
+ * an available Trino are all silent: no invented warning from absent data.
+ * Each affected table links to the page where its count can be inspected.
+ */
+export function CompactionWarning({ refreshKey }: { refreshKey: number }) {
+  const status = useService((s) => lakehouseService.getCompactionStatus(s), [refreshKey])
+  if (status.status !== "success") return null
+
+  const affected = tablesNeedingCompaction(status.data)
+  if (affected.length === 0) return null
+
+  return (
+    <div
+      role="alert"
+      className="rounded-lg border border-destructive/40 bg-destructive/5 p-4 text-sm"
+    >
+      <p className="font-semibold text-destructive">Compaction needed, but nothing can do it</p>
+      <p className="mt-1 text-foreground">
+        {systemCompactionWarningMessage(affected.length)}
+      </p>
+      <ul className="mt-2 flex flex-wrap gap-x-4 gap-y-1">
+        {affected.map((t) => (
+          <li key={`${t.namespace}.${t.name}`} className="text-foreground">
+            <Link
+              href={lakehouseTableHref(t.namespace, t.name)}
+              className="font-mono text-primary hover:underline"
+            >
+              {t.namespace}.{t.name}
+            </Link>
+            <span className="text-muted-foreground"> — {t.smallFileCount} small files</span>
+          </li>
+        ))}
+      </ul>
+      {status.data.unmeasuredTables > 0 ? (
+        <p className="mt-2 text-xs text-muted-foreground">
+          {status.data.unmeasuredTables} more {status.data.unmeasuredTables === 1 ? "table was" : "tables were"} not measured and are not listed.
+        </p>
+      ) : null}
+    </div>
   )
 }
 

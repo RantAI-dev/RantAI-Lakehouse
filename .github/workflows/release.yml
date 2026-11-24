@@ -48,6 +48,9 @@ on:
       - "rust/Dockerfile"
       - "dagster/Dockerfile"
       - "ops/oidc-mock/**"
+      # REL-16: the offline init image's build context. A change to it
+      # changes an image the dry run builds and the install proof starts.
+      - "ops/init/**"
 
 # Least privilege. Nothing may write to the repository or to a package
 # unless the job that does it says so; the dry run may not write at all.
@@ -65,7 +68,7 @@ jobs:
   dry-run:
     name: Release · dry run
     # Never for a tag push: that is the real release, and it must not be
-    # preceded by a second full build of the same four images.
+    # preceded by a second full build of the same five images.
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # 150 minutes: the bundle now holds EVERY image the release runs
@@ -230,7 +233,7 @@ jobs:
         with:
           driver-opts: network=host
 
-      # The four images a release publishes. `GIT_SHA` is the commit the
+      # The five images a release publishes. `GIT_SHA` is the commit the
       # release is built from: the API serves an op's source only when
       # the op's stamped commit is its own, and without the arg both
       # stamp "unknown" and the console's source view answers 409 (see
@@ -274,6 +277,20 @@ jobs:
           tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-oidc-mock:${{ steps.version.outputs.version }}
           push: true
 
+      # REL-16: one small image carries curl, jq and openssl for all of the
+      # stack's init jobs, so an offline install starts them with no
+      # package-mirror access. It is built, signed, SBOM'd and bundled
+      # exactly like the other first-party images; `release-images.json`
+      # maps the services that run it.
+      - name: Build and push the init image
+        id: image-init
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ops/init
+          file: ops/init/Dockerfile
+          tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-init:${{ steps.version.outputs.version }}
+          push: true
+
       - name: Build and push the console image
         id: image-console
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -294,12 +311,13 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ steps.version.outputs.version }}"
-          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
+          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console rantai-lakehouse-init; do
             case "$name" in
               rantai-lakehouse-api) digest="${{ steps.image-api.outputs.digest }}" ;;
               rantai-lakehouse-dagster) digest="${{ steps.image-dagster.outputs.digest }}" ;;
               rantai-lakehouse-oidc-mock) digest="${{ steps.image-oidc.outputs.digest }}" ;;
               rantai-lakehouse-console) digest="${{ steps.image-console.outputs.digest }}" ;;
+              rantai-lakehouse-init) digest="${{ steps.image-init.outputs.digest }}" ;;
             esac
             echo "::group::$name"
             echo "digest: $digest"
@@ -311,6 +329,7 @@ jobs:
             echo "dagster=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-dagster:${{ steps.version.outputs.version }}@${{ steps.image-dagster.outputs.digest }}"
             echo "oidc=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-oidc-mock:${{ steps.version.outputs.version }}@${{ steps.image-oidc.outputs.digest }}"
             echo "console=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-console:${{ steps.version.outputs.version }}@${{ steps.image-console.outputs.digest }}"
+            echo "init=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-init:${{ steps.version.outputs.version }}@${{ steps.image-init.outputs.digest }}"
           } >> "$GITHUB_OUTPUT"
 
       # The digests, and the services that run them: the mapping is the
@@ -323,8 +342,10 @@ jobs:
             --arg dagster "${{ steps.images.outputs.dagster }}" \
             --arg oidc "${{ steps.images.outputs.oidc }}" \
             --arg console "${{ steps.images.outputs.console }}" \
+            --arg init "${{ steps.images.outputs.init }}" \
             '{"rantai-lakehouse-api": $api, "rantai-lakehouse-dagster": $dagster,
-              "rantai-lakehouse-oidc-mock": $oidc, "rantai-lakehouse-console": $console}' > digests.json
+              "rantai-lakehouse-oidc-mock": $oidc, "rantai-lakehouse-console": $console,
+              "rantai-lakehouse-init": $init}' > digests.json
           jq -n --argjson digests "$(cat digests.json)" \
             --slurpfile map ops/release/release-images.json '
               reduce ($map[0] | to_entries[]) as $entry
@@ -400,7 +421,7 @@ jobs:
           COSIGN_PRIVATE_KEY: ${{ steps.throwaway-key.outputs.private_key }}
         run: |
           set -euo pipefail
-          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
+          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console rantai-lakehouse-init; do
             ref="$(jq -r --arg name "$name" '.[$name]' digests.json)"
             echo "signing $ref"
             cosign sign --key "$COSIGN_KEY" \
@@ -449,6 +470,16 @@ jobs:
           output-file: sbom/rantai-lakehouse-oidc-mock.cdx.json
           upload-artifact: false
 
+      # REL-16: the init image is a first-party image too, so it carries a
+      # CycloneDX JSON SBOM and an attestation like the other four.
+      - name: The SBOM of the init image
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ steps.images.outputs.init }}
+          format: cyclonedx-json
+          output-file: sbom/rantai-lakehouse-init.cdx.json
+          upload-artifact: false
+
       - name: The SBOM of the console image
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
@@ -464,7 +495,7 @@ jobs:
           COSIGN_PRIVATE_KEY: ${{ steps.throwaway-key.outputs.private_key }}
         run: |
           set -euo pipefail
-          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
+          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console rantai-lakehouse-init; do
             ref="$(jq -r --arg name "$name" '.[$name]' digests.json)"
             echo "attesting $name"
             cosign attest --key "$COSIGN_KEY" --type cyclonedx \
@@ -894,7 +925,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      # The same four images as the dry run, with the same arguments;
+      # The same five images as the dry run, with the same arguments;
       # see the dry run for why each one is what it is.
       - name: Build and push the API image
         id: image-api
@@ -933,6 +964,20 @@ jobs:
           tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-oidc-mock:${{ steps.version.outputs.version }}
           push: true
 
+      # REL-16: one small image carries curl, jq and openssl for all of the
+      # stack's init jobs, so an offline install starts them with no
+      # package-mirror access. It is built, signed, SBOM'd and bundled
+      # exactly like the other first-party images; `release-images.json`
+      # maps the services that run it.
+      - name: Build and push the init image
+        id: image-init
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ops/init
+          file: ops/init/Dockerfile
+          tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-init:${{ steps.version.outputs.version }}
+          push: true
+
       - name: Build and push the console image
         id: image-console
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -952,12 +997,13 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ steps.version.outputs.version }}"
-          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
+          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console rantai-lakehouse-init; do
             case "$name" in
               rantai-lakehouse-api) digest="${{ steps.image-api.outputs.digest }}" ;;
               rantai-lakehouse-dagster) digest="${{ steps.image-dagster.outputs.digest }}" ;;
               rantai-lakehouse-oidc-mock) digest="${{ steps.image-oidc.outputs.digest }}" ;;
               rantai-lakehouse-console) digest="${{ steps.image-console.outputs.digest }}" ;;
+              rantai-lakehouse-init) digest="${{ steps.image-init.outputs.digest }}" ;;
             esac
             echo "::group::$name"
             echo "digest: $digest"
@@ -969,6 +1015,7 @@ jobs:
             echo "dagster=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-dagster:${{ steps.version.outputs.version }}@${{ steps.image-dagster.outputs.digest }}"
             echo "oidc=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-oidc-mock:${{ steps.version.outputs.version }}@${{ steps.image-oidc.outputs.digest }}"
             echo "console=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-console:${{ steps.version.outputs.version }}@${{ steps.image-console.outputs.digest }}"
+            echo "init=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-init:${{ steps.version.outputs.version }}@${{ steps.image-init.outputs.digest }}"
           } >> "$GITHUB_OUTPUT"
 
       - name: The images the services run
@@ -979,8 +1026,10 @@ jobs:
             --arg dagster "${{ steps.images.outputs.dagster }}" \
             --arg oidc "${{ steps.images.outputs.oidc }}" \
             --arg console "${{ steps.images.outputs.console }}" \
+            --arg init "${{ steps.images.outputs.init }}" \
             '{"rantai-lakehouse-api": $api, "rantai-lakehouse-dagster": $dagster,
-              "rantai-lakehouse-oidc-mock": $oidc, "rantai-lakehouse-console": $console}' > digests.json
+              "rantai-lakehouse-oidc-mock": $oidc, "rantai-lakehouse-console": $console,
+              "rantai-lakehouse-init": $init}' > digests.json
           jq -n --argjson digests "$(cat digests.json)" \
             --slurpfile map ops/release/release-images.json '
               reduce ($map[0] | to_entries[]) as $entry
@@ -1008,7 +1057,7 @@ jobs:
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
           set -euo pipefail
-          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
+          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console rantai-lakehouse-init; do
             ref="$(jq -r --arg name "$name" '.[$name]' digests.json)"
             echo "signing $ref"
             cosign sign --key "$COSIGN_KEY" \
@@ -1053,6 +1102,16 @@ jobs:
           output-file: sbom/rantai-lakehouse-oidc-mock.cdx.json
           upload-artifact: false
 
+      # REL-16: the init image is a first-party image too, so it carries a
+      # CycloneDX JSON SBOM and an attestation like the other four.
+      - name: The SBOM of the init image
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ steps.images.outputs.init }}
+          format: cyclonedx-json
+          output-file: sbom/rantai-lakehouse-init.cdx.json
+          upload-artifact: false
+
       - name: The SBOM of the console image
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
@@ -1069,7 +1128,7 @@ jobs:
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
           set -euo pipefail
-          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
+          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console rantai-lakehouse-init; do
             ref="$(jq -r --arg name "$name" '.[$name]' digests.json)"
             echo "attesting $name"
             cosign attest --key "$COSIGN_KEY" --type cyclonedx \
@@ -1329,7 +1388,7 @@ jobs:
             echo "notes are written in REL-2 S5 (docs/core/reference/release-policy.md)."
             echo ""
             echo "The offline bundle is $size bytes ($((size / 1024 / 1024)) MiB) compressed."
-            echo "It holds every image the release runs — the four published ones and the"
+            echo "It holds every image the release runs — the five published ones and the"
             echo "third-party ones, each by digest."
             echo ""
             echo "The bundle is attached in $parts part(s), 1900 MiB at most each ($version"
@@ -1474,16 +1533,69 @@ jobs:
       # install runs — a pull that still works means the runner has a
       # way to the registries, and the proof is not air-gapped.
       #
-      # The hosts are the ones the registries answer on: Docker Hub's
-      # registry, its authentication and its index, GHCR, Quay, and the
-      # CDN the Docker Hub layers come from.
+      # The hosts are the ones the registries AND package mirrors answer
+      # on: Docker Hub's registry, its authentication and its index, GHCR,
+      # Quay, the CDN the Docker Hub layers come from, and the Alpine CDN.
+      # REL-16: the /etc/hosts cut is the HOST side; the CONTAINER side is
+      # cut with an iptables REJECT on DOCKER-USER, so a container cannot
+      # reach any external host — including dl-cdn.alpinelinux.org — while
+      # the runner's own GitHub control channel stays up.
       - name: Cut the runner off from the registries
         run: |
           set -euo pipefail
+          # The hosts sinkhole is belt-and-suspenders (REL-12): it catches
+          # name resolution, and the two firewalls below catch a cached
+          # answer or a direct-IP pull that bypasses DNS. Registries AND
+          # package mirrors resolve to 0.0.0.0, so a host `docker pull` or
+          # an `apk add` cannot reach them. REL-16: the Alpine CDN is named
+          # even though the init containers no longer install packages at
+          # start — that is the regression this proof must catch.
+          #
+          # The HOST keeps its route to GitHub: the Actions runner's control
+          # channel is neither a container (so DOCKER-USER does not touch it)
+          # nor uid 0 (so the host OUTPUT firewall does not touch it).
           for host in registry-1.docker.io auth.docker.io index.docker.io \
-            ghcr.io quay.io production.cloudflare.docker.com; do
+            ghcr.io quay.io production.cloudflare.docker.com \
+            dl-cdn.alpinelinux.org; do
             echo "0.0.0.0 $host" | sudo tee -a /etc/hosts
           done
+
+          # CONTAINER egress is cut at the bridge, not at the host:
+          # DOCKER-USER is evaluated before Docker's own FORWARD rules, so
+          # this blocks ALL traffic FROM containers to the internet —
+          # registries, the Alpine mirror, PyPI, anything — while leaving
+          # the host (and the runner's GitHub connection) alone.
+          # ESTABLISHED/RELATED keep existing connections working, and
+          # RFC1918 destinations keep the compose network and the host's
+          # published ports reachable.
+          sudo iptables -F DOCKER-USER
+          sudo iptables -I DOCKER-USER 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+          sudo iptables -I DOCKER-USER 2 -s 127.0.0.0/8 -j ACCEPT
+          sudo iptables -I DOCKER-USER 3 -d 127.0.0.0/8 -j ACCEPT
+          sudo iptables -I DOCKER-USER 4 -d 172.16.0.0/12 -j ACCEPT
+          sudo iptables -I DOCKER-USER 5 -d 10.0.0.0/8 -j ACCEPT
+          sudo iptables -I DOCKER-USER 6 -d 192.168.0.0/16 -j ACCEPT
+          sudo iptables -I DOCKER-USER 7 -j REJECT --reject-with icmp-admin-prohibited
+          # The rule is ASSERTED, not assumed: a runner without the chain,
+          # or another rule accepting before ours, would leave the proof
+          # silently connected.
+          rules="$(sudo iptables -S DOCKER-USER)"
+          case "$rules" in
+            *"-j REJECT"*) echo "container egress is rejected: $rules" ;;
+            *) echo "::error::DOCKER-USER has no REJECT rule: $rules"; exit 1 ;;
+          esac
+
+          # REL-12: the real HOST cutoff. `dockerd`/`containerd` leave the
+          # host in OUTPUT as uid 0; blocking only that uid's 80/443 leaves
+          # Runner.Worker's HTTPS (non-root), loopback and container traffic
+          # (FORWARD/DOCKER-USER, just cut above) untouched. The two cuts are
+          # complementary: this one owns host OUTPUT, DOCKER-USER owns
+          # container FORWARD, and neither touches the runner's GitHub
+          # control channel.
+          sudo bash ops/release/airgap_firewall.sh enable
+
+          # Both sides of the cut are proved the way they always were: a
+          # pull of an image that is not in the bundle must fail.
           if docker pull alpine:3.20; then
             echo "::error::the runner can still pull from a registry: the proof is not air-gapped"
             exit 1
@@ -1520,6 +1632,23 @@ jobs:
           # not by a runner.
           ./lakehousectl install --bundle bundle --dir install \
             --ignore-preflight disk --ignore-preflight memory
+
+      # REL-16: prove the CONTAINER side of the air gap, not just the host's.
+      # A container from the bundle's own init image must not be able to
+      # reach the Alpine mirror or any other internet host. This is why
+      # curl/jq/openssl are baked into that image: a runtime package
+      # install would fail here, exactly as it fails on an offline host.
+      - name: Containers have no outbound internet access
+        run: |
+          set -euo pipefail
+          image="$(jq -r '.images["lakekeeper-warehouse-init"]' bundle/release.json)"
+          for url in http://dl-cdn.alpinelinux.org/alpine/v3.20/main/ https://example.com/; do
+            if docker run --rm "$image" curl -fsS --max-time 5 "$url" >/dev/null 2>&1; then
+              echo "::error::a container can still reach $url: the air gap is not real"
+              exit 1
+            fi
+          done
+          echo "containers cannot reach the Alpine mirror or the internet."
 
       # A fresh install names the tenant that owns the shared catalog
       # (REL-10). With more than one tenant and the setting empty, the
@@ -1600,6 +1729,17 @@ jobs:
         if: always()
         run: |
           docker compose -p rantai-lakehouse ps || true
+
+      - name: Restore outbound firewall rules
+        if: always()
+        run: |
+          set -euo pipefail
+          # REL-12: the air gap is job-scoped. Remove it even when a
+          # proof step failed, so the chain never outlives this job.
+          # The guard covers a failed checkout: no script, no chain.
+          if [ -f ops/release/airgap_firewall.sh ]; then
+            sudo bash ops/release/airgap_firewall.sh disable
+          fi
 
   update-proof:
     name: Proof · the update moves the stack, and rolls back
@@ -1989,14 +2129,66 @@ jobs:
       # the install runs — a runner that can still pull would hide the
       # bug this proof exists for. The throwaway registry on
       # `localhost` is NOT cut off: it is this job's own, and both
-      # images were pushed to it before the cut.
+      # images were pushed to it before the cut. REL-16 adds the Alpine
+      # CDN to the HOST's blocked names and an iptables REJECT on
+      # DOCKER-USER for CONTAINER egress; the host's GitHub connection is
+      # deliberately untouched.
       - name: Cut the runner off from the registries
         run: |
           set -euo pipefail
+          # The hosts sinkhole is belt-and-suspenders (REL-12): it catches
+          # name resolution, and the two firewalls below catch a cached
+          # answer or a direct-IP pull that bypasses DNS. Registries AND
+          # package mirrors resolve to 0.0.0.0, so a host `docker pull` or
+          # an `apk add` cannot reach them. REL-16: the Alpine CDN is named
+          # even though the init containers no longer install packages at
+          # start — that is the regression this proof must catch.
+          #
+          # The HOST keeps its route to GitHub: the Actions runner's control
+          # channel is neither a container (so DOCKER-USER does not touch it)
+          # nor uid 0 (so the host OUTPUT firewall does not touch it).
           for host in registry-1.docker.io auth.docker.io index.docker.io \
-            ghcr.io quay.io production.cloudflare.docker.com; do
+            ghcr.io quay.io production.cloudflare.docker.com \
+            dl-cdn.alpinelinux.org; do
             echo "0.0.0.0 $host" | sudo tee -a /etc/hosts
           done
+
+          # CONTAINER egress is cut at the bridge, not at the host:
+          # DOCKER-USER is evaluated before Docker's own FORWARD rules, so
+          # this blocks ALL traffic FROM containers to the internet —
+          # registries, the Alpine mirror, PyPI, anything — while leaving
+          # the host (and the runner's GitHub connection) alone.
+          # ESTABLISHED/RELATED keep existing connections working, and
+          # RFC1918 destinations keep the compose network and the host's
+          # published ports reachable.
+          sudo iptables -F DOCKER-USER
+          sudo iptables -I DOCKER-USER 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+          sudo iptables -I DOCKER-USER 2 -s 127.0.0.0/8 -j ACCEPT
+          sudo iptables -I DOCKER-USER 3 -d 127.0.0.0/8 -j ACCEPT
+          sudo iptables -I DOCKER-USER 4 -d 172.16.0.0/12 -j ACCEPT
+          sudo iptables -I DOCKER-USER 5 -d 10.0.0.0/8 -j ACCEPT
+          sudo iptables -I DOCKER-USER 6 -d 192.168.0.0/16 -j ACCEPT
+          sudo iptables -I DOCKER-USER 7 -j REJECT --reject-with icmp-admin-prohibited
+          # The rule is ASSERTED, not assumed: a runner without the chain,
+          # or another rule accepting before ours, would leave the proof
+          # silently connected.
+          rules="$(sudo iptables -S DOCKER-USER)"
+          case "$rules" in
+            *"-j REJECT"*) echo "container egress is rejected: $rules" ;;
+            *) echo "::error::DOCKER-USER has no REJECT rule: $rules"; exit 1 ;;
+          esac
+
+          # REL-12: the real HOST cutoff. `dockerd`/`containerd` leave the
+          # host in OUTPUT as uid 0; blocking only that uid's 80/443 leaves
+          # Runner.Worker's HTTPS (non-root), loopback and the local
+          # throwaway registry on localhost:5000 untouched. The two cuts are
+          # complementary: this one owns host OUTPUT, DOCKER-USER (cut just
+          # above) owns container FORWARD, and neither touches the runner's
+          # GitHub control channel.
+          sudo bash ops/release/airgap_firewall.sh enable
+
+          # Both sides of the cut are proved the way they always were: a
+          # pull of an image that is not in the bundle must fail.
           if docker pull alpine:3.20; then
             echo "::error::the runner can still pull from a registry: the proof is not air-gapped"
             exit 1
@@ -2034,6 +2226,23 @@ jobs:
             grep -n 'CATALOG_TENANT_ID' install/.env >&2 || true
             exit 1
           fi
+
+      # REL-16: the container side of the air gap, proved with the
+      # bundle's own init image. If a container could still reach the
+      # Alpine mirror or the internet, an init job that installs a
+      # package at start would pass this proof and fail on a real
+      # offline host.
+      - name: Containers have no outbound internet access
+        run: |
+          set -euo pipefail
+          image="$(jq -r '.images["lakekeeper-warehouse-init"]' bundle-a/release.json)"
+          for url in http://dl-cdn.alpinelinux.org/alpine/v3.20/main/ https://example.com/; do
+            if docker run --rm "$image" curl -fsS --max-time 5 "$url" >/dev/null 2>&1; then
+              echo "::error::a container can still reach $url: the air gap is not real"
+              exit 1
+            fi
+          done
+          echo "containers cannot reach the Alpine mirror or the internet."
 
       - name: The stack is ready and the console answers
         run: |
@@ -2411,3 +2620,14 @@ jobs:
         if: always()
         run: |
           docker compose -p rantai-lakehouse ps || true
+
+      - name: Restore outbound firewall rules
+        if: always()
+        run: |
+          set -euo pipefail
+          # REL-12: the air gap is job-scoped. Remove it even when a
+          # proof step failed, so the chain never outlives this job.
+          # The guard covers a failed checkout: no script, no chain.
+          if [ -f ops/release/airgap_firewall.sh ]; then
+            sudo bash ops/release/airgap_firewall.sh disable
+          fi

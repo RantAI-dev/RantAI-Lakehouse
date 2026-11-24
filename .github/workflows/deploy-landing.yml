@@ -1,0 +1,107 @@
+# Publish the landing page to GitHub Pages (WEB-1): https://lakehouse.rantai.dev
+#
+# The page is the same `LandingPage` component the console serves at
+# `/landing`, exported statically by `ops/landing-pages` (a minimal Next
+# project) because the console's own config is `output: "standalone"` with a
+# `force-dynamic` root layout (`SEC-47`). See `ops/landing-pages/README.md`.
+#
+# It is its own workflow, not a job in ci.yml: it deploys rather than gates,
+# it needs the `pages: write`/`id-token: write` permissions ci.yml's read-only
+# token deliberately does not have, and it must run on a push to `main` that
+# touches only the page's inputs.
+name: Deploy Landing Page
+
+on:
+  push:
+    branches: [main]
+    # Everything the export reads. A landing edit, an icon, the design system
+    # tokens or fonts, the build runner, or the dependency tree must publish;
+    # an unrelated console change must not.
+    paths:
+      - "src/app/landing/**"
+      - "src/features/landing/**"
+      - "src/app/globals.css"
+      - "src/app/fonts/**"
+      # The two console modules the landing components import (`cn`, and the
+      # reduced-motion hook the landing re-exports).
+      - "src/lib/utils.ts"
+      - "src/hooks/use-reduced-motion.ts"
+      - "design-system/globals.css"
+      - "design-system/tokens/**"
+      - "design-system/fonts/**"
+      - "public/**"
+      - "ops/landing-pages/**"
+      - "scripts/build-landing-pages.ts"
+      - "package.json"
+      - "bun.lock"
+      - "tsconfig.json"
+      - ".github/workflows/deploy-landing.yml"
+  # On demand, so the page can be republished without a code change (for
+  # example after the custom domain or the Pages environment is changed).
+  workflow_dispatch:
+
+# The least GitHub Pages deployment needs: read the tree, publish the artifact,
+# and accept the OIDC token `deploy-pages` exchanges for the deployment.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time, and never cancel one in flight: a half-published
+# artifact is a broken site.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build the static export
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.12"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # The published site has no console of its own; the CTA points at the
+      # demo one. `src/features/landing/landing-copy.ts` reads this at build
+      # time and falls back to `/login` when it is unset.
+      - name: Build the landing page
+        run: NEXT_PUBLIC_CONSOLE_URL=https://lakehouse-demo.rantai.dev/login bun run build:landing
+
+      # A missing `.nojekyll` breaks `_next/` and a missing `CNAME` drops the
+      # custom domain; fail here instead of publishing a broken site.
+      - name: Verify the export
+        run: |
+          set -euo pipefail
+          test -f out-landing/index.html
+          test -f out-landing/CNAME
+          test "$(cat out-landing/CNAME)" = "lakehouse.rantai.dev"
+          test -f out-landing/.nojekyll
+          test -d out-landing/_next
+          grep -q "Your data has a home now" out-landing/index.html
+
+      - name: Upload the Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: out-landing
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
