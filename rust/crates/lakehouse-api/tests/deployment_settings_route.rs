@@ -276,3 +276,56 @@ async fn the_deployment_route_needs_settings_write() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+/// `BI-44`: the whole body, so the two additive fields can be asserted
+/// without changing the `features()` helper the older tests use.
+async fn deployment_body(app: &axum::Router, cookie: &str) -> Value {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(DEPLOYMENT)
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// A full stack reports its defaults and keeps the three-field body the
+/// console has always read: two new top-level keys only.
+#[tokio::test]
+async fn the_deployment_answer_names_the_full_stack_by_default() {
+    let TestApp { router, pool } = spin_up_with_env(&HashMap::new()).await;
+    let admin = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+    let body = deployment_body(&router, &cookie).await;
+    assert_eq!(body["installMode"], json!("full"));
+    assert_eq!(body["queryEngine"], json!("clickhouse"));
+    assert_eq!(body.as_object().unwrap().len(), 3);
+}
+
+/// A `bi-only` Trino installation names itself so the console can hide
+/// lakehouse-only pages without guessing from which URLs answered.
+#[tokio::test]
+async fn the_deployment_answer_names_the_bi_only_engine() {
+    let env = HashMap::from([
+        ("LAKEHOUSE_INSTALL_MODE".to_owned(), "bi-only".to_owned()),
+        ("LAKEHOUSE_QUERY_ENGINE".to_owned(), "trino".to_owned()),
+        ("TRINO_URL".to_owned(), "http://127.0.0.1:1".to_owned()),
+        // The harness sets a ClickHouse URL for every test; a bi-only
+        // Trino installation must not name that engine at all.
+        ("CH_URL".to_owned(), String::new()),
+    ]);
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+    let admin = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+    let body = deployment_body(&router, &cookie).await;
+    assert_eq!(body["installMode"], json!("bi-only"));
+    assert_eq!(body["queryEngine"], json!("trino"));
+}
