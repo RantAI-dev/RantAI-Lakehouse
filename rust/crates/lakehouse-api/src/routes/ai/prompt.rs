@@ -66,6 +66,23 @@ RULES
 - Only state numbers that appear in a tool result in this conversation.
 - Be concise. Use Markdown: short paragraphs, bold for the key figure, tables for comparisons.";
 
+/// The extra rules a `bi-only` install needs, and the only prompt text this
+/// file adds for `BI-44`. They are built here, never in `SYSTEM_BASE`: the
+/// `full` mode prompt stays byte-identical for every `AI-32` pin, while a
+/// model in a one-engine install is told which dialect its `run_sql` calls
+/// run and which engine it must never name. External tables are read in
+/// place, so the Bronze/Silver/Gold story in [`SYSTEM_BASE`] does not apply
+/// to this deployment.
+pub(super) fn bi_only_engine_rules(engine: crate::config::QueryEngine) -> String {
+    let (active, inactive) = match engine {
+        crate::config::QueryEngine::Trino => ("Trino SQL", "ClickHouse SQL"),
+        crate::config::QueryEngine::ClickHouse => ("ClickHouse SQL", "Trino SQL"),
+    };
+    format!(
+        "\n\nBI-ONLY ENGINE RULES\n- This installation runs {active} only. {inactive} is not installed: never reference, target or suggest a {inactive} table, database, session setting or tool call.\n- External tables are read in place through {active}; no data is copied into a lakehouse. There are no Bronze/Silver/Gold layers, no `serving` marts and no primary/secondary datasets.\n- Call list_datasets and describe_dataset for the table names and columns, then run_sql on those names."
+    )
+}
+
 /// Appended after the mode text when the chat may ask the person a question
 /// (`AI_ASK_BACK` on and `ask_user` in the tool list). It is a separate block
 /// and not part of [`SYSTEM_BASE`], so a deployment with the switch off
@@ -1134,6 +1151,25 @@ pub(super) fn group_of(name: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `BI-44` slice 3: the in-place rules are a separate block, so the
+    /// measured `full` prompt is untouched. Each install names only the
+    /// engine it started.
+    #[test]
+    fn the_bi_only_rules_name_only_the_active_engine() {
+        use crate::config::QueryEngine;
+
+        let trino = bi_only_engine_rules(QueryEngine::Trino);
+        assert!(trino.contains("BI-ONLY ENGINE RULES"));
+        assert!(trino.contains("Trino SQL"), "{trino}");
+        assert!(trino.contains("never reference, target or suggest a ClickHouse SQL"), "{trino}");
+        assert!(trino.contains("read in place"), "{trino}");
+        assert!(!trino.contains("target a ClickHouse SQL table"), "{trino}");
+
+        let ch = bi_only_engine_rules(QueryEngine::ClickHouse);
+        assert!(ch.contains("ClickHouse SQL"), "{ch}");
+        assert!(ch.contains("never reference, target or suggest a Trino SQL"), "{ch}");
+    }
 
     #[test]
     fn the_count_rules_are_five_lines_and_name_no_dataset() {
