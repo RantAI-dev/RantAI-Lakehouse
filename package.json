@@ -16,6 +16,7 @@
   "scripts": {
     "dev": "bun --bun next dev",
     "build": "next build",
+    "build:landing": "bun scripts/build-landing-pages.ts",
     "start": "bun --bun next start",
     "lint": "bun --bun eslint",
     "test": "bun test src",

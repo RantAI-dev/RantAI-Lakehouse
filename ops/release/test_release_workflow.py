@@ -297,9 +297,11 @@ PULL = re.compile(r'docker pull\s+"(?P<argument>[^"]*)"')
 SAVE = re.compile(r"docker save\b(?P<argument>.*)$")
 TAG = re.compile(r'docker tag\s+"(?P<argument>[^"]*)"')
 
-# The registries the proof cuts the runner off from: Docker Hub's
-# registry, its authentication and its index, GHCR, Quay, and the CDN
-# the Docker Hub layers come from.
+# The hosts the proof cuts the runner off from: Docker Hub's registry,
+# its authentication and its index, GHCR, Quay, the CDN the Docker Hub
+# layers come from, and — since REL-16 — the Alpine package mirror. A
+# runtime `apk add` is what failed an offline start, so blocking the
+# mirror is part of the air-gap contract, not just the registries.
 REGISTRIES = (
     "registry-1.docker.io",
     "auth.docker.io",
@@ -307,7 +309,15 @@ REGISTRIES = (
     "ghcr.io",
     "quay.io",
     "production.cloudflare.docker.com",
+    "dl-cdn.alpinelinux.org",
 )
+
+# REL-16: the container side of the air gap. `DOCKER-USER` is read before
+# Docker's own FORWARD rules, so a REJECT there stops ALL outbound
+# container traffic while leaving the host's GitHub control channel up.
+CONTAINER_EGRESS_CHAIN = "DOCKER-USER"
+CONTAINER_EGRESS_REJECT = "REJECT"
+CONTAINER_PROBE_STEP = "Containers have no outbound internet access"
 
 # The console image's build context: `.dockerignore` decides what the
 # console build sees, because the console is built from the repository
@@ -1428,8 +1438,30 @@ def air_gap_problems(document: dict[str, Any]) -> list[str]:
     for host in REGISTRIES:
         if host not in run:
             problems.append(f"the air-gap step does not cut {host} off")
+    # REL-16: the host-only cut was not enough — a container could still
+    # reach a package mirror, so starting an init job that installs a
+    # package passed the proof and failed on a real air-gapped host.
+    if "iptables" not in run or CONTAINER_EGRESS_CHAIN not in run:
+        problems.append("the air-gap step does not cut container egress with iptables DOCKER-USER")
+    if CONTAINER_EGRESS_REJECT not in run:
+        problems.append("the air-gap step does not REJECT container egress")
+    if "ESTABLISHED,RELATED" not in run or "127.0.0.0/8" not in run:
+        problems.append("the air-gap cut does not preserve established and loopback traffic")
     if "docker pull" not in run or "exit 1" not in run:
         problems.append("the air-gap step does not prove that the cut holds")
+    # A container probe, after the install (the init image is in the
+    # bundle), proves the container side with the image that has to work
+    # offline — not just with a rule listing.
+    if CONTAINER_PROBE_STEP not in names:
+        problems.append("the proof never probes container outbound internet access")
+    elif names.index(CONTAINER_PROBE_STEP) < names.index("Install the bundle"):
+        problems.append("the container probe runs before the bundle is installed")
+    else:
+        probe = str(step_named(document, "install-proof", CONTAINER_PROBE_STEP).get("run") or "")
+        if "dl-cdn.alpinelinux.org" not in probe:
+            problems.append("the container probe does not try the Alpine mirror")
+        if "curl" not in probe or "exit 1" not in probe:
+            problems.append("the container probe does not prove that a container is cut off")
     return problems
 
 
@@ -2299,6 +2331,30 @@ class ReleaseWorkflowTest(unittest.TestCase):
         problems = air_gap_problems(document)
         self.assertIn("the proof installs before the runner is cut off", problems)
 
+    def test_a_host_only_cut_is_reported(self) -> None:
+        """REL-16: the new container checks must be able to fail.
+
+        A workflow that only maps registry names in `/etc/hosts` is the
+        old proof: a container can still reach the Alpine mirror, so an
+        init job that installs a package at start would pass it.
+        """
+        hosts = "\n".join(f'          echo "0.0.0.0 {host}" | sudo tee -a /etc/hosts' for host in REGISTRIES)
+        document = yaml.safe_load(
+            "name: Synthetic\non: workflow_dispatch\njobs:\n"
+            "  install-proof:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - name: Cut the runner off from the registries\n"
+            "        run: |\n          set -euo pipefail\n"
+            f"{hosts}\n"
+            "          if docker pull alpine:3.20; then exit 1; fi\n"
+            "      - name: Install the bundle\n        run: lakehousectl install\n"
+        )
+        problems = air_gap_problems(document)
+        self.assertIn(
+            "the air-gap step does not cut container egress with iptables DOCKER-USER",
+            problems,
+        )
+        self.assertIn("the proof never probes container outbound internet access", problems)
+
     def test_no_job_loses_a_service_container_to_the_store_switch(self) -> None:
         """REL-2 S3 review round 4 BLOCKER 1: the dry run lost its registry.
 
@@ -2483,6 +2539,24 @@ class UpdateProofTest(unittest.TestCase):
             step_index(self.document, "update-proof", "Install bundle A"),
             "the install runs before the runner is cut off",
         )
+
+    def test_the_update_proof_cuts_container_egress_too(self) -> None:
+        """REL-16: the update proof's air gap covers containers as well."""
+        run = str(
+            step_named(self.document, "update-proof", AIR_GAP_STEP).get("run") or ""
+        )
+        self.assertIn("iptables", run)
+        self.assertIn(CONTAINER_EGRESS_CHAIN, run)
+        self.assertIn(CONTAINER_EGRESS_REJECT, run)
+        self.assertIn("dl-cdn.alpinelinux.org", run)
+
+    def test_the_update_proof_probes_container_outbound_access(self) -> None:
+        """REL-16: a container from bundle A must have no internet."""
+        probe = step_named(self.document, "update-proof", CONTAINER_PROBE_STEP)
+        run = str(probe.get("run") or "")
+        self.assertIn("dl-cdn.alpinelinux.org", run)
+        self.assertIn("curl", run)
+        self.assertIn("exit 1", run)
 
     def test_the_update_proof_seeds_the_three_markers(self) -> None:
         """Step 2 of D21: a row in the application database, a row in

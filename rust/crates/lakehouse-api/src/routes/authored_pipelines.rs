@@ -138,6 +138,19 @@ pub fn chain_sensor_name(id: &str) -> String {
     format!("{}_chain", job_name(id))
 }
 
+/// The target-lag (freshness) sensor name `authored_factory.py` gives a
+/// pipeline whose `targetLag.kind == "lag"` (`lag_sensor_name` there).
+///
+/// BLD-18: pausing must stop this sensor explicitly, next to the cron
+/// schedule and the dependency `_after` sensor. Dagster keeps a sensor's
+/// stored RUNNING/STOPPED state across a code-location reload, so the
+/// Python `paused` skip alone cannot silence a sensor that was already
+/// running before the reload.
+#[must_use]
+pub fn lag_sensor_name(id: &str) -> String {
+    format!("{}_lag", job_name(id))
+}
+
 /// The id part of an `authored__<id>` Dagster job name (the prefix every
 /// authored factory job carries, see [`job_name`]). Used by the
 /// runId-keyed pipeline routes (`run_steps` / `run_logs` / `retry_run`)
@@ -2912,6 +2925,43 @@ fn unavailable() -> Response {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    /// Derive a BLD-21-valid output table from a test pipeline name.
+    ///
+    /// BLD-20 made fixtures derive the target table from the unique pipeline
+    /// name (two pipelines may not claim one output table). BLD-21 then made
+    /// the engine's identifier rule apply at save time: a hyphen in a name
+    /// like `down-pipeline` produced `down-pipeline_tgt`, which is refused
+    /// with a 400 before the route under test can return its intended 404.
+    /// Fold every non-identifier character to `_`, keep the name within the
+    /// compiler's limit, and prefix so it can never start with a digit.
+    fn safe_test_target_table(name: &str) -> String {
+        let mut out = String::from("t_");
+        let mut last_underscore = false;
+        for ch in name.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                out.push(ch);
+                last_underscore = ch == '_';
+            } else if !last_underscore {
+                out.push('_');
+                last_underscore = true;
+            }
+        }
+        out.truncate(crate::pipeline_compile::MAX_NAME_CHARS);
+        out
+    }
+
+    #[test]
+    fn safe_test_target_table_satisfies_bld21_for_every_fixture_name_shape() {
+        let long = "x".repeat(crate::pipeline_compile::MAX_NAME_CHARS + 10);
+        for name in ["down-pipeline", "a--b", "9lead", "__prefix", long.as_str()] {
+            let table = safe_test_target_table(name);
+            assert!(
+                super::validate_target_table(&table).is_ok(),
+                "{name} derived an invalid target table {table:?}"
+            );
+        }
+    }
+
     /// BLD-1 part 1 review R1-B9 / D10a: who an edit makes the author.
     ///
     /// A person who is not the author and changes what the pipeline reads
@@ -3026,6 +3076,13 @@ mod tests {
             "authored__pl_ui_check_flow_mumidzub"
         );
         assert_eq!(schedule_name("pl-a-1"), "authored__pl_a_1_schedule");
+        // BLD-18: the same sanitize rule gives the freshness sensor's name;
+        // the pause/resume route has to know it to stop/start it in Dagster.
+        assert_eq!(lag_sensor_name("pl-a-1"), "authored__pl_a_1_lag");
+        assert_eq!(
+            lag_sensor_name("pl-ui-check-flow-mumidzub"),
+            "authored__pl_ui_check_flow_mumidzub_lag"
+        );
     }
 
     /// R3 plan 2a: a 3-cycle `A → B → C → A` is caught when the user
@@ -3613,7 +3670,12 @@ mod tests {
                 transforms: Vec::new(),
                 fbic_enabled: false,
                 target_zone: "silver".to_owned(),
-                target_table: "tgt".to_owned(),
+                // BLD-20: derive the output table from the pipeline name so
+                // fixtures that author several pipelines in one test do not
+                // trip the store's one-writer-per-output-table guard.
+                // BLD-21: the helper folds name hyphens etc. so the derived
+                // table is a valid engine identifier, never a 400.
+                target_table: safe_test_target_table(name),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,
@@ -4017,7 +4079,12 @@ mod tests {
                 transforms: Vec::new(),
                 fbic_enabled: false,
                 target_zone: "silver".to_owned(),
-                target_table: "tgt".to_owned(),
+                // BLD-20: derive the output table from the pipeline name so
+                // fixtures that author several pipelines in one test do not
+                // trip the store's one-writer-per-output-table guard.
+                // BLD-21: the helper folds name hyphens etc. so the derived
+                // table is a valid engine identifier, never a 400.
+                target_table: safe_test_target_table(name),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,
@@ -5315,7 +5382,12 @@ mod tests {
                 transforms: Vec::new(),
                 fbic_enabled: false,
                 target_zone: "silver".to_owned(),
-                target_table: "tgt".to_owned(),
+                // BLD-20: derive the output table from the pipeline name so
+                // fixtures that author several pipelines in one test do not
+                // trip the store's one-writer-per-output-table guard.
+                // BLD-21: the helper folds name hyphens etc. so the derived
+                // table is a valid engine identifier, never a 400.
+                target_table: safe_test_target_table(name),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,
@@ -5515,7 +5587,12 @@ mod tests {
                 transforms: Vec::new(),
                 fbic_enabled: false,
                 target_zone: "silver".to_owned(),
-                target_table: "tgt".to_owned(),
+                // BLD-20: derive the output table from the pipeline name so
+                // fixtures that author several pipelines in one test do not
+                // trip the store's one-writer-per-output-table guard.
+                // BLD-21: the helper folds name hyphens etc. so the derived
+                // table is a valid engine identifier, never a 400.
+                target_table: safe_test_target_table(name),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,
@@ -5657,7 +5734,12 @@ mod tests {
                 transforms: Vec::new(),
                 fbic_enabled: false,
                 target_zone: "silver".to_owned(),
-                target_table: "tgt".to_owned(),
+                // BLD-20: derive the output table from the pipeline name so
+                // fixtures that author several pipelines in one test do not
+                // trip the store's one-writer-per-output-table guard.
+                // BLD-21: the helper folds name hyphens etc. so the derived
+                // table is a valid engine identifier, never a 400.
+                target_table: safe_test_target_table(name),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,

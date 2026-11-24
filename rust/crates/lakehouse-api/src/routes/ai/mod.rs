@@ -41,12 +41,12 @@ use axum::extract::{Extension, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
-use lakehouse_clickhouse::ChClient;
+use lakehouse_clickhouse::{ChClient, QueryOptions};
 use lakehouse_core::ApiError;
 use lakehouse_llm::{
     ChatOptions, HiddenSpans, LlmMessage, LlmMessageRole, StreamPiece, ToolCall, ToolCallFunction,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::error::ApiResult;
@@ -2422,9 +2422,16 @@ async fn ensure_chat_session_table(ch: &ChClient) -> Result<(), lakehouse_clickh
         .map(drop)
 }
 
-/// `s.replace(/\\/g, "\\\\").replace(/'/g, "''")`.
-fn esc(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "''")
+/// A SQL fragment together with the values it binds.
+///
+/// SEC-60: the conversation store no longer hand-escapes values into its
+/// statements. SQL and parameters travel as one unit so a caller cannot pair
+/// a fragment with the wrong values, and a quote or a backslash in a value
+/// reaches the engine through `param_<name>` instead of through the text.
+#[derive(Debug, Default)]
+struct BoundSql {
+    sql: String,
+    params: Vec<(String, String)>,
 }
 
 /// The signed-in user every session operation is scoped to.
@@ -2492,22 +2499,33 @@ pub struct SessionIdQuery {
 }
 
 /// The list filters as a `WHERE` clause — owner always, then mode and search.
-fn session_filter(owner: &str, mode: Option<&str>, q: Option<&str>) -> String {
+///
+/// Every value is a `{name:Type}` placeholder filled by `ClickHouse` from the
+/// returned [`BoundSql::params`] (SEC-60). The search uses
+/// `positionCaseInsensitiveUTF8` rather than `LIKE`, so the value needs no
+/// wildcard escaping: `%` and `_` in a query are literal characters.
+fn session_filter(owner: &str, mode: Option<&str>, q: Option<&str>) -> BoundSql {
     let mut conditions = vec![
         "is_deleted = 0".to_owned(),
-        format!("owner_id = '{}'", esc(owner)),
+        "owner_id = {owner:String}".to_owned(),
     ];
+    let mut params = vec![("owner".to_owned(), owner.to_owned())];
     if let Some(m) = mode.filter(|m| matches!(*m, "ask" | "build")) {
-        conditions.push(format!("mode = '{m}'"));
+        conditions.push("mode = {mode:String}".to_owned());
+        params.push(("mode".to_owned(), m.to_owned()));
     }
     if let Some(q) = q.map(str::trim).filter(|q| !q.is_empty()) {
-        let q = esc(q);
-        conditions.push(format!(
-            "(positionCaseInsensitiveUTF8(title, '{q}') > 0 \
-             OR positionCaseInsensitiveUTF8(messages_json, '{q}') > 0)"
-        ));
+        conditions.push(
+            "(positionCaseInsensitiveUTF8(title, {q:String}) > 0 \
+             OR positionCaseInsensitiveUTF8(messages_json, {q:String}) > 0)"
+                .to_owned(),
+        );
+        params.push(("q".to_owned(), q.to_owned()));
     }
-    conditions.join(" AND ")
+    BoundSql {
+        sql: conditions.join(" AND "),
+        params,
+    }
 }
 
 /// `GET /api/ai/sessions` — a page of the caller's sessions, or `?id=` for
@@ -2555,17 +2573,27 @@ async fn session_list(
     let limit = q.limit.unwrap_or(30).clamp(1, 100);
     let offset = q.offset.unwrap_or(0).min(100_000);
     let filter = session_filter(owner, q.mode.as_deref(), q.q.as_deref());
-    // One row past the page says whether another page exists.
+    // One row past the page says whether another page exists. SEC-60: the
+    // filter, the page size and the offset are all bound values; only the
+    // fixed column list and literals written in this file are SQL text.
+    let sql = format!(
+        "SELECT id, title, mode, toString(updated_at) AS updated_at, \
+         positionCaseInsensitive(messages_json, '\"chartCreated\":true') > 0 AS chart_created, \
+         substringUTF8(JSONExtractString(messages_json, -1, 'content'), 1, 240) AS preview \
+         FROM console.chat_session FINAL WHERE {filter_sql} \
+         ORDER BY updated_at DESC LIMIT {{limit:UInt32}} OFFSET {{offset:UInt32}}",
+        filter_sql = filter.sql
+    );
+    let mut params = filter.params;
+    params.push(("limit".to_owned(), (limit + 1).to_string()));
+    params.push(("offset".to_owned(), offset.to_string()));
     let rows = ch
-        .rows(
-            &format!(
-                "SELECT id, title, mode, toString(updated_at) AS updated_at, \
-                 positionCaseInsensitive(messages_json, '\"chartCreated\":true') > 0 AS chart_created, \
-                 substringUTF8(JSONExtractString(messages_json, -1, 'content'), 1, 240) AS preview \
-                 FROM console.chat_session FINAL WHERE {filter} \
-                 ORDER BY updated_at DESC LIMIT {} OFFSET {offset}",
-                limit + 1
-            ),
+        .rows_with_options(
+            &sql,
+            &QueryOptions {
+                params,
+                ..QueryOptions::default()
+            },
             None,
         )
         .await?;
@@ -2585,11 +2613,16 @@ async fn session_list(
 
     let count_filter = session_filter(owner, None, q.q.as_deref());
     let count_rows = ch
-        .rows(
+        .rows_with_options(
             &format!(
                 "SELECT mode, count() AS n FROM console.chat_session FINAL \
-                 WHERE {count_filter} GROUP BY mode"
+                 WHERE {count_sql} GROUP BY mode",
+                count_sql = count_filter.sql
             ),
+            &QueryOptions {
+                params: count_filter.params,
+                ..QueryOptions::default()
+            },
             None,
         )
         .await?;
@@ -2621,15 +2654,21 @@ async fn session_row(
     owner: &str,
     id: &str,
 ) -> Result<Option<Map<String, Value>>, lakehouse_clickhouse::ChError> {
+    // SEC-60: both keys are bound by the engine. They used to be escaped by
+    // hand into the statement, which a quote or a backslash could break out
+    // of; the placeholders are filled from `param_id` / `param_owner` instead.
     let rows = ch
-        .rows(
-            &format!(
-                "SELECT id, title, mode, messages_json, title_locked, toString(updated_at) AS updated_at \
-                 FROM console.chat_session FINAL \
-                 WHERE is_deleted = 0 AND id = '{}' AND owner_id = '{}' LIMIT 1",
-                esc(id),
-                esc(owner)
-            ),
+        .rows_with_options(
+            "SELECT id, title, mode, messages_json, title_locked, toString(updated_at) AS updated_at \
+             FROM console.chat_session FINAL \
+             WHERE is_deleted = 0 AND id = {id:String} AND owner_id = {owner:String} LIMIT 1",
+            &QueryOptions {
+                params: vec![
+                    ("id".to_owned(), id.to_owned()),
+                    ("owner".to_owned(), owner.to_owned()),
+                ],
+                ..QueryOptions::default()
+            },
             None,
         )
         .await?;
@@ -2746,25 +2785,52 @@ fn derive_title(messages: &[Value]) -> String {
     format!("{}…", cut.trim_end())
 }
 
+/// The INSERT head for [`CREATE_CHAT_SESSION_TABLE`]. The data follows on the
+/// next line as `JSONEachRow`, so no caller value is ever part of the SQL.
+const INSERT_SESSION: &str = "INSERT INTO console.chat_session \
+     (id, title, mode, messages_json, owner_id, title_locked, is_deleted) FORMAT JSONEachRow";
+
+/// One row of [`CREATE_CHAT_SESSION_TABLE`] in `ClickHouse`'s `JSONEachRow`
+/// shape (the pattern `lakehouse_bi::geo::region_inserts` uses). The field
+/// names are the table's columns; `serde_json` quotes every value, so a
+/// quote, a backslash, a newline or Unicode in a conversation cannot end a
+/// field, and the whole row stays in the POST body instead of a URL
+/// parameter (`SEC-60` review: a 200 KB `messages_json` would overflow the
+/// URL once percent-encoded).
+#[derive(Serialize)]
+struct SessionJsonRow<'a> {
+    id: &'a str,
+    title: &'a str,
+    mode: &'a str,
+    messages_json: &'a str,
+    owner_id: &'a str,
+    title_locked: u8,
+    is_deleted: u8,
+}
+
 /// Insert one full version of a session row (`ReplacingMergeTree` keeps the
 /// newest by `updated_at`).
 async fn write_session(
     ch: &ChClient,
     row: &SessionWrite<'_>,
 ) -> Result<(), lakehouse_clickhouse::ChError> {
-    let sql = format!(
-        "INSERT INTO console.chat_session \
-         (id, title, mode, messages_json, owner_id, title_locked, is_deleted) \
-         VALUES ('{}', '{}', '{}', '{}', '{}', {}, {})",
-        esc(row.id),
-        esc(row.title),
-        esc(row.mode),
-        esc(row.messages_json),
-        esc(row.owner),
-        u8::from(row.title_locked),
-        u8::from(row.deleted),
-    );
-    ch.exec(&sql, None).await
+    let json = serde_json::to_string(&SessionJsonRow {
+        id: row.id,
+        title: row.title,
+        mode: row.mode,
+        messages_json: row.messages_json,
+        owner_id: row.owner,
+        title_locked: u8::from(row.title_locked),
+        is_deleted: u8::from(row.deleted),
+    })
+    .map_err(|err| {
+        // SEC-11 / SEC-60: log the serde error's raw text, but never put it in
+        // a response. The caller gets only this fixed sentence.
+        tracing::error!(error = %err, "could not serialize a chat session row");
+        lakehouse_clickhouse::ChError::Server("could not serialize a chat session row".to_owned())
+    })?;
+    // The statement itself has no user text; the data follows on one line.
+    ch.exec(&format!("{INSERT_SESSION}\n{json}\n"), None).await
 }
 
 struct SessionWrite<'a> {
@@ -3970,19 +4036,32 @@ mod tests {
     #[test]
     fn session_filter_always_scopes_to_the_owner() {
         let f = session_filter("u-1", None, None);
-        assert_eq!(f, "is_deleted = 0 AND owner_id = 'u-1'");
+        assert_eq!(f.sql, "is_deleted = 0 AND owner_id = {owner:String}");
+        assert_eq!(f.params, vec![("owner".to_owned(), "u-1".to_owned())]);
     }
 
     #[test]
-    fn session_filter_whitelists_mode_and_escapes_search() {
+    fn session_filter_whitelists_mode_and_binds_search() {
         let f = session_filter("u-1", Some("build"), Some(" it's "));
-        assert!(f.contains("mode = 'build'"));
-        assert!(f.contains("positionCaseInsensitiveUTF8(title, 'it''s')"));
+        assert!(f.sql.contains("mode = {mode:String}"));
+        assert!(
+            f.sql
+                .contains("positionCaseInsensitiveUTF8(title, {q:String}) > 0")
+        );
+        assert_eq!(
+            f.params,
+            vec![
+                ("owner".to_owned(), "u-1".to_owned()),
+                ("mode".to_owned(), "build".to_owned()),
+                ("q".to_owned(), "it's".to_owned()),
+            ]
+        );
         let f = session_filter("u-1", Some("x' OR 1=1 --"), None);
         assert!(
-            !f.contains("mode"),
-            "unknown modes are dropped, not quoted in"
+            !f.sql.contains("mode"),
+            "unknown modes are dropped, not bound in"
         );
+        assert_eq!(f.params, vec![("owner".to_owned(), "u-1".to_owned())]);
     }
 
     #[test]
@@ -4516,9 +4595,239 @@ mod tests {
         assert_eq!(id.len(), 10);
     }
 
+    /// The values that used to be hand-escaped into the SQL (SEC-60) now
+    /// travel as a `param_<name>` map beside a statement of placeholders.
     #[test]
-    fn esc_doubles_backslashes_and_quotes() {
-        assert_eq!(esc("O'Brien\\x"), "O''Brien\\\\x");
+    fn session_filter_binds_values_instead_of_interpolating_them() {
+        let filter = session_filter("o'wner\\x", Some("ask"), Some("  sea'rch\\%  "));
+        assert_eq!(
+            filter.sql,
+            "is_deleted = 0 AND owner_id = {owner:String} AND mode = {mode:String} \
+             AND (positionCaseInsensitiveUTF8(title, {q:String}) > 0 \
+             OR positionCaseInsensitiveUTF8(messages_json, {q:String}) > 0)"
+        );
+        assert!(
+            !filter.sql.contains("o'wner") && !filter.sql.contains("sea'rch"),
+            "no raw value may be written into the SQL: {}",
+            filter.sql
+        );
+        assert_eq!(
+            filter.params,
+            vec![
+                ("owner".to_owned(), "o'wner\\x".to_owned()),
+                ("mode".to_owned(), "ask".to_owned()),
+                // The search value is trimmed, but its quote and backslash
+                // are preserved byte for byte, and `%` is an ordinary char.
+                ("q".to_owned(), "sea'rch\\%".to_owned()),
+            ]
+        );
+
+        let bare = session_filter("o'wner\\x", None, Some("   "));
+        assert!(!bare.sql.contains("mode ="), "{}", bare.sql);
+        assert!(
+            !bare.sql.contains("positionCaseInsensitiveUTF8"),
+            "{}",
+            bare.sql
+        );
+        assert_eq!(
+            bare.params,
+            vec![("owner".to_owned(), "o'wner\\x".to_owned())]
+        );
+    }
+
+    /// A `ChClient` whose requests land on `server`, for the store's own
+    /// wiremock tests below. No Postgres or `AppState` is involved: these are
+    /// the store functions themselves, called with hostile keys.
+    fn ch_client(server: &MockServer) -> ChClient {
+        ChClient::new(server.uri(), "default".to_owned(), String::new())
+    }
+
+    /// Only the `param_<name>` pairs of a request: `query_with_options` also
+    /// sends a fixed `cancel_http_readonly_queries_on_client_close` setting.
+    fn bound_pairs(request: &wiremock::Request) -> Vec<(String, String)> {
+        request
+            .url
+            .query_pairs()
+            .filter(|(name, _)| name.starts_with("param_"))
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn session_row_sends_the_id_and_owner_as_http_parameters() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"meta":[],"data":[],"rows":0}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let row = session_row(&ch_client(&server), "o'w\\ner", "s'1\\2")
+            .await
+            .unwrap();
+        assert!(row.is_none(), "the mock returned no rows");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert!(body.contains("id = {id:String}"), "{body}");
+        assert!(body.contains("owner_id = {owner:String}"), "{body}");
+        assert!(
+            !body.contains("s'1\\2") && !body.contains("o'w\\ner"),
+            "raw keys must not be written into the SQL: {body}"
+        );
+        assert_eq!(
+            bound_pairs(&requests[0]),
+            vec![
+                ("param_id".to_owned(), "s'1\\2".to_owned()),
+                ("param_owner".to_owned(), "o'w\\ner".to_owned()),
+            ]
+        );
+    }
+
+    /// SEC-60 review: a 200 KB conversation must not go into the URL, where
+    /// percent-encoding can push it past the HTTP/ClickHouse URI limit. The
+    /// row goes in the POST body as one `JSONEachRow` object, and `serde_json`
+    /// — not hand-escaping — handles every tricky character.
+    #[tokio::test]
+    async fn write_session_sends_a_json_each_row_body_not_url_parameters() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let id = "s'1\\2";
+        let owner = "o'w\\ner\n☃";
+        let title = "a 'quoted' \\ title\nline 2";
+        let messages = serde_json::to_string(&json!([{
+            "role": "user",
+            "content": format!("it's \\ C:\\data\n100%_wild ☃ {}", "x".repeat(70_000)),
+        }]))
+        .unwrap();
+        assert!(messages.len() > 64 * 1024, "a large conversation body");
+        assert!(id.contains('\'') && id.contains('\\'), "a hostile id");
+        assert!(
+            owner.contains('\'') && owner.contains('\\') && owner.contains('\n'),
+            "a hostile owner"
+        );
+        write_session(
+            &ch_client(&server),
+            &SessionWrite {
+                id,
+                owner,
+                title,
+                title_locked: true,
+                mode: "ask",
+                messages_json: &messages,
+                deleted: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].url.query().is_none(),
+            "the whole row stays in the POST body, never in the URL: {:?}",
+            requests[0].url.query()
+        );
+
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        let (head, data) = body
+            .split_once('\n')
+            .expect("an INSERT head line then one JSONEachRow object");
+        assert_eq!(head, INSERT_SESSION);
+        assert!(data.ends_with('\n'), "one JSON object per line");
+        let row: Value = serde_json::from_str(data.trim_end()).expect("a JSONEachRow object");
+        assert_eq!(row.as_object().unwrap().len(), 7, "every column is named");
+        assert_eq!(row["id"], json!(id));
+        assert_eq!(row["title"], json!(title));
+        assert_eq!(row["mode"], json!("ask"));
+        assert_eq!(row["messages_json"], json!(messages));
+        assert_eq!(row["owner_id"], json!(owner));
+        assert_eq!(row["title_locked"], json!(1));
+        assert_eq!(row["is_deleted"], json!(0));
+        assert!(
+            !head.contains(id) && !head.contains(owner) && !head.contains(title),
+            "no caller value may be part of the SQL: {head}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_list_binds_the_search_mode_and_pagination() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"meta":[],"data":[],"rows":0}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let query = SessionsQuery {
+            id: None,
+            q: Some("sea'rch\\%".to_owned()),
+            mode: Some("build".to_owned()),
+            limit: Some(5),
+            offset: Some(2),
+        };
+        let page = session_list(&ch_client(&server), "o'w\\ner", &query)
+            .await
+            .unwrap();
+        assert_eq!(page["sessions"], json!([]));
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "the page read and the per-mode counts");
+        let list = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert!(
+            list.contains("owner_id = {owner:String} AND mode = {mode:String}"),
+            "{list}"
+        );
+        assert!(
+            list.contains("positionCaseInsensitiveUTF8(title, {q:String}) > 0"),
+            "{list}"
+        );
+        assert!(
+            list.contains("LIMIT {limit:UInt32} OFFSET {offset:UInt32}"),
+            "{list}"
+        );
+        assert!(
+            !list.contains("sea'rch") && !list.contains("o'w\\ner"),
+            "raw values must not be written into the SQL: {list}"
+        );
+        assert_eq!(
+            bound_pairs(&requests[0]),
+            vec![
+                ("param_owner".to_owned(), "o'w\\ner".to_owned()),
+                ("param_mode".to_owned(), "build".to_owned()),
+                ("param_q".to_owned(), "sea'rch\\%".to_owned()),
+                ("param_limit".to_owned(), "6".to_owned()),
+                ("param_offset".to_owned(), "2".to_owned()),
+            ]
+        );
+
+        let counts = String::from_utf8(requests[1].body.clone()).unwrap();
+        assert!(
+            counts.contains("WHERE is_deleted = 0 AND owner_id = {owner:String}"),
+            "{counts}"
+        );
+        assert!(
+            counts.contains("positionCaseInsensitiveUTF8(messages_json, {q:String}) > 0"),
+            "{counts}"
+        );
+        assert!(
+            !counts.contains("mode =") && !counts.contains("LIMIT"),
+            "the counts filter only by owner and search: {counts}"
+        );
+        assert_eq!(
+            bound_pairs(&requests[1]),
+            vec![
+                ("param_owner".to_owned(), "o'w\\ner".to_owned()),
+                ("param_q".to_owned(), "sea'rch\\%".to_owned()),
+            ]
+        );
     }
 
     /// One message with one tool step whose result carries `bytes` of text.

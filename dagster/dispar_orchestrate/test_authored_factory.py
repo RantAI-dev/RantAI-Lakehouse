@@ -2522,6 +2522,33 @@ class TestLagSensor:
         assert sensor.default_status == authored_factory.DefaultSensorStatus.RUNNING
         assert sensor.job.name == "authored__pl_lag_order"
 
+    def test_a_paused_lag_pipeline_regains_its_running_sensor_when_resumed(self) -> None:
+        """BLD-18: pausing omits the freshness sensor, resuming restores it.
+
+        Dagster keeps a stored sensor's RUNNING/STOPPED state across a
+        code-location reload, so the factory's `paused` skip is only half of
+        the pause: the Rust route stops the stored sensor explicitly before
+        the reload (and starts it after the reload on resume). This test
+        pins the factory half of that contract across the round trip.
+        """
+        paused = {
+            "id": "pl-lag-roundtrip",
+            "status": "paused",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        assert authored_factory.build_authored_lag_sensor(paused, self._order_job) is None
+
+        resumed = {**paused, "status": "ready"}
+        sensor = authored_factory.build_authored_lag_sensor(resumed, self._order_job)
+        assert sensor is not None
+        assert sensor.name == authored_factory.lag_sensor_name("pl-lag-roundtrip")
+        assert sensor.default_status == authored_factory.DefaultSensorStatus.RUNNING
+
+        built = authored_factory.build_authored_lag_sensors([(paused, self._order_job)])
+        assert built == [], "a paused target-lag pipeline contributes no sensor to the code location"
+        built = authored_factory.build_authored_lag_sensors([(resumed, self._order_job)])
+        assert [s.name for s in built] == [authored_factory.lag_sensor_name("pl-lag-roundtrip")]
+
     def _eval_sensor(self, response_mock: Any) -> list[Any]:
         from dagster import build_sensor_context
         pipeline = {

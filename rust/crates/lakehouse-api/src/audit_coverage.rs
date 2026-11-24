@@ -437,11 +437,10 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("DELETE", "/api/maps/{id}", Coverage::Handler { action: "map_delete" }),
     ("POST", "/api/knowledge/sources", Coverage::Central { action: "knowledge_source.create", resource_kind: "knowledge_source", id_param: IdParam::None }),
     ("POST", "/api/knowledge/vector-jobs", Coverage::Central { action: "knowledge_vector_job.create", resource_kind: "knowledge_vector_job", id_param: IdParam::None }),
-    ("POST", "/api/agents/workflows", Coverage::Central { action: "agent_workflow.create", resource_kind: "agent_workflow", id_param: IdParam::None }),
-    ("POST", "/api/agents/employees", Coverage::Central { action: "digital_employee.create", resource_kind: "digital_employee", id_param: IdParam::None }),
-    ("POST", "/api/agents/employees/{id}/suspend", Coverage::Central { action: "digital_employee.suspend", resource_kind: "digital_employee", id_param: IdParam::Path("id") }),
-    ("POST", "/api/agents/employees/{id}/resume", Coverage::Central { action: "digital_employee.resume", resource_kind: "digital_employee", id_param: IdParam::Path("id") }),
-    ("POST", "/api/agents/employees/{id}/revoke", Coverage::Central { action: "digital_employee.revoke", resource_kind: "digital_employee", id_param: IdParam::Path("id") }),
+    // WEB-4 retired workflow creation, employee creation and the
+    // suspend/resume/revoke routes: their audit entries went with them.
+    // The headless-run route is kept — Dagster's scheduled/manual trigger
+    // still calls it and its execution is audited.
     ("POST", "/api/agents/employees/{id}/run", Coverage::Central { action: "digital_employee.run", resource_kind: "digital_employee", id_param: IdParam::Path("id") }),
     ("POST", "/api/agents/approvals/{id}/decide", Coverage::Handler { action: crate::routes::agents::APPROVAL_DECIDE_ACTION }),
 ];
