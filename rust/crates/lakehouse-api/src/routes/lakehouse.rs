@@ -32,6 +32,7 @@ use serde_json::{Map, Value, json};
 
 use crate::bounded;
 use crate::error::ApiResult;
+use crate::health;
 use crate::json::ApiJson;
 use crate::lakehouse_catalog;
 use crate::routes::governance::{latest_maintenance_run, maintenance_history_table_name};
@@ -328,8 +329,26 @@ fn field_json(f: &lakehouse_iceberg::rest::FieldDetail) -> Value {
     })
 }
 
-fn table_detail_body(detail: &TableDetail) -> Value {
+/// A table with at least this many measured small files needs compaction
+/// (OPS-21). The number is the G3 synthetic load's shape — 20 small files
+/// per day partition measured ~15-20x worse planning time than a one-file
+/// control (`docs/plans/G3-RESULT.md`, ADR 0009) — not a guessed tolerance.
+/// Shared with the console's warning helper (`src/lib/lakehouse-view.ts`).
+pub const NEEDS_COMPACTION_FILE_COUNT: u64 = 20;
+
+/// Upper bound on tables one `/api/lakehouse/compaction-status` call scans.
+/// Trino's cron compacts Bronze only (ADR 0009), and a namespace can hold
+/// hundreds of tables; bounding the list keeps System status from fanning
+/// out an unbounded number of catalog + manifest reads. Tables past the cap
+/// are reported as `unmeasuredTables`, never as `0`.
+const MAX_COMPACTION_SCAN_TABLES: usize = 50;
+
+fn table_detail_body(detail: &TableDetail, compaction_available: bool) -> Value {
     json!({
+        // `checked && ok` on the same probe set Services reports — see
+        // `health::trino_compaction_available`. Config alone cannot answer
+        // this: compose gives `TRINO_URL` a default even with the profile off.
+        "compactionAvailable": compaction_available,
         "schema": detail.schema.iter().map(field_json).collect::<Vec<_>>(),
         // The table's schema history, oldest first. A field keeps its `id`
         // across versions, which is what lets a reader tell a rename from
@@ -349,10 +368,11 @@ fn table_detail_body(detail: &TableDetail) -> Value {
         "snapshots": detail.snapshots.iter().map(snapshot_json).collect::<Vec<_>>(),
         "stats": {
             "fileCount": detail.stats.file_count,
-            // Needs a manifest read this workstream does not do — not
-            // guessed from the snapshot summary.
-            "smallFileCount": Value::Null,
-            "smallFileThresholdBytes": Value::Null,
+            // Measured from the current snapshot's manifests by
+            // `lakehouse_iceberg::rest`. `None` means the manifests could
+            // not be read, which serializes to `null` — never a fabricated 0.
+            "smallFileCount": detail.small_file_count,
+            "smallFileThresholdBytes": rest::SMALL_FILE_THRESHOLD_BYTES,
             "recordCount": detail.stats.record_count,
             "totalBytes": detail.stats.total_bytes,
             "snapshotCount": detail.snapshot_count,
@@ -789,13 +809,123 @@ pub async fn table_detail(
         let ident = ident.clone();
         move |client| {
             let ident = ident.clone();
-            async move { rest::load_table_detail(&client, &ident).await }
+            async move {
+                rest::load_table_detail_with_small_files(
+                    &client,
+                    &ident,
+                    rest::SMALL_FILE_THRESHOLD_BYTES,
+                )
+                .await
+            }
         }
     })
     .await
     .map_err(|err| classify_catalog_access_error(err, "table"))?;
 
-    Ok(ApiJson(table_detail_body(&detail)))
+    // One cached probe set, the same `/api/ops/services` reads. `Some(0)`
+    // small files and `compactionAvailable: false` are both measured facts,
+    // not an inference from whether `TRINO_URL` happens to be set.
+    let probes = health::cached_probe_all(&state).await;
+    Ok(ApiJson(table_detail_body(
+        &detail,
+        health::trino_compaction_available(&probes),
+    )))
+}
+
+/// Builds `GET /api/lakehouse/compaction-status`'s body from already-read
+/// counts. Pure so the "warn only from measured counts" rule is assertable
+/// without a catalog or an object store.
+///
+/// Only tables whose measured count reaches [`NEEDS_COMPACTION_FILE_COUNT`]
+/// are listed. A name whose count could not be read is absent from `tables`
+/// and counted in `unmeasuredTables` — never loaded as a zero.
+fn compaction_status_body(
+    compaction_available: bool,
+    candidates: &[String],
+    counts: &HashMap<String, u64>,
+) -> Value {
+    let mut needing: Vec<(&String, &u64)> = counts
+        .iter()
+        .filter(|(_, count)| **count >= NEEDS_COMPACTION_FILE_COUNT)
+        .collect();
+    needing.sort_by(|a, b| a.0.cmp(b.0));
+    json!({
+        "compactionAvailable": compaction_available,
+        "smallFileThresholdBytes": rest::SMALL_FILE_THRESHOLD_BYTES,
+        "needsCompactionFileCount": NEEDS_COMPACTION_FILE_COUNT,
+        "tables": needing.into_iter().map(|(name, count)| json!({
+            // Trino's cron compacts Bronze only (ADR 0009), so this is the
+            // namespace every row in `tables` belongs to.
+            "namespace": "bronze",
+            "name": name,
+            "smallFileCount": count,
+        })).collect::<Vec<_>>(),
+        "measuredTables": counts.len(),
+        "unmeasuredTables": candidates.len().saturating_sub(counts.len()),
+    })
+}
+
+/// `GET /api/lakehouse/compaction-status` — the System status warning's one
+/// call. Trino's cron only compacts Bronze (ADR 0009), so only that namespace
+/// is scanned; the tenant/role reach is resolved exactly as [`tables`] does,
+/// and the per-table manifest reads are bounded by [`bounded::run_with_budget`]
+/// and a hard table cap rather than issued as an unbounded N+1 from the
+/// console. Tables that did not answer are reported as unmeasured, never as
+/// small-file count zero.
+///
+/// # Errors
+/// 404 if `X-Tenant` names a tenant the caller does not belong to; 503 if
+/// the catalog or the claims cannot be read (same posture as [`tables`]).
+/// An individual table's manifest read failing is not a route error — it
+/// leaves that table out of `tables` and increments `unmeasuredTables`.
+pub async fn compaction_status(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Value>> {
+    let namespace = "bronze";
+    // Same two gates, same order, as `tables`: a table out of the caller's
+    // reach or hidden by their roles must not appear in a deployment-wide
+    // status list either.
+    let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
+    let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
+    let ns = NamespaceIdent::from_strs([namespace])
+        .map_err(|_| ApiError::BadRequest("namespace is invalid".to_owned()))?;
+    let client = lakehouse_catalog::client(&state)
+        .await
+        .map_err(|err| classify_catalog_access_error(err, "table"))?;
+    let idents = rest::list_table_idents(&client, &ns)
+        .await
+        .map_err(|err| classify_rest_error(&err, "namespace"))?;
+    let idents = leave_out_tables_out_of_reach(&state, reach, namespace, idents).await?;
+    let candidates: Vec<String> = idents
+        .into_iter()
+        .filter(|ident| access.allows(namespace, ident.name()))
+        .map(|ident| ident.name().to_owned())
+        .take(MAX_COMPACTION_SCAN_TABLES)
+        .collect();
+
+    let counts = bounded::run_with_budget(candidates.clone(), Duration::from_secs(5), 8, {
+        let ns = ns.clone();
+        move |name: String| {
+            let client = client.clone();
+            let ns = ns.clone();
+            async move {
+                let ident = TableIdent::new(ns, name);
+                rest::load_small_file_count(&client, &ident, rest::SMALL_FILE_THRESHOLD_BYTES)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        }
+    })
+    .await;
+    let probes = health::cached_probe_all(&state).await;
+    Ok(ApiJson(compaction_status_body(
+        health::trino_compaction_available(&probes),
+        &candidates,
+        &counts,
+    )))
 }
 
 /// `true` only for `bronze`: the P4 maintenance job (and its
@@ -1341,9 +1471,10 @@ mod tests {
                 record_count: Some(100),
                 total_bytes: Some(1024),
             },
+            small_file_count: None,
         };
 
-        let body = table_detail_body(&detail);
+        let body = table_detail_body(&detail, false);
 
         assert_eq!(body["schema"][0]["name"], json!("id"));
         assert_eq!(body["schema"][0]["required"], json!(true));
@@ -1364,9 +1495,97 @@ mod tests {
         );
         assert_eq!(body["stats"]["fileCount"], json!(1));
         assert_eq!(body["stats"]["smallFileCount"], Value::Null);
-        assert_eq!(body["stats"]["smallFileThresholdBytes"], Value::Null);
+        assert_eq!(
+            body["stats"]["smallFileThresholdBytes"],
+            json!(rest::SMALL_FILE_THRESHOLD_BYTES),
+            "the threshold is a documented constant, measured or not"
+        );
         assert_eq!(body["stats"]["snapshotCount"], json!(1));
         assert_eq!(body["stats"]["metadataLogCount"], json!(1));
+        assert_eq!(body["compactionAvailable"], json!(false));
+    }
+
+    /// OPS-21: a measured count reaches the response as a number, and the
+    /// Trino flag is whatever the probe set answered — never inferred from
+    /// the count itself.
+    #[test]
+    fn table_detail_body_reports_a_measured_small_file_count_and_trino_flag() {
+        let mut detail = TableDetail {
+            schema: Vec::new(),
+            partition_fields: Vec::new(),
+            properties: HashMap::new(),
+            snapshots: Vec::new(),
+            schema_versions: Vec::new(),
+            snapshot_count: 0,
+            metadata_log_count: 0,
+            stats: TableStats::default(),
+            small_file_count: Some(0),
+        };
+
+        let body = table_detail_body(&detail, true);
+        assert_eq!(body["stats"]["smallFileCount"], json!(0));
+        assert_eq!(body["compactionAvailable"], json!(true));
+
+        detail.small_file_count = Some(37);
+        let body = table_detail_body(&detail, false);
+        assert_eq!(body["stats"]["smallFileCount"], json!(37));
+        assert_eq!(body["compactionAvailable"], json!(false));
+    }
+
+    /// OPS-21: only measured counts at or above the documented threshold
+    /// appear, and unreadable ones are counted as unmeasured rather than
+    /// quietly folded into the warning list as zero.
+    #[test]
+    fn compaction_status_lists_only_measured_tables_needing_compaction() {
+        let candidates = vec![
+            "orders".to_owned(),
+            "events".to_owned(),
+            "clean".to_owned(),
+            "unreadable".to_owned(),
+        ];
+        let counts = HashMap::from([
+            ("orders".to_owned(), 42_u64),
+            ("events".to_owned(), NEEDS_COMPACTION_FILE_COUNT),
+            ("clean".to_owned(), 1_u64),
+        ]);
+
+        let body = compaction_status_body(false, &candidates, &counts);
+
+        assert_eq!(body["compactionAvailable"], json!(false));
+        assert_eq!(
+            body["smallFileThresholdBytes"],
+            json!(rest::SMALL_FILE_THRESHOLD_BYTES)
+        );
+        assert_eq!(body["needsCompactionFileCount"], json!(20));
+        assert_eq!(
+            body["tables"][0]["name"],
+            json!("events"),
+            "the rows are sorted by table name, not by HashMap iteration order"
+        );
+        assert_eq!(body["tables"][0]["namespace"], json!("bronze"));
+        assert_eq!(body["tables"][0]["smallFileCount"], json!(20));
+        assert_eq!(body["tables"][1]["name"], json!("orders"));
+        assert_eq!(body["tables"][1]["smallFileCount"], json!(42));
+        assert_eq!(body["tables"].as_array().map(Vec::len), Some(2));
+        assert_eq!(body["measuredTables"], json!(3));
+        assert_eq!(
+            body["unmeasuredTables"],
+            json!(1),
+            "a manifest that could not be read is not a measured zero"
+        );
+    }
+
+    #[test]
+    fn compaction_status_is_silent_when_trino_is_available() {
+        let body = compaction_status_body(
+            true,
+            &["orders".to_owned()],
+            &HashMap::from([("orders".to_owned(), 99_u64)]),
+        );
+        assert_eq!(body["compactionAvailable"], json!(true));
+        // The data is still returned; the console decides not to warn. This
+        // keeps one endpoint for both states instead of two code paths.
+        assert_eq!(body["tables"][0]["smallFileCount"], json!(99));
     }
 
     /// `id` and `parentId` must both survive as strings past

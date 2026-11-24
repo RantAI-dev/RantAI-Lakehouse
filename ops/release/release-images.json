@@ -7,5 +7,11 @@
     "dagster-daemon",
     "backup-job"
   ],
-  "rantai-lakehouse-oidc-mock": ["oidc-mock"]
+  "rantai-lakehouse-oidc-mock": ["oidc-mock"],
+  "rantai-lakehouse-init": [
+    "lakekeeper-warehouse-init",
+    "lakekeeper-authz-init",
+    "lakekeeper-warehouse-init-seaweedfs",
+    "lakekeeper-authz-init-seaweedfs"
+  ]
 }

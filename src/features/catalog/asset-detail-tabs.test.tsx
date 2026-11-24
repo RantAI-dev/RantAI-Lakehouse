@@ -26,8 +26,9 @@ import { chooseOption } from "@/components/patterns/select-field.testing"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { NO_READABLE_TABLE } from "@/lib/asset-query"
 import { formatDate, formatDateTime } from "@/lib/format"
-import { assetService } from "@/services"
+import { assetService, governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
+import { ServiceError } from "@/services/errors"
 import { AssetDetailTabs } from "./asset-detail-tabs"
 import type { MeaningState } from "./asset-meaning"
 import type { SemanticEntry } from "@/services/contracts/semantic"
@@ -128,6 +129,7 @@ const TABLE = {
     snapshotCount: 1,
     metadataLogCount: 1,
   },
+  compactionAvailable: false,
 }
 
 /**
@@ -2496,6 +2498,31 @@ describe("Access tab: enforcing and deleting a policy", () => {
 
     await waitFor(() => expect(reloaded).toHaveBeenCalled())
     expect(writes(fetchSpy)).toEqual([["PUT", "/api/governance/policies/p1/status", { status: "ready" }]])
+  })
+
+  // WEB-6: reading `run.error` on the line after `await run.run(...)` saw the
+  // closure's stale value, so the first refused change produced a toast with
+  // no API sentence. `getError()` is written inside `run` before it resolves.
+  it("shows the API's sentence in the toast when enforcing is refused", async () => {
+    stubApi()
+    const reloaded = mock(() => {})
+    url.search = "tab=access"
+    spyOn(governanceService, "setPolicyStatus").mockRejectedValue(
+      new ServiceError("invalid_request", "This policy masks a column that no longer exists.")
+    )
+    const errors = spyOn(toast, "error").mockImplementation(() => 1)
+    renderTabs({ ...BRONZE, policySummary: [policy("draft")] }, reloaded)
+
+    const item = screen.getByText("mask-amount").closest("li") as HTMLElement
+    fireEvent.click(await within(item).findByRole("button", { name: "Enforce" }))
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Enforce" }))
+
+    await waitFor(() => expect(errors).toHaveBeenCalledTimes(1))
+    expect(errors.mock.calls[0]?.[0]).toBe("Enforce policy failed")
+    expect((errors.mock.calls[0]?.[1] as { description?: string })?.description).toContain(
+      "This policy masks a column that no longer exists."
+    )
+    expect(reloaded).not.toHaveBeenCalled()
   })
 
   it("stops enforcing a policy back to a draft", async () => {
