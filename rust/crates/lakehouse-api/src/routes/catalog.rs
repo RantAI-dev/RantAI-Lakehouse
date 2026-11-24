@@ -268,6 +268,13 @@ pub async fn list(
     headers: HeaderMap,
     Query(params): Query<ListQuery>,
 ) -> Response {
+    // `BI-44` slice 2: a `bi-only` install has no lakehouse registry to
+    // list. The active engine's own catalog is the source of truth, so this
+    // branch must return before any Lakekeeper or `ClickHouse` registry
+    // dial. `full` mode never enters it and keeps its byte-shaped answer.
+    if state.config.is_bi_only() {
+        return in_place_list(&state, params.limit).await;
+    }
     match catalog_tenant_refusal(&state, &principal, &headers).await {
         Ok(Some(reason)) => {
             return (
@@ -368,6 +375,119 @@ pub async fn list(
         }
         Err(err) => list_unavailable(err),
     }
+}
+
+/// `GET /api/catalog` for a `bi-only` installation: the active engine's own
+/// external tables, in the same `assets`/`namespaces` shape the console
+/// already reads (`BI-44` slice 2).
+///
+/// Everything unmeasured is `null` rather than a guessed number: there are
+/// no parts to count rows or bytes from, no watermark to turn into
+/// `freshnessLagSeconds`, and no lineage to claim. Each asset is marked
+/// `zone: "external"` so the console can tell an in-place source from a
+/// loaded lakehouse table.
+async fn in_place_list(state: &AppState, requested: Option<u32>) -> Response {
+    // The limit is checked here because the `full` path validates it later;
+    // a `bi-only` answer must refuse the same bad values in the same words.
+    let limit = match requested_limit(requested) {
+        Ok(limit) => limit,
+        Err(err) => return ApiRejection(err).into_response(),
+    };
+    let engine = state.config.query_engine;
+    let cap = limit.unwrap_or(200).clamp(1, 200);
+    let outcome: Result<Vec<crate::in_place::InPlaceTable>, crate::in_place::IntrospectionError> =
+        match engine {
+            crate::config::QueryEngine::Trino => {
+                crate::in_place::introspect_trino_tables(&state.trino, cap).await
+            }
+            crate::config::QueryEngine::ClickHouse => {
+                crate::in_place::introspect_clickhouse_external_tables(&state.clickhouse, cap).await
+            }
+        };
+    let tables = match outcome {
+        Ok(tables) => tables,
+        Err(err) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiJson(json!({
+                    "error": err.to_string(),
+                    "assets": [],
+                    "namespaces": [],
+                })),
+            )
+                .into_response();
+        }
+    };
+    let assets: Vec<Value> = tables
+        .iter()
+        .map(|table| {
+            let namespace = match (&table.catalog, engine) {
+                (Some(catalog), crate::config::QueryEngine::Trino) => {
+                    format!("{catalog}.{}", table.schema)
+                }
+                _ => table.schema.clone(),
+            };
+            json!({
+                "id": table.full_name,
+                "name": table.name,
+                "namespace": namespace,
+                "type": "table",
+                "layer": "external",
+                "tier": "external",
+                "classification": "external",
+                "owner": "",
+                "domain": "",
+                "description": format!(
+                    "External table read in place through {}. No lakehouse copy exists.",
+                    engine.name()
+                ),
+                "format": format!("{} external table", engine.name()),
+                "engine": engine.name(),
+                "rows": Value::Null,
+                "sizeBytes": Value::Null,
+                "columnCount": Value::Null,
+                "freshnessLagSeconds": Value::Null,
+                "lastUpdated": Value::Null,
+                "health": "unknown",
+                "residency": "",
+                "zone": "external",
+            })
+        })
+        .collect();
+    let namespaces: Vec<Value> = {
+        let mut order: Vec<String> = Vec::new();
+        let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for asset in &assets {
+            let ns = asset["namespace"].as_str().unwrap_or_default().to_owned();
+            if !counts.contains_key(&ns) {
+                order.push(ns.clone());
+            }
+            *counts.entry(ns).or_insert(0) += 1;
+        }
+        order
+            .into_iter()
+            .map(|name| {
+                json!({
+                    "id": name,
+                    "name": name,
+                    "description": "External schema read in place, not copied into the lakehouse.",
+                    "assetCount": counts[&name],
+                    "owner": "",
+                    "residency": "",
+                    "sourceEngine": engine.name(),
+                })
+            })
+            .collect()
+    };
+    (
+        StatusCode::OK,
+        ApiJson(json!({
+            "assets": assets,
+            "namespaces": namespaces,
+            "supported": true,
+        })),
+    )
+        .into_response()
 }
 
 /// The catalog as `list` serves it: [`list_body`] and the four enrichment
