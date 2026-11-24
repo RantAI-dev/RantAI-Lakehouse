@@ -1293,15 +1293,35 @@ fn split_zone_table(location: &str) -> (String, String) {
 // every save path (create, update, restore, generate, clone-by-create) shares
 // one guard.
 
+/// The canonical `ClickHouse` zone for an output table.
+///
+/// BLD-19 (04e6ff031) makes `gold` an alias of `serving` at the API write
+/// boundary: both spellings name the same physical `serving` database. The
+/// store guard must agree, or a legacy pre-BLD-19 `gold.orders` row and a new
+/// `serving.orders` save could both claim the same `ClickHouse` table (PR #703).
+/// Trimming and case-folding happen here so callers pass the already-canonical
+/// zone to both the advisory-lock key and the SQL predicate.
+#[must_use]
+fn canonical_output_zone(target_zone: &str) -> &str {
+    let zone = target_zone.trim();
+    if zone.eq_ignore_ascii_case("gold") {
+        "serving"
+    } else {
+        zone
+    }
+}
+
 /// The normalized key for an output table: both halves trimmed and
-/// lowercased, so `("Silver", " Orders ")` and `("silver", "orders")` are the
-/// same physical table. Used both as the advisory-lock key and as the name in
-/// the 409, so the sentence a caller sees names exactly what was claimed.
+/// lowercased, and a `gold` zone canonicalized to `serving` (BLD-19), so
+/// `("Silver", " Orders ")` and `("silver", "orders")` are the same physical
+/// table, as are `("gold", "orders")` and `("serving", "orders")`. Used both
+/// as the advisory-lock key and as the name in the 409, so the sentence a
+/// caller sees names exactly what was claimed.
 #[must_use]
 fn normalize_output_table(target_zone: &str, target_table: &str) -> String {
     format!(
         "{}.{}",
-        target_zone.trim().to_lowercase(),
+        canonical_output_zone(target_zone).to_lowercase(),
         target_table.trim().to_lowercase()
     )
 }
@@ -1336,8 +1356,10 @@ fn output_table_conflict(key: &str) -> StoreError {
 /// Stored targets are compared through the same normalization as
 /// [`normalize_output_table`]: `split_part(target, '.', 1)` is the zone and
 /// the remainder after the first `.` is the table (matching
-/// [`split_zone_table`]), both `LOWER(TRIM(...))`d. No tenant filter, per the
-/// global scope above.
+/// [`split_zone_table`]), both `LOWER(TRIM(...))`d. The stored zone is also
+/// canonicalized (`gold` -> `serving`, BLD-19) in SQL so a legacy `gold.foo`
+/// row collides with a new `serving.foo` save — and the incoming zone is
+/// canonicalized before binding. No tenant filter, per the global scope above.
 async fn assert_output_table_unclaimed(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     exclude_id: Option<&str>,
@@ -1353,13 +1375,16 @@ async fn assert_output_table_unclaimed(
         "SELECT EXISTS ( \
              SELECT 1 FROM pipeline_definition \
              WHERE ($1::text IS NULL OR id <> $1) \
-               AND LOWER(TRIM(split_part(target, '.', 1))) = LOWER(TRIM($2)) \
+               AND CASE LOWER(TRIM(split_part(target, '.', 1))) \
+                       WHEN 'gold' THEN 'serving' \
+                       ELSE LOWER(TRIM(split_part(target, '.', 1))) \
+                   END = LOWER(TRIM($2)) \
                AND LOWER(TRIM(substring(target FROM position('.' IN target) + 1))) = \
                    LOWER(TRIM($3)) \
          )",
     )
     .bind(exclude_id)
-    .bind(target_zone)
+    .bind(canonical_output_zone(target_zone))
     .bind(target_table)
     .fetch_one(&mut **tx)
     .await?;

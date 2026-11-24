@@ -4282,6 +4282,50 @@ async fn output_table_conflict_ignores_case_and_padding(pool: PgPool) -> sqlx::R
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn legacy_gold_and_serving_targets_claim_the_same_output_table(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    // BLD-19 (04e6ff031) maps `gold` to `serving` at the API write boundary:
+    // a legacy `gold.foo` row and a new `serving.foo` save name one physical
+    // ClickHouse table. The store guard must reject both orderings (PR #703).
+    let gold = pipelines::create_pipeline(&pool, &claimed_input("pl-gold", "gold", "foo"), None)
+        .await
+        .unwrap();
+    let err =
+        pipelines::create_pipeline(&pool, &claimed_input("pl-serving", "serving", "foo"), None)
+            .await
+            .unwrap_err();
+    assert!(
+        matches!(err, StoreError::FieldConflict(_)),
+        "a legacy gold row must conflict with a serving save, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("serving.foo"),
+        "the 409 must name the canonical serving table, got {err}"
+    );
+
+    // The other ordering: a serving row blocks a case/padded legacy gold save.
+    pipelines::delete_pipeline(&pool, &gold.id, None)
+        .await
+        .unwrap();
+    pipelines::create_pipeline(&pool, &claimed_input("pl-serving", "serving", "foo"), None)
+        .await
+        .unwrap();
+    let err = pipelines::create_pipeline(
+        &pool,
+        &claimed_input("pl-gold-again", " GOLD ", " Foo "),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, StoreError::FieldConflict(_)),
+        "a serving row must conflict with a legacy gold save, got {err:?}"
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn the_same_table_in_a_different_zone_is_allowed(pool: PgPool) -> sqlx::Result<()> {
     pipelines::create_pipeline(
         &pool,

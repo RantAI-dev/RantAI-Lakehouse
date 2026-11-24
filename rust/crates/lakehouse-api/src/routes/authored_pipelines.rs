@@ -2901,6 +2901,43 @@ fn unavailable() -> Response {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    /// Derive a BLD-21-valid output table from a test pipeline name.
+    ///
+    /// BLD-20 made fixtures derive the target table from the unique pipeline
+    /// name (two pipelines may not claim one output table). BLD-21 then made
+    /// the engine's identifier rule apply at save time: a hyphen in a name
+    /// like `down-pipeline` produced `down-pipeline_tgt`, which is refused
+    /// with a 400 before the route under test can return its intended 404.
+    /// Fold every non-identifier character to `_`, keep the name within the
+    /// compiler's limit, and prefix so it can never start with a digit.
+    fn safe_test_target_table(name: &str) -> String {
+        let mut out = String::from("t_");
+        let mut last_underscore = false;
+        for ch in name.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                out.push(ch);
+                last_underscore = ch == '_';
+            } else if !last_underscore {
+                out.push('_');
+                last_underscore = true;
+            }
+        }
+        out.truncate(crate::pipeline_compile::MAX_NAME_CHARS);
+        out
+    }
+
+    #[test]
+    fn safe_test_target_table_satisfies_bld21_for_every_fixture_name_shape() {
+        let long = "x".repeat(crate::pipeline_compile::MAX_NAME_CHARS + 10);
+        for name in ["down-pipeline", "a--b", "9lead", "__prefix", long.as_str()] {
+            let table = safe_test_target_table(name);
+            assert!(
+                super::validate_target_table(&table).is_ok(),
+                "{name} derived an invalid target table {table:?}"
+            );
+        }
+    }
+
     /// BLD-1 part 1 review R1-B9 / D10a: who an edit makes the author.
     ///
     /// A person who is not the author and changes what the pipeline reads
@@ -3605,7 +3642,9 @@ mod tests {
                 // BLD-20: derive the output table from the pipeline name so
                 // fixtures that author several pipelines in one test do not
                 // trip the store's one-writer-per-output-table guard.
-                target_table: format!("{name}_tgt"),
+                // BLD-21: the helper folds name hyphens etc. so the derived
+                // table is a valid engine identifier, never a 400.
+                target_table: safe_test_target_table(name),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,
@@ -4012,7 +4051,9 @@ mod tests {
                 // BLD-20: derive the output table from the pipeline name so
                 // fixtures that author several pipelines in one test do not
                 // trip the store's one-writer-per-output-table guard.
-                target_table: format!("{name}_tgt"),
+                // BLD-21: the helper folds name hyphens etc. so the derived
+                // table is a valid engine identifier, never a 400.
+                target_table: safe_test_target_table(name),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,
@@ -5313,7 +5354,9 @@ mod tests {
                 // BLD-20: derive the output table from the pipeline name so
                 // fixtures that author several pipelines in one test do not
                 // trip the store's one-writer-per-output-table guard.
-                target_table: format!("{name}_tgt"),
+                // BLD-21: the helper folds name hyphens etc. so the derived
+                // table is a valid engine identifier, never a 400.
+                target_table: safe_test_target_table(name),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,
@@ -5516,7 +5559,9 @@ mod tests {
                 // BLD-20: derive the output table from the pipeline name so
                 // fixtures that author several pipelines in one test do not
                 // trip the store's one-writer-per-output-table guard.
-                target_table: format!("{name}_tgt"),
+                // BLD-21: the helper folds name hyphens etc. so the derived
+                // table is a valid engine identifier, never a 400.
+                target_table: safe_test_target_table(name),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,
@@ -5661,7 +5706,9 @@ mod tests {
                 // BLD-20: derive the output table from the pipeline name so
                 // fixtures that author several pipelines in one test do not
                 // trip the store's one-writer-per-output-table guard.
-                target_table: format!("{name}_tgt"),
+                // BLD-21: the helper folds name hyphens etc. so the derived
+                // table is a valid engine identifier, never a 400.
+                target_table: safe_test_target_table(name),
                 schedule: "manual".to_owned(),
                 owner: None,
                 description: None,

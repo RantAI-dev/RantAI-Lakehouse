@@ -1256,7 +1256,9 @@ async fn editing_a_pipeline_to_steal_another_output_table_is_409() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(target, "gold.b_only");
+    // BLD-19 (04e6ff031) canonicalizes a `gold` target to `serving` at the
+    // API write boundary, so B's own unchanged table is `serving.b_only`.
+    assert_eq!(target, "serving.b_only");
 }
 
 #[tokio::test]
