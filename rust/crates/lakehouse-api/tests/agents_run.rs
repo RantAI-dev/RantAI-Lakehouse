@@ -610,40 +610,8 @@ async fn llm_unavailable_ends_the_run_failed_without_a_panic() {
     assert_eq!(steps[0]["status"], json!("failed"));
 }
 
-/// D (T3.2's fix): `POST /api/agents/employees` with an invalid `mode`
-/// returns a clean 400, not a raw database `CHECK`-violation error.
-#[tokio::test]
-async fn create_employee_with_invalid_mode_is_bad_request() {
-    let mock = MockServer::start().await;
-    let app = spin_up_with_llm(&mock.uri(), None).await;
-    let cookie = session_cookie_for_seeded_user(&app.pool, "fajar@meridian.example").await;
-
-    let resp = app
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/agents/employees")
-                .header("content-type", "application/json")
-                .header("cookie", cookie)
-                .body(Body::from(
-                    serde_json::to_vec(&json!({
-                        "name": "bad-mode-employee-http",
-                        "purpose": "p",
-                        "autonomy": "L1",
-                        "dataScope": "d",
-                        "budgetLimit": 0,
-                        "mode": "sleep",
-                    }))
-                    .unwrap(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
+// WEB-4 retired `POST /api/agents/employees`; the test that checked its
+// invalid-`mode` 400 went with the route (route_auth.rs pins the new 404).
 
 /// SEC-57: a SCHEDULED run's approval names NO requester — the schedule
 /// asked, not a person — so anybody holding `agent:approve` may decide

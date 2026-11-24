@@ -1,0 +1,14 @@
+/*
+ * The landing page's globals: the console's own stylesheet (which pulls the
+ * design system's tokens, Tailwind and base layers) plus an explicit Tailwind
+ * content root.
+ *
+ * `@source` is needed because Tailwind v4's automatic content detection starts
+ * from the project directory it is built in, and this project
+ * (`ops/landing-pages`) holds none of the landing components. The path is
+ * relative to THIS file, so it points at the real feature folder the export
+ * compiles.
+ */
+@import "../../../src/app/globals.css";
+
+@source "../../../src/features/landing";

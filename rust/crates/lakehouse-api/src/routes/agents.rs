@@ -10,21 +10,31 @@
 //! create, 404 on a missing id, 409 on a duplicate name or a re-decided
 //! approval, 400 on a malformed body, 503 with no database pool.
 //!
-//! # Scope: no execution runtime
+//! # Scope: no general agent runtime
 //!
-//! `AgentService` has no "run this agent"/"invoke this tool" method, and
-//! this module does not add one. `listRuns`/`getRun` serve historical run
-//! *records* (seeded the same way every other Phase 2 domain seeds its
-//! fixtures) — nothing here launches an agent or a tool. See
-//! `lakehouse_store::agents`'s module doc comment.
+//! `getRun` serves a historical run *record* — nothing here launches an
+//! arbitrary agent or tool. The one real execution door is the headless
+//! employee run (`POST /api/agents/employees/{id}/run`), which dispatches
+//! only the registered copilot tools. See `lakehouse_store::agents`'s
+//! module doc comment.
 //!
-//! # Console surface removed
+//! # Retired and retained surfaces (`WEB-4`)
 //!
-//! `WS1` task 1.11 removed the Agent Workflows and Tool Registry pages:
-//! nothing executes an authored workflow, and the agent runtime never
-//! reads the tool registry. `/api/agents/workflows` still serves real
-//! `Postgres` CRUD, stays registered and `POLICY_TABLE`-classified, and is
-//! left for a later workstream to reuse or retire.
+//! `WS1` task 1.11 removed the Agent Workflows and Tool Registry pages,
+//! and `WEB-3` slice 1 removed the employee and runs-list pages. `WEB-4`
+//! audited every caller before retiring the routes those pages used:
+//! workflows (GET/POST), employee creation and the suspend/resume/revoke
+//! lifecycle, and the runs LIST had no assistant tool, console page, CLI or
+//! script caller, so their handlers, policy entries, audit entries and
+//! tests were removed with them.
+//!
+//! Three `/api/agents/employees*` routes stayed because they are **live**,
+//! not console leftovers: `GET /employees` is read at code-load by Dagster's
+//! schedule factory (`dagster/dispar_orchestrate/agent_runs.py`), `GET
+//! /employees/{id}` names the employee on the retained run-detail page, and
+//! `POST /employees/{id}/run` is the scheduled/manual trigger that same
+//! job calls. `GET /runs/{id}` stays because an assistant approval creates
+//! a real `agent_run` and `/agents/runs/[runId]` shows its trace.
 //!
 //! `GET /api/agents/tools` (WS7 item G4) no longer serves that unread
 //! `agent_tool` Postgres table — it now reflects
@@ -41,14 +51,16 @@
 
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+// SEC-68's run-principal builder needs `PrincipalId`; WEB-4 removed the
+// retired create/lifecycle handlers that were the only users of a
+// module-level `StatusCode` (the tests import their own).
+use axum::http::HeaderMap;
 use lakehouse_auth::{PermissionSet, Principal, PrincipalId};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::StoreError;
 use lakehouse_store::agents::{
-    self, AgentRun, AgentWorkflow, ApprovalItem, CreateEmployeeInput, CreateWorkflowInput,
-    Decision, DigitalEmployee, LinkedApprovalRequest, RunStep,
+    self, AgentRun, ApprovalItem, Decision, DigitalEmployee, LinkedApprovalRequest, RunStep,
 };
 use lakehouse_store::audit::NewAuditEvent;
 use serde::Deserialize;
@@ -79,14 +91,6 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiErro
     serde_json::from_slice(body).map_err(|err| ApiError::BadRequest(format!("invalid JSON: {err}")))
 }
 
-fn required(field: &str, value: &str) -> Result<String, ApiError> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(ApiError::BadRequest(format!("{field} is required")));
-    }
-    Ok(trimmed.to_owned())
-}
-
 /// The detail a run's step, or a run's outcome, keeps of a tool's result.
 ///
 /// A run's detail is read by a browser on the run page, so it takes the
@@ -98,61 +102,6 @@ fn required(field: &str, value: &str) -> Result<String, ApiError> {
 /// is stored as the tool returned it.
 fn stored_tool_detail(shown: &Value) -> String {
     serde_json::to_string(shown).unwrap_or_default()
-}
-
-const VALID_AUTONOMY: [&str; 4] = ["L1", "L2", "L3", "L4"];
-
-/// `agent_employee.mode`'s `CHECK` constraint values
-/// (`0025_agent_schedule.sql`) — a headless run uses this to pick the
-/// copilot's `SYSTEM_ASK_SUFFIX`/`SYSTEM_BUILD_SUFFIX` equivalent.
-const VALID_MODE: [&str; 2] = ["ask", "build"];
-
-// ── Workflows ──────────────────────────────────────────────────────────
-
-/// `GET /api/agents/workflows`.
-///
-/// # Errors
-///
-/// 503 if no pool is configured; 500 on a database failure.
-pub async fn list_workflows(
-    State(state): State<AppState>,
-) -> ApiResult<ApiJson<Vec<AgentWorkflow>>> {
-    Ok(ApiJson(agents::list_workflows(pool(&state)?).await?))
-}
-
-/// The `POST /api/agents/workflows` body. Mirrors `CreateWorkflowInput`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateWorkflowBody {
-    name: String,
-    trigger: String,
-    #[serde(default)]
-    step_kinds: Vec<String>,
-    approval_required: bool,
-    #[serde(default)]
-    owner: Option<String>,
-}
-
-/// `POST /api/agents/workflows` — create a workflow. Returns 201.
-///
-/// # Errors
-///
-/// 400 on a malformed body or a blank required field; 409 if the name is
-/// taken; 503/500 as above.
-pub async fn create_workflow(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> ApiResult<(StatusCode, ApiJson<AgentWorkflow>)> {
-    let body: CreateWorkflowBody = parse_body(&body)?;
-    let input = CreateWorkflowInput {
-        name: required("name", &body.name)?,
-        trigger: required("trigger", &body.trigger)?,
-        step_count: i64::try_from(body.step_kinds.len()).unwrap_or(i64::MAX),
-        approval_required: body.approval_required,
-        owner: body.owner,
-    };
-    let created = agents::create_workflow(pool(&state)?, &input).await?;
-    Ok((StatusCode::CREATED, ApiJson(created)))
 }
 
 // ── Employees ──────────────────────────────────────────────────────────
@@ -186,140 +135,11 @@ pub async fn get_employee(
     Ok(ApiJson(employee))
 }
 
-/// The `POST /api/agents/employees` body. Mirrors `CreateEmployeeInput`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateEmployeeBody {
-    name: String,
-    purpose: String,
-    autonomy: String,
-    #[serde(default)]
-    allowed_tools: Vec<String>,
-    data_scope: String,
-    budget_limit: f64,
-    #[serde(default)]
-    owner: Option<String>,
-    #[serde(default)]
-    prompt: Option<String>,
-    #[serde(default)]
-    schedule_cron: Option<String>,
-    #[serde(default)]
-    mode: Option<String>,
-    #[serde(default)]
-    permissions: Option<String>,
-    /// `SEC-68`: the agent's explicit table-access grant (role NAMES).
-    /// Optional at create time — an absent grant means no tables, fail
-    /// closed — and validated exactly like the dedicated read-roles
-    /// endpoint below.
-    #[serde(default, rename = "readRoles")]
-    read_roles: Option<Vec<String>>,
-}
-
-/// `POST /api/agents/employees` — create a digital employee. Returns 201.
-///
-/// # T3.2 fix: `mode` used to reach the database unvalidated
-///
-/// `agent_employee.mode` carries a `CHECK (mode IN ('ask', 'build'))`
-/// constraint (`0025_agent_schedule.sql`), but nothing validated `body.mode`
-/// before this handler handed it to [`agents::create_employee`] — an
-/// invalid value (`{"mode": "sleep"}`) surfaced as a raw Postgres
-/// constraint-violation error (an opaque 500) instead of a clean 400,
-/// exactly the gap [`VALID_MODE`] closes here, the same way [`VALID_AUTONOMY`]
-/// already does for `autonomy`.
-///
-/// # The permissions never exceed the creator's (`SEC-20`, plan 97)
-///
-/// A scheduled run takes its [`PermissionSet`] from the employee's own
-/// `permissions` column and needs no `agent:manage`, so an employee holding
-/// more than its creator would let the creator read what their own roles do
-/// not allow. The route needs `agent:manage` (`POLICY_TABLE`), and
-/// [`check_permission_ceiling`] refuses every permission the creator does not
-/// hold, `*:*` included.
-///
-/// # Errors
-///
-/// 400 on a malformed body, a blank required field, an unrecognized
-/// `autonomy`, an unrecognized `mode`, or a `permissions` token that is not
-/// `resource:action`; 403 when `permissions` names one the creator does not
-/// hold; 409 if the name is taken; 503/500 as above.
-pub async fn create_employee(
-    State(state): State<AppState>,
-    Extension(principal): Extension<Principal>,
-    body: Bytes,
-) -> ApiResult<(StatusCode, ApiJson<DigitalEmployee>)> {
-    let body: CreateEmployeeBody = parse_body(&body)?;
-    let autonomy = required("autonomy", &body.autonomy)?;
-    if !VALID_AUTONOMY.contains(&autonomy.as_str()) {
-        return Err(ApiError::BadRequest(format!(
-            "autonomy must be one of {VALID_AUTONOMY:?}, got {autonomy:?}"
-        ))
-        .into());
-    }
-    if let Some(mode) = &body.mode
-        && !VALID_MODE.contains(&mode.as_str())
-    {
-        return Err(ApiError::BadRequest(format!(
-            "mode must be one of {VALID_MODE:?}, got {mode:?}"
-        ))
-        .into());
-    }
-    check_permission_ceiling(&principal, body.permissions.as_deref())?;
-    // SEC-68: an agent created with a role grant is subject to the same
-    // unknown-name and no-escalation rules as the dedicated endpoint.
-    let read_roles = normalize_role_names(body.read_roles.as_deref().unwrap_or_default());
-    validate_read_roles(pool(&state)?, &principal, &read_roles).await?;
-    let input = CreateEmployeeInput {
-        name: required("name", &body.name)?,
-        purpose: required("purpose", &body.purpose)?,
-        autonomy,
-        allowed_tools: body.allowed_tools,
-        data_scope: required("dataScope", &body.data_scope)?,
-        budget_limit: body.budget_limit,
-        owner: body.owner,
-        prompt: body.prompt,
-        schedule_cron: body.schedule_cron,
-        mode: body.mode,
-        permissions: body.permissions,
-        read_roles,
-    };
-    let created = agents::create_employee(pool(&state)?, &input).await?;
-    Ok((StatusCode::CREATED, ApiJson(created)))
-}
-
-/// `SEC-20`, plan 97: refuses a `permissions` value that grants more than
-/// `creator` holds.
-///
-/// Walks the tokens [`PermissionSet::parse`] yields, because a run parses the
-/// stored column the same way. A non-blank token that does not parse as
-/// `resource:action` would grant nothing when parsed and so slip past this
-/// check unseen; it is refused with a 400 instead of being stored, which keeps
-/// the stored string equal to what was checked. [`PermissionSet::has`] answers
-/// per token, so `*:*` and `resource:*` pass only for a creator whose own
-/// grant is as wide.
-///
-/// # Errors
-///
-/// 400 for a token that is not `resource:action`; 403 naming the first
-/// permission `creator` does not hold. The name comes from the request.
-fn check_permission_ceiling(creator: &Principal, asked: Option<&str>) -> Result<(), ApiError> {
-    for token in asked.unwrap_or("").split(',') {
-        let token = token.trim();
-        if token.is_empty() {
-            continue;
-        }
-        let Some(permission) = PermissionSet::parse(token).as_strings().pop() else {
-            return Err(ApiError::BadRequest(
-                "permissions must be comma-separated resource:action pairs".to_owned(),
-            ));
-        };
-        if !creator.permissions.has(&permission) {
-            return Err(ApiError::PermissionDenied(format!(
-                "you cannot give an employee the permission {permission}, which you do not hold"
-            )));
-        }
-    }
-    Ok(())
-}
+// WEB-4 retired `POST /api/agents/employees` (and with it the request body,
+// the `agent:manage` permission ceiling and the create-time validation).
+// The store function stays, so a future scheduler or operator tool can
+// reuse it without a migration. SEC-68's dedicated read-roles route and its
+// validation helpers below were NOT retired — they are live.
 
 /// A role set is a set: trim, drop blanks, dedupe in first-seen order so the
 /// same name is never validated or stored twice (ADM-4 D1's shape, reused
@@ -438,44 +258,11 @@ fn map_transition_result(
     }
 }
 
-/// `POST /api/agents/employees/{id}/suspend`.
-///
-/// # Errors
-///
-/// 404 if `id` is unknown; 503/500 as above.
-pub async fn suspend_employee(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<ApiJson<DigitalEmployee>> {
-    let result = agents::suspend_employee(pool(&state)?, &id).await;
-    map_transition_result(&id, result)
-}
-
-/// `POST /api/agents/employees/{id}/resume`.
-///
-/// # Errors
-///
-/// 404 if `id` is unknown; 503/500 as above.
-pub async fn resume_employee(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<ApiJson<DigitalEmployee>> {
-    let result = agents::resume_employee(pool(&state)?, &id).await;
-    map_transition_result(&id, result)
-}
-
-/// `POST /api/agents/employees/{id}/revoke`.
-///
-/// # Errors
-///
-/// 404 if `id` is unknown; 503/500 as above.
-pub async fn revoke_employee(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<ApiJson<DigitalEmployee>> {
-    let result = agents::revoke_employee(pool(&state)?, &id).await;
-    map_transition_result(&id, result)
-}
+// WEB-4 retired the `{id}/{suspend,resume,revoke}` lifecycle routes (no
+// caller outside the removed console pages). The store functions stay, so a
+// future scheduler or operator tool can reuse them without a migration.
+// The `map_transition_result` helper above is retained: SEC-68's
+// `PUT /employees/{id}/read-roles` still needs it.
 
 // ── Tools ──────────────────────────────────────────────────────────────
 
@@ -576,49 +363,23 @@ pub async fn list_tools(
 
 // ── Runs ───────────────────────────────────────────────────────────────
 
-/// Query parameters shared by `GET /api/agents/runs` and
-/// `GET /api/agents/approvals`.
+/// Query parameters for `GET /api/agents/approvals`.
+///
+/// The runs LIST was retired by WEB-4 (no caller), so this filter is now
+/// only the approvals inbox's `?employeeId=`.
 #[derive(Debug, Deserialize)]
 pub struct EmployeeQuery {
     /// `?employeeId=<id>` — restrict to one employee.
     employee_id: Option<String>,
 }
 
-/// `GET /api/agents/runs?employeeId=` — mirrors `AgentService::listRuns`.
-///
-/// `SEC-20` (plan ai-118): a run belongs to the deployment, not to a tenant
-/// — `agent_employee` has no tenant column and its `owner` is free text — so
-/// the shared catalog's own rule decides who reads the run history: the
-/// tenant that owns the shared catalog, or an unrestricted caller. A caller
-/// the rule refuses gets the empty list, so the answer says nothing about
-/// what the deployment ran.
-///
-/// # Errors
-///
-/// 503 if no pool is configured; 500 on a database failure.
-pub async fn list_runs(
-    State(state): State<AppState>,
-    Extension(principal): Extension<Principal>,
-    headers: HeaderMap,
-    Query(query): Query<EmployeeQuery>,
-) -> ApiResult<ApiJson<Vec<AgentRun>>> {
-    if crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers)
-        .await?
-        .is_some()
-    {
-        return Ok(ApiJson(Vec::new()));
-    }
-    Ok(ApiJson(
-        agents::list_runs(pool(&state)?, query.employee_id.as_deref()).await?,
-    ))
-}
-
 /// `GET /api/agents/runs/{id}`.
 ///
 /// `SEC-20` (plan ai-118): the run history is the deployment's, so the
-/// shared catalog's own rule decides who reads it (see [`list_runs`]). A
-/// caller the rule refuses gets the unknown 404, so the answer says nothing
-/// about whether the run exists.
+/// shared catalog's own rule decides who reads it. A caller the rule
+/// refuses gets the unknown 404, so the answer says nothing about whether
+/// the run exists. This route stays: an assistant approval creates a real
+/// `agent_run` and `/agents/runs/[runId]` shows its trace (`WEB-3` D3).
 ///
 /// # Errors
 ///
@@ -2213,7 +1974,7 @@ mod tests {
     use std::collections::HashMap;
 
     use axum::body::to_bytes;
-    use axum::http::Request;
+    use axum::http::{Request, StatusCode};
     use lakehouse_auth::PrincipalId;
     use serde_json::Value;
     use tower::ServiceExt;
@@ -2229,12 +1990,13 @@ mod tests {
 
     #[tokio::test]
     async fn every_database_backed_route_returns_503_without_a_pool() {
+        // Only the routes WEB-4 kept: the retired workflows, employee
+        // create/lifecycle and runs-list paths are asserted 404 in
+        // `tests/route_auth.rs`'s WEB-4 regression instead.
         let paths = [
-            "/api/agents/workflows",
             "/api/agents/employees",
             "/api/agents/employees/emp-x",
             "/api/agents/tools",
-            "/api/agents/runs",
             "/api/agents/runs/run-x",
             "/api/agents/approvals",
         ];
@@ -2299,25 +2061,6 @@ mod tests {
                 .usage_count_30d,
             0
         );
-    }
-
-    #[test]
-    fn create_employee_body_rejects_unknown_autonomy() {
-        let body = CreateEmployeeBody {
-            name: "n".to_owned(),
-            purpose: "p".to_owned(),
-            autonomy: "L9".to_owned(),
-            allowed_tools: vec![],
-            data_scope: "d".to_owned(),
-            budget_limit: 0.0,
-            owner: None,
-            prompt: None,
-            schedule_cron: None,
-            mode: None,
-            permissions: None,
-            read_roles: None,
-        };
-        assert!(!VALID_AUTONOMY.contains(&body.autonomy.as_str()));
     }
 
     // ── SEC-68: runtime narrowing and grant validation ──────────────────
@@ -2655,29 +2398,6 @@ mod tests {
         assert_eq!(actor, "Nightly Ingest Bot");
     }
 
-    /// D (T3.2's fix): `create_employee` must validate `mode` the same way
-    /// it already validates `autonomy` — an unrecognized value never
-    /// reaches `agents::create_employee` to surface as a raw DB `CHECK`
-    /// violation.
-    #[test]
-    fn create_employee_body_rejects_unknown_mode() {
-        let body = CreateEmployeeBody {
-            name: "n".to_owned(),
-            purpose: "p".to_owned(),
-            autonomy: "L1".to_owned(),
-            allowed_tools: vec![],
-            data_scope: "d".to_owned(),
-            budget_limit: 0.0,
-            owner: None,
-            prompt: None,
-            schedule_cron: None,
-            mode: Some("sleep".to_owned()),
-            permissions: None,
-            read_roles: None,
-        };
-        assert!(!VALID_MODE.contains(&body.mode.as_deref().unwrap()));
-    }
-
     fn admin_perms() -> PermissionSet {
         PermissionSet::parse("*:*")
     }
@@ -2947,7 +2667,7 @@ mod tests {
 
             let state = state_for(&pool, &server.uri());
 
-            let input = CreateEmployeeInput {
+            let input = store_agents::CreateEmployeeInput {
                 name: "budget-test-employee".to_owned(),
                 purpose: "p".to_owned(),
                 autonomy: "L2".to_owned(),
@@ -3027,7 +2747,7 @@ mod tests {
 
             let state = state_for(&pool, &server.uri());
 
-            let input = CreateEmployeeInput {
+            let input = store_agents::CreateEmployeeInput {
                 name: "under-budget-employee".to_owned(),
                 purpose: "p".to_owned(),
                 autonomy: "L2".to_owned(),
@@ -3101,7 +2821,7 @@ mod tests {
 
             let state = state_for(&pool, &server.uri());
 
-            let input = CreateEmployeeInput {
+            let input = store_agents::CreateEmployeeInput {
                 name: "unconfigured-budget-employee".to_owned(),
                 purpose: "p".to_owned(),
                 autonomy: "L2".to_owned(),

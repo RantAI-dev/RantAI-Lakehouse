@@ -44,6 +44,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+use lakehouse_core::secret::SecretValue;
 use lakehouse_notify::{DeliveryFailure, EmailSender, SmtpCaBundle, SmtpConfig};
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
@@ -313,7 +314,7 @@ fn sender(relay: &Relay, host: &str, secure: bool, ca_bundle: Option<SmtpCaBundl
         port: relay.smtp_port,
         secure,
         user: None,
-        pass: String::new(),
+        pass: SecretValue::new(String::new()),
         from: "sender@example.com".to_owned(),
         ca_bundle,
     })
