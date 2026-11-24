@@ -46,6 +46,10 @@ once a first release is tagged.
 - In Ask mode the assistant explains a calculated field and finds one before saying it does not exist: a name `describe_mart` does not list may still be a calculated field, so a request like "explain the calculated field total_tamu" has it call `list_calculated_fields` for that mart or SQL source, which explains the formula in plain words, and it runs no SQL for that (backlog `AI-4`).
 - In Ask mode the assistant looks for a saved metric before it writes SQL, and names the metric when it uses it (backlog `AI-7`).
 
+### Removed
+
+- The API routes that only the console pages removed by `WEB-3` called are retired (backlog `WEB-4`), after an audit of the assistant's tools, live console pages, Dagster jobs, the CLI and the docs/scripts: `GET /api/ops/observability`, `GET`/`POST /api/agents/workflows`, employee creation and the `{id}/suspend`, `{id}/resume`, `{id}/revoke` lifecycle routes, and `GET /api/agents/runs` (list only). Their route registrations, `POLICY_TABLE` entries, audit-coverage entries, handlers and tests are gone; the retired paths answer 404 (the `{kind}` dispatcher gives `observability` its own 404, distinct from a never-known kind's 400). No migration was added and no database table or column was dropped. `GET /api/agents/runs/{id}`, `/api/agents/approvals*`, `GET /api/ops/workloads` and `GET /api/ops/services` stay: approvals link to a run's trace, the assistant's workload tools read `/ops/workloads`, System status reads `/ops/services`, and Dagster's schedule factory and job still call the employee list, detail and headless-run routes. The `agent:manage` permission stays seeded and is still checked inside the headless-run handler for a manual trigger.
+
 ### Fixed
 
 - Alerts (backlog `BI-65`, owner QA): the page keeps its tab in the address (`/alerts?tab=rules`), so saving or leaving a rule returns to Rules & Digests instead of Active Incidents; a digest's Dashboard field shows the dashboard's name, not its id; the rule page has one way back (the arrow), which asks "Discard your changes?" when something changed, and no Cancel button.
