@@ -2054,9 +2054,9 @@ pub async fn trigger(
     // header requirement and yields `None` for an empty body, the same
     // behavior the existing `routes::connectors::test_connection` call
     // site relies on.
-    let (run_config, full_refresh) = body
-        .map(|Json(b)| (b.run_config, b.full_refresh.unwrap_or(false)))
-        .unwrap_or((None, false));
+    let (run_config, full_refresh) = body.map_or((None, false), |Json(b)| {
+        (b.run_config, b.full_refresh.unwrap_or(false))
+    });
     // F2.5: when the caller sent a run_config, check its shape FIRST
     // (object, size, `pl-` refusal, REFUSED hint) before we ever talk
     // to Dagster. These are refusals the route can resolve locally
@@ -3573,27 +3573,7 @@ pub async fn generate(
         .and_then(|d| d.kind.clone())
         .filter(|k| PIPELINE_KINDS.contains(&k.as_str()))
         .unwrap_or_else(|| "batch".to_owned());
-    // A model that proposes incremental without a usable cursor (or with a
-    // strategy it invented) would produce a draft that fails its first run.
-    // Fall back to the full rebuild the row can actually execute, and say so
-    // in the log — never a refused create for a shape the model was never
-    // asked to supply completely.
-    let materialization = match crate::routes::authored_pipelines::validate_materialization(
-        &kind,
-        draft.as_ref().and_then(|d| d.incremental_column.clone()),
-        draft.as_ref().and_then(|d| d.incremental_strategy.clone()),
-        draft.as_ref().and_then(|d| d.partition_granularity.clone()),
-        draft.as_ref().and_then(|d| d.lookback_hours),
-    ) {
-        Ok(config) => config,
-        Err(_) => {
-            tracing::warn!("pipeline draft: incomplete incremental config, falling back to batch");
-            kind = "batch".to_owned();
-            crate::routes::authored_pipelines::validate_materialization(
-                &kind, None, None, None, None,
-            )?
-        }
-    };
+    let materialization = draft_materialization(draft.as_ref(), &mut kind)?;
     let source_table = draft
         .as_ref()
         .and_then(|d| d.source_table.clone())
@@ -3755,6 +3735,30 @@ struct PipelineDraft {
     lookback_hours: Option<i32>,
     #[serde(default)]
     transforms: Vec<String>,
+}
+
+/// BLD-12: validate the materialization a model proposed. A draft that asks
+/// for incremental without a usable cursor (or with an invented strategy)
+/// would fail on its first run, so fall back to the full rebuild the row can
+/// actually execute instead of storing a broken definition.
+fn draft_materialization(
+    draft: Option<&PipelineDraft>,
+    kind: &mut String,
+) -> Result<crate::routes::authored_pipelines::MaterializationConfig, ApiError> {
+    let proposed = crate::routes::authored_pipelines::validate_materialization(
+        kind,
+        draft.and_then(|d| d.incremental_column.clone()),
+        draft.and_then(|d| d.incremental_strategy.clone()),
+        draft.and_then(|d| d.partition_granularity.clone()),
+        draft.and_then(|d| d.lookback_hours),
+    );
+    if let Ok(config) = proposed {
+        return Ok(config);
+    }
+    tracing::warn!("pipeline draft: incomplete incremental config, falling back to batch");
+    kind.clear();
+    kind.push_str("batch");
+    crate::routes::authored_pipelines::validate_materialization(kind, None, None, None, None)
 }
 
 /// Ask the LLM to draft a pipeline for `instruction` against `database`.

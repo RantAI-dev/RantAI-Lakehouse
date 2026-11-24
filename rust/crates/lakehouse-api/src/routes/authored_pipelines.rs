@@ -558,7 +558,7 @@ pub struct MaterializationConfig {
     pub lookback_hours: i32,
 }
 
-/// Whether `column` is a safe ClickHouse identifier for the cursor: the
+/// Whether `column` is a safe `ClickHouse` identifier for the cursor: the
 /// same shape `authored_factory._is_safe_ch_identifier` re-checks before it
 /// interpolates a column into SQL, with the BLD-12 128-character ceiling.
 #[must_use]
@@ -1304,11 +1304,20 @@ fn update_input_from_body(
     form: &DefinitionForm,
     first: &lakehouse_store::pipelines::PipelineInput,
     body: &UpdateBody,
-    materialization: &MaterializationConfig,
     connector_change: ConnectorChange,
     run_as: lakehouse_store::pipelines::RunAsChange,
-) -> UpdatePipelineInput {
-    UpdatePipelineInput {
+) -> Result<UpdatePipelineInput, ApiError> {
+    // BLD-12: an edit may only name an active kind, and an incremental one
+    // must carry a safe cursor. A batch save resets the incremental fields;
+    // nothing is written until this passes (fail closed, fixed 400 messages).
+    let materialization = validate_materialization(
+        &body.kind,
+        body.incremental_column.clone(),
+        body.incremental_strategy.clone(),
+        body.partition_granularity.clone(),
+        body.lookback_hours,
+    )?;
+    Ok(UpdatePipelineInput {
         kind: body.kind.clone(),
         source_zone: first.zone.clone(),
         source_table: first.table.clone(),
@@ -1329,7 +1338,7 @@ fn update_input_from_body(
         depends_on: body.depends_on.clone(),
         connector_id: connector_change,
         run_as,
-    }
+    })
 }
 
 /// R1-B3 / D3a: a body in today's form, applied to the definition it may
@@ -2473,16 +2482,6 @@ pub async fn update(
     // call. It sits beside the zone guard so all four save routes answer
     // the same bad name with the same sentence.
     validate_target_table(&body.target_table)?;
-    // BLD-12: an edit may only name an active kind, and an incremental one
-    // must carry a safe cursor. A batch save resets the incremental fields;
-    // nothing is written until this passes (fail closed, fixed 400 messages).
-    let materialization = validate_materialization(
-        &body.kind,
-        body.incremental_column.clone(),
-        body.incremental_strategy.clone(),
-        body.partition_granularity.clone(),
-        body.lookback_hours,
-    )?;
     // BLD-1 part 1 / D3: one function turns either body form into D1's shape.
     let mut form = definition_form(
         body.inputs.clone(),
@@ -2575,14 +2574,7 @@ pub async fn update(
         (&body.target_zone, &body.target_table),
     )
     .await?;
-    let input = update_input_from_body(
-        &form,
-        &first,
-        &body,
-        &materialization,
-        connector_change,
-        new_run_as,
-    );
+    let input = update_input_from_body(&form, &first, &body, connector_change, new_run_as)?;
     let updated = pipelines::update_pipeline(pool, &id, &input, Some(principal.id.uuid()))
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
