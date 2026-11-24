@@ -3,6 +3,7 @@
 import { Tooltip as TooltipPrimitive } from "@base-ui/react/tooltip"
 
 import { cn } from "@/lib/utils"
+import { useSurfaceThemeClass } from "@/components/ui/surface-theme"
 
 function TooltipProvider({
   delay = 0,
@@ -38,6 +39,8 @@ function TooltipContent({
     TooltipPrimitive.Positioner.Props,
     "align" | "alignOffset" | "side" | "sideOffset"
   >) {
+  // WEB-10: the portal stays on <body>; copy the opener's theme onto the popup.
+  const surfaceThemeClass = useSurfaceThemeClass()
   return (
     <TooltipPrimitive.Portal>
       <TooltipPrimitive.Positioner
@@ -56,6 +59,7 @@ function TooltipContent({
           data-slot="tooltip-content"
           className={cn(
             "z-50 inline-flex w-fit max-w-xs origin-(--transform-origin) items-center gap-1.5 rounded-md bg-foreground px-3 py-1.5 text-xs text-background has-data-[slot=kbd]:pr-1.5 **:data-[slot=kbd]:relative **:data-[slot=kbd]:isolate **:data-[slot=kbd]:z-50 **:data-[slot=kbd]:rounded-sm transition-[opacity,scale,translate] duration-150 ease-ui data-ending-style:scale-[0.97] data-ending-style:opacity-0 data-ending-style:duration-100 data-instant:duration-0! data-starting-style:scale-[0.97] data-starting-style:opacity-0",
+            surfaceThemeClass,
             className
           )}
           {...props}

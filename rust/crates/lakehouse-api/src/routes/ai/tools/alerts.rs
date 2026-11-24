@@ -57,11 +57,21 @@ const NO_ADDRESS: &str = "Your account's email address could not be read, so thi
 /// `mart`, `measure`, `agg`, `op`, `threshold`, `metric`, `board`, `chart`,
 /// `series`, `filters`, `condition`, `channel`, `target`, `enabled`) already
 /// match the tool schema's property names one-for-one, so no field-by-field
-/// mapping is needed. Malformed/missing fields simply become `None`/defaults,
-/// exactly like the JSON body `routes::alerts::create`/`update` parse —
-/// [`save_rule_with_checks`] and `save_rule` do the real validation.
-fn parse_input(args: &Map<String, Value>) -> AlertRuleInput {
-    serde_json::from_value(Value::Object(args.clone())).unwrap_or_default()
+/// mapping is needed. Missing fields become `None`, exactly like the JSON body
+/// `routes::alerts::create`/`update` parse — [`save_rule_with_checks`] and
+/// `save_rule` do the real validation.
+///
+/// `BI-65`: a field the input does not have, or one of the wrong type, is the
+/// tool's error naming it (serde's own sentence, never an upstream's), as the
+/// routes answer a 400. It used to fall back to an empty input, so a call with
+/// one stray argument lost every field and read as "name is required".
+///
+/// # Errors
+///
+/// The tool's answer, `{ "error": … }`.
+fn parse_input(args: &Map<String, Value>) -> Result<AlertRuleInput, Value> {
+    serde_json::from_value(Value::Object(args.clone()))
+        .map_err(|err| json!({ "error": format!("The rule could not be read: {err}") }))
 }
 
 /// `BI-37` D3: a chart alert with no target goes to the caller's own email
@@ -126,7 +136,10 @@ pub(super) async fn create_alert_rule(
     principal: Option<&Principal>,
     args: &Map<String, Value>,
 ) -> Value {
-    let mut input = parse_input(args);
+    let mut input = match parse_input(args) {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
     if let Err(error) = fill_own_address(state, principal, &mut input).await {
         return error;
     }
@@ -154,7 +167,10 @@ pub(super) async fn update_alert_rule(
     if id.is_empty() {
         return json!({ "error": "id is required" });
     }
-    let mut input = parse_input(args);
+    let mut input = match parse_input(args) {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
     if let Err(error) = fill_own_address(state, principal, &mut input).await {
         return error;
     }
@@ -423,7 +439,7 @@ mod tests {
             "filters".to_owned(),
             json!([{ "column": "region", "values": ["Bali"] }]),
         );
-        let input = parse_input(&args);
+        let input = parse_input(&args).unwrap();
         assert_eq!(input.name.as_deref(), Some("Kunjungan turun"));
         assert_eq!(input.kind.as_deref(), Some("alert"));
         assert_eq!(input.mart.as_deref(), Some("mart_wisman"));
@@ -437,6 +453,33 @@ mod tests {
             input.filters.as_ref().map(Vec::len),
             Some(1),
             "the page's filters ride along, as `export_chart` takes them"
+        );
+    }
+
+    /// `BI-65`: a digest's schedule rides in the tool's args like any field, and
+    /// a stray argument is an error that names it, not an empty rule.
+    #[test]
+    fn parse_input_reads_a_digest_schedule_and_refuses_a_stray_argument() {
+        let mut args = Map::new();
+        args.insert("name".to_owned(), json!("Monday digest"));
+        args.insert("type".to_owned(), json!("digest"));
+        args.insert("board".to_owned(), json!("b_sales"));
+        args.insert(
+            "schedule".to_owned(),
+            json!({ "kind": "weekly", "weekday": 1, "hour": 8, "minute": 0 }),
+        );
+        args.insert("timeZone".to_owned(), json!("Asia/Jakarta"));
+        let input = parse_input(&args).unwrap();
+        assert_eq!(input.schedule.unwrap()["weekday"], 1);
+        assert_eq!(input.time_zone.as_deref(), Some("Asia/Jakarta"));
+
+        args.insert("recipients".to_owned(), json!(["a@example.test"]));
+        let refused = parse_input(&args).unwrap_err();
+        assert!(
+            refused["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("unknown field `recipients`")),
+            "{refused}"
         );
     }
 

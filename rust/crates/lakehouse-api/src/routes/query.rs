@@ -316,6 +316,32 @@ fn is_trino_engine(engine: &str) -> bool {
     crate::sql_rewrite::Engine::from_name(engine) == crate::sql_rewrite::Engine::Trino
 }
 
+/// The one place that resolves the engine a request names (`BI-44`). An
+/// omitted (or empty) name is the installation's configured engine; in
+/// `bi-only` mode an explicit name that is not that engine is a 400 BEFORE
+/// parameter substitution, the policy rewrite or any dial, so a request
+/// can never start the engine the operator deliberately did not deploy.
+/// The full stack keeps its old `ClickHouse` default and accepts both names.
+///
+/// # Errors
+///
+/// [`ApiError::BadRequest`] when a `bi-only` installation is asked for the
+/// inactive (or an unknown) engine. The message names the configured
+/// engine; it never reflects caller text or an upstream error.
+fn resolve_request_engine(state: &AppState, requested: Option<&str>) -> Result<String, ApiError> {
+    let requested = requested.map(str::trim).filter(|name| !name.is_empty());
+    let engine = requested
+        .unwrap_or_else(|| state.config.default_query_engine_name())
+        .to_owned();
+    if !state.config.engine_allowed(&engine) {
+        return Err(ApiError::BadRequest(format!(
+            "This installation runs the {} engine only; the other query engine is not configured and was not used.",
+            state.config.default_query_engine_name()
+        )));
+    }
+    Ok(engine)
+}
+
 async fn rewrite_sql_for_principal_inner(
     state: &AppState,
     sql: &str,
@@ -1974,8 +2000,9 @@ pub async fn run(
     // The engine is only a request field, so reading it before the guards
     // changes nothing about which refusal a request meets. The scanner needs
     // it (a backslash ends a quoted run on `ClickHouse` and not on `Trino`),
-    // and so does `tables_read` in [`run_statement`].
-    let engine = parsed.engine.as_deref().unwrap_or("clickhouse").to_owned();
+    // and so does `tables_read` in [`run_statement`]. `BI-44`: resolving it
+    // here also refuses the inactive engine before any guard dials it.
+    let engine = resolve_request_engine(&state, parsed.engine.as_deref())?;
     let principal = principal.map(|Extension(p)| p);
 
     // `query-parameters.md`, decision 13: the placeholders are filled as soon as the statement is
@@ -2098,6 +2125,18 @@ async fn run_statement_with(
     engine: &str,
     text: FailureText,
 ) -> Result<ApiJson<Value>, AssistantFailure> {
+    // `BI-44`: the assistant's `run_sql`/`run_saved_query` reach this
+    // function with a fixed engine name, not through `run`'s request
+    // resolver. Check the same invariant here so no caller can dial the
+    // engine a `bi-only` installation never started. The `run`/`estimate`
+    // handlers have already refused it above; this is the choke point.
+    if !state.config.engine_allowed(engine) {
+        return Err(AssistantFailure::fixed(ApiError::BadRequest(format!(
+            "This installation runs the {} engine only; the other query engine is not configured and was not used.",
+            state.config.default_query_engine_name()
+        ))));
+    }
+
     // The statement's tables are parsed with the dialect of the engine it
     // names (the same parser the policy step uses), and the history row
     // records them whether the run completes, fails or is refused (`QS-4`,
@@ -2819,9 +2858,11 @@ pub async fn estimate(
     };
     let (parameters, definitions) = parameter_inputs(parsed.parameters, parsed.definitions)?;
     // `QS-6` (`LH-QS-4-08`): the estimate reads the engine the request names,
-    // exactly as `run` does, so a Trino tab's placeholders are filled and its
-    // statement is judged by Trino's rules rather than ClickHouse's.
-    let engine = parsed.engine.as_deref().unwrap_or("clickhouse").to_owned();
+    // exactly as `run` does (including `BI-44`'s installation default and its
+    // refusal of the inactive engine), so a Trino tab's placeholders are
+    // filled and its statement is judged by Trino's rules rather than
+    // ClickHouse's.
+    let engine = resolve_request_engine(&state, parsed.engine.as_deref())?;
     // `query-parameters.md`, decision 13: the estimate explains the statement the run would send, so
     // it fills the placeholders first, with the run's function and before
     // every guard below. A refusal is the run's 400 sentence; the estimate
@@ -3694,6 +3735,7 @@ async fn write_download_rows<S: crate::export::RowSource>(
         locale,
         labels: &labels,
         formats: &formats,
+        note: None,
     };
     crate::export::write_export_with_byte_cap(source, &options, Some(byte_cap)).await
 }
@@ -3944,6 +3986,10 @@ pub async fn download(
         query_id: Some(download_query_id(caller.id.uuid(), run_id)),
         // A download keeps the engine's own formatting (out of scope of `DATA-53`).
         quote_decimals: false,
+        // `BI-34` covers the dashboard's downloads; Query Studio's keeps the
+        // engine's default until it has its own decision.
+        max_memory_usage: None,
+        params: Vec::new(),
     };
     let statement = download_statement(&rewritten);
 
@@ -8313,5 +8359,72 @@ mod claim_reads_tests {
         assert_eq!(batch["bronze.mine"], TableClaim::Ours);
         assert_eq!(batch["bronze.theirs"], TableClaim::Theirs);
         assert_eq!(batch["silver.mine"], TableClaim::Unclaimed);
+    }
+}
+
+#[cfg(test)]
+mod install_mode_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use super::resolve_request_engine;
+    use crate::config::Config;
+    use crate::state::AppState;
+
+    fn state_for(env: &[(&str, &str)]) -> AppState {
+        let map: HashMap<String, String> = env
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect();
+        AppState::new(Config::from_map(&map).unwrap())
+    }
+
+    /// The full stack keeps the old `ClickHouse` default and both engines,
+    /// including an unknown name that falls through to `ClickHouse`.
+    #[test]
+    fn the_full_stack_keeps_both_engines_and_the_clickhouse_default() {
+        let state = state_for(&[]);
+        assert_eq!(resolve_request_engine(&state, None).unwrap(), "clickhouse");
+        assert_eq!(
+            resolve_request_engine(&state, Some("trino")).unwrap(),
+            "trino"
+        );
+        assert_eq!(
+            resolve_request_engine(&state, Some("typo")).unwrap(),
+            "typo"
+        );
+    }
+
+    /// A `bi-only` installation defaults to its chosen engine and refuses
+    /// the other one, with a message that names the configured engine and
+    /// says plainly that nothing was dialed.
+    #[test]
+    fn a_bi_only_installation_defaults_to_and_permits_only_its_configured_engine() {
+        let state = state_for(&[
+            ("LAKEHOUSE_INSTALL_MODE", "bi-only"),
+            ("LAKEHOUSE_QUERY_ENGINE", "trino"),
+            ("TRINO_URL", "http://trino:8080"),
+        ]);
+        assert_eq!(resolve_request_engine(&state, None).unwrap(), "trino");
+        assert_eq!(
+            resolve_request_engine(&state, Some("   ")).unwrap(),
+            "trino"
+        );
+        let err = resolve_request_engine(&state, Some("clickhouse")).unwrap_err();
+        assert_eq!(err.status(), 400);
+        assert!(err.to_string().contains("trino"));
+        assert!(!err.to_string().contains("clickhouse"));
+        let err = resolve_request_engine(&state, Some("typo")).unwrap_err();
+        assert_eq!(err.status(), 400);
+
+        let state = state_for(&[("LAKEHOUSE_INSTALL_MODE", "bi-only")]);
+        assert_eq!(resolve_request_engine(&state, None).unwrap(), "clickhouse");
+        assert_eq!(
+            resolve_request_engine(&state, Some("trino"))
+                .unwrap_err()
+                .status(),
+            400
+        );
     }
 }

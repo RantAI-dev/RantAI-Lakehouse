@@ -26,6 +26,7 @@ use crate::catalog_search_cache::SearchSnapshotCache;
 use crate::config::Config;
 use crate::connector_secret_store::{ConnectorSecretStore, SharedKeyring};
 use crate::gold_lock::MartLocks;
+use crate::routes::ai::data_map::DataMapCache;
 use crate::secret_crypto::{CryptoError, Keyring, MANAGED_FILE_PREFIX};
 use crate::secret_manager::{ManagerResolver, SecretManagerKind, SecretManagerSettings};
 use crate::upload_convert::ConversionRunner;
@@ -191,6 +192,11 @@ pub struct AppState {
     /// populated, like [`Self::bronze_stats_cache`]; holds nothing per
     /// caller.
     pub catalog_search_cache: Arc<SearchSnapshotCache>,
+    /// The copilot's DATA MAP cache (OPS-36). Held here, not in a process-wide
+    /// `static`, so each app — and each deployment instance — builds and
+    /// reuses its own map: a chat in one test app can no longer read the map
+    /// another app's `ClickHouse` mock built and change the system prompt.
+    pub(crate) data_map_cache: Arc<DataMapCache>,
     /// `Trino` `/v1/statement` client for `routes::query::run`'s
     /// `engine: "trino"` path (WS2 §4). Always present, like
     /// [`Self::clickhouse`], never `Option` — the `trino` compose profile
@@ -224,12 +230,12 @@ pub struct AppState {
     pub pipeline_source_allowlist: Arc<crate::pipeline_source::SourceAllowlist>,
     /// Ring buffer of the last [`POLICY_DECISION_LATENCY_CAP`]
     /// `sql_rewrite::enforce` prefetch+rewrite durations (WS7 item C2) —
-    /// `routes::query::run` records one sample per call, refused or not;
-    /// `GET /api/ops/observability`'s `policyDecisionP95Ms` computes a
-    /// real p95 from it instead of the literal `null` WS1's honesty pass
-    /// left in place. Always populated (same pattern as
-    /// [`Self::gold_export_locks`]/[`Self::bronze_stats_cache`]): needs no
-    /// external dependency, just an in-process buffer.
+    /// `routes::query::run` records one sample per call, refused or not.
+    /// `GET /api/ops/observability` used to compute a real p95 from it;
+    /// WEB-4 retired that view (no caller), so the buffer is written but
+    /// read only by its own tests until another consumer needs it. It is
+    /// kept, not dropped, because it costs no external dependency (same
+    /// pattern as [`Self::gold_export_locks`]/[`Self::bronze_stats_cache`]).
     pub policy_decision_latencies: PolicyDecisionLatencies,
     /// Client for Lakekeeper's `management/v1/*` API, used by `POST
     /// /api/identity/tenants` to provision a tenant's
@@ -263,6 +269,10 @@ pub struct AppState {
     /// feature decision 5); a third request waits for a slot. Shared across
     /// clones.
     pub pdf_slots: Arc<tokio::sync::Semaphore>,
+    /// At most [`EXPORT_AT_ONCE`] dashboard downloads run at once per process
+    /// (`BI-34`, plan D3); a further one is refused with a 429, it does not
+    /// wait. Scheduled reports do not take these slots. Shared across clones.
+    pub export_slots: Arc<tokio::sync::Semaphore>,
     /// At most `TILE_CONCURRENCY_MAX` (default 24) dashboard tiles are
     /// computed at once per process, across every request (`BI-4` part A,
     /// plan D2); a request also caps itself at 6. Shared across clones.
@@ -317,6 +327,12 @@ pub struct AppState {
 /// Gotenberg container has 1 GiB; a third request waits its turn.
 pub const PDF_AT_ONCE: usize = 2;
 
+/// Dashboard downloads at once per API process (`BI-34`, plan D3): the same
+/// number as the PDF's, because a download holds a statement on the engine
+/// ([`crate::export::EXPORT_MEMORY_BYTES`] each) and a file in the temporary
+/// directory ([`crate::export::EXPORT_BYTE_CAP`] at most) for as long as it runs.
+pub const EXPORT_AT_ONCE: usize = 2;
+
 /// Build the admin-scoped [`LakekeeperAdminClient`] from the token file at
 /// `token_path`, or `None` when this deployment has no usable admin token.
 ///
@@ -359,11 +375,12 @@ const POLICY_DECISION_LATENCY_CAP: usize = 1000;
 
 /// Thread-safe ring buffer of policy-decision durations, shared (via
 /// [`Arc`]) across every clone of [`AppState`] so every request records
-/// into, and every `/api/ops/observability` read sees, the SAME buffer.
+/// into the SAME buffer.
 ///
 /// A plain `Mutex<VecDeque<Duration>>`, not a lock-free structure: this is
-/// written once per `routes::query::run` call and read at most once per
-/// `/api/ops/observability` request — nowhere near a contention hot path
+/// written once per `routes::query::run` call. WEB-4 removed the
+/// `/api/ops/observability` reader, so there is no request-time read today
+/// (only the type's own unit tests) — nowhere near a contention hot path
 /// (WS7 item C2 Step 2's own "implementer's choice, documented").
 #[derive(Clone, Default)]
 pub struct PolicyDecisionLatencies(
@@ -747,9 +764,9 @@ impl AppState {
     #[allow(
         clippy::too_many_lines,
         reason = "one struct literal naming every shared handle, a line per \
-                  field; `tile_slots` (BI-4 part A), `result_cache` (part B), `query_limits` (BI-5) and \
-                  `readiness_cache` (REL-2 S1 review SHOULD-FIX 1) are \
-                  the lines that took it from 100 to 103"
+                  field; `tile_slots` (BI-4 part A), `result_cache` (part B), `query_limits` (BI-5), \
+                  `readiness_cache` (REL-2 S1 review SHOULD-FIX 1) and `data_map_cache` (OPS-36) \
+                  are the later lines that grew it past 100"
     )]
     pub fn new(config: Config) -> Self {
         let clickhouse = Arc::new(ChClient::new(
@@ -886,6 +903,7 @@ impl AppState {
             iceberg: Arc::new(RwLock::new(None)),
             bronze_stats_cache: Arc::new(BronzeStatsCache::new()),
             catalog_search_cache: Arc::new(SearchSnapshotCache::new()),
+            data_map_cache: Arc::new(DataMapCache::default()),
             trino: Arc::new(trino),
             health_cache: Arc::new(tokio::sync::Mutex::new(None)),
             readiness_cache: Arc::new(tokio::sync::Mutex::new(None)),
@@ -895,6 +913,7 @@ impl AppState {
             upload_receive,
             conversion_runner,
             pdf_slots: Arc::new(tokio::sync::Semaphore::new(PDF_AT_ONCE)),
+            export_slots: Arc::new(tokio::sync::Semaphore::new(EXPORT_AT_ONCE)),
             tile_slots: Arc::new(crate::tile_pool::slots_from_env()),
             result_cache: Arc::new(crate::result_cache::ResultCache::new(
                 crate::result_cache::max_mb_from(

@@ -87,6 +87,10 @@ mod notifications;
 mod ops;
 mod overview;
 pub(crate) mod params;
+// The picture route's drain (`ADM-2`, plan adm-120): reads the request body
+// an early answer left behind, so the client is not left writing into a
+// closed connection. See the module's own doc comment.
+mod picture_drain;
 mod pipeline_preview;
 mod pipelines;
 mod quality;
@@ -125,7 +129,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
-use axum::middleware::{Next, from_fn_with_state};
+use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use lakehouse_core::ApiError;
@@ -692,6 +696,10 @@ fn lakehouse_router() -> Router<AppState> {
             get(lakehouse::list_maintenance_policies),
         )
         .route("/api/lakehouse/capacity", get(lakehouse::capacity))
+        .route(
+            "/api/lakehouse/compaction-status",
+            get(lakehouse::compaction_status),
+        )
 }
 
 /// The static (non-`{kind}`) `/api/governance/*` routes, split out for the
@@ -1326,27 +1334,22 @@ fn knowledge_router() -> Router<AppState> {
 /// `clippy::too_many_lines` reason as [`pipelines_router`].
 fn agents_router() -> Router<AppState> {
     Router::new()
-        .route(
-            "/api/agents/workflows",
-            get(agents::list_workflows).post(agents::create_workflow),
-        )
-        .route(
-            "/api/agents/employees",
-            get(agents::list_employees).post(agents::create_employee),
-        )
+        // WEB-4: the workflows routes, employee creation and the
+        // suspend/resume/revoke lifecycle, and the runs LIST were retired.
+        // No assistant tool, console page, CLI or script calls them. They
+        // are absent from `POLICY_TABLE` too, so they answer 404 — pinned
+        // by `tests/route_auth.rs`'s `web4_retired_paths_are_not_registered`.
+        //
+        // The three employee routes that remain are live consumers, not
+        // console leftovers: `GET /employees` is read at code-load by
+        // Dagster's schedule factory
+        // (`dagster/dispar_orchestrate/agent_runs.py`), `GET /employees/{id}`
+        // names the employee on the retained run-detail page, and `POST
+        // /employees/{id}/run` is the scheduled/manual trigger that same
+        // Dagster job calls. `GET /runs/{id}` stays because an approval
+        // creates a real `agent_run` and its page shows the trace.
+        .route("/api/agents/employees", get(agents::list_employees))
         .route("/api/agents/employees/{id}", get(agents::get_employee))
-        .route(
-            "/api/agents/employees/{id}/suspend",
-            axum::routing::post(agents::suspend_employee),
-        )
-        .route(
-            "/api/agents/employees/{id}/resume",
-            axum::routing::post(agents::resume_employee),
-        )
-        .route(
-            "/api/agents/employees/{id}/revoke",
-            axum::routing::post(agents::revoke_employee),
-        )
         .route(
             "/api/agents/employees/{id}/run",
             axum::routing::post(agents::run_employee),
@@ -1356,7 +1359,6 @@ fn agents_router() -> Router<AppState> {
         // real ai_registry::TOOLS registry, see routes::agents's module
         // doc comment.
         .route("/api/agents/tools", get(agents::list_tools))
-        .route("/api/agents/runs", get(agents::list_runs))
         .route("/api/agents/runs/{id}", get(agents::get_run))
         .route("/api/agents/approvals", get(agents::list_approvals))
         .route(
@@ -1877,9 +1879,11 @@ pub fn router(state: AppState) -> Router {
         )
         // A picture arrives as a form, so this route alone takes a body of
         // 1 MiB (the 512 KB logo limit and the form's framing); the layer on
-        // the `PUT` keeps the raised limit off every other route.
+        // the `PUT` keeps the raised limit off every other route. The path
+        // is the one constant `routes::picture_drain` reads too, so the
+        // drain and the route cannot name different paths.
         .route(
-            "/api/settings/general/images/{kind}",
+            picture_drain::PICTURE_ROUTE_PATTERN,
             put(settings::put_general_image)
                 .layer(DefaultBodyLimit::max(settings::PICTURE_BODY_LIMIT_BYTES))
                 .delete(settings::delete_general_image),
@@ -1937,8 +1941,9 @@ pub fn router(state: AppState) -> Router {
         // only — no `search` route here, see `routes::knowledge`'s module
         // doc comment).
         .merge(knowledge_router())
-        // Phase 2, Task 2.9: digital employees, tools, workflows, runs,
-        // and approvals.
+        // Phase 2, Task 2.9 (WEB-4): the employee list/detail/run reads,
+        // tools, run detail and approvals. Workflows, employee creation,
+        // lifecycle changes and the runs list were retired.
         .merge(agents_router())
         // Task 3.2: login/logout/me/change-password.
         .merge(auth_router());
@@ -1976,6 +1981,16 @@ pub fn router(state: AppState) -> Router {
 /// before it (the query scope) would run per query inside the handler's
 /// response instead. Like the gate, it is added before the two fallbacks, so
 /// a `404` or `405` writes nothing.
+///
+/// `ADM-2` (plan adm-120): the picture route's drain sits between the gate
+/// and the fallbacks, so it wraps the gate but not the fallbacks. It is
+/// outside `auth_gate` because the gate's `401` is one of the early answers
+/// the drain exists for — an unauthenticated caller must get the JSON error
+/// on a connection that is still usable, not a reset — and it is inside
+/// `timeout_middleware` because the time it spends draining a body counts
+/// against the request's deadline. `route_layer` (not `layer`) because it
+/// must not touch the fallbacks: a `404` or `405` writes nothing and reads
+/// nothing.
 fn gated(routes: Router<AppState>, state: AppState) -> Router {
     routes
         // Task 3.2: the one authorization gate every route (bar the four
@@ -1999,6 +2014,9 @@ fn gated(routes: Router<AppState>, state: AppState) -> Router {
             crate::audit_coverage::audit_gate,
         ))
         .layer(from_fn_with_state(state.clone(), auth_gate))
+        // `ADM-2` (plan adm-120): the picture route's drain, outside the
+        // gate and inside the timeout. See `routes::picture_drain`.
+        .route_layer(from_fn(picture_drain::drain))
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(no_such_address)
         .layer(from_fn_with_state(state.clone(), timeout_middleware))
@@ -2129,9 +2147,13 @@ async fn ready(State(state): State<AppState>) -> Response {
 ///
 /// Two responses have no route of their own to render this through: the
 /// request timeout ([`timeout_middleware`]) and the 405 for a method no
-/// handler serves ([`method_not_allowed`]).
+/// handler serves ([`method_not_allowed`]). The picture route's drain
+/// (`routes::picture_drain`) renders its 413 through it as well.
+///
+/// `pub(crate)`, not private: the drain is a sibling module and needs the
+/// same envelope for its own answer.
 #[derive(Debug, Serialize)]
-struct FixedErrorBody {
+pub(crate) struct FixedErrorBody {
     error: String,
 }
 

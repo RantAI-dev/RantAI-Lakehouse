@@ -120,15 +120,36 @@ fn clause_hides_board(sql: &str) -> bool {
     false
 }
 
-/// The `owner_id` a saved rule's `INSERT` wrote: the rule's last value, a
-/// single-quoted literal (`SqlLiteral` doubles an inner quote; owner ids never
-/// carry one).
+/// The `owner_id` a saved rule's `INSERT` wrote. The column is found by name in
+/// the statement's column list and its value by splitting the `VALUES` list on
+/// the commas outside quotes (`SqlLiteral` doubles an inner quote). It used to
+/// be "the last literal", which stopped being the owner when `BI-65` added
+/// `schedule` and `time_zone` after it: the fake then served an empty owner for
+/// the re-read, the rule looked as if it watched something else, and its state
+/// was dropped (PR #650 CI). This is the stand-in's mistake, not the product's:
+/// a real `ClickHouse` returns the stored owner.
 fn inserted_owner(sql: &str) -> Option<String> {
-    // `save_rule` writes `VALUES ('id','name',...)` with no space after a
-    // comma, and `owner_id` is the last column.
-    let values = sql.split(") VALUES (").nth(1)?;
-    let last = values.rsplit("','").next()?;
-    Some(last.strip_suffix("')")?.to_owned())
+    let (head, values) = sql.split_once(") VALUES (")?;
+    let columns = head.split_once('(')?.1;
+    let at = columns.split(',').position(|c| c == "owner_id")?;
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = values.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if quoted && chars.peek() == Some(&'\'') => {
+                chars.next();
+                current.push('\'');
+            }
+            '\'' => quoted = !quoted,
+            ',' if !quoted => fields.push(std::mem::take(&mut current)),
+            ')' if !quoted => break,
+            _ => current.push(c),
+        }
+    }
+    fields.push(current);
+    fields.get(at).cloned()
 }
 
 impl Respond for FakeCh {

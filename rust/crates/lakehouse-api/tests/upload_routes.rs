@@ -672,7 +672,95 @@ impl Respond for HeldDescribe {
     }
 }
 
-// ── the stack ────────────────────────────────────────────────────────────
+/// Holds incoming `ClickHouse` requests whose body contains `dataset_catalog`
+/// at a `tokio::sync::Barrier` until `parties` requests have arrived, then
+/// forwards every request to `upstream` (`stack.ch`).
+///
+/// `wiremock`'s `Respond::respond` runs synchronously while holding the
+/// server's single-threaded write lock, so blocking inside a `wiremock`
+/// responder would prevent the second request from arriving. Putting the async
+/// barrier in an `axum` gate in front of `stack.ch` suspends the first
+/// request without blocking `stack.ch`, while `stack.ch` still records every
+/// forwarded request.
+async fn start_dataset_catalog_barrier(
+    upstream: String,
+    parties: usize,
+) -> (String, tokio::sync::oneshot::Sender<()>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ClickHouse barrier listener");
+    let addr = listener.local_addr().unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(parties));
+    let released = Arc::new(AtomicBool::new(false));
+    let client = reqwest::Client::new();
+    let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+        let barrier = Arc::clone(&barrier);
+        let released = Arc::clone(&released);
+        let client = client.clone();
+        let upstream = upstream.clone();
+        async move {
+            let method = req.method().clone();
+            let path_and_query = req
+                .uri()
+                .path_and_query()
+                .map_or("/", axum::http::uri::PathAndQuery::as_str);
+            let url = format!("{upstream}{path_and_query}");
+            let headers = req.headers().clone();
+            let body = to_bytes(req.into_body(), 1024 * 1024).await.unwrap();
+            if std::str::from_utf8(&body).is_ok_and(|s| s.contains("dataset_catalog"))
+                && !released.load(Ordering::Acquire)
+            {
+                if tokio::time::timeout(Duration::from_secs(30), barrier.wait())
+                    .await
+                    .is_err()
+                {
+                    return axum::response::Response::builder()
+                        .status(StatusCode::GATEWAY_TIMEOUT)
+                        .body(Body::from("dataset_catalog barrier timed out"))
+                        .unwrap();
+                }
+                released.store(true, Ordering::Release);
+            }
+            let mut forwarded = client.request(
+                reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(),
+                url,
+            );
+            for (name, value) in &headers {
+                if name == axum::http::header::HOST || name == axum::http::header::CONTENT_LENGTH {
+                    continue;
+                }
+                forwarded = forwarded.header(name.as_str(), value.as_bytes());
+            }
+            let resp = forwarded.body(body).send().await.unwrap();
+            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap();
+            let resp_headers = resp.headers().clone();
+            let resp_body = resp.bytes().await.unwrap();
+            let mut reply = axum::response::Response::builder().status(status);
+            for (name, value) in &resp_headers {
+                if name == axum::http::header::TRANSFER_ENCODING
+                    || name == axum::http::header::CONTENT_LENGTH
+                {
+                    continue;
+                }
+                reply = reply.header(name.as_str(), value.as_bytes());
+            }
+            reply.body(Body::from(resp_body)).unwrap()
+        }
+    });
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await;
+    });
+    (format!("http://{addr}"), tx)
+}
+
+// ── the stack ─────────────────────────────────────────────────────────────
 
 /// What differs between stacks: the Iceberg query database, and where
 /// `Dagster` and `ClickHouse` are when a test wants them not to be at the
@@ -681,6 +769,9 @@ struct Options {
     iceberg_query_db: Option<&'static str>,
     dagster_url: Option<&'static str>,
     ch_url: Option<&'static str>,
+    /// `REL-27`: when set, hold `dataset_catalog` requests in an async barrier
+    /// gate until this many parties have arrived before forwarding to `stack.ch`.
+    dataset_catalog_barrier: Option<usize>,
     /// `SEC-22` D3: how many conversions run at once per API process.
     upload_max_conversions: Option<&'static str>,
     /// `SEC-22`: the child the runner starts, when it is not the binary
@@ -713,6 +804,7 @@ impl Default for Options {
             iceberg_query_db: Some("icecat_api"),
             dagster_url: None,
             ch_url: None,
+            dataset_catalog_barrier: None,
             upload_max_conversions: None,
             conversion_child: None,
             conversion_output_cap: None,
@@ -733,6 +825,7 @@ struct Stack {
     s3: MockServer,
     dagster: MockServer,
     ch: MockServer,
+    _barrier_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 struct Reply {
@@ -787,6 +880,14 @@ impl Stack {
         Self::with(Options::default()).await
     }
 
+    async fn with_dataset_catalog_barrier(parties: usize) -> Self {
+        Self::with(Options {
+            dataset_catalog_barrier: Some(parties),
+            ..Options::default()
+        })
+        .await
+    }
+
     async fn with(options: Options) -> Self {
         let s3 = MockServer::start().await;
         let dagster = MockServer::start().await;
@@ -817,6 +918,12 @@ impl Stack {
         }
         if let Some(url) = options.ch_url {
             env.insert("CH_URL".to_owned(), url.to_owned());
+        }
+        let mut barrier_shutdown = None;
+        if let Some(parties) = options.dataset_catalog_barrier {
+            let (proxy_url, shutdown) = start_dataset_catalog_barrier(ch.uri(), parties).await;
+            env.insert("CH_URL".to_owned(), proxy_url);
+            barrier_shutdown = Some(shutdown);
         }
         if let Some(url) = options.catalog_url {
             // `DATA-55` review R2: the load's healing rule reads the Iceberg
@@ -863,6 +970,7 @@ impl Stack {
             s3,
             dagster,
             ch,
+            _barrier_shutdown: barrier_shutdown,
         }
     }
 
@@ -2442,19 +2550,16 @@ async fn a_third_large_load_is_429_with_the_large_load_sentence() {
 ///
 /// Both requests must be past the "is it loading?" check before either claims,
 /// or the early check would refuse the second and the claim would never be
-/// tested. The registry lookup in between is slowed down for that: it is the
-/// call both make after the early checks and before the claim.
+/// tested. The registry lookup in between is held behind a two-party barrier
+/// (`REL-27`) instead of a timer delay, so both requests deterministically reach
+/// it after the early checks and before either claims.
 #[tokio::test]
 async fn two_simultaneous_ingests_of_one_upload_launch_once() {
-    let stack = Stack::start().await;
+    let stack = Stack::with_dataset_catalog_barrier(2).await;
     let bayu = stack.bayu().await;
     Mock::given(method("POST"))
         .and(body_string_contains("dataset_catalog"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_delay(Duration::from_millis(500))
-                .set_body_json(rows_body(&json!([]))),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(rows_body(&json!([]))))
         .mount(&stack.ch)
         .await;
     Mock::given(method("POST"))
@@ -3388,8 +3493,9 @@ async fn a_failed_claim_keeps_another_tenant_out_of_the_table_and_lets_its_own_t
 
 /// Review finding B4: two tenants asking for one new name at the same moment,
 /// one loads and the other is refused, and one run is launched. The registry
-/// lookup both make after the ownership check is slowed down so that both are
-/// past that check before either claims, as
+/// lookup both make after the ownership check is held behind a two-party
+/// barrier (`REL-27`) instead of a timer delay so that both are guaranteed to
+/// be past that check before either claims, as
 /// `two_simultaneous_ingests_of_one_upload_launch_once` does.
 ///
 /// What this pins is the outcome under a real race: one launch, one claim, and
@@ -3401,16 +3507,12 @@ async fn a_failed_claim_keeps_another_tenant_out_of_the_table_and_lets_its_own_t
 /// is the one that fixes the first path.
 #[tokio::test]
 async fn two_tenants_asking_for_one_new_name_at_the_same_moment_one_launches() {
-    let stack = Stack::start().await;
+    let stack = Stack::with_dataset_catalog_barrier(2).await;
     let bayu = stack.bayu().await;
     let andi = stack.andi().await;
     Mock::given(method("POST"))
         .and(body_string_contains("dataset_catalog"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_delay(Duration::from_millis(500))
-                .set_body_json(rows_body(&json!([]))),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(rows_body(&json!([]))))
         .mount(&stack.ch)
         .await;
     Mock::given(method("POST"))
@@ -6894,6 +6996,40 @@ async fn a_settled_typed_load_carries_the_report_of_values_that_did_not_fit() {
         "the report of a typed workbook load is read: {}",
         workbook.text
     );
+}
+
+/// `REL-15`: a reader that settles the same run concurrently cannot observe
+/// the terminal status before the report. Four GETs arrive together; every one
+/// returns the finished row WITH its report, never `failed` with no
+/// `badValues`. The status and the report are one database update.
+#[tokio::test]
+async fn concurrent_readers_never_see_a_terminal_status_before_its_report() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_run_status(&stack.dagster, "FAILURE").await;
+    seed_typed_loading(&stack, "up-1").await;
+    stack.bucket.put(
+        &format!("uploads/{GROUP}/up-1.csv.bad-values.json"),
+        &report_bytes(5),
+    );
+    mount_results(
+        &stack.ch,
+        &json!([result_row("up-1", "failed", None, BAD_VALUES_REASON, 30)]),
+    )
+    .await;
+
+    let (a, b, c, d) = tokio::join!(
+        stack.get(&bayu, "/api/uploads/up-1"),
+        stack.get(&bayu, "/api/uploads/up-1"),
+        stack.get(&bayu, "/api/uploads/up-1"),
+        stack.get(&bayu, "/api/uploads/up-1"),
+    );
+    for reply in [a, b, c, d] {
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+        assert_eq!(reply.json["status"], "failed", "{}", reply.text);
+        assert_eq!(reply.json["error"], BAD_VALUES_REASON, "{}", reply.text);
+        assert_eq!(reply.json["badValues"]["count"], 5, "{}", reply.text);
+    }
 }
 
 /// No report, a report that is not the job's shape, and a report of an upload

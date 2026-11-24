@@ -32,6 +32,7 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import { useAuth } from "@/features/auth/auth-provider"
 import { formatDateTime, formatDuration, formatRelativeTime } from "@/lib/format"
 import { withNotify } from "@/lib/notify"
+import { readableErrorMessage } from "@/lib/notify-message"
 import type { EntityStatus } from "@/lib/status"
 import { cn } from "@/lib/utils"
 import { identityService, pipelineService } from "@/services"
@@ -39,7 +40,14 @@ import type { PipelineDetail, PipelineRun } from "@/services/contracts/pipelines
 import { AuthoredFlow, DagsterDefinition } from "./pipeline-definition"
 import { PipelineMasthead, PipelineVitals } from "./pipeline-detail-header"
 import { isLiveRun, runDurationMs, summarizeRuns } from "./pipeline-run-stats"
-import { describeCron, isScheduleRunning, localizeScheduleTime, parseSchedule } from "./pipeline-schedule"
+import {
+  describeCron,
+  isLagTrigger,
+  isScheduleRunning,
+  localizeScheduleTime,
+  parseSchedule,
+  triggerSummary,
+} from "./pipeline-schedule"
 import { RunHistoryStrip, runFill, statusLabel } from "./run-history-strip"
 import { authorChoices, readsAs } from "./pipeline-reads-as"
 import { RunInspector } from "./run-inspector"
@@ -51,6 +59,10 @@ const LIVE_POLL_MS = 4000
 const IDLE_POLL_MS = 30_000
 /** How long after a launch to keep polling fast: the new run may take a few seconds to be listed. */
 const LAUNCH_WINDOW_MS = 20_000
+/** BLD-11 D10: bounded detail poll while a just-marked-ready job is loading. */
+const JOB_LOAD_POLL_MS = 4000
+/** 30 looks x 4 s = the 2-minute bound on that poll. */
+const JOB_LOAD_MAX_TICKS = 30
 
 type TabId = "runs" | "definition" | "settings"
 
@@ -176,6 +188,38 @@ export function PipelineDetailPage() {
   const summary = React.useMemo(() => summarizeRuns(runs), [runs])
   const anyLive = runs.some(isLiveRun)
 
+  // BLD-11 F6/D10: a just-marked-ready authored pipeline has no job yet, and
+  // the reload is now a background write. Poll its detail briefly so the
+  // page notices when the orchestrator loads the job, then stop.
+  const [jobLoadActive, setJobLoadActive] = React.useState(false)
+  const jobLoadTicks = React.useRef(0)
+  const detailNeedsJob =
+    state.status === "success" &&
+    state.data.engine === "authored" &&
+    state.data.status === "ready" &&
+    !state.data.orchestratorJob
+  React.useEffect(() => {
+    if (detailNeedsJob) {
+      setJobLoadActive(true)
+    } else {
+      setJobLoadActive(false)
+      jobLoadTicks.current = 0
+    }
+  }, [detailNeedsJob])
+  React.useEffect(() => {
+    if (!jobLoadActive || !detailNeedsJob) return
+    const t = setInterval(() => {
+      if (jobLoadTicks.current >= JOB_LOAD_MAX_TICKS) {
+        setJobLoadActive(false)
+        clearInterval(t)
+        return
+      }
+      jobLoadTicks.current += 1
+      state.reload()
+    }, JOB_LOAD_POLL_MS)
+    return () => clearInterval(t)
+  }, [jobLoadActive, detailNeedsJob, state.reload])
+
   // BLD-1 / D2: who this pipeline reads as. The NAME rides along with the
   // detail read, so everyone sees it; the user LIST is only needed by the
   // assign control below, which is `identity:write` — and that list is
@@ -250,12 +294,12 @@ export function PipelineDetailPage() {
     )
   )
   const pause = useServiceAction(
-    withNotify({ success: "Schedule paused", error: "The schedule could not be paused" }, (signal, id: string) =>
+    withNotify({ success: "Pipeline paused", error: "The pipeline could not be paused" }, (signal, id: string) =>
       pipelineService.pausePipeline(id, signal)
     )
   )
   const resume = useServiceAction(
-    withNotify({ success: "Schedule resumed", error: "The schedule could not be resumed" }, (signal, id: string) =>
+    withNotify({ success: "Pipeline resumed", error: "The pipeline could not be resumed" }, (signal, id: string) =>
       pipelineService.resumePipeline(id, signal)
     )
   )
@@ -310,7 +354,14 @@ export function PipelineDetailPage() {
   const p = state.data
   const authored = p.engine === "authored"
   const readsAsState = readsAs(p, users)
-  const authorChoicesState = authorChoices(users, p.tenantId)
+  // BLD-11 F5/D7: the panel must not say "nobody can read as it" when the
+  // masthead names an author, nor when the user list failed to load.
+  const authorChoicesState = authorChoices(
+    users,
+    p.tenantId,
+    readsAsState,
+    usersState.status === "error"
+  )
   const schedule = parseSchedule(p.schedule)
   // A Dagster job's status is its newest run's, never "paused": whether it
   // is paused lives in its schedule's state. An authored pipeline carries
@@ -319,8 +370,19 @@ export function PipelineDetailPage() {
     ? p.status === "paused"
     : schedule.kind === "cron" && schedule.state !== null && !isScheduleRunning(schedule.state)
   const isDraft = p.status === "draft"
-  const scheduleText =
-    schedule.kind === "manual"
+  // BLD-11 F2/D3: the trigger is the target lag when one is set, whatever
+  // cron text is stored; a cron the orchestrator never builds must not be
+  // named as if it fired.
+  const trigger = triggerSummary(schedule, p.targetLag)
+  // BLD-18: any automatic authored trigger can be paused. A target lag
+  // runs a freshness sensor (not the stored cron), a dependency chain runs
+  // an `_after` sensor, and a cron runs a schedule — pausing stops all
+  // three in Dagster, so none of them is a reason to hide the button.
+  const hasAutomaticTrigger =
+    authored && (schedule.kind === "cron" || isLagTrigger(trigger) || (p.dependsOn?.length ?? 0) > 0)
+  const scheduleText = isLagTrigger(trigger)
+    ? trigger.label
+    : schedule.kind === "manual"
       ? "Manual only"
       : schedule.kind === "cron"
         ? `${localizeScheduleTime(describeCron(schedule.cron) ?? "Cron", p.nextRunAt)} (cron ${schedule.cron})${schedule.state ? `, ${schedule.state.toLowerCase()}` : ""}`
@@ -362,7 +424,13 @@ export function PipelineDetailPage() {
         size="sm"
         disabled={activate.status === "pending"}
         onClick={async () => {
-          if (await activate.run(pipelineId)) state.reload()
+          if (await activate.run(pipelineId)) {
+            // BLD-11 D10: start a fresh bounded window — the job is built on
+            // the background reload this page no longer waits for.
+            jobLoadTicks.current = 0
+            setJobLoadActive(true)
+            state.reload()
+          }
         }}
       >
         <PlayIcon data-icon="inline-start" />
@@ -372,25 +440,26 @@ export function PipelineDetailPage() {
   ) : (
     <>
       {authoredMenu}
-      {schedule.kind === "cron" ? (
-        schedulePaused ? (
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={resume.status === "pending"}
-            onClick={async () => {
-              if (await resume.run(pipelineId)) state.reload()
-            }}
-          >
-            <PlayIcon data-icon="inline-start" />
-            {resume.status === "pending" ? "Resuming…" : "Resume schedule"}
-          </Button>
-        ) : (
-          <Button variant="outline" size="sm" disabled={pause.status === "pending"} onClick={() => setPauseOpen(true)}>
-            <PauseIcon data-icon="inline-start" />
-            Pause schedule
-          </Button>
-        )
+      {/* BLD-18: Pause is offered for target-lag pipelines too — the API
+          now stops the freshness sensor explicitly before the reload. A
+          paused pipeline always keeps Resume so it can be turned back on. */}
+      {schedulePaused ? (
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={resume.status === "pending"}
+          onClick={async () => {
+            if (await resume.run(pipelineId)) state.reload()
+          }}
+        >
+          <PlayIcon data-icon="inline-start" />
+          {resume.status === "pending" ? "Resuming…" : "Resume"}
+        </Button>
+      ) : hasAutomaticTrigger ? (
+        <Button variant="outline" size="sm" disabled={pause.status === "pending"} onClick={() => setPauseOpen(true)}>
+          <PauseIcon data-icon="inline-start" />
+          Pause
+        </Button>
       ) : null}
       <Button
         size="sm"
@@ -415,6 +484,18 @@ export function PipelineDetailPage() {
         actions={actions}
         readsAs={readsAsState}
       />
+
+      {/* BLD-11 D10: a refused Run now is shown where the button is, not only
+          in a toast that disappears. `useServiceAction.run` clears this on
+          the next launch. */}
+      {runNow.status === "error" && runNow.error ? (
+        <p
+          role="alert"
+          className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+        >
+          {readableErrorMessage(runNow.error.message)}
+        </p>
+      ) : null}
 
       {/* BLD-1 / D2: the one control that can change who a pipeline reads
           as. Platform Admin only (`identity:write`), the same grant the
@@ -466,9 +547,15 @@ export function PipelineDetailPage() {
 
       {authored && !isDraft && !p.orchestratorJob ? (
         <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-          The orchestrator has not loaded this pipeline&apos;s job yet. Run now asks it to reload first; if it still has
-          no job, check that <code className="font-mono">PIPELINE_RUN_TOKEN</code> is set for both the API and the Dagster
-          code location.
+          {jobLoadActive ? (
+            "The orchestrator is loading this pipeline's job."
+          ) : (
+            <>
+              The orchestrator has not loaded this pipeline&apos;s job yet. Run now asks it to reload first; if it still
+              has no job, check that <code className="font-mono">PIPELINE_RUN_TOKEN</code> is set for both the API and
+              the Dagster code location.
+            </>
+          )}
         </p>
       ) : null}
 
@@ -479,6 +566,7 @@ export function PipelineDetailPage() {
           nextRunAt={p.nextRunAt}
           schedule={schedule}
           schedulePaused={schedulePaused}
+          targetLag={p.targetLag}
           now={now}
         />
       ) : null}
@@ -624,10 +712,10 @@ export function PipelineDetailPage() {
       <ConfirmActionDialog
         open={pauseOpen}
         onOpenChange={setPauseOpen}
-        title="Pause schedule"
-        description={`Pause ${p.name}'s schedule? It will not fire until resumed.`}
+        title="Pause pipeline"
+        description={`Pause ${p.name}'s automatic runs? Its schedule, dependency sensor and target-lag sensor stop until resumed.`}
         impact="Runs already in flight continue. Run now still works while paused."
-        confirmLabel="Pause schedule"
+        confirmLabel="Pause"
         confirming={pause.status === "pending"}
         onConfirm={async () => {
           if (await pause.run(pipelineId)) {

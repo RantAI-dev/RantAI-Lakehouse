@@ -101,6 +101,12 @@ impl From<GoldExportError> for ApiError {
             // not a 500: the fix is retrying with a smaller mart or a
             // deliberately raised cap, not anything server-side.
             | GoldExportError::RowCapExceeded { .. }
+            // DATA-6 D7: the target table is another mart's latest-copy
+            // table. It joins the same 422 group for the same reason: its
+            // `Display` is this repo's own fixed sentence (naming the
+            // mart, no upstream words), so the fix is renaming the mart,
+            // not anything server-side.
+            | GoldExportError::TargetIsLatestCopy { .. }
             // WS7 item D2: `err.to_string()` is safe here — the inner
             // string is already `policy_engine::enforcement_error_message`'s
             // own fixed, non-leaking text (`export_batch_sql` never wraps
@@ -281,6 +287,24 @@ fn check_export_token(
                 .to_owned(),
         )),
     }
+}
+
+/// `SEC-66`: the read-only Gold routes accept `gold:read` where
+/// [`check_export_token`] used to demand `gold:export`. The shared-token
+/// match and the service-identity fallback are delegated to that guard
+/// unchanged, so the scheduler's `x-run-token` path and the no-token
+/// service path behave exactly as before. The WRITE route still calls
+/// [`check_export_token`] directly: `gold:read` must never open an export.
+fn check_gold_read_token(
+    configured: Option<&str>,
+    header_token: Option<&str>,
+    query_token: Option<&str>,
+    principal: Option<&Principal>,
+) -> Result<(), ApiError> {
+    if principal.is_some_and(|p| p.has("gold:read")) {
+        return Ok(());
+    }
+    check_export_token(configured, header_token, query_token, principal)
 }
 
 /// Reads the `gold-export` principal's Lakekeeper bearer token from
@@ -501,13 +525,14 @@ pub async fn export(
         return Ok(ApiJson(body));
     }
 
-    // Held for the rest of this handler (dropped at function return,
-    // success or error alike) — see this function's "Single-flight" doc
+    // Held for the rest of this handler (dropped explicitly below, before
+    // the latest-copy launch — see this function's "Single-flight" doc
     // section above for why acquiring it is the very first thing done
-    // after validating the mart name. A `409` here records NO run (DATA-56):
-    // the publish that holds the lock records its own row, and a row written
-    // by the call it turned away would be newer and hide that result.
-    let _export_guard = state
+    // after validating the mart name. A `409` here records NO run
+    // (DATA-56): the publish that holds the lock records its own row, and
+    // a row written by the call it turned away would be newer and hide
+    // that result.
+    let export_guard = state
         .gold_export_locks
         .try_acquire(mart_ident.as_str())
         .await
@@ -586,6 +611,13 @@ pub async fn export(
 
     let result = export_result?;
 
+    // DATA-6 D6: a publish that wrote rows is followed by one
+    // `gold_latest_copy_job` run for this mart. The single-flight lock is
+    // released BEFORE the launch (the launch is a best-effort follow-up
+    // to a publish that already succeeded; the next publish must not
+    // queue behind an orchestrator round trip it does not need).
+    drop(export_guard);
+
     Ok(ApiJson(json!({
         "namespace": result.namespace,
         "table": result.table,
@@ -593,7 +625,42 @@ pub async fn export(
         "rowsExported": result.rows_exported,
         "snapshotId": result.snapshot_id,
         "exportedAt": result.exported_at_ms.and_then(millis_to_rfc3339),
+        // DATA-6 M2: the ONE stamp this publish wrote on every row, so
+        // "the rows of this publish" are addressable; microseconds are
+        // kept because two publishes can fall in one second.
+        "copyExportedAt": result
+            .copy_exported_at_micros
+            .and_then(crate::gold_latest_copy::micros_to_rfc3339),
+        "latestCopy": latest_copy_answer(&state, mart_ident.as_str(), &result).await,
     })))
+}
+
+/// The `latestCopy` field of [`export`]'s answer (D6, D13): the launched
+/// job's table name and status, or `null` when this publish wrote no
+/// copy (a zero-row publish — nothing to copy, and the field says so,
+/// rather than pretending a run was queued). The launch is best-effort:
+/// its own failure is recorded and answered as `"not_started"`, never
+/// propagated into the publish's answer.
+async fn latest_copy_answer(
+    state: &AppState,
+    mart: &str,
+    result: &gold_export::GoldExportResult,
+) -> Value {
+    let (true, Some(copy_micros)) = (result.rows_exported > 0, result.copy_exported_at_micros)
+    else {
+        return Value::Null;
+    };
+    let request = crate::gold_latest_copy::LatestCopyRequest {
+        mart,
+        table: &result.table,
+        copy_exported_at_micros: copy_micros,
+        rows: u64::try_from(result.rows_exported).unwrap_or(u64::MAX),
+    };
+    let status = crate::gold_latest_copy::launch(&state.dagster, &state.clickhouse, &request).await;
+    json!({
+        "table": format!("gold.{}", lakehouse_iceberg::gold::latest_table_name(&result.table)),
+        "status": status,
+    })
 }
 
 /// Best-effort history write for one finished export attempt: at most one row
@@ -880,10 +947,20 @@ fn millis_to_rfc3339(ms: i64) -> Option<String> {
 ///
 /// # Errors
 ///
-/// Returns 401/503 from [`check_export_token`] (same guard as `POST` —
-/// this still reveals row counts, not public data), 503 if the Lakekeeper
-/// token cannot be read, or 500 if the catalog refuses or fails the call
-/// for any reason other than "table not found", or the Iceberg read fails.
+/// Returns 401/503 from [`check_gold_read_token`] (`SEC-66`: the read-side
+/// guard also accepts `gold:read`; this still reveals row counts, not
+/// public data), 422 with the tenant gate's fixed sentence when the
+/// deployment holds several tenants and names no catalog tenant
+/// (`DATA-64`/`SEC-50`), 404 with the gate's own table sentence for a
+/// signed-in person whose tenant does not own the shared catalog
+/// (`DATA-64`/`SEC-50`), 503 with the shared catalog's own sentence when
+/// the deployment cannot count its tenants (`SEC-50` R5), 503 if the
+/// Lakekeeper token cannot be read, or 500 if the catalog refuses or fails
+/// the call for any reason other than "table not found", or the Iceberg
+/// read fails. The `DATA-64` tenant gate runs right after the mart name is
+/// validated and BEFORE the Lakekeeper token file or Iceberg is touched,
+/// so a caller whose reach does not cover the shared catalog learns
+/// nothing about the mart.
 pub async fn read_back(
     State(state): State<AppState>,
     Path(mart): Path<String>,
@@ -892,7 +969,7 @@ pub async fn read_back(
     principal: Option<Extension<Principal>>,
 ) -> ApiResult<ApiJson<Value>> {
     let header_token = headers.get("x-run-token").and_then(|v| v.to_str().ok());
-    check_export_token(
+    check_gold_read_token(
         state.config.gold_export_run_token.as_deref(),
         header_token,
         query.token.as_deref(),
@@ -901,6 +978,15 @@ pub async fn read_back(
 
     let mart_ident =
         Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+
+    // DATA-64 / SEC-50: read-back reads the SHARED catalog, so the gate
+    // asks whose reach covers it — a signed-in person's own tenant, or the
+    // catalog's own tenant for a job with no user (`export`'s own rule,
+    // R4/D3). It runs BEFORE the Lakekeeper token file and the Iceberg read
+    // below, so a caller whose reach does not cover the shared catalog is
+    // refused with the gate's 404/422/503 and learns nothing about the mart.
+    let actor = gold_export_gate_actor(principal.as_ref().map(|Extension(p)| p), &headers);
+    let _ = gated_source_table(&state, mart_ident.as_str(), actor).await?;
 
     let token = read_catalog_token(&state.config.lakekeeper_gold_export_token_file).await?;
     let iceberg_config = gold_export::iceberg_config(
@@ -954,8 +1040,8 @@ pub(crate) fn read_back_body(mart: &str, readback: Option<&gold_export::GoldRead
 #[derive(Debug, Deserialize)]
 pub struct ExportsQuery {
     mart: String,
-    /// Same shared-token/permission gate as `export`/`read_back` — see
-    /// [`check_export_token`].
+    /// Same shared-token/permission gate as `read_back` — see
+    /// [`check_gold_read_token`].
     token: Option<String>,
 }
 
@@ -967,8 +1053,16 @@ pub struct ExportsQuery {
 /// # Errors
 ///
 /// Returns 400 if `mart` is missing/blank or not a valid identifier,
-/// 401/503 from [`check_export_token`], or 500 if the `ClickHouse` query
-/// fails.
+/// 401/503 from [`check_gold_read_token`] (`SEC-66`: the read-side guard
+/// also accepts `gold:read`), 422 with the tenant gate's fixed sentence
+/// when the deployment holds several tenants and names no catalog tenant
+/// (`DATA-64`/`SEC-50`), 404 with the gate's own table sentence for a
+/// signed-in person whose tenant does not own the shared catalog
+/// (`DATA-64`/`SEC-50`), 503 with the shared catalog's own sentence when
+/// the deployment cannot count its tenants (`SEC-50` R5), or 500 if the
+/// `ClickHouse` query fails. The `DATA-64` tenant gate runs right after
+/// the mart name is validated and BEFORE `ClickHouse` is touched, so
+/// history the caller may not read is never queried.
 pub async fn exports(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -976,7 +1070,7 @@ pub async fn exports(
     principal: Option<Extension<Principal>>,
 ) -> ApiResult<ApiJson<Value>> {
     let header_token = headers.get("x-run-token").and_then(|v| v.to_str().ok());
-    check_export_token(
+    check_gold_read_token(
         state.config.gold_export_run_token.as_deref(),
         header_token,
         query.token.as_deref(),
@@ -985,6 +1079,15 @@ pub async fn exports(
 
     let mart_ident = Ident::new(query.mart.trim())
         .map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+
+    // DATA-64 / SEC-50: the history reveals the shared catalog mart's row
+    // counts and timing, so it is gated exactly as `read_back` is — the
+    // signed-in person as themselves, a job with no user as the catalog's
+    // own tenant (R4, D3). The gate runs BEFORE `ClickHouse` is read, so a
+    // caller whose reach does not cover the shared catalog gets the gate's
+    // 404/422/503 and no history query is issued.
+    let actor = gold_export_gate_actor(principal.as_ref().map(|Extension(p)| p), &headers);
+    let _ = gated_source_table(&state, mart_ident.as_str(), actor).await?;
 
     let runs = gold_export_history::list_export_runs(&state.clickhouse, mart_ident.as_str(), 50)
         .await
@@ -1212,6 +1315,16 @@ async fn publication_body(
     let last_trim = gold_export_history::last_trim(&state.clickhouse, mart)
         .await
         .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
+    // DATA-6 D4: the latest-copy table's name, what it holds, and the
+    // newest run's outcome — the same classified-ClickHouse-failure shape
+    // as its neighbours (principle 4). `sanitize_mart_name` failing here
+    // is a 400 `invalid mart`, the same mapping `consumers` uses.
+    let sanitized_mart = lakehouse_iceberg::gold::sanitize_mart_name(mart)
+        .map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+    let (latest_holds, latest_run) =
+        crate::gold_latest_copy::latest_copy_state(&state.clickhouse, mart)
+            .await
+            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     Ok(json!({
         "mart": mart,
         "enabled": enabled,
@@ -1222,6 +1335,11 @@ async fn publication_body(
         "lastFailure": last_failure(newest_run.as_ref()),
         "canEdit": can_edit,
         "trim": last_trim,
+        "latestCopy": {
+            "table": format!("gold.{}", lakehouse_iceberg::gold::latest_table_name(&sanitized_mart)),
+            "holds": latest_holds,
+            "lastRun": latest_run,
+        },
     }))
 }
 
@@ -1265,17 +1383,17 @@ fn pool(state: &AppState) -> Result<&sqlx::PgPool, ApiError> {
 /// deployment publishes exactly this list, which is empty until a
 /// `gold:export` principal switches a mart on.
 ///
-/// The floor is `RequiresAuth` (see `POLICY_TABLE`) PLUS
-/// [`check_export_token`] in the handler, same two-layer shape as the
-/// export routes: the scheduler authenticates with its run token or
-/// service identity; a human session needs `gold:export`. A publication
-/// list is not secret the way row data is, but it does reveal what a
-/// deployment considers its "open format" copy — same posture as
-/// `GET /api/gold/exports`.
+/// The floor is the SEC-66 read grant (`gold:read`, or the wider
+/// `gold:export`) in `POLICY_TABLE` PLUS [`check_gold_read_token`] in the
+/// handler, same two-layer shape as the other Gold GETs: the scheduler
+/// authenticates with its run token or service identity; a human session
+/// needs one of the two Gold grants. A publication list is not secret the
+/// way row data is, but it does reveal what a deployment considers its
+/// "open format" copy — same posture as `GET /api/gold/exports`.
 ///
 /// # Errors
 ///
-/// Returns 401/503 from [`check_export_token`], 503 when Postgres is not
+/// Returns 401/503 from [`check_gold_read_token`], 503 when Postgres is not
 /// configured ([`pool`]; this feature is Postgres-backed, unlike the
 /// export routes), or 500 for a store failure (classified, never raw
 /// upstream text).
@@ -1286,7 +1404,7 @@ pub async fn publications(
     principal: Option<Extension<Principal>>,
 ) -> ApiResult<ApiJson<Value>> {
     let header_token = headers.get("x-run-token").and_then(|v| v.to_str().ok());
-    check_export_token(
+    check_gold_read_token(
         state.config.gold_export_run_token.as_deref(),
         header_token,
         query.token.as_deref(),
@@ -1566,6 +1684,55 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// `SEC-66`: a person holding the read grant can open the Gold GETs
+    /// whether or not a run token is configured, without presenting one —
+    /// the policy gate admits them and this handler guard must not undo it.
+    #[test]
+    fn gold_read_permission_passes_the_read_guard_with_or_without_a_configured_token() {
+        assert!(
+            check_gold_read_token(None, None, None, Some(&human_principal_with("gold:read")))
+                .is_ok()
+        );
+        assert!(
+            check_gold_read_token(
+                Some("secret"),
+                None,
+                None,
+                Some(&human_principal_with("gold:read")),
+            )
+            .is_ok()
+        );
+    }
+
+    /// `SEC-66`: the read grant stays read-only — the export WRITE still
+    /// calls `check_export_token` directly and must refuse it.
+    #[test]
+    fn gold_read_permission_does_not_pass_the_write_guard() {
+        assert!(
+            check_export_token(None, None, None, Some(&human_principal_with("gold:read"))).is_err()
+        );
+        assert!(
+            check_export_token(
+                Some("secret"),
+                None,
+                None,
+                Some(&human_principal_with("gold:read")),
+            )
+            .is_err()
+        );
+    }
+
+    /// `SEC-66`: the scheduler's two token paths are unchanged by the new
+    /// read guard — the shared token and an unscoped service principal
+    /// still pass exactly as they did through `check_export_token`.
+    #[test]
+    fn read_guard_still_accepts_the_shared_token_and_an_unscoped_service_principal() {
+        assert!(check_gold_read_token(Some("secret"), Some("secret"), None, None).is_ok());
+        let mut service = service_principal();
+        service.permissions = PermissionSet::parse("");
+        assert!(check_gold_read_token(None, None, None, Some(&service)).is_ok());
     }
 
     #[test]
@@ -1855,8 +2022,35 @@ mod tests {
                 rows_exported: 1,
                 snapshot_id: Some(1),
                 exported_at_ms: Some(1_700_000_000_000),
+                copy_exported_at_micros: Some(1_700_000_000_123_456),
             }))
             .is_none()
+        );
+    }
+
+    /// `DATA-6` D7: a mart whose Iceberg table is another mart's
+    /// latest-copy table is refused with the fixed sentence, as a 422 —
+    /// the text names the mart and carries no upstream words (no catalog
+    /// address, no HTTP detail), so it is safe to answer as-is.
+    #[test]
+    fn a_latest_copy_target_answers_the_fixed_sentence_as_a_422() {
+        let err = ApiError::from(GoldExportError::TargetIsLatestCopy {
+            mart: "x_latest".to_owned(),
+        });
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let text = err.to_string();
+        assert!(
+            text.contains("x_latest"),
+            "the sentence names the mart: {text}"
+        );
+        assert!(text.contains("latest-copy table"), "{text}");
+        assert!(
+            !text.to_lowercase().contains("iceberg catalog"),
+            "no catalog address travels: {text}"
+        );
+        assert!(
+            !text.to_lowercase().contains("http"),
+            "no HTTP detail travels: {text}"
         );
     }
 
