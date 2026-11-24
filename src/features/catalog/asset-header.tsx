@@ -50,6 +50,7 @@ import { cn } from "@/lib/utils"
 import { ASSET_TYPE_LABEL, type AssetDetail } from "@/services/contracts/assets"
 import { EditDetailsDialog } from "./asset-about"
 import { classificationTitle, healthTitle, layerTitle, tierTitle } from "./asset-badges"
+import { AssetConnectDialog } from "./asset-connect-dialog"
 import { CertificationDialog, DeprecationNotice } from "./asset-certification"
 import { canDropTable, useDropTable } from "./asset-drop"
 import { lineageKey } from "./asset-lineage"
@@ -90,6 +91,9 @@ export function AssetHeader({
 }) {
   const { hasPermission } = useAuth()
   const [dialog, setDialog] = React.useState<"certification" | "edit" | "publish" | null>(null)
+  // P2 `reczz28d1eZjrBAZ` (merged from main): the connect dialog is a separate
+  // header action, a compact trigger rather than inline connection details.
+  const [connectOpen, setConnectOpen] = React.useState(false)
   const table = icebergTableOf(iceberg)
   // The primary opens Query Studio only on a table the console can read and
   // for a reader who may run a query; otherwise the page has no primary and
@@ -180,6 +184,9 @@ export function AssetHeader({
             ) : null}
           </DropdownMenuContent>
         </DropdownMenu>
+        <Button variant="outline" onClick={() => setConnectOpen(true)}>
+          Connect
+        </Button>
         {missingPermissions.length > 0 ? (
           // Where access is missing, once: the Sample and Lineage tabs'
           // empty states point back up here.
@@ -270,6 +277,8 @@ export function AssetHeader({
           </div>
         </DialogContent>
       </Dialog>
+      {/* Mounted only while open: its snippets need a `zone.table` id, which a header on an asset without one has no use for. */}
+      {connectOpen ? <AssetConnectDialog asset={a} open onOpenChange={setConnectOpen} /> : null}
       {drop.dialog}
     </header>
   )

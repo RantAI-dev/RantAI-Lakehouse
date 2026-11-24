@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::header;
+use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_bi::access::Level;
@@ -176,7 +176,28 @@ fn read_body(body: &Bytes) -> Result<(ImportBody, DashboardFile), ApiError> {
 
 /// The tables of the serving layer: the ones a chart can read (the list the
 /// chart builder's picker shows).
-async fn readable_tables(state: &AppState) -> Result<BTreeSet<String>, ApiError> {
+///
+/// # Shared catalog names (SEC-58)
+///
+/// These names come from `system.tables` over the deployment's single shared
+/// `serving` catalog. `SEC-20`/`SEC-50` gate rows, not names, so the same
+/// [`crate::routes::catalog::catalog_tenant_refusal`] the catalog uses gates
+/// this read: a caller whose tenant does not own the shared catalog gets an
+/// empty set without any `system.tables` query. That makes the import preview
+/// suggest no shared table and compute no `missingColumns` from its columns;
+/// on import, no file table maps to a shared one and those charts are left
+/// out. An error from the gate is returned unchanged (fail closed).
+async fn readable_tables(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+) -> Result<BTreeSet<String>, ApiError> {
+    if crate::routes::catalog::catalog_tenant_refusal(state, principal, headers)
+        .await?
+        .is_some()
+    {
+        return Ok(BTreeSet::new());
+    }
     let rows = state
         .clickhouse
         .rows(
@@ -203,11 +224,12 @@ async fn readable_tables(state: &AppState) -> Result<BTreeSet<String>, ApiError>
 pub async fn import_preview(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     require_can_ever(&state, &principal, Level::Edit).await?;
     let (_, document) = read_body(&body)?;
-    let readable = readable_tables(&state).await?;
+    let readable = readable_tables(&state, &principal, &headers).await?;
     let mut tables = Vec::new();
     for table in &document.tables {
         let suggested = readable.contains(&table.name).then(|| table.name.clone());
@@ -274,6 +296,7 @@ enum Outcome {
 pub async fn import(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     // The same gate as `POST /api/dashboard/boards`: `edit` somewhere, then
@@ -294,8 +317,10 @@ pub async fn import(
     };
 
     // The mapping: only file tables can be mapped, and only to a table that is
-    // here. A chart that needs any other table is left out below.
-    let readable = readable_tables(&state).await?;
+    // here. A chart that needs any other table is left out below. SEC-58:
+    // `readable_tables` is tenant-gated, so a non-catalog tenant cannot map a
+    // file table onto a shared `serving` table it does not own.
+    let readable = readable_tables(&state, &principal, &headers).await?;
     let in_file: BTreeSet<&str> = document.tables.iter().map(|t| t.name.as_str()).collect();
     let mapping: BTreeMap<String, String> = parsed
         .mapping
@@ -472,4 +497,196 @@ async fn make_chart(
         .await
         .map_err(|err| classify_ch_error(&err))?;
     Ok(Outcome::Made(spec.spec.id))
+}
+
+#[cfg(test)]
+mod sec58_import_name_gate {
+    //! SEC-58: the import preview's `readableTables` and `missingColumns`
+    //! name the deployment's shared `serving` catalog. The same
+    //! `catalog::catalog_tenant_refusal` gate the catalog uses must keep those
+    //! names from a tenant that does not own the catalog, without breaking
+    //! import for the catalog's own tenant or a platform admin.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use axum::Extension;
+    use axum::body::Bytes;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use lakehouse_auth::{PermissionSet, Principal, PrincipalId};
+    use lakehouse_store::PgPool;
+    // Force-links the `#[ctor]` Postgres testcontainer bootstrap.
+    use lakehouse_test_support as _;
+    use uuid::Uuid;
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::import_preview;
+    use crate::config::Config;
+    use crate::state::AppState;
+
+    const TENANT_A: &str = "11111111-1111-4111-8111-000000000001";
+    const TENANT_B: &str = "11111111-1111-4111-8111-000000000002";
+
+    fn state_for(pool: &PgPool, ch_url: &str, catalog_tenant_id: Option<&str>) -> AppState {
+        let options = pool.connect_options();
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "DATABASE_URL".to_owned(),
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options.get_database().expect("a named test database"),
+            ),
+        );
+        env.insert("CH_URL".to_owned(), ch_url.to_owned());
+        if let Some(id) = catalog_tenant_id {
+            env.insert("CATALOG_TENANT_ID".to_owned(), id.to_owned());
+        }
+        AppState::new(Config::from_map(&env).expect("a valid test Config"))
+    }
+
+    fn principal(tenant_ids: &[Uuid], permissions: &str) -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::new_v4()),
+            tenant_ids: tenant_ids.to_vec(),
+            display_name: "Test Principal".to_owned(),
+            permissions: PermissionSet::parse(permissions),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// A file that lists one table of the shared catalog and the columns its
+    /// chart read. The preview must never echo the table as `suggested` or
+    /// report its `missingColumns` to a caller that does not own the catalog.
+    fn file_body() -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "file": {
+                    "kind": "rantai-dashboard", "version": 1,
+                    "board": { "name": "Sales" },
+                    "charts": [],
+                    "tables": [{ "name": "sales", "columns": ["amount", "secret_column"] }],
+                },
+                "mapping": {},
+                "folderId": "",
+            }))
+            .unwrap(),
+        )
+    }
+
+    async fn mock_serving_catalog() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM system.tables"))
+            .and(body_string_contains("AND name="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "n", "type": "String"}],
+                "data": [{"n": "1"}], "rows": 1,
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM system.tables"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "name", "type": "String"}],
+                "data": [{"name": "sales"}, {"name": "stock"}], "rows": 2,
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM system.columns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "name", "type": "String"}, {"name": "type", "type": "String"}],
+                "data": [{"name": "amount", "type": "UInt64"}], "rows": 1,
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [], "data": [], "rows": 0,
+            })))
+            .with_priority(10)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn preview(state: AppState, caller: Principal) -> serde_json::Value {
+        let body = import_preview(
+            State(state),
+            Extension(caller),
+            HeaderMap::new(),
+            file_body(),
+        )
+        .await
+        .expect("a valid preview request");
+        body.0
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_outsider_preview_leaks_no_shared_table_or_column_names(pool: PgPool) {
+        let ch = mock_serving_catalog().await;
+        let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+        let outsider = principal(
+            &[TENANT_B.parse().unwrap()],
+            "dashboard:read,dashboard:write",
+        );
+
+        let body = preview(state, outsider).await;
+
+        assert_eq!(body["readableTables"], serde_json::json!([]));
+        assert_eq!(body["tables"][0]["suggested"], serde_json::Value::Null);
+        assert_eq!(body["tables"][0]["missingColumns"], serde_json::json!([]));
+        let queries: Vec<String> = ch
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert!(
+            !queries
+                .iter()
+                .any(|q| q.contains("system.tables") || q.contains("system.columns")),
+            "an outsider must not query the shared catalog: {queries:?}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_catalog_member_and_an_admin_still_get_the_preview_suggestions(pool: PgPool) {
+        let ch = mock_serving_catalog().await;
+        let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+        let callers = [
+            principal(
+                &[TENANT_A.parse().unwrap()],
+                "dashboard:read,dashboard:write",
+            ),
+            principal(&[], "*:*"),
+        ];
+        for caller in callers {
+            let body = preview(state.clone(), caller).await;
+            assert!(
+                body["readableTables"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t == "sales"),
+                "the catalog owner and an admin keep the suggestions: {body}"
+            );
+            assert_eq!(body["tables"][0]["suggested"], serde_json::json!("sales"));
+            assert_eq!(
+                body["tables"][0]["missingColumns"],
+                serde_json::json!(["secret_column"]),
+                "the catalog owner and an admin still see which columns are missing"
+            );
+        }
+    }
 }
