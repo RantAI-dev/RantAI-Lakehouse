@@ -1020,6 +1020,42 @@ mod tests {
         assert_eq!(none.applied(), Vec::<&str>::new());
     }
 
+    /// SEC-73: a narrowed principal must not escape the tenant gate by
+    /// writing a `WITH` name that differs from the bare table only in case.
+    /// `ClickHouse` matches `WITH` names by exact case, so `FROM t` is a real
+    /// table in the connection's database, not the `` `T` `` CTE.
+    #[test]
+    fn a_mixed_case_cte_does_not_hide_a_bare_table_from_the_gate() {
+        use sqlparser::dialect::ClickHouseDialect;
+
+        let access = crate::table_access::TableAccess::Listed(
+            [("silver".to_owned(), "orders".to_owned())]
+                .into_iter()
+                .collect(),
+            std::collections::HashSet::new(),
+        );
+        assert!(
+            matches!(
+                hidden_read(
+                    "WITH T AS (SELECT 1) SELECT * FROM t",
+                    &ClickHouseDialect {},
+                    &access
+                ),
+                Some(HiddenRead::Table(table)) if table == "t"
+            ),
+            "the bare table `t` must reach the gate"
+        );
+        assert!(
+            hidden_read(
+                "WITH T AS (SELECT 1) SELECT * FROM T",
+                &ClickHouseDialect {},
+                &access
+            )
+            .is_none(),
+            "an exact-case CTE reference names no table to gate"
+        );
+    }
+
     #[test]
     fn engine_error_messages_are_distinct_english_sentences() {
         // The three user-facing texts are English, and each

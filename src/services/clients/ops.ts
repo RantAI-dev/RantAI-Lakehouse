@@ -7,8 +7,9 @@ import { ServiceError, deniedFor } from "../errors";
  * Dagster. `WEB-3` slice 1 (D1/D2) removed the observability and workloads
  * reads with their pages — the numbers they showed were nulls and fixed
  * literals, and the one real action (cancel a running query) is Query
- * Studio's Stop (`BI-5`). The backend routes stay registered (D2) for the
- * assistant's tools; `WEB-4` retires them.
+ * Studio's Stop (`BI-5`). `WEB-4` retired `/api/ops/observability` (no
+ * caller left); `/api/ops/workloads` stays registered because the
+ * assistant's `list_workloads`/`kill_query` tools read it.
  */
 async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
   const res = await apiFetch(url, { signal });

@@ -59,7 +59,12 @@ describe("AssistantSettingsForm (ADM-9)", () => {
   it("never pre-fills the key, and only asks for it when it is replaced", async () => {
     mockApi({ ...SAVED, key: { set: true, source: "console" } })
     render(<AssistantSettingsForm canWrite />)
-    await screen.findByText("Set")
+    // "Set" is derived from the fetched data and renders before the load
+    // effect has initialised the fields. Waiting for that effect-driven
+    // value proves the form has settled, so Replace cannot race a late
+    // state update (REL-24).
+    const url = (await screen.findByLabelText("Provider address")) as HTMLInputElement
+    await waitFor(() => expect(url.value).toBe("https://api.example.com/v1"))
     expect(screen.queryByLabelText("Key")).toBeNull()
     fireEvent.click(screen.getByRole("button", { name: "Replace" }))
     const key = (await screen.findByLabelText("Key")) as HTMLInputElement

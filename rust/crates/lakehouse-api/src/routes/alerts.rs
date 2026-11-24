@@ -2718,6 +2718,10 @@ mod tests {
                 .await;
             let state = state_for(&server.uri());
 
+            // `call_run` clones `AppState` into its future; OPS-36's per-state
+            // DATA MAP cache adds an `Arc` to that clone, which pushed this
+            // test's future past clippy's 16 KiB threshold. Box it rather than
+            // allowing the lint away.
             let body = Box::pin(call_run(&state, Some("al-no-such-rule"))).await;
 
             assert_eq!(body["schemaPassStarted"], json!(false));
@@ -2741,6 +2745,8 @@ mod tests {
             // so ask again until a pass of ours starts.
             let mut started = false;
             for _ in 0..100 {
+                // See the note in `a_single_rule_run_does_not_start_a_schema_pass`:
+                // box the state-cloning future to stay under the size lint.
                 if Box::pin(call_run(&state, None)).await["schemaPassStarted"] == json!(true) {
                     started = true;
                     break;
@@ -2767,6 +2773,7 @@ mod tests {
     /// run id must not re-deliver, via `pipeline_run_event`).
     mod late_pass {
         use lakehouse_clickhouse::ChClient;
+        use lakehouse_core::secret::SecretValue;
         use lakehouse_notify::{EmailSender, SmtpConfig};
         use wiremock::MockServer;
         use wiremock::matchers::method;
@@ -2781,7 +2788,7 @@ mod tests {
                 port: 587,
                 secure: false,
                 user: None,
-                pass: String::new(),
+                pass: SecretValue::new(String::new()),
                 from: String::new(),
                 ca_bundle: None,
             })

@@ -988,17 +988,65 @@ pub(super) async fn get_lineage(
     out
 }
 
-pub(super) async fn get_quality(ch: &ChClient) -> Value {
-    match ch
+/// Counts the latest verdict per `(tabel, cek)` a narrowed caller may read,
+/// grouped by verdict (`GOV-16`).
+///
+/// The rows come from the per-table query below rather than a `GROUP BY
+/// verdict` in `ClickHouse`, because a table the caller's role hides must be
+/// dropped before the counts are made: an aggregate taken over every table
+/// cannot be narrowed afterwards. Filtering in [`crate::routes::quality::
+/// asset_readable`] — the predicate the quality, incident, schedule and
+/// classification lists use — keeps the six readers on one rule. A table with
+/// no name is hidden from a narrowed caller (fail closed). The counts are
+/// strings, as `toString(count())` made them in the SQL this replaces.
+fn quality_summary(
+    rows: &[Map<String, Value>],
+    access: &crate::table_access::TableAccess,
+) -> Value {
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for row in rows {
+        let table = row.get("tabel").and_then(Value::as_str);
+        if !crate::routes::quality::asset_readable(access, table) {
+            continue;
+        }
+        let verdict = row
+            .get("verdict")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        *counts.entry(verdict).or_default() += 1;
+    }
+    let summary: Vec<Value> = counts
+        .into_iter()
+        .map(|(verdict, n)| json!({ "verdict": verdict, "n": n.to_string() }))
+        .collect();
+    json!({ "summary": summary })
+}
+
+pub(super) async fn get_quality(state: &AppState, principal: Option<&Principal>) -> Value {
+    // GOV-16: narrow the summary by the person's role table access, the GOV-7
+    // / GOV-15 mechanism every other quality reader uses. A headless run is a
+    // system call and is not narrowed (`GOV-15` D7); a person whose role
+    // cannot be read right now gets an error rather than every table's count
+    // (fail closed).
+    let access = match principal {
+        Some(principal) => match table_access(state, principal).await {
+            Ok(access) => access,
+            Err(sentence) => return json!({ "error": sentence }),
+        },
+        None => crate::table_access::TableAccess::All,
+    };
+    match state
+        .clickhouse
         .rows(
-            "SELECT verdict, toString(count()) n FROM ( \
+            "SELECT tabel, verdict FROM ( \
                SELECT tabel, cek, argMax(verdict, dibuat_pada) verdict FROM _silver_meta.quality GROUP BY tabel, cek \
-             ) GROUP BY verdict",
+             )",
             None,
         )
         .await
     {
-        Ok(rows) => json!({ "summary": rows }),
+        Ok(rows) => quality_summary(&rows, &access),
         // Measured on the local stack: the results table simply does not
         // exist until a quality run writes it, and the raw
         // `UNKNOWN_DATABASE` text went straight into the answer. Say what
@@ -2379,6 +2427,57 @@ mod registry_clash {
             id[0]["description"],
             json!("the secondary id"),
             "the secondary registry's own dataset: {out}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gov16_quality_summary {
+    //! GOV-16: the assistant's quality summary is counted over the tables the
+    //! person's role may read, using the same predicate the quality, incident,
+    //! schedule and classification lists use. These are pure row-shaping
+    //! tests: they need no `ClickHouse`, only the access decision.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use std::collections::HashSet;
+
+    fn narrowed() -> crate::table_access::TableAccess {
+        crate::table_access::TableAccess::Listed(
+            [("silver".to_owned(), "orders".to_owned())]
+                .into_iter()
+                .collect(),
+            HashSet::new(),
+        )
+    }
+
+    fn verdict_row(tabel: &str, verdict: &str) -> Map<String, Value> {
+        let Value::Object(row) = json!({"tabel": tabel, "verdict": verdict}) else {
+            unreachable!("a JSON object literal")
+        };
+        row
+    }
+
+    #[test]
+    fn the_summary_counts_only_the_granted_tables() {
+        let rows = vec![
+            verdict_row("silver.orders", "pass"),
+            verdict_row("silver.customers", "fail"),
+            verdict_row("orders", "warn"),
+            verdict_row("", "fail"),
+        ];
+        assert_eq!(
+            quality_summary(&rows, &narrowed()),
+            json!({"summary": [{"verdict": "pass", "n": "1"}]})
+        );
+        assert_eq!(
+            quality_summary(&rows, &crate::table_access::TableAccess::All),
+            json!({"summary": [
+                {"verdict": "fail", "n": "2"},
+                {"verdict": "pass", "n": "1"},
+                {"verdict": "warn", "n": "1"},
+            ]})
         );
     }
 }

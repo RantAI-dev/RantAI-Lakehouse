@@ -81,7 +81,9 @@ pub const OIDC_PROMPT_OFF: &str = "off";
 /// Only `PORT`, `CATALOG_TENANT_ID`, `AI_DEFAULT_REPLY_LANGUAGE`,
 /// `AI_SEMANTIC_LAYER`, `AI_ASK_BACK`, `AI_RELEVANT_TABLES`, `AI_SQL_HELP`,
 /// `CONNECTOR_TYPED_CREDENTIALS`, `EMBED_TOKEN_MAX_LIFETIME_SECONDS`,
-/// `CONNECTOR_TLS_CA_FILE`, `SMTP_CA_FILE` and `TRUSTED_PROXIES` can fail resolution. `PORT` is load-bearing and Rust-only (the TypeScript
+/// `CONNECTOR_TLS_CA_FILE`, `SMTP_CA_FILE`, `LAKEHOUSE_INSTALL_MODE`,
+/// `LAKEHOUSE_QUERY_ENGINE`, the two engines' mutual exclusion (`BI-44`)
+/// and `TRUSTED_PROXIES` can fail resolution. `PORT` is load-bearing and Rust-only (the TypeScript
 /// backend runs under Next.js and never binds a port itself), so an
 /// unparseable value refusing to boot is the correct, Rust-specific failure
 /// mode. `SMTP_PORT` deliberately has no equivalent error variant —
@@ -229,6 +231,23 @@ pub enum ConfigError {
     /// bundle cannot be used (`SEC-56` D5).
     #[error("SMTP_CA_FILE must contain at least one PEM certificate, found none in {0:?}")]
     EmptySmtpCaFile(std::path::PathBuf),
+    /// `LAKEHOUSE_INSTALL_MODE` was set to something other than `"full"`
+    /// or `"bi-only"`. Failing start-up is the only honest answer: a typo
+    /// must not silently leave a customer's data being copied into a
+    /// lakehouse when they asked for an in-place installation (`BI-44`).
+    #[error("LAKEHOUSE_INSTALL_MODE must be \"full\" or \"bi-only\", got {0:?}")]
+    InvalidInstallMode(String),
+    /// `LAKEHOUSE_QUERY_ENGINE` was set to something other than
+    /// `"clickhouse"` or `"trino"`. A fallback would dial an engine the
+    /// operator did not choose, so the deployment refuses to boot.
+    #[error("LAKEHOUSE_QUERY_ENGINE must be \"clickhouse\" or \"trino\", got {0:?}")]
+    InvalidQueryEngine(String),
+    /// `bi-only` was configured with both engine URLs, or with Trino
+    /// chosen but no `TRINO_URL`: the owner decided that only ONE engine
+    /// runs per installation so the two never compete for the host's
+    /// memory (`BI-44`). The message names the conflicting variables.
+    #[error("{0}")]
+    EngineMutualExclusion(String),
 }
 
 /// The language the copilot answers in when the user's message is too short
@@ -249,6 +268,90 @@ impl ReplyLanguage {
         match self {
             Self::Indonesian => "Indonesian",
             Self::English => "English",
+        }
+    }
+}
+
+/// What kind of installation this deployment is (`BI-44`).
+///
+/// `Full` is the existing stack: it copies source data into the lakehouse
+/// and runs every service. `BiOnly` reads the customer's own database in
+/// place through ONE query engine; the lakehouse-only services (object
+/// store, catalog, orchestration) are not part of the installation. The
+/// default is `Full`, so every existing config and deployment is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallMode {
+    /// The whole lakehouse stack (the only mode before `BI-44`).
+    Full,
+    /// Dashboards, Query Studio and the assistant over an external source,
+    /// with no copy into the lakehouse.
+    BiOnly,
+}
+
+impl InstallMode {
+    /// The spelling `GET /api/settings/deployment` and the console use.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::BiOnly => "bi-only",
+        }
+    }
+
+    /// Parse `LAKEHOUSE_INSTALL_MODE`: trimmed and case-insensitive, with
+    /// unset or empty meaning the `Full` default. A non-empty unknown value
+    /// is an error, never a silent fallback.
+    fn from_env_value(raw: Option<&str>) -> Result<Self, ConfigError> {
+        let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::Full);
+        };
+        if raw.eq_ignore_ascii_case("full") {
+            Ok(Self::Full)
+        } else if raw.eq_ignore_ascii_case("bi-only") {
+            Ok(Self::BiOnly)
+        } else {
+            Err(ConfigError::InvalidInstallMode(raw.to_owned()))
+        }
+    }
+}
+
+/// The ONE query engine a `bi-only` installation reads its source through
+/// (`BI-44`). In `Full` mode both engines may run; this value names the
+/// default for ad hoc queries, not a restriction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryEngine {
+    /// `ClickHouse` external engines (`PostgreSQL`, `MySQL`, remote
+    /// `ClickHouse`). The default, matching every pre-`BI-44` config.
+    ClickHouse,
+    /// `Trino` federated catalogs (the wider source list in
+    /// `docs/core/specs/bi-44.md`).
+    Trino,
+}
+
+impl QueryEngine {
+    /// The spelling `GET /api/settings/deployment`, the query routes and
+    /// the console use.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::ClickHouse => "clickhouse",
+            Self::Trino => "trino",
+        }
+    }
+
+    /// Parse `LAKEHOUSE_QUERY_ENGINE`: trimmed and case-insensitive, with
+    /// unset or empty meaning the `ClickHouse` default. A non-empty unknown
+    /// value is an error, never a silent fallback to a different engine.
+    fn from_env_value(raw: Option<&str>) -> Result<Self, ConfigError> {
+        let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::ClickHouse);
+        };
+        if raw.eq_ignore_ascii_case("clickhouse") {
+            Ok(Self::ClickHouse)
+        } else if raw.eq_ignore_ascii_case("trino") {
+            Ok(Self::Trino)
+        } else {
+            Err(ConfigError::InvalidQueryEngine(raw.to_owned()))
         }
     }
 }
@@ -415,6 +518,17 @@ pub struct Config {
     /// and read-only in `kafka-connect` at the SAME path, because the connector
     /// JSON names the file by this path. Set it only in a test.
     pub cdc_secrets_dir: String,
+    /// The kind of installation (`LAKEHOUSE_INSTALL_MODE`, `BI-44`).
+    /// `Full` by default: adding the variable to an existing deployment
+    /// changes nothing. `BiOnly` makes the API report lakehouse-only
+    /// services as unchecked and refuses to dial an engine the operator
+    /// did not choose — see [`Config::engine_allowed`].
+    pub install_mode: InstallMode,
+    /// The query engine chosen for this installation
+    /// (`LAKEHOUSE_QUERY_ENGINE`, `BI-44`). `ClickHouse` by default. In
+    /// `Full` mode this only sets the default engine of an ad hoc query; in
+    /// `BiOnly` mode it is the ONLY engine the API may use.
+    pub query_engine: QueryEngine,
     /// `ClickHouse` HTTP interface URL. Default
     /// `"http://localhost:18123"` (`clickhouse.ts:11`, `??`).
     pub ch_url: String,
@@ -1258,6 +1372,8 @@ impl std::fmt::Debug for Config {
     )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
+            .field("install_mode", &self.install_mode)
+            .field("query_engine", &self.query_engine)
             .field("ch_url", &self.ch_url)
             .field("ch_user", &self.ch_user)
             .field("ch_password", &REDACTED)
@@ -1569,6 +1685,44 @@ fn truthy(env: &HashMap<String, String>, key: &str) -> Option<String> {
     env.get(key).filter(|v| !v.is_empty()).cloned()
 }
 
+/// Whether an operator explicitly named an engine's URL. An empty or
+/// whitespace-only value is "not set": compose files and `.env` templates
+/// pass empty strings for variables nobody filled in (`ADM-9 review R6`),
+/// and an empty address cannot dial anything.
+fn explicitly_set(env: &HashMap<String, String>, key: &str) -> bool {
+    env.get(key).is_some_and(|value| !value.trim().is_empty())
+}
+
+/// The `BI-44` mutual-exclusion gate: in `bi-only` mode exactly one engine
+/// may be named, and it must be the chosen one. The owner decided the two
+/// never run side by side so they do not compete for the host's memory.
+/// `Full` mode is deliberately untouched — a deployment with both URLs
+/// keeps working exactly as before this setting existed.
+fn validate_bi_only_engines(
+    install_mode: InstallMode,
+    query_engine: QueryEngine,
+    env: &HashMap<String, String>,
+) -> Result<(), ConfigError> {
+    if install_mode != InstallMode::BiOnly {
+        return Ok(());
+    }
+    let trino_set = explicitly_set(env, "TRINO_URL");
+    let clickhouse_set = explicitly_set(env, "CH_URL");
+    let side_by_side = "ClickHouse and Trino cannot run side by side in bi-only mode; unset the other engine's URL";
+    match query_engine {
+        QueryEngine::Trino if !trino_set => Err(ConfigError::EngineMutualExclusion(format!(
+            "LAKEHOUSE_QUERY_ENGINE=trino in bi-only mode requires TRINO_URL to be set; {side_by_side}"
+        ))),
+        QueryEngine::Trino if clickhouse_set => Err(ConfigError::EngineMutualExclusion(format!(
+            "LAKEHOUSE_QUERY_ENGINE=trino in bi-only mode forbids CH_URL; {side_by_side}"
+        ))),
+        QueryEngine::ClickHouse if trino_set => Err(ConfigError::EngineMutualExclusion(format!(
+            "LAKEHOUSE_QUERY_ENGINE=clickhouse in bi-only mode forbids TRINO_URL; {side_by_side}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Reads an on/off switch that is on unless set. Empty is unset (see
 /// [`truthy`]), unset and `true` are on, only the exact word `false` is off.
 /// Any other value is an error built by `unsupported`, so a typo such as
@@ -1857,6 +2011,11 @@ impl Config {
     ///   [`ConfigError::EmptySmtpCaFile`], if `SMTP_CA_FILE` is set and
     ///   non-empty but names a file that cannot be read, or one that holds
     ///   no PEM certificate (`SEC-56` D5).
+    /// - [`ConfigError::InvalidInstallMode`] or
+    ///   [`ConfigError::InvalidQueryEngine`], if either `BI-44` setting is
+    ///   non-empty but not one of its two names.
+    /// - [`ConfigError::EngineMutualExclusion`], if `bi-only` mode names
+    ///   both engine URLs, or names Trino without a `TRINO_URL`.
     ///
     /// An unparseable `SMTP_PORT` does NOT error — see [`Config::smtp_port`].
     #[allow(
@@ -1951,7 +2110,19 @@ impl Config {
             None => (None, None),
         };
 
+        // `BI-44`: resolve the two installation settings before any field
+        // is built, then check the one-engine invariant. A typo or a
+        // both-engines config stops the process here rather than silently
+        // starting a second memory-hungry service.
+        let install_mode =
+            InstallMode::from_env_value(env.get("LAKEHOUSE_INSTALL_MODE").map(String::as_str))?;
+        let query_engine =
+            QueryEngine::from_env_value(env.get("LAKEHOUSE_QUERY_ENGINE").map(String::as_str))?;
+        validate_bi_only_engines(install_mode, query_engine, env)?;
+
         Ok(Self {
+            install_mode,
+            query_engine,
             ch_url: or_default(env, "CH_URL", "http://localhost:18123"),
             ch_user: or_default(env, "CH_USER", "default"),
             ch_password: or_default(env, "CH_PASSWORD", ""),
@@ -2295,6 +2466,36 @@ impl Config {
             allow_all: self.webhook_test_allow_all,
             allowed: self.webhook_allowed_cidrs.clone(),
         }
+    }
+
+    /// Whether this installation reads its source in place and runs only
+    /// one query engine (`BI-44`).
+    #[must_use]
+    pub const fn is_bi_only(&self) -> bool {
+        matches!(self.install_mode, InstallMode::BiOnly)
+    }
+
+    /// The engine a request that names none gets: the installation's
+    /// chosen engine in `bi-only` mode, `ClickHouse` in the full stack
+    /// (unchanged pre-`BI-44` behaviour).
+    #[must_use]
+    pub const fn default_query_engine_name(&self) -> &'static str {
+        self.query_engine.name()
+    }
+
+    /// Whether a request may name this engine at all. In `bi-only` mode
+    /// only the configured engine is a real service; the other one was
+    /// deliberately not started, so a request naming it must be refused
+    /// before anything dials it. Unknown names are never allowed here, so
+    /// a typo cannot fall through to the full stack's `ClickHouse`
+    /// fallback (`sql_rewrite::Engine::from_name`). The full stack keeps
+    /// its two engines and its fallback for unknown names.
+    #[must_use]
+    pub fn engine_allowed(&self, engine_name: &str) -> bool {
+        if !self.is_bi_only() {
+            return true;
+        }
+        engine_name.trim() == self.query_engine.name()
     }
 }
 
@@ -3844,5 +4045,118 @@ mod tests {
                 ConfigError::InvalidUploadLimit("UPLOAD_SESSION_TTL_HOURS", bad.to_owned())
             );
         }
+    }
+
+    /// `BI-44`: an installation that never set the new variables keeps
+    /// every pre-existing config and its `ClickHouse` default, including a
+    /// deployment that names BOTH engine URLs (the full stack runs both).
+    #[test]
+    fn the_full_installation_remains_the_default_with_both_engines_allowed() {
+        let cfg = Config::from_map(&map(&[
+            ("CH_URL", "http://clickhouse:8123"),
+            ("TRINO_URL", "http://trino:8080"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.install_mode, InstallMode::Full);
+        assert_eq!(cfg.query_engine, QueryEngine::ClickHouse);
+        assert!(!cfg.is_bi_only());
+        assert_eq!(cfg.default_query_engine_name(), "clickhouse");
+        assert!(cfg.engine_allowed("clickhouse"));
+        assert!(cfg.engine_allowed("trino"));
+        assert!(cfg.engine_allowed("typo"));
+    }
+
+    /// The two values are trimmed and case-insensitive; an empty value is
+    /// the same as unset, but a non-empty unknown one refuses to boot.
+    #[test]
+    fn install_mode_and_query_engine_parse_trimmed_and_fail_closed_on_unknown_values() {
+        let cfg = Config::from_map(&map(&[
+            ("LAKEHOUSE_INSTALL_MODE", " BI-ONLY "),
+            ("LAKEHOUSE_QUERY_ENGINE", " TrInO "),
+            ("TRINO_URL", "http://trino:8080"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.install_mode, InstallMode::BiOnly);
+        assert_eq!(cfg.query_engine, QueryEngine::Trino);
+        assert_eq!(cfg.default_query_engine_name(), "trino");
+        assert_eq!(
+            Config::from_map(&env_with("LAKEHOUSE_INSTALL_MODE", "half")).unwrap_err(),
+            ConfigError::InvalidInstallMode("half".to_owned())
+        );
+        assert_eq!(
+            Config::from_map(&env_with("LAKEHOUSE_QUERY_ENGINE", "duckdb")).unwrap_err(),
+            ConfigError::InvalidQueryEngine("duckdb".to_owned())
+        );
+        let empty = Config::from_map(&map(&[
+            ("LAKEHOUSE_INSTALL_MODE", ""),
+            ("LAKEHOUSE_QUERY_ENGINE", "  "),
+        ]))
+        .unwrap();
+        assert_eq!(empty.install_mode, InstallMode::Full);
+        assert_eq!(empty.query_engine, QueryEngine::ClickHouse);
+    }
+
+    /// The owner's one-engine rule (`BI-44`): a Trino-only install must
+    /// name `TRINO_URL` and must not name `CH_URL`; an empty URL is not an
+    /// explicit setting.
+    #[test]
+    fn bi_only_trino_requires_its_url_and_forbids_clickhouse() {
+        let cfg = Config::from_map(&map(&[
+            ("LAKEHOUSE_INSTALL_MODE", "bi-only"),
+            ("LAKEHOUSE_QUERY_ENGINE", "trino"),
+            ("TRINO_URL", "http://trino:8080"),
+            ("CH_URL", "  "),
+        ]))
+        .unwrap();
+        assert!(cfg.is_bi_only());
+        assert!(cfg.engine_allowed("trino"));
+        assert!(!cfg.engine_allowed("clickhouse"));
+        assert!(!cfg.engine_allowed("typo"));
+        let err = Config::from_map(&map(&[
+            ("LAKEHOUSE_INSTALL_MODE", "bi-only"),
+            ("LAKEHOUSE_QUERY_ENGINE", "trino"),
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::EngineMutualExclusion(_)),
+            "a missing Trino URL must refuse start-up: {err:?}"
+        );
+        let err = Config::from_map(&map(&[
+            ("LAKEHOUSE_INSTALL_MODE", "bi-only"),
+            ("LAKEHOUSE_QUERY_ENGINE", "trino"),
+            ("TRINO_URL", "http://trino:8080"),
+            ("CH_URL", "http://clickhouse:8123"),
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::EngineMutualExclusion(_)),
+            "a second engine must refuse start-up: {err:?}"
+        );
+    }
+
+    /// The mirror of the Trino case: a ClickHouse-only install refuses a
+    /// `TRINO_URL` but needs none of its own (the code default applies).
+    #[test]
+    fn bi_only_clickhouse_forbids_a_trino_url() {
+        let cfg = Config::from_map(&map(&[
+            ("LAKEHOUSE_INSTALL_MODE", "bi-only"),
+            ("LAKEHOUSE_QUERY_ENGINE", "clickhouse"),
+            ("TRINO_URL", ""),
+        ]))
+        .unwrap();
+        assert!(cfg.engine_allowed("clickhouse"));
+        assert!(!cfg.engine_allowed("trino"));
+        assert_eq!(cfg.default_query_engine_name(), "clickhouse");
+        let err = Config::from_map(&map(&[
+            ("LAKEHOUSE_INSTALL_MODE", "bi-only"),
+            ("LAKEHOUSE_QUERY_ENGINE", "clickhouse"),
+            ("CH_URL", "http://clickhouse:8123"),
+            ("TRINO_URL", "http://trino:8080"),
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::EngineMutualExclusion(_)),
+            "a second engine must refuse start-up: {err:?}"
+        );
     }
 }
