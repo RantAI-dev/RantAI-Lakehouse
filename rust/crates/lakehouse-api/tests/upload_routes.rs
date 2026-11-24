@@ -6998,6 +6998,40 @@ async fn a_settled_typed_load_carries_the_report_of_values_that_did_not_fit() {
     );
 }
 
+/// `REL-15`: a reader that settles the same run concurrently cannot observe
+/// the terminal status before the report. Four GETs arrive together; every one
+/// returns the finished row WITH its report, never `failed` with no
+/// `badValues`. The status and the report are one database update.
+#[tokio::test]
+async fn concurrent_readers_never_see_a_terminal_status_before_its_report() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_run_status(&stack.dagster, "FAILURE").await;
+    seed_typed_loading(&stack, "up-1").await;
+    stack.bucket.put(
+        &format!("uploads/{GROUP}/up-1.csv.bad-values.json"),
+        &report_bytes(5),
+    );
+    mount_results(
+        &stack.ch,
+        &json!([result_row("up-1", "failed", None, BAD_VALUES_REASON, 30)]),
+    )
+    .await;
+
+    let (a, b, c, d) = tokio::join!(
+        stack.get(&bayu, "/api/uploads/up-1"),
+        stack.get(&bayu, "/api/uploads/up-1"),
+        stack.get(&bayu, "/api/uploads/up-1"),
+        stack.get(&bayu, "/api/uploads/up-1"),
+    );
+    for reply in [a, b, c, d] {
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+        assert_eq!(reply.json["status"], "failed", "{}", reply.text);
+        assert_eq!(reply.json["error"], BAD_VALUES_REASON, "{}", reply.text);
+        assert_eq!(reply.json["badValues"]["count"], 5, "{}", reply.text);
+    }
+}
+
 /// No report, a report that is not the job's shape, and a report of an upload
 /// that was loaded with no column list are all no report.
 #[tokio::test]
