@@ -43,6 +43,7 @@
 //! The lexer it reads with lives in [`crate::sql_lex`], the module that
 //! holds the engine's lexical rules (`SEC-62`).
 
+use crate::config::{InstallMode, QueryEngine};
 use crate::sql_lex::{SpanKind, lex};
 use crate::sql_rewrite::Engine;
 
@@ -360,6 +361,12 @@ pub(crate) enum SqlSourceRefusal {
     /// It reads a table outside `serving` (including `console.*` and
     /// `system.*`), or a bare table name.
     OutsideServing,
+    /// In `bi-only` mode it reads no 2-/3-part external table, reads a
+    /// reserved schema, or uses a table function instead of a table.
+    OutsideExternal,
+    /// A `Trino` write/session/procedure keyword passed the read-only check
+    /// (`is_trino_safe` is the extra guard `Trino` needs).
+    TrinoUnsafe,
     /// A well-formed `{{name}}` placeholder (`QS-5`). A dashboard source cannot
     /// take parameters until part 2, and the engine would answer with a
     /// message about `{`.
@@ -419,6 +426,12 @@ impl SqlSourceRefusal {
             Self::OutsideServing => {
                 "a SQL source may only read Gold tables, written as serving.<table>."
             }
+            Self::OutsideExternal => {
+                "a SQL source in a BI-only install may only read external tables named schema.table or catalog.schema.table on the installed engine."
+            }
+            Self::TrinoUnsafe => {
+                "a SQL source may not use a Trino write, session or procedure statement."
+            }
             Self::ParametersLater => {
                 "Parameters in a dashboard's SQL source come later: give the value in the SQL \
                  for now."
@@ -459,14 +472,92 @@ pub(crate) fn check_sql_source(sql: &str) -> Result<String, SqlSourceRefusal> {
     Ok(trimmed.to_owned())
 }
 
+/// [`check_sql_source`] for the installation's mode and active engine.
+///
+/// `full` keeps the old `serving.<table>` rule unchanged: this function
+/// delegates to [`check_sql_source`] and never forks its verdict. A `bi-only`
+/// install has no `serving` marts; it admits one read-only `SELECT`/`WITH`
+/// over 2-part (`schema.table`) or 3-part (`catalog.schema.table`) external
+/// tables in the active engine's dialect, with no `ClickHouse` table function,
+/// reserved metadata schema, `SETTINGS`/`FORMAT`, placeholder or second
+/// statement. The rules are the same shared lexer and parser
+/// ([`crate::sql_lex`], [`crate::sql_rewrite`]) the query route uses, so a
+/// source the preview accepts is one the engine may actually read in place.
+///
+/// # Errors
+///
+/// The [`SqlSourceRefusal`] naming the first rule `sql` breaks.
+pub(crate) fn check_sql_source_for_mode(
+    sql: &str,
+    install_mode: InstallMode,
+    engine: QueryEngine,
+) -> Result<String, SqlSourceRefusal> {
+    if install_mode == InstallMode::Full {
+        return check_sql_source(sql);
+    }
+    let lex_engine = match engine {
+        QueryEngine::ClickHouse => Engine::ClickHouse,
+        QueryEngine::Trino => Engine::Trino,
+    };
+    let trimmed = check_sql_text_for_engine(sql, lex_engine)?;
+    if engine == QueryEngine::Trino && !is_trino_safe(trimmed) {
+        return Err(SqlSourceRefusal::TrinoUnsafe);
+    }
+    let trino_dialect = crate::sql_rewrite::TrinoDialect::default();
+    let ch_dialect = sqlparser::dialect::ClickHouseDialect {};
+    let dialect: &dyn sqlparser::dialect::Dialect = match engine {
+        QueryEngine::Trino => &trino_dialect,
+        QueryEngine::ClickHouse => &ch_dialect,
+    };
+    let tables = crate::sql_rewrite::referenced_table_keys(trimmed, dialect)
+        .ok_or(SqlSourceRefusal::Unparseable)?;
+    // No table at all is not an empty source: a table function or a constant
+    // `SELECT` would be wrapped and run with no proof of what it reads.
+    if tables.is_empty() || !tables.iter().all(|t| external_table_key_allowed(&t.full)) {
+        return Err(SqlSourceRefusal::OutsideExternal);
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Whether `full` is a 2-/3-part in-place table name, and not a reserved
+/// metadata schema. The first two parts are checked: a 3-part name whose
+/// schema is `system` is as much a metadata read as `system.tables` is.
+fn external_table_key_allowed(full: &str) -> bool {
+    const RESERVED: [&str; 7] = [
+        "system",
+        "information_schema",
+        "pg_catalog",
+        "jmx",
+        "memory",
+        "tpch",
+        "tpcds",
+    ];
+    let parts: Vec<&str> = full.split('.').collect();
+    (2..=3).contains(&parts.len())
+        && parts.iter().all(|part| !part.is_empty())
+        && !parts
+            .iter()
+            .take(2)
+            .any(|part| RESERVED.iter().any(|r| r.eq_ignore_ascii_case(part)))
+}
+
 /// The shared lexical core: trimmed text (one trailing `;` dropped) that is
 /// non-blank, within [`SQL_SOURCE_MAX_CHARS`], free of `{{placeholder}}`s,
 /// one read-only `SELECT`/`WITH` statement with no `;` in its code and no
 /// `SETTINGS`/`FORMAT` clause.
 ///
 /// Returns the trimmed text on the way through, because the two callers that
-/// share this need exactly that text to parse next.
+/// share this need exactly that text to parse next. `full` mode's caller
+/// passes [`Engine::ClickHouse`] — the only change here is the engine
+/// argument, so its verdicts and tests stay the same.
 fn check_sql_text(sql: &str) -> Result<&str, SqlTextRefusal> {
+    check_sql_text_for_engine(sql, Engine::ClickHouse)
+}
+
+/// [`check_sql_text`] with the engine whose rules the statement is read
+/// with (`SEC-62`): `Trino` and `ClickHouse` disagree about comments,
+/// quotes and backslashes, so the lexer must know which one runs it.
+fn check_sql_text_for_engine(sql: &str, engine: Engine) -> Result<&str, SqlTextRefusal> {
     let trimmed = sql.trim();
     let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
     if trimmed.is_empty() {
@@ -475,14 +566,14 @@ fn check_sql_text(sql: &str) -> Result<&str, SqlTextRefusal> {
     if trimmed.chars().count() > SQL_SOURCE_MAX_CHARS {
         return Err(SqlTextRefusal::TooLong);
     }
-    // `query-parameters.md` decision 15: before anything reads the statement as ClickHouse SQL. The
+    // `query-parameters.md` decision 15: before anything reads the statement as SQL. The
     // scanner is the one that knows comments and quotes, so a `{{` in a
     // comment, or text that is not a well-formed placeholder, changes
     // nothing here.
     if crate::query_params::holds_placeholder(trimmed) {
         return Err(SqlTextRefusal::ParametersLater);
     }
-    let code = strip_sql_noise(trimmed, Engine::ClickHouse);
+    let code = strip_sql_noise(trimmed, engine);
     let lower = code.trim_start().to_ascii_lowercase();
     let starts_select = ["select", "with"].iter().any(|kw| {
         lower
@@ -491,7 +582,7 @@ fn check_sql_text(sql: &str) -> Result<&str, SqlTextRefusal> {
     });
     // `is_read_only` also admits SHOW/DESCRIBE/EXPLAIN, which cannot be a
     // derived table, hence the narrower first-word check.
-    if !starts_select || !is_read_only(trimmed, Engine::ClickHouse) {
+    if !starts_select || !is_read_only(trimmed, engine) {
         return Err(SqlTextRefusal::NotASelect);
     }
     if code.contains(';') {
@@ -1051,6 +1142,147 @@ mod sql_source_rules {
         assert_eq!(
             check_sql_source("SELECT * FROM serving.a WHERE x = {{"),
             Err(SqlSourceRefusal::Unparseable)
+        );
+    }
+}
+
+#[cfg(test)]
+mod sql_source_for_mode_rules {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::{SqlSourceRefusal, check_sql_source_for_mode};
+    use crate::config::{InstallMode, QueryEngine};
+
+    const BI_TRINO: (InstallMode, QueryEngine) = (InstallMode::BiOnly, QueryEngine::Trino);
+    const BI_CH: (InstallMode, QueryEngine) = (InstallMode::BiOnly, QueryEngine::ClickHouse);
+    const FULL: (InstallMode, QueryEngine) = (InstallMode::Full, QueryEngine::ClickHouse);
+
+    /// A three-part federated table and a two-part external table are both
+    /// admitted in `bi-only+trino`; the normalized text is what a caller
+    /// stores and previews.
+    #[test]
+    fn bi_only_trino_admits_external_two_and_three_part_tables() {
+        let sql = "  SELECT id, email FROM erp_pg.public.customers WHERE id > 1;  ";
+        let ok = check_sql_source_for_mode(sql, BI_TRINO.0, BI_TRINO.1).expect("a federated table");
+        assert!(ok.starts_with("SELECT"));
+        assert!(!ok.ends_with(';'));
+        assert!(
+            check_sql_source_for_mode(
+                "WITH c AS (SELECT * FROM public.customers) SELECT * FROM c",
+                BI_TRINO.0,
+                BI_TRINO.1,
+            )
+            .is_ok()
+        );
+        assert!(
+            check_sql_source_for_mode("SELECT * FROM public.customers", BI_CH.0, BI_CH.1).is_ok()
+        );
+    }
+
+    /// `full` mode is a different rule, not a widened one: it still requires
+    /// `serving.<table>` and refuses an external table.
+    #[test]
+    fn full_mode_still_requires_serving_tables() {
+        assert!(check_sql_source_for_mode(
+            "SELECT * FROM serving.mart_a",
+            FULL.0,
+            FULL.1,
+        )
+        .is_ok());
+        for sql in [
+            "SELECT * FROM erp_pg.public.customers",
+            "SELECT * FROM public.customers",
+        ] {
+            assert_eq!(
+                check_sql_source_for_mode(sql, FULL.0, FULL.1),
+                Err(SqlSourceRefusal::OutsideServing),
+                "{sql}"
+            );
+        }
+    }
+
+    /// Writes, session statements, a second statement, a trailing
+    /// `SETTINGS`/`FORMAT` and a placeholder are refused before any engine
+    /// receives them, in both `bi-only` engines.
+    #[test]
+    fn bi_only_refuses_writes_multi_statements_settings_and_placeholders() {
+        for (mode, engine) in [BI_TRINO, BI_CH] {
+            for sql in [
+                "INSERT INTO public.customers VALUES (1)",
+                "DROP TABLE public.customers",
+                "SHOW TABLES",
+                "SELECT * FROM public.a; SELECT 2 FROM public.b",
+                "SELECT * FROM public.a SETTINGS max_threads = 1",
+                "SELECT * FROM public.a FORMAT JSON",
+                "SELECT * FROM public.a WHERE x = {{x}}",
+                "",
+            ] {
+                let refusal = check_sql_source_for_mode(sql, mode, engine).unwrap_err();
+                assert!(
+                    refusal != SqlSourceRefusal::OutsideExternal,
+                    "the source guard must name the real cause: {sql} -> {refusal:?}"
+                );
+            }
+            assert_eq!(
+                check_sql_source_for_mode("SET SESSION foo = 1", BI_TRINO.0, BI_TRINO.1),
+                Err(SqlSourceRefusal::NotASelect)
+            );
+            assert_eq!(
+                check_sql_source_for_mode(
+                    "SELECT * FROM public.a WHERE x = 1; SET SESSION foo = 1",
+                    BI_TRINO.0,
+                    BI_TRINO.1,
+                ),
+                Err(SqlSourceRefusal::MultipleStatements)
+            );
+        }
+    }
+
+    /// `system.*`/`information_schema.*`, bare names, table functions and a
+    /// constant `SELECT` are not external sources and are refused by name.
+    #[test]
+    fn bi_only_refuses_metadata_schemas_bare_tables_and_table_functions() {
+        for sql in [
+            "SELECT * FROM system.tables",
+            "SELECT * FROM information_schema.columns",
+            "SELECT * FROM erp_pg.system.tables",
+            "SELECT * FROM pg_catalog.pg_tables",
+            "SELECT * FROM customers",
+            "SELECT 1",
+        ] {
+            assert_eq!(
+                check_sql_source_for_mode(sql, BI_TRINO.0, BI_TRINO.1),
+                Err(SqlSourceRefusal::OutsideExternal),
+                "{sql}"
+            );
+        }
+        // A table function names no real table, so the collector finds no
+        // source to admit (the policy rewrite would refuse it later too).
+        assert_eq!(
+            check_sql_source_for_mode(
+                "SELECT * FROM url('http://example.invalid/data.csv')",
+                BI_CH.0,
+                BI_CH.1,
+            ),
+            Err(SqlSourceRefusal::OutsideExternal)
+        );
+        assert_eq!(
+            check_sql_source_for_mode(
+                "SELECT * FROM erp_pg.public.customers WHERE (((",
+                BI_TRINO.0,
+                BI_TRINO.1,
+            ),
+            Err(SqlSourceRefusal::Unparseable)
+        );
+    }
+
+    /// The reason a caller sees is fixed text: no upstream or caller words
+    /// are echoed by the refusal message.
+    #[test]
+    fn a_bi_only_refusal_has_a_fixed_sentence() {
+        assert_eq!(
+            SqlSourceRefusal::OutsideExternal.message(),
+            "a SQL source in a BI-only install may only read external tables named schema.table or catalog.schema.table on the installed engine."
         );
     }
 }
