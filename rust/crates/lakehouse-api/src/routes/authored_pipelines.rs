@@ -127,6 +127,19 @@ pub fn sensor_name(id: &str) -> String {
     format!("{}_after", job_name(id))
 }
 
+/// The target-lag (freshness) sensor name `authored_factory.py` gives a
+/// pipeline whose `targetLag.kind == "lag"` (`lag_sensor_name` there).
+///
+/// BLD-18: pausing must stop this sensor explicitly, next to the cron
+/// schedule and the dependency `_after` sensor. Dagster keeps a sensor's
+/// stored RUNNING/STOPPED state across a code-location reload, so the
+/// Python `paused` skip alone cannot silence a sensor that was already
+/// running before the reload.
+#[must_use]
+pub fn lag_sensor_name(id: &str) -> String {
+    format!("{}_lag", job_name(id))
+}
+
 /// The id part of an `authored__<id>` Dagster job name (the prefix every
 /// authored factory job carries, see [`job_name`]). Used by the
 /// runId-keyed pipeline routes (`run_steps` / `run_logs` / `retry_run`)
@@ -3052,6 +3065,13 @@ mod tests {
             "authored__pl_ui_check_flow_mumidzub"
         );
         assert_eq!(schedule_name("pl-a-1"), "authored__pl_a_1_schedule");
+        // BLD-18: the same sanitize rule gives the freshness sensor's name;
+        // the pause/resume route has to know it to stop/start it in Dagster.
+        assert_eq!(lag_sensor_name("pl-a-1"), "authored__pl_a_1_lag");
+        assert_eq!(
+            lag_sensor_name("pl-ui-check-flow-mumidzub"),
+            "authored__pl_ui_check_flow_mumidzub_lag"
+        );
     }
 
     /// R3 plan 2a: a 3-cycle `A → B → C → A` is caught when the user
