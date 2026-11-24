@@ -4919,6 +4919,70 @@ async fn overview_alerts_refuses_dashboard_read_principal() {
     assert_ne!(allowed.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// SEC-67: the three overview alert state-change routes are `alert:write`
+/// writes, while the list above stays readable with `alert:read` alone. Pin
+/// the table rows and both sides of the gate on each route: no session is
+/// 401, an `alert:read`-only principal is 403, and an `alert:write` principal
+/// gets past the gate (the handler then returns 404 for the unknown id).
+#[tokio::test]
+async fn overview_alert_state_change_routes_require_alert_write() {
+    let TestApp { router, pool } = spin_up().await;
+
+    for (pattern, action) in [
+        ("/api/overview/alerts/{id}/acknowledge", "acknowledge"),
+        ("/api/overview/alerts/{id}/resolve", "resolve"),
+        ("/api/overview/alerts/{id}/silence", "silence"),
+    ] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == "POST" && *p == pattern)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresPermission("alert:write")),
+            "POST {pattern}"
+        );
+
+        let path = format!("/api/overview/alerts/sec67-unknown-id/{action}");
+
+        // No session -> 401.
+        let anonymous = request_with_cookie(&router, "POST", &path, "").await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{path}");
+
+        // `alert:read` may see the list but not change it -> 403.
+        let reader = create_principal_with_permissions(&pool, "alert:read").await;
+        let reader_cookie = session_cookie_for_user(&pool, reader).await;
+        let denied = request_with_cookie(&router, "POST", &path, &reader_cookie).await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN, "{path}");
+
+        // `alert:write` gets past auth/authz. Silence needs a JSON body; the
+        // unknown alert id then makes the handler answer 404.
+        let writer = create_principal_with_permissions(&pool, "alert:write").await;
+        let writer_cookie = session_cookie_for_user(&pool, writer).await;
+        let allowed = if action == "silence" {
+            request_with_cookie_and_body(
+                &router,
+                "POST",
+                &path,
+                &writer_cookie,
+                br#"{"untilMinutes":60}"#.to_vec(),
+            )
+            .await
+        } else {
+            request_with_cookie(&router, "POST", &path, &writer_cookie).await
+        };
+        let status = allowed.status();
+        assert!(
+            status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+            "{path}: an alert:write principal must get past the gate, got {status}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{path}: the handler returns 404 for an unknown alert id"
+        );
+    }
+}
+
 /// BLD-1 part 1 / D8: the run route that replaced `.../enforce` is in
 /// `POLICY_TABLE` as `pipeline:read`, the old path is gone from the table, and
 /// the gate answers both ways: no session is 401, `query:read` alone is 403,

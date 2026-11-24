@@ -6,6 +6,7 @@ import { XIcon } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
+import { useSurfaceThemeClass } from "@/components/ui/surface-theme"
 
 function Dialog({ ...props }: DialogPrimitive.Root.Props) {
   return <DialogPrimitive.Root data-slot="dialog" {...props} />
@@ -45,6 +46,8 @@ function DialogContent({
   showCloseButton = true,
   ...props
 }: DialogPrimitive.Popup.Props & { showCloseButton?: boolean }) {
+  // WEB-10: the portal stays on <body>; copy the opener's theme onto the dialog.
+  const surfaceThemeClass = useSurfaceThemeClass()
   return (
     <DialogPortal>
       <DialogOverlay />
@@ -52,6 +55,7 @@ function DialogContent({
         data-slot="dialog-content"
         className={cn(
           "fixed top-1/2 left-1/2 z-50 grid grid-cols-[minmax(0,1fr)] w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl border border-border bg-background p-6 text-sm text-foreground shadow-xl outline-none transition-[opacity,scale,translate] duration-200 ease-ui data-ending-style:scale-[0.97] data-ending-style:opacity-0 data-ending-style:duration-150 data-starting-style:scale-95 data-starting-style:opacity-0 sm:max-w-lg",
+          surfaceThemeClass,
           className
         )}
         {...props}

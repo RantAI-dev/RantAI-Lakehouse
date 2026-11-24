@@ -174,6 +174,84 @@ async fn error_body(resp: axum::http::Response<Body>) -> (StatusCode, Value) {
     (status, body)
 }
 
+/// `DATA-64`: the tenant gate's 404 for the mart these tests read. The same
+/// fixed sentence `export` is already refused with, from the same
+/// `routes::gold::gated_source_table` call now made by `read_back`/`exports`.
+const TABLE_REFUSAL: &str =
+    "Table not found or not available to your organisation: serving.gold_export_smoke";
+
+/// `GET /api/gold/export/{mart}` (the publish read-back) with the
+/// scheduler's two headers — the same authentication shape as
+/// [`post_export_with_scheduler_headers`].
+async fn get_read_back_with_scheduler_headers(
+    app: &axum::Router,
+    token: &str,
+) -> axum::http::Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/gold/export/gold_export_smoke")
+                .header("authorization", format!("Bearer {token}"))
+                .header("x-run-token", token)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright")
+}
+
+/// `GET /api/gold/exports?mart=` (the publish history) with the
+/// scheduler's two headers.
+async fn get_history_with_scheduler_headers(
+    app: &axum::Router,
+    token: &str,
+) -> axum::http::Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/gold/exports?mart=gold_export_smoke")
+                .header("authorization", format!("Bearer {token}"))
+                .header("x-run-token", token)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright")
+}
+
+/// `GET` either read surface as a signed-in person (session cookie only).
+async fn get_as(app: &axum::Router, cookie: &str, uri: &str) -> axum::http::Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright")
+}
+
+/// The engine was never asked — the tenant gate refused before any
+/// `ClickHouse` read. Read-back does not touch `ClickHouse` at all, so the
+/// assertion is trivially true there; what proves the gate precedence for
+/// read-back is the gate's own sentence in the body (the `Lakekeeper` token
+/// file would have answered 503 first otherwise).
+async fn assert_engine_untouched(engine: &MockServer, context: &str) {
+    let requests = engine
+        .received_requests()
+        .await
+        .expect("the mock engine records requests");
+    assert!(
+        requests.is_empty(),
+        "{context}: nothing may be asked: {requests:?}"
+    );
+}
+
 /// The deployment the seeded identity migration creates: four tenants, so
 /// the deployment holds more than one.
 fn seeded_tenant_ids() -> [&'static str; 4] {
@@ -398,5 +476,234 @@ async fn a_person_of_the_catalogs_tenant_holding_gold_export_reaches_the_engine(
     assert!(
         !requests.is_empty(),
         "the export reads the mart, so the engine must have been asked"
+    );
+}
+
+// ── DATA-64: the SEC-50 tenant gate on the two read surfaces ─────────────
+//
+// `GET /api/gold/export/{mart}` (read-back) and `GET /api/gold/exports`
+// (history) reveal the shared catalog mart's row counts and timing. Before
+// DATA-64 they ran no tenant check at all, unlike `POST`/publication. The
+// tests below prove both refusal ways on BOTH handlers, before any engine
+// or `Lakekeeper` read, plus positive controls that get past the gate.
+
+/// `DATA-64`/`SEC-50`: the read-back acts as the catalog's tenant for a job
+/// with no user. A multi-tenant deployment with no `CATALOG_TENANT_ID` has
+/// no such tenant, so the gate refuses with 422 BEFORE the `Lakekeeper` token
+/// file or `Iceberg` is read — the gate's own sentence, not the token-file
+/// 503, is what the caller sees.
+#[tokio::test]
+async fn a_job_with_no_catalog_tenant_is_refused_before_the_read_back_reads_anything() {
+    let engine = mount_engine().await;
+    let mut overrides = HashMap::new();
+    overrides.insert("GOLD_EXPORT_RUN_TOKEN".to_owned(), TOKEN.to_owned());
+    overrides.insert("CH_URL".to_owned(), engine.uri());
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+    seed_gold_export_service_credential(&pool, TOKEN).await;
+
+    let (status, body) =
+        error_body(get_read_back_with_scheduler_headers(&router, TOKEN).await).await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["error"].as_str(),
+        Some(JOB_NEEDS_CATALOG_TENANT),
+        "{body}"
+    );
+    assert_engine_untouched(&engine, "the read-back refusal precedes the engine").await;
+}
+
+/// `DATA-64`/`SEC-50`: the export history is gated identically, before
+/// `ClickHouse` is asked for a single run.
+#[tokio::test]
+async fn a_job_with_no_catalog_tenant_is_refused_before_export_history_is_read() {
+    let engine = mount_engine().await;
+    let mut overrides = HashMap::new();
+    overrides.insert("GOLD_EXPORT_RUN_TOKEN".to_owned(), TOKEN.to_owned());
+    overrides.insert("CH_URL".to_owned(), engine.uri());
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+    seed_gold_export_service_credential(&pool, TOKEN).await;
+
+    let (status, body) = error_body(get_history_with_scheduler_headers(&router, TOKEN).await).await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["error"].as_str(),
+        Some(JOB_NEEDS_CATALOG_TENANT),
+        "{body}"
+    );
+    assert_engine_untouched(&engine, "the history refusal precedes the engine").await;
+}
+
+/// `DATA-64`/`SEC-50` R4: a signed-in person is gated as THEMSELVES. A
+/// `gold:export` holder of a tenant that does not own the shared catalog
+/// gets the gate's 404 on the read-back, before Lakekeeper or `ClickHouse`.
+#[tokio::test]
+async fn a_person_of_another_tenant_holding_gold_export_is_refused_on_the_read_back() {
+    let engine = mount_engine().await;
+    let mut overrides = HashMap::new();
+    overrides.insert("CH_URL".to_owned(), engine.uri());
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+    grant_gold_export(&pool, "sari@meridian.example").await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let (status, body) =
+        error_body(get_as(&router, &cookie, "/api/gold/export/gold_export_smoke").await).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"].as_str(), Some(TABLE_REFUSAL), "{body}");
+    assert_engine_untouched(&engine, "the read-back refusal precedes the engine").await;
+}
+
+/// The same person of another tenant is refused on the history route, with
+/// no history query issued.
+#[tokio::test]
+async fn a_person_of_another_tenant_holding_gold_export_is_refused_on_export_history() {
+    let engine = mount_engine().await;
+    let mut overrides = HashMap::new();
+    overrides.insert("CH_URL".to_owned(), engine.uri());
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+    grant_gold_export(&pool, "sari@meridian.example").await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let (status, body) =
+        error_body(get_as(&router, &cookie, "/api/gold/exports?mart=gold_export_smoke").await)
+            .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"].as_str(), Some(TABLE_REFUSAL), "{body}");
+    assert_engine_untouched(&engine, "the history refusal precedes the engine").await;
+}
+
+/// Positive control: with a catalog tenant configured, the job gets PAST
+/// the gate on the read-back. The next step is the unprovisioned `Lakekeeper`
+/// token file, so a 503 there — and not the gate's 422 — is the proof.
+#[tokio::test]
+async fn a_job_with_a_catalog_tenant_gets_past_the_gate_on_the_read_back() {
+    let engine = mount_engine().await;
+    let mut overrides = HashMap::new();
+    overrides.insert("GOLD_EXPORT_RUN_TOKEN".to_owned(), TOKEN.to_owned());
+    overrides.insert("CH_URL".to_owned(), engine.uri());
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+    seed_gold_export_service_credential(&pool, TOKEN).await;
+
+    let (status, body) =
+        error_body(get_read_back_with_scheduler_headers(&router, TOKEN).await).await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the unprovisioned token file is the step after the gate: {body}"
+    );
+    assert_ne!(
+        body["error"].as_str(),
+        Some(JOB_NEEDS_CATALOG_TENANT),
+        "{body}"
+    );
+    assert_ne!(body["error"].as_str(), Some(TABLE_REFUSAL), "{body}");
+    assert_engine_untouched(&engine, "read-back never reads ClickHouse").await;
+}
+
+/// Positive control: with a catalog tenant configured, the job gets PAST
+/// the gate on the history route and `ClickHouse` is asked for the runs.
+#[tokio::test]
+async fn a_job_with_a_catalog_tenant_gets_past_the_gate_on_export_history() {
+    let engine = mount_engine().await;
+    let mut overrides = HashMap::new();
+    overrides.insert("GOLD_EXPORT_RUN_TOKEN".to_owned(), TOKEN.to_owned());
+    overrides.insert("CH_URL".to_owned(), engine.uri());
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+    seed_gold_export_service_credential(&pool, TOKEN).await;
+
+    let (status, body) = error_body(get_history_with_scheduler_headers(&router, TOKEN).await).await;
+
+    assert_ne!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the gate refused a job the catalog's own tenant may run: {body}"
+    );
+    assert_ne!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_ne!(
+        body["error"].as_str(),
+        Some(JOB_NEEDS_CATALOG_TENANT),
+        "{body}"
+    );
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the stand-in answers the history read: {body}"
+    );
+    assert_eq!(body["mart"], "gold_export_smoke", "{body}");
+    let requests = engine
+        .received_requests()
+        .await
+        .expect("the mock engine records requests");
+    assert!(
+        !requests.is_empty(),
+        "past the gate the history is read from ClickHouse"
+    );
+}
+
+/// Positive control: a person of the catalog's own tenant holding
+/// `gold:export` gets past the gate on the read-back as well.
+#[tokio::test]
+async fn a_person_of_the_catalogs_tenant_gets_past_the_gate_on_the_read_back() {
+    let engine = mount_engine().await;
+    let mut overrides = HashMap::new();
+    overrides.insert("CH_URL".to_owned(), engine.uri());
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+    grant_gold_export(&pool, "rina@meridian.example").await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    let (status, body) =
+        error_body(get_as(&router, &cookie, "/api/gold/export/gold_export_smoke").await).await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the unprovisioned token file is the step after the gate: {body}"
+    );
+    assert_ne!(body["error"].as_str(), Some(TABLE_REFUSAL), "{body}");
+    assert_ne!(
+        body["error"].as_str(),
+        Some(JOB_NEEDS_CATALOG_TENANT),
+        "{body}"
+    );
+}
+
+/// Positive control: the same person of the catalog's tenant gets past the
+/// gate on the history route, whose `ClickHouse` read then succeeds.
+#[tokio::test]
+async fn a_person_of_the_catalogs_tenant_gets_past_the_gate_on_export_history() {
+    let engine = mount_engine().await;
+    let mut overrides = HashMap::new();
+    overrides.insert("CH_URL".to_owned(), engine.uri());
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+    grant_gold_export(&pool, "rina@meridian.example").await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    let (status, body) =
+        error_body(get_as(&router, &cookie, "/api/gold/exports?mart=gold_export_smoke").await)
+            .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the stand-in answers the history read: {body}"
+    );
+    assert_eq!(body["mart"], "gold_export_smoke", "{body}");
+    let requests = engine
+        .received_requests()
+        .await
+        .expect("the mock engine records requests");
+    assert!(
+        !requests.is_empty(),
+        "past the gate the history is read from ClickHouse"
     );
 }

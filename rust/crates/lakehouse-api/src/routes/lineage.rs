@@ -843,6 +843,14 @@ mod tests {
             zone_node("silver.orders").map(|n| n.0),
             Some("table:silver.orders".to_owned())
         );
+        // BLD-19: an authored pipeline's `serving.m` target resolves to the
+        // same `table:serving.m` id `routes::catalog` returns for a Gold
+        // mart, so the lineage edge joins the Data Explorer node.
+        assert_eq!(
+            zone_node("serving.m").map(|n| n.0),
+            Some("table:serving.m".to_owned())
+        );
+        assert_eq!(zone_node("serving.m").map(|n| n.2), Some("gold"));
         assert_eq!(
             zone_node("gold.m").map(|n| n.0),
             Some("table:serving.m".to_owned())

@@ -119,10 +119,15 @@
 //!   represents storage/backup operations at all (Data Engineer's
 //!   `pipeline:*`/`catalog:write`/`connector:manage` stop short of
 //!   storage); reachable only via Platform Admin's `*:*`.
-//! * `alert:write` (`/api/alerts` `POST`/`PUT`/`DELETE`) — granted to Data
-//!   Engineer (`0020`): alert rules are operational tooling over the same
-//!   pipelines/connectors Data Engineer already manages, and it is the
-//!   natural owner of "define a threshold alert on a data pipeline".
+//! * `alert:write` (`/api/alerts` `POST`/`PUT`/`DELETE`, and since `SEC-67`
+//!   the three `/api/overview/alerts/{id}/{acknowledge,resolve,silence}`
+//!   state-change routes) — granted to Data Engineer (`0020`): alert rules
+//!   are operational tooling over the same pipelines/connectors Data
+//!   Engineer already manages, and it is the natural owner of "define a
+//!   threshold alert on a data pipeline" and act on the ones that fire.
+//!   `SEC-67` moved the overview state changes off `RequiresAuth` so a
+//!   viewer who may read the list (`alert:read`) cannot silently change it;
+//!   the list itself keeps the ADM-13 any-of.
 //!
 //! See `migrations/0020_extend_role_grants.sql` for the exact `UPDATE`
 //! statements and `agent_workload_storage_alert_permissions_seed_alignment`
@@ -351,14 +356,21 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET", "/api/lakehouse/capacity",                        Policy::RequiresPermission("catalog:read")),
     ("GET", "/api/lakehouse/maintenance-policies",            Policy::RequiresAuth),
 
-    // ── Overview / alerts: no seeded resource maps to these — auth only. ─
+    // ── Overview / alerts: the Home read surfaces have no single seeded
+    //    resource and stay auth-only / any-of, but the three state-change
+    //    routes below mutate a live alert and take the same `alert:write`
+    //    the rule CRUD routes do (SEC-67). ────────────────────────────────
     ("GET",  "/api/overview",                                Policy::RequiresAuth),
     ("POST", "/api/overview",                                Policy::RequiresAuth),
-    // ADM-13 (D10.3), ADM-13 review round 1, B3: Home alerts list takes the same any-of as GET /api/alerts
+    // ADM-13 (D10.3), ADM-13 review round 1, B3: Home alerts list takes the same any-of as GET /api/alerts,
+    // so an `alert:read`-only viewer can see alerts without being able to change their state (SEC-67).
     ("GET",  "/api/overview/alerts",                          Policy::RequiresAnyPermission(&["alert:read", "alert:write"])),
-    ("POST", "/api/overview/alerts/{id}/acknowledge",         Policy::RequiresAuth),
-    ("POST", "/api/overview/alerts/{id}/resolve",             Policy::RequiresAuth),
-    ("POST", "/api/overview/alerts/{id}/silence",             Policy::RequiresAuth),
+    // SEC-67: acknowledging, resolving and silencing a live alert are state
+    // changes, not reads. A viewer holding only `alert:read` can see the list
+    // above but must be refused (403) here; same `alert:write` as `/api/alerts`.
+    ("POST", "/api/overview/alerts/{id}/acknowledge",         Policy::RequiresPermission("alert:write")),
+    ("POST", "/api/overview/alerts/{id}/resolve",             Policy::RequiresPermission("alert:write")),
+    ("POST", "/api/overview/alerts/{id}/silence",             Policy::RequiresPermission("alert:write")),
 
     // ── Ops: `{kind}` fans out to several logical resources with no single
     //    seeded permission — auth only (see module doc comment). Cancelling
@@ -2157,6 +2169,49 @@ mod tests {
                 .map(|(_, _, policy)| *policy);
             assert_eq!(row, Some(Policy::RequiresAuth), "{method} /api/alerts");
         }
+    }
+
+    /// `SEC-67`: acknowledging, resolving and silencing an overview alert
+    /// change its state, so they take `alert:write` — the same permission as
+    /// the `/api/alerts` rule CRUD — rather than merely a login. A viewer
+    /// holding only `alert:read` can list the alerts but must be refused on
+    /// all three; the GET keeps the ADM-13 any-of so that read-only view works.
+    #[test]
+    fn overview_alert_state_changes_need_alert_write_not_just_a_login() {
+        use lakehouse_auth::PermissionSet;
+
+        for path in [
+            "/api/overview/alerts/{id}/acknowledge",
+            "/api/overview/alerts/{id}/resolve",
+            "/api/overview/alerts/{id}/silence",
+        ] {
+            // Pin the table row itself: a regression to `RequiresAuth` fails
+            // here even if the permission-set checks below still happen to
+            // pass for the principals chosen.
+            assert_eq!(
+                policy_for("POST", path),
+                Some(Policy::RequiresPermission("alert:write")),
+                "POST {path}"
+            );
+            assert_denied_then_allowed(
+                "POST",
+                path,
+                &PermissionSet::parse("alert:read"),
+                "an alert:read-only viewer",
+                &PermissionSet::parse("alert:write"),
+                "an alert:write holder",
+            );
+        }
+
+        // The list stays open to either permission (ADM-13 D10.3): the viewer
+        // denied above can still see the alerts it can no longer change.
+        assert_eq!(
+            policy_for("GET", "/api/overview/alerts"),
+            Some(Policy::RequiresAnyPermission(&[
+                "alert:read",
+                "alert:write"
+            ])),
+        );
     }
 
     /// Proves `0020_extend_role_grants.sql`'s intent at the `PermissionSet`
