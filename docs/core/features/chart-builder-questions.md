@@ -81,4 +81,4 @@ Run on the QA stack (main `0ea686e5` plus the open console pull requests) by bro
 - `BI-6-AC4`: pass.
 - `BI-6-AC5`: pass.
 - `AI-6-AC1` (BI-6 part): partial: the chart was built and matched SQL only with explicit wording; a natural request hit the tool-call limit and described a chart that was not built (follow-up item).
-- 2026-11-24 (`AI-36`, `PR pending`): fixed — when the tool trace shows a chart write was attempted but no chart was saved before the tool-call limit, the assistant now replaces that claim with a fixed sentence saying no chart was made and naming the tools that ran.
+- 2026-11-24 (`AI-36`, `PR #722`): fixed — when the tool trace shows a chart write was attempted but no chart was saved before the tool-call limit, the assistant now replaces that claim with a fixed sentence saying no chart was made and naming the tools that ran.
