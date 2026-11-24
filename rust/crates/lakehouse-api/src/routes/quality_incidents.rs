@@ -176,20 +176,19 @@ pub struct IncidentsQuery {
 ///
 /// # Errors
 ///
-/// `400` for a `status` that is not `open`, `resolved` or `all`;
-/// `503`/`500` on a store failure.
+/// `400` for a `status` that is not `open`, `resolved` or `all`; `403` for a
+/// caller outside the tenant that owns the shared catalog; `503`/`500` on a
+/// store or table-access failure.
 pub async fn list_incidents(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     headers: HeaderMap,
     Query(query): Query<IncidentsQuery>,
 ) -> ApiResult<ApiJson<Value>> {
-    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4
-    if let Some(reason) =
-        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await?
-    {
-        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
-    }
+    // GOV-16: the one GOV-15 gate — catalog tenant first, role table access
+    // second — so the list cannot be used to learn which tables a role hides.
+    let access =
+        crate::routes::quality::quality_table_access(&state, Some(&principal), &headers).await?;
     let status = match query.status.as_deref() {
         None | Some("") => StatusFilter::Open,
         Some(other) => StatusFilter::parse(other).ok_or_else(|| {
@@ -206,9 +205,13 @@ pub async fn list_incidents(
     let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
     let assets: Vec<String> = incidents.iter().map(|i| i.asset.clone()).collect();
     let readable = crate::routes::query::reachable_names(&state, reach, &assets).await?;
+    // GOV-16: an incident names the table it is about, so a narrowed caller
+    // does not see the incidents of tables their role cannot read. The same
+    // predicate hides the rows on every quality/governance list.
     let incidents: Vec<_> = incidents
         .into_iter()
         .filter(|i| readable.contains(&i.asset))
+        .filter(|i| crate::routes::quality::asset_readable(&access, Some(&i.asset)))
         .collect();
     Ok(ApiJson(json!({ "incidents": incidents })))
 }
@@ -253,8 +256,8 @@ pub async fn resolve_incident(
         }
         // GOV-15 (GOV-12 plan, section 4): resolving is refused for an
         // incident on a table the caller's role does not read, and it reads as
-        // an unknown id (the same 404). The incident list itself is not
-        // narrowed by role (D5).
+        // an unknown id (the same 404). GOV-16 narrows the list itself the
+        // same way, so a hidden table's incident cannot be found from either.
         Some(incident) => {
             // SEC-80: an incident on a table another tenant claimed reads as an
             // unknown id too.

@@ -71,6 +71,17 @@ module attaches `allow_database_iceberg = 1` to every statement whose
 compiled text reads it — the `readsIceberg` flag `_compiled_sql` gets back
 from the API decides. `_reading` carries the detail.
 
+# The Gold zone (BLD-19)
+
+Gold marts are ClickHouse tables in `serving`: it is the only Gold database
+`routes::catalog` lists (`WHERE database IN ('silver','serving')`, returned as
+`serving.<name>` with `layer: gold`) and the one `routes::lineage` names
+`table:serving.<name>`. A stored pipeline can still carry `gold` as its source
+or target zone from before that rule; `_canonical_clickhouse_zone` maps it to
+`serving` here so a run never `CREATE`s an orphan `gold` database that neither
+the catalog nor lineage lists. `bronze` is deliberately not mapped: refusing
+it as a target is the rule these runs fail with, not a spelling to fold away.
+
 BLD-1 part 1 / D14: this module no longer builds SQL. It asks the API for
 the statement (`POST /api/pipelines/runnable/{id}/compile`) and runs it.
 
@@ -256,6 +267,19 @@ FBIC_UNSUPPORTED_REASON = (
 BRONZE_TARGET_REFUSED_REASON = (
     "a pipeline cannot write to bronze; bronze is written by ingestion"
 )
+
+
+def _canonical_clickhouse_zone(zone: str) -> str:
+    """The one ClickHouse database a zone names (BLD-19): Gold is `serving`,
+    the database `routes::catalog` lists and `routes::lineage` names. A stored
+    definition can still say `gold` from before that rule; treating the two
+    spellings as the same zone keeps such a pipeline writing to a database
+    the catalog and lineage both list instead of creating an orphan `gold`
+    one. `bronze` is left alone on purpose — its refusal as a target is a
+    separate rule, not a spelling to normalise away.
+    """
+    return "serving" if zone == "gold" else zone
+
 
 # BLD-7 / decision 3 + `DEC-15`: a pipeline's `connectorId` says where its
 # data came from, never that the run should read the source again. The API
@@ -459,7 +483,13 @@ def _ensure_target_table(
 
     `SELECT ... AS ... LIMIT 0` is the FIRST statement that may read a Bronze
     source, so it carries the read setting when it does (`_reading`); the
-    `CREATE DATABASE` above it writes only and never carries one."""
+    `CREATE DATABASE` above it writes only and never carries one.
+
+    BLD-19: the zone is normalised here as well as at the op boundary, so a
+    legacy `gold` definition can never make this helper issue
+    `CREATE DATABASE IF NOT EXISTS gold` — only `serving`, `silver`, `lake`,
+    ... the catalog knows about."""
+    target_zone = _canonical_clickhouse_zone(target_zone)
     _ch_exec(target, f"CREATE DATABASE IF NOT EXISTS {target_zone}")
     _ch_exec(
         target,
@@ -512,6 +542,10 @@ def _write_clickhouse_table(
     run is retryable because no committed write happened to the live
     target.
     """
+    # BLD-19: normalise before ANY statement is formatted, so every table in
+    # the swap sequence names the Gold database the catalog lists, whether
+    # the stored definition says `serving` or a legacy `gold`.
+    target_zone = _canonical_clickhouse_zone(target_zone)
     _ensure_target_table(target, target_zone, target_table, select_sql, reads_iceberg)
     staging_table = f"__staging_{target_table}"
     # Idempotency under retry: drop any staging table left behind from
@@ -547,7 +581,25 @@ def _write_clickhouse_table(
 
 
 def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
-    definition = pipeline["definition"]
+    # BLD-19: read a NORMALISED copy of the definition. The op's source tags
+    # (`reads`/`writes`) and its body below all come from this one copy, so a
+    # legacy `gold` source or target names `serving` in the metadata, in every
+    # statement the op sends and in the asset materialization it logs. The
+    # stored row is not mutated: this is a read-time normalisation of the zone
+    # spelling, not a rewrite of the pipeline.
+    definition = dict(pipeline["definition"])
+    definition["sourceZone"] = _canonical_clickhouse_zone(definition.get("sourceZone", ""))
+    definition["targetZone"] = _canonical_clickhouse_zone(definition.get("targetZone", ""))
+    inputs = definition.get("inputs")
+    if isinstance(inputs, list):
+        definition["inputs"] = [
+            (
+                {**input_, "zone": _canonical_clickhouse_zone(input_.get("zone", ""))}
+                if isinstance(input_, dict)
+                else input_
+            )
+            for input_ in inputs
+        ]
     pid = pipeline["id"]
     safe_name = _dagster_safe_name(pid)
 
@@ -1115,7 +1167,7 @@ def build_authored_dependency_sensor(
     # loaded", and only a `bronze` source names such a table -- the zone a
     # load writes (`routes::uploads::run_config`,
     # `ingest_factory.py`'s `bronze.<target>` materialization). A pipeline
-    # whose source is `silver`/`gold`/... has no Bronze table to match, so
+    # whose source is `silver`/`serving` (Gold)/... has no Bronze table to match, so
     # its filtered upstream matches nothing and the chain waits with a
     # reason rather than firing on every load. The API refuses that
     # combination on create/update/restore

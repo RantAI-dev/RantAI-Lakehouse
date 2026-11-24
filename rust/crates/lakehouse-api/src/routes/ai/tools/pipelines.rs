@@ -1237,6 +1237,62 @@ mod t1_3_tests {
         );
     }
 
+    /// BLD-19: the assistant's `create_pipeline` advertises `serving` as
+    /// the Gold zone and lands on the same CREATE route as the console.
+    /// A Gold pipeline it authors must therefore store `serving.mart` —
+    /// the id the catalog and lineage use — not an orphan `gold.mart`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_pipeline_with_a_serving_target_stores_serving(pool: PgPool) {
+        let (state, _dagster) = state_with_pg(&pool).await;
+        let user: Uuid =
+            sqlx::query_scalar("SELECT id FROM app_user WHERE email = 'fajar@meridian.example'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let tenant: Uuid =
+            sqlx::query_scalar("SELECT tenant_id FROM app_user_tenant WHERE user_id = $1 LIMIT 1")
+                .bind(user)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let principal = Principal {
+            id: PrincipalId::User(user),
+            tenant_ids: vec![tenant],
+            display_name: "Platform Admin".to_owned(),
+            permissions: PermissionSet::parse("*:*"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
+
+        let mut args = Map::new();
+        args.insert("name".to_owned(), json!("tool-serving-target"));
+        args.insert(
+            "inputs".to_owned(),
+            json!([{ "name": "mart", "zone": "serving", "table": "mart_source" }]),
+        );
+        args.insert(
+            "steps".to_owned(),
+            json!([{ "name": "projected", "kind": "sql", "sql": "SELECT * FROM mart" }]),
+        );
+        args.insert("targetZone".to_owned(), json!("serving"));
+        args.insert("targetTable".to_owned(), json!("tool_serving_out"));
+
+        let created = create_pipeline(&state, Some(&principal), &args).await;
+        assert_eq!(created["target"], "serving.tool_serving_out", "{created}");
+        let id = created["id"].as_str().expect("the created pipeline's id");
+        let stored = lakehouse_store::pipelines::get_pipeline(&pool, id)
+            .await
+            .expect("get_pipeline")
+            .expect("the pipeline exists");
+        assert_eq!(stored.target, "serving.tool_serving_out");
+        let definition = lakehouse_store::pipelines::get_definition(&pool, id)
+            .await
+            .expect("get_definition")
+            .expect("the definition exists");
+        assert_eq!(definition.inputs[0].zone, "serving");
+    }
+
     /// BLD-16 / J8: the assistant's `create_pipeline` takes a `join` and an
     /// `aggregate` form step, and the created definition keeps them — the
     /// tool calls the CREATE route, so the whole save-time check (D2–D6,

@@ -1762,7 +1762,7 @@ fn create_pipeline_schema() -> Value {
     // to beats a raised `recursion_limit` the whole crate would carry.
     let steps = create_pipeline_steps_parameter();
     json!({ "type": "function", "function": { "name": "create_pipeline",
-        "description": "Author a new pipeline that reads tables and writes a target table, saved as a draft; mark_pipeline_ready makes it runnable. Source zones: bronze, silver, gold. Target zones: silver, gold; a pipeline never writes bronze, which ingestion writes. A pipeline is 1-5 named inputs and 0-20 named steps, in one of two shapes: (a) inputs and steps, where a step is { name, kind: 'sql', sql } (one read-only SELECT over the inputs and earlier steps by name; every table you read must be listed under inputs), { name, kind: 'transform', reads, transforms }, or a form step: { name, kind: 'join', left, right, joinType, on, columns }, { name, kind: 'aggregate', reads, groupBy, measures, havingMatch, having }, { name, kind: 'filter', reads, match, conditions }; or (b) sourceZone, sourceTable and transforms, one input and one transform step. Send one shape, never both. Prefer a form step when it says what the person asked, because they can then change it in the form; use a SQL step for a CASE, a calculated column, a window function, a join that is not on equal columns, or mixed all and any. A join matches on equal columns only, 1-10 pairs; look its sides' columns up first with describe_mart, describe_dataset or run_sql and list every output column. A measure's name cannot be a column the step reads; a having names a group-by column or a measure; values are text, except a count, sum or average compared with a number. Transforms: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
+        "description": "Author a new pipeline that reads tables and writes a target table, saved as a draft; mark_pipeline_ready makes it runnable. Source zones: bronze, silver, serving. Target zones: silver, serving. Gold marts live in the ClickHouse serving database -- that is the zone for Gold inputs and outputs, matching the catalog and describe_mart. A pipeline never writes bronze, which ingestion writes. A pipeline is 1-5 named inputs and 0-20 named steps, in one of two shapes: (a) inputs and steps, where a step is { name, kind: 'sql', sql } (one read-only SELECT over the inputs and earlier steps by name; every table you read must be listed under inputs), { name, kind: 'transform', reads, transforms }, or a form step: { name, kind: 'join', left, right, joinType, on, columns }, { name, kind: 'aggregate', reads, groupBy, measures, havingMatch, having }, { name, kind: 'filter', reads, match, conditions }; or (b) sourceZone, sourceTable and transforms, one input and one transform step. Send one shape, never both. Prefer a form step when it says what the person asked, because they can then change it in the form; use a SQL step for a CASE, a calculated column, a window function, a join that is not on equal columns, or mixed all and any. A join matches on equal columns only, 1-10 pairs; look its sides' columns up first with describe_mart, describe_dataset or run_sql and list every output column. A measure's name cannot be a column the step reads; a having names a group-by column or a measure; values are text, except a count, sum or average compared with a number. Transforms: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
         "parameters": { "type": "object", "properties": {
             "name": { "type": "string" },
             "description": { "type": "string" },
@@ -1770,13 +1770,13 @@ fn create_pipeline_schema() -> Value {
                 "description": "the tables the pipeline reads, each with the short name its steps use",
                 "items": { "type": "object", "properties": {
                     "name": { "type": "string", "description": "name steps read it by, letters digits and _ only" },
-                    "zone": { "type": "string", "enum": ["bronze", "silver", "gold"] },
+                    "zone": { "type": "string", "enum": ["bronze", "silver", "serving"] },
                     "table": { "type": "string" } },
                     "required": ["name", "zone", "table"] } },
             "steps": steps,
-            "sourceZone": { "type": "string", "enum": ["bronze", "silver", "gold"] },
+            "sourceZone": { "type": "string", "enum": ["bronze", "silver", "serving"] },
             "sourceTable": { "type": "string" },
-            "targetZone": { "type": "string", "enum": ["silver", "gold"] },
+            "targetZone": { "type": "string", "enum": ["silver", "serving"] },
             "targetTable": { "type": "string" },
             "transforms": { "type": "array", "items": { "type": "string" } },
             "incrementalColumn": { "type": "string", "description": "optional column for incremental loads" },
@@ -3601,6 +3601,37 @@ mod tests {
              (rust/crates/lakehouse-api/tests/fixtures/tool_schemas.json) — \
              regenerate the fixture ONLY for an intentional, reviewed \
              schema change, never to make this test pass during a refactor"
+        );
+    }
+
+    /// BLD-19: the assistant must not be told to write a `gold` database
+    /// that the catalog does not list. Gold lives in `serving`, both as an
+    /// input zone and as a target zone; the description says so explicitly
+    /// so the model can map a request for "Gold" onto the right enum value.
+    #[test]
+    fn create_pipeline_schema_names_serving_as_the_gold_zone() {
+        let schema = (find("create_pipeline").expect("registered tool").schema)();
+        let properties = &schema["function"]["parameters"]["properties"];
+        assert_eq!(
+            properties["targetZone"]["enum"],
+            json!(["silver", "serving"])
+        );
+        assert_eq!(
+            properties["sourceZone"]["enum"],
+            json!(["bronze", "silver", "serving"])
+        );
+        assert_eq!(
+            properties["inputs"]["items"]["properties"]["zone"]["enum"],
+            json!(["bronze", "silver", "serving"])
+        );
+        let description = schema["function"]["description"]
+            .as_str()
+            .expect("a description");
+        assert!(description.contains("Target zones: silver, serving"));
+        assert!(description.contains("Gold marts live in the ClickHouse serving database"));
+        assert!(
+            !description.contains("silver, gold"),
+            "the old zone spelling must not be advertised to the model"
         );
     }
 

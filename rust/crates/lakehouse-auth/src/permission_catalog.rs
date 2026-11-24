@@ -139,6 +139,13 @@ pub const PERMISSIONS: &[PermissionInfo] = &[
         area: "Pipelines",
         description: "Publish Gold marts and export them as open files.",
     },
+    // SEC-66: the read side of Gold is a separate grant from publishing —
+    // opening the exports page must not require the power to export.
+    PermissionInfo {
+        name: "gold:read",
+        area: "Pipelines",
+        description: "View Gold mart exports, publication state and outside readers.",
+    },
     // ── Governance ───────────────────────────────────────────────────────
     PermissionInfo {
         name: "policy:read",
@@ -206,6 +213,13 @@ pub const PERMISSIONS: &[PermissionInfo] = &[
         name: "assistant:ask",
         area: "Assistant",
         description: "The assistant in Ask mode only. Its read tools may read tables, metrics and the catalog that the person may read (masks, row filters and GOV-7 still apply).",
+    },
+    // SEC-66: reading an agent's run history is a distinct, read-only grant
+    // in the same `agent` family as `agent:approve` and `agent:manage`.
+    PermissionInfo {
+        name: "agent:read",
+        area: "Assistant",
+        description: "View assistant agent runs and their step history.",
     },
     PermissionInfo {
         name: "agent:approve",
@@ -359,6 +373,23 @@ mod tests {
             .find(|p| p.name == "usage:read")
             .expect("usage:read must be in the catalog");
         assert_eq!(entry.area, "Operations");
+    }
+
+    /// `SEC-66`: both new read permissions are offered by the picker, in
+    /// the areas their existing write/approve siblings already use, so an
+    /// administrator can grant them from Settings > Roles.
+    #[test]
+    fn gold_read_and_agent_read_are_offered_under_their_existing_families() {
+        let gold = PERMISSIONS
+            .iter()
+            .find(|p| p.name == "gold:read")
+            .expect("gold:read must be in the catalog");
+        assert_eq!(gold.area, "Pipelines");
+        let agent = PERMISSIONS
+            .iter()
+            .find(|p| p.name == "agent:read")
+            .expect("agent:read must be in the catalog");
+        assert_eq!(agent.area, "Assistant");
     }
 
     /// `WEB-8` D1: the four strings seeded into built-in roles but never

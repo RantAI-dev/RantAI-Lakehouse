@@ -25,8 +25,9 @@ questions:
   - which image does this service run? (`compose_images`)
   - which of those are ours, and which are theirs? (`third_party`)
 
-OURS are the services the pipeline published — the four images this
-repository builds, published by digest. THEIRS is every other service:
+OURS are the services the pipeline published — the five images this
+repository builds, published by digest (REL-16 added the init image).
+THEIRS is every other service:
 a third-party image, which the S1 lint already pinned by digest.
 
 Their integrity does NOT come from a signature. We cannot sign another
@@ -100,8 +101,8 @@ def third_party(images: dict[str, str], published: dict[str, str]) -> dict[str, 
     """The images this repository did NOT publish.
 
     The published map is service -> reference: the services that run
-    the four images the pipeline built and pushed. Every other service
-    runs a third-party image.
+    the images the pipeline built and pushed. Every other service runs a
+    third-party image.
     """
     return {
         service: reference

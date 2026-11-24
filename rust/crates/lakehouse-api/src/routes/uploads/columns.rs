@@ -478,37 +478,21 @@ pub(super) fn parse_report(bytes: &[u8]) -> Option<Value> {
     Some(json!({ "count": count, "byColumn": by_column, "rows": rows }))
 }
 
-/// After a typed load is settled, keep the job's report on the upload, whatever
-/// the outcome (a `stop` load fails with it, a `null` load succeeds with it).
-/// Returns the row as it is afterwards. A missing or unreadable report changes
-/// nothing: no values to report is the common case. Never fails the settling.
-pub(super) async fn keep_report(
-    state: &AppState,
-    pool: &lakehouse_store::PgPool,
-    row: Upload,
-    run_id: &str,
-) -> Upload {
-    if row.column_spec.is_none() {
-        return row;
-    }
-    let Ok(store) = crate::upload_store::UploadStore::connect(&state.config).await else {
-        return row;
-    };
+/// Read the job's report of values that did not fit, BEFORE the upload row is
+/// settled (`REL-15`). The caller writes it in the same `UPDATE` as the terminal
+/// status, so a reader never sees `failed`/`ingested` without the report that
+/// belongs to it. The report is read from object storage only for a typed load
+/// (`DATA-18`). A missing, unreadable or malformed report is no report — the
+/// load still settles, and missing bad values are the honest answer. Never
+/// fails the settling.
+pub(super) async fn read_report(state: &AppState, row: &Upload) -> Option<Value> {
+    row.column_spec.as_ref()?;
+    let store = crate::upload_store::UploadStore::connect(&state.config)
+        .await
+        .ok()?;
     let key = report_key(&row.storage_key);
-    let Ok(bytes) = store.head_bytes(&key, MAX_REPORT_BYTES).await else {
-        return row;
-    };
-    let Some(report) = parse_report(&bytes) else {
-        return row;
-    };
-    match uploads::record_bad_values(pool, &row.id, run_id, &report).await {
-        Ok(true) => uploads::get(pool, &row.id)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(row),
-        _ => row,
-    }
+    let bytes = store.head_bytes(&key, MAX_REPORT_BYTES).await.ok()?;
+    parse_report(&bytes)
 }
 
 #[cfg(test)]

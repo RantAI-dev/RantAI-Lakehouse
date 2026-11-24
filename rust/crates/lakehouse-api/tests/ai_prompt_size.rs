@@ -51,12 +51,10 @@ struct Measured {
 
 /// Runs one turn as `cookie` and reads the first request the model got.
 async fn measure(mode: &str, principal: Principal) -> Measured {
-    // The DATA MAP cache is one entry for the whole process, kept for two
-    // minutes, and its text is part of the system message. A chat that ran
-    // earlier in the same process would leave its map behind and move the
-    // totals with test order, so the cache is cleared here and every total
-    // is measured against the map this test's own mocks produce (`AI-32`).
-    lakehouse_api::clear_data_map_cache().await;
+    // `OPS-36`: the DATA MAP cache lives on each `AppState`, so this app
+    // builds and reuses its own map. A chat that ran earlier in the same
+    // process can no longer leave its map behind, and every total is
+    // measured against the map this test's own mocks produce (`AI-32`).
     let llm = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -170,7 +168,7 @@ fn size(text: &str) -> (usize, usize) {
 /// measured total. The admin Build ceiling is above the owner's earlier
 /// target of 68,000, which the sweep did not reach.
 ///
-/// [`measure`] clears the data-map cache before each turn, so a total is the
+/// `OPS-36` scoped the data-map cache to each `AppState`, so a total is the
 /// same when this file runs alone and when the whole suite runs (`AI-32`).
 const ADMIN_BUILD_CEILING: usize = 76_407;
 const ADMIN_ASK_CEILING: usize = 19_724;

@@ -637,6 +637,15 @@ const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
 // short sentence naming it, and trimmed to fit the viewer ceiling with the
 // ceilings unchanged. The new hash is the old bytes with the rewritten block
 // in place of the old four bullets. (Before: `f77c95e5...762ae1ed`.)
+//
+// Checked for `BLD-19` (PR #707 review fix, ci-required failure on da2a7c9):
+// `create_pipeline`'s tool description now names `serving` instead of `gold`,
+// but that description lives in the registry schema, which travels in the
+// request's `tools` array — not in these system-prompt bytes. The prompt's
+// own Pipelines line (`prompt.rs`) names the tool only ("authors one as a
+// draft") and carries no zone words, so this pin does not move; the zone
+// wording is pinned by `tests/fixtures/tool_schemas.json` instead. The
+// offered-tool list above is untouched — no tool was added or removed.
 const SYSTEM_SHA256_WITHOUT_ALLOWLIST: &str =
     "61ee27897923e5f8bdbd74f359bd2086f65e23948a685f742b819e71e113d159";
 
@@ -653,13 +662,10 @@ fn sha256_hex(text: &str) -> String {
 #[tokio::test]
 async fn a_chat_with_no_allowlist_is_offered_today_s_tools_and_today_s_prompt() {
     for switch in ["true", "false"] {
-        // The DATA MAP cache is one entry for the whole process, kept for two
-        // minutes: a chat that ran before this one in the same process would
-        // leave its map behind, and the prompt's bytes would then be the ones
-        // of that map instead of the ones this test mocks. The cache is
-        // cleared here, so the pin is the same in one process as it is alone
-        // (`AI-32`).
-        lakehouse_api::clear_data_map_cache().await;
+        // OPS-36: the DATA MAP cache lives on each AppState now, so this app
+        // gets the map its own mocks build. A chat in another test app can no
+        // longer leave its map in a process-wide slot and change the pinned
+        // bytes, even when the assistant tests run in parallel (`AI-32`).
         let llm = mock_model(vec![model_round(Some("Hi."), &[])]).await;
         let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
 

@@ -1608,21 +1608,46 @@ impl<'a> Settler<'a> {
 
     /// Write `outcome` under `run_id`. A reader that lost the race, or lost
     /// the row to a delete, returns whatever is there now.
+    ///
+    /// `REL-15`: the report is read while the row is still `ingesting`, then
+    /// status, error, row count and bad values are written by ONE update
+    /// ([`uploads::mark_finished_with_bad_values`]). A reader that settles the
+    /// same run concurrently either wins that update — and gets the whole row
+    /// back — or re-reads the winner's row: nobody observes a terminal status
+    /// before its report. Reading first is safe: the job writes the report in
+    /// the `finally` around the load, before it records the run's outcome.
     async fn record(&self, row: Upload, run_id: Option<&str>, outcome: &Outcome) -> Upload {
+        let report = if run_id.is_some() {
+            columns::read_report(self.state, &row).await
+        } else {
+            None
+        };
         let settled = match outcome {
             Outcome::Ingested { rows } => {
-                uploads::mark_finished(self.pool, &row.id, run_id, None, *rows).await
+                uploads::mark_finished_with_bad_values(
+                    self.pool,
+                    &row.id,
+                    run_id,
+                    None,
+                    *rows,
+                    report.as_ref(),
+                )
+                .await
             }
             Outcome::Failed(reason) => {
-                uploads::mark_finished(self.pool, &row.id, run_id, Some(reason), None).await
+                uploads::mark_finished_with_bad_values(
+                    self.pool,
+                    &row.id,
+                    run_id,
+                    Some(reason),
+                    None,
+                    report.as_ref(),
+                )
+                .await
             }
         };
         match settled {
-            Ok(Some(updated)) => match run_id {
-                // `DATA-18`: a typed load may have left a report of values that did not fit.
-                Some(run_id) => columns::keep_report(self.state, self.pool, updated, run_id).await,
-                None => updated,
-            },
+            Ok(Some(updated)) => updated,
             Ok(None) => uploads::get(self.pool, &row.id)
                 .await
                 .ok()

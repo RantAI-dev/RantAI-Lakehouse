@@ -5374,7 +5374,7 @@
     "type": "function",
     "function": {
       "name": "create_pipeline",
-      "description": "Author a new pipeline that reads tables and writes a target table, saved as a draft; mark_pipeline_ready makes it runnable. Source zones: bronze, silver, gold. Target zones: silver, gold; a pipeline never writes bronze, which ingestion writes. A pipeline is 1-5 named inputs and 0-20 named steps, in one of two shapes: (a) inputs and steps, where a step is { name, kind: 'sql', sql } (one read-only SELECT over the inputs and earlier steps by name; every table you read must be listed under inputs), { name, kind: 'transform', reads, transforms }, or a form step: { name, kind: 'join', left, right, joinType, on, columns }, { name, kind: 'aggregate', reads, groupBy, measures, havingMatch, having }, { name, kind: 'filter', reads, match, conditions }; or (b) sourceZone, sourceTable and transforms, one input and one transform step. Send one shape, never both. Prefer a form step when it says what the person asked, because they can then change it in the form; use a SQL step for a CASE, a calculated column, a window function, a join that is not on equal columns, or mixed all and any. A join matches on equal columns only, 1-10 pairs; look its sides' columns up first with describe_mart, describe_dataset or run_sql and list every output column. A measure's name cannot be a column the step reads; a having names a group-by column or a measure; values are text, except a count, sum or average compared with a number. Transforms: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
+      "description": "Author a new pipeline that reads tables and writes a target table, saved as a draft; mark_pipeline_ready makes it runnable. Source zones: bronze, silver, serving. Target zones: silver, serving. Gold marts live in the ClickHouse serving database -- that is the zone for Gold inputs and outputs, matching the catalog and describe_mart. A pipeline never writes bronze, which ingestion writes. A pipeline is 1-5 named inputs and 0-20 named steps, in one of two shapes: (a) inputs and steps, where a step is { name, kind: 'sql', sql } (one read-only SELECT over the inputs and earlier steps by name; every table you read must be listed under inputs), { name, kind: 'transform', reads, transforms }, or a form step: { name, kind: 'join', left, right, joinType, on, columns }, { name, kind: 'aggregate', reads, groupBy, measures, havingMatch, having }, { name, kind: 'filter', reads, match, conditions }; or (b) sourceZone, sourceTable and transforms, one input and one transform step. Send one shape, never both. Prefer a form step when it says what the person asked, because they can then change it in the form; use a SQL step for a CASE, a calculated column, a window function, a join that is not on equal columns, or mixed all and any. A join matches on equal columns only, 1-10 pairs; look its sides' columns up first with describe_mart, describe_dataset or run_sql and list every output column. A measure's name cannot be a column the step reads; a having names a group-by column or a measure; values are text, except a count, sum or average compared with a number. Transforms: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
       "parameters": {
         "type": "object",
         "properties": {
@@ -5401,7 +5401,7 @@
                   "enum": [
                     "bronze",
                     "silver",
-                    "gold"
+                    "serving"
                   ]
                 },
                 "table": {
@@ -5658,7 +5658,7 @@
             "enum": [
               "bronze",
               "silver",
-              "gold"
+              "serving"
             ]
           },
           "sourceTable": {
@@ -5668,7 +5668,7 @@
             "type": "string",
             "enum": [
               "silver",
-              "gold"
+              "serving"
             ]
           },
           "targetTable": {
