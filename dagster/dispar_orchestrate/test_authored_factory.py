@@ -50,6 +50,7 @@ from dagster import (
 )
 
 from dispar_orchestrate import authored_factory
+from dispar_orchestrate.incremental_write import IncrementalConfig, MaterializationResult
 from dispar_orchestrate.authored_factory import (
     DAGSTER_LOCATION,
     DAGSTER_REPO,
@@ -3005,3 +3006,42 @@ class CodeLocationLoadMutationTest(unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn("Duplicate", message)
         self.assertIn("authored__pl_down_1", message)
+
+
+class BLD12FactoryHookTest(unittest.TestCase):
+    """The runnable payload's top-level `kind` and the op's `full_refresh`
+    config must both reach the writer; otherwise an incremental pipeline
+    silently degrades to a full rebuild on every run."""
+
+    def test_full_refresh_config_and_runnable_kind_reach_the_writer(self) -> None:
+        definition = {
+            "sourceZone": "silver", "sourceTable": "orders",
+            "targetZone": "serving", "targetTable": "orders_clean",
+            "incrementalColumn": "event_time",
+            "incrementalStrategy": "partition_replace",
+            "partitionGranularity": "day", "lookbackHours": 6,
+            "transforms": [], "fbicEnabled": False, "maxRetries": 2,
+        }
+        pipeline = {"id": "pl-bld12", "status": "ready", "kind": "incremental", "definition": definition}
+        resp = mock.Mock(status_code=200)
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"sql": "SELECT id, event_time FROM silver.`orders`", "readsIceberg": False}
+        seen: dict[str, Any] = {}
+
+        def fake_writer(*args: Any, **_kwargs: Any) -> MaterializationResult:
+            seen["config"] = args[5]
+            return MaterializationResult(rows=0, materialization_mode="full", full_reason="requested")
+
+        with mock.patch.object(authored_factory, "_compiled_sql", return_value=("SELECT 1", False)), \
+             mock.patch.object(authored_factory, "write_incrementally", side_effect=fake_writer), \
+             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")), \
+             mock.patch.object(authored_factory, "AuthoredPipelineConfig", return_value=_cfg()), \
+             mock.patch.object(authored_factory.requests, "post", return_value=resp):
+            run_fn = authored_factory._op_for_pipeline(pipeline)
+            run_fn(build_op_context(op_config={"full_refresh": True}))
+
+        config = seen["config"]
+        self.assertIsInstance(config, IncrementalConfig)
+        self.assertEqual(config.kind, "incremental")
+        self.assertEqual(config.strategy, "partition_replace")
+        self.assertTrue(config.full_refresh)

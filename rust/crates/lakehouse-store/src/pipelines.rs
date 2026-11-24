@@ -2030,6 +2030,10 @@ pub async fn delete_pipeline(
 struct RunnableRow {
     id: String,
     name: String,
+    /// BLD-12: the factory needs the authored kind next to the definition —
+    /// `AuthoredDefinition` holds only inputs/steps/target, so without this
+    /// every run would be treated as a batch full rebuild.
+    kind: String,
     status: String,
     schedule: String,
     /// BLD-12: mirrored on [`RunnablePipeline`] next to the definition so a
@@ -2057,6 +2061,9 @@ pub struct RunnablePipeline {
     pub id: String,
     /// Display name.
     pub name: String,
+    /// BLD-12: the authored kind (`batch` or `incremental`). The factory reads
+    /// this to decide the materialization strategy.
+    pub kind: String,
     /// `ready` or `paused`: a paused pipeline still has a job (so it can be
     /// run by hand); only its schedule is stopped.
     pub status: String,
@@ -2109,7 +2116,7 @@ pub struct RunnablePipeline {
 /// Returns [`StoreError::Database`] if a query fails.
 pub async fn list_runnable_pipelines(pool: &PgPool) -> Result<Vec<RunnablePipeline>, StoreError> {
     let rows: Vec<RunnableRow> = sqlx::query_as(
-        "SELECT id, name, status, schedule, incremental_column, \
+        "SELECT id, name, kind, status, schedule, incremental_column, \
              incremental_strategy, partition_granularity, lookback_hours, \
              depends_on, target_lag_seconds, target_lag_downstream, tenant_id \
              FROM pipeline_definition \
@@ -2124,6 +2131,7 @@ pub async fn list_runnable_pipelines(pool: &PgPool) -> Result<Vec<RunnablePipeli
             out.push(RunnablePipeline {
                 id: row.id,
                 name: row.name,
+                kind: row.kind,
                 status: row.status,
                 schedule: row.schedule,
                 incremental_column: row.incremental_column,

@@ -732,7 +732,11 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
                 compiled_sql,
                 reads_iceberg,
                 IncrementalConfig.from_payload(
-                    definition,
+                    # The runnable payload carries `kind` at the TOP level
+                    # (RunnablePipeline.kind) and the materialization fields on
+                    # `definition`. Merge them so a legacy definition dict that
+                    # has no `kind` still runs as the full rebuild it always did.
+                    {**definition, "kind": pipeline.get("kind", definition.get("kind"))},
                     bool(context.op_config.get("full_refresh", False)),
                 ),
             )

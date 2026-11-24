@@ -191,6 +191,7 @@ async fn incremental_materialization_fields_round_trip_through_every_read(
         .iter()
         .find(|p| p.id == created.id)
         .expect("runnable");
+    assert_eq!(one.kind, "incremental");
     assert_eq!(one.incremental_strategy, "partition_replace");
     assert_eq!(one.partition_granularity, "month");
     assert_eq!(one.lookback_hours, 24);
