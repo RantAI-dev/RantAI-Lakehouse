@@ -2125,6 +2125,10 @@ mod tests {
     /// An authored Bronze-to-Silver pipeline with a `minutes`-target lag.
     fn pipeline(id: &str, minutes: i32) -> Pipeline {
         Pipeline {
+            incremental_column: None,
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             id: id.to_owned(),
             name: id.to_owned(),
             kind: "batch".to_owned(),

@@ -303,7 +303,13 @@ pub(super) async fn trigger_pipeline(
         return json!({ "error": "id is required" });
     }
     let run_config = args.get("runConfig").cloned();
-    let body = Json(TriggerBody { run_config });
+    // BLD-12: `fullRefresh` on a tool call means the same thing as on the
+    // console's button — a full atomic rebuild of the authored target.
+    let full_refresh = args.get("fullRefresh").and_then(Value::as_bool);
+    let body = Json(TriggerBody {
+        run_config,
+        full_refresh,
+    });
     let extension = principal.cloned().map(Extension);
     response_to_value(
         crate::routes::pipelines::trigger(
