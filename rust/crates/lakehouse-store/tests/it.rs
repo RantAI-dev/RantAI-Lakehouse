@@ -55,6 +55,7 @@ mod report_subscriptions;
 mod reporting_settings;
 mod schema;
 mod schema_change;
+mod sec66_read_permissions;
 mod semantic;
 mod sessions;
 mod upload_folders;

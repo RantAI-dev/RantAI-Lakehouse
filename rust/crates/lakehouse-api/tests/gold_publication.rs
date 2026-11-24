@@ -241,11 +241,11 @@ async fn put_publication_is_denied_to_a_principal_without_gold_export() {
     assert_eq!(status, StatusCode::FORBIDDEN, "403 from the auth gate");
 }
 
-/// The scheduler's list route has TWO layers: the `RequiresAuth` floor
-/// (covered by `route_auth.rs`) PLUS `check_export_token` in the handler
-/// (the plan's own requirement). A session that clears the floor but
-/// holds neither `gold:export` nor the shared token must not read the
-/// publication list.
+/// The scheduler's list route has TWO layers: the SEC-66 read grant in
+/// `POLICY_TABLE` PLUS `check_export_token` in the handler (the plan's own
+/// requirement). A session holding neither a Gold grant nor the shared
+/// token must not read the publication list — since SEC-66 it is refused
+/// at the gate (403) before the handler's token branch is ever reached.
 #[tokio::test]
 async fn publications_list_still_requires_the_export_permission_beyond_the_auth_floor() {
     let (app, _ch) = spin_up_with_clickhouse().await;
@@ -261,8 +261,11 @@ async fn publications_list_still_requires_the_export_permission_beyond_the_auth_
     )
     .await;
     assert!(
-        status == StatusCode::UNAUTHORIZED || status == StatusCode::SERVICE_UNAVAILABLE,
-        "check_export_token must refuse a session without gold:export, got {status}"
+        status == StatusCode::FORBIDDEN
+            || status == StatusCode::UNAUTHORIZED
+            || status == StatusCode::SERVICE_UNAVAILABLE,
+        "neither the SEC-66 policy gate nor check_export_token may let a session \
+         without a Gold grant or the shared token read the list, got {status}"
     );
 }
 
@@ -393,14 +396,15 @@ async fn enabling_lists_a_mart_and_disabling_removes_it_from_the_list() {
 
 /// A mart that exists but was never switched on reports the OFF default:
 /// `enabled: false, updatedAt: null`, honest nulls for both freshness
-/// facts it cannot have yet, and `canEdit: false` for a session without
-/// `gold:export` (the floor is only `RequiresAuth` here — read-only).
+/// facts it cannot have yet, and `canEdit: false` for a reader who holds
+/// `gold:read` but not `gold:export` (SEC-66 made the detail read-gated,
+/// while the edit button still follows the write permission).
 #[tokio::test]
 async fn detail_defaults_for_a_never_enabled_mart_are_the_off_state() {
     let (app, ch) = spin_up_with_clickhouse().await;
     seed_mart(&ch, "plain_mart").await;
     let sessions = Sessions { app };
-    let cookie = sessions.with("").await;
+    let cookie = sessions.with("gold:read").await;
 
     let (status, body) = send(
         &sessions.app.router,

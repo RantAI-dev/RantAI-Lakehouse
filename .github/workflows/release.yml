@@ -1543,13 +1543,17 @@ jobs:
       - name: Cut the runner off from the registries
         run: |
           set -euo pipefail
+          # The hosts sinkhole is belt-and-suspenders (REL-12): it catches
+          # name resolution, and the two firewalls below catch a cached
+          # answer or a direct-IP pull that bypasses DNS. Registries AND
+          # package mirrors resolve to 0.0.0.0, so a host `docker pull` or
+          # an `apk add` cannot reach them. REL-16: the Alpine CDN is named
+          # even though the init containers no longer install packages at
+          # start — that is the regression this proof must catch.
+          #
           # The HOST keeps its route to GitHub: the Actions runner's control
-          # channel is not a container, and blocking host OUTPUT would kill
-          # this job. Registries AND package mirrors resolve to 0.0.0.0, so
-          # a host `docker pull` or an `apk add` cannot reach them. REL-16:
-          # the Alpine CDN is named even though the init containers no
-          # longer install packages at start — that is the regression this
-          # proof must catch.
+          # channel is neither a container (so DOCKER-USER does not touch it)
+          # nor uid 0 (so the host OUTPUT firewall does not touch it).
           for host in registry-1.docker.io auth.docker.io index.docker.io \
             ghcr.io quay.io production.cloudflare.docker.com \
             dl-cdn.alpinelinux.org; do
@@ -1581,7 +1585,16 @@ jobs:
             *) echo "::error::DOCKER-USER has no REJECT rule: $rules"; exit 1 ;;
           esac
 
-          # The host side of the cut is proved the way it always was: a
+          # REL-12: the real HOST cutoff. `dockerd`/`containerd` leave the
+          # host in OUTPUT as uid 0; blocking only that uid's 80/443 leaves
+          # Runner.Worker's HTTPS (non-root), loopback and container traffic
+          # (FORWARD/DOCKER-USER, just cut above) untouched. The two cuts are
+          # complementary: this one owns host OUTPUT, DOCKER-USER owns
+          # container FORWARD, and neither touches the runner's GitHub
+          # control channel.
+          sudo bash ops/release/airgap_firewall.sh enable
+
+          # Both sides of the cut are proved the way they always were: a
           # pull of an image that is not in the bundle must fail.
           if docker pull alpine:3.20; then
             echo "::error::the runner can still pull from a registry: the proof is not air-gapped"
@@ -1716,6 +1729,17 @@ jobs:
         if: always()
         run: |
           docker compose -p rantai-lakehouse ps || true
+
+      - name: Restore outbound firewall rules
+        if: always()
+        run: |
+          set -euo pipefail
+          # REL-12: the air gap is job-scoped. Remove it even when a
+          # proof step failed, so the chain never outlives this job.
+          # The guard covers a failed checkout: no script, no chain.
+          if [ -f ops/release/airgap_firewall.sh ]; then
+            sudo bash ops/release/airgap_firewall.sh disable
+          fi
 
   update-proof:
     name: Proof · the update moves the stack, and rolls back
@@ -2112,13 +2136,17 @@ jobs:
       - name: Cut the runner off from the registries
         run: |
           set -euo pipefail
+          # The hosts sinkhole is belt-and-suspenders (REL-12): it catches
+          # name resolution, and the two firewalls below catch a cached
+          # answer or a direct-IP pull that bypasses DNS. Registries AND
+          # package mirrors resolve to 0.0.0.0, so a host `docker pull` or
+          # an `apk add` cannot reach them. REL-16: the Alpine CDN is named
+          # even though the init containers no longer install packages at
+          # start — that is the regression this proof must catch.
+          #
           # The HOST keeps its route to GitHub: the Actions runner's control
-          # channel is not a container, and blocking host OUTPUT would kill
-          # this job. Registries AND package mirrors resolve to 0.0.0.0, so
-          # a host `docker pull` or an `apk add` cannot reach them. REL-16:
-          # the Alpine CDN is named even though the init containers no
-          # longer install packages at start — that is the regression this
-          # proof must catch.
+          # channel is neither a container (so DOCKER-USER does not touch it)
+          # nor uid 0 (so the host OUTPUT firewall does not touch it).
           for host in registry-1.docker.io auth.docker.io index.docker.io \
             ghcr.io quay.io production.cloudflare.docker.com \
             dl-cdn.alpinelinux.org; do
@@ -2150,7 +2178,16 @@ jobs:
             *) echo "::error::DOCKER-USER has no REJECT rule: $rules"; exit 1 ;;
           esac
 
-          # The host side of the cut is proved the way it always was: a
+          # REL-12: the real HOST cutoff. `dockerd`/`containerd` leave the
+          # host in OUTPUT as uid 0; blocking only that uid's 80/443 leaves
+          # Runner.Worker's HTTPS (non-root), loopback and the local
+          # throwaway registry on localhost:5000 untouched. The two cuts are
+          # complementary: this one owns host OUTPUT, DOCKER-USER (cut just
+          # above) owns container FORWARD, and neither touches the runner's
+          # GitHub control channel.
+          sudo bash ops/release/airgap_firewall.sh enable
+
+          # Both sides of the cut are proved the way they always were: a
           # pull of an image that is not in the bundle must fail.
           if docker pull alpine:3.20; then
             echo "::error::the runner can still pull from a registry: the proof is not air-gapped"
@@ -2583,3 +2620,14 @@ jobs:
         if: always()
         run: |
           docker compose -p rantai-lakehouse ps || true
+
+      - name: Restore outbound firewall rules
+        if: always()
+        run: |
+          set -euo pipefail
+          # REL-12: the air gap is job-scoped. Remove it even when a
+          # proof step failed, so the chain never outlives this job.
+          # The guard covers a failed checkout: no script, no chain.
+          if [ -f ops/release/airgap_firewall.sh ]; then
+            sudo bash ops/release/airgap_firewall.sh disable
+          fi

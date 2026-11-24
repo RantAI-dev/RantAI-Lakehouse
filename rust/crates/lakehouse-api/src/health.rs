@@ -639,6 +639,23 @@ pub async fn cached_probe_all(state: &AppState) -> Vec<ServiceHealth> {
     .await
 }
 
+/// The single definition of "Trino compaction is available on this
+/// deployment", used by OPS-21's table-detail warning and the
+/// `/api/lakehouse/compaction-status` summary.
+///
+/// `trino_health_url` is set in compose even when the `trino` profile is off
+/// (`TRINO_URL` has a host-agnostic default), so config alone cannot tell
+/// "profile enabled" from "profile never started". The cached probe set is
+/// the same one `/api/ops/services` and `/api/overview` report: `checked`
+/// rules out "never configured", and `ok` rules out "configured but the
+/// coordinator is not running". Both must hold before the console may say
+/// Trino can compact — otherwise it would be telling a reader that the
+/// profile is on while the Services table shows it unreachable.
+#[must_use]
+pub fn trino_compaction_available(probes: &[ServiceHealth]) -> bool {
+    probes.iter().any(|h| h.id == "trino" && h.checked && h.ok)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -778,6 +795,39 @@ mod tests {
         assert_eq!(
             health.version, None,
             "Trino's /v1/info shape was never observed live"
+        );
+    }
+
+    // OPS-21: "Trino can compact" is `checked && ok`, never `ok` alone and
+    // never an env-var guess. The three rows below are exactly the three
+    // states the probe set produces.
+    #[test]
+    fn trino_compaction_available_only_when_the_probe_ran_and_succeeded() {
+        fn trino(checked: bool, ok: bool) -> ServiceHealth {
+            ServiceHealth {
+                id: "trino",
+                name: "trino",
+                ok,
+                checked,
+                latency_ms: None,
+                version: None,
+                checked_at: "2026-11-23T00:00:00Z".to_owned(),
+                error: None,
+            }
+        }
+
+        assert!(trino_compaction_available(&[trino(true, true)]));
+        assert!(
+            !trino_compaction_available(&[trino(true, false)]),
+            "configured but unreachable (the `trino` profile is off) is not available"
+        );
+        assert!(
+            !trino_compaction_available(&[trino(false, false)]),
+            "never configured is not available either"
+        );
+        assert!(
+            !trino_compaction_available(&[]),
+            "no probe row means nothing measured, not available"
         );
     }
 
