@@ -930,9 +930,18 @@ fn millis_to_rfc3339(ms: i64) -> Option<String> {
 /// # Errors
 ///
 /// Returns 401/503 from [`check_export_token`] (same guard as `POST` —
-/// this still reveals row counts, not public data), 503 if the Lakekeeper
-/// token cannot be read, or 500 if the catalog refuses or fails the call
-/// for any reason other than "table not found", or the Iceberg read fails.
+/// this still reveals row counts, not public data), 422 with the tenant
+/// gate's fixed sentence when the deployment holds several tenants and
+/// names no catalog tenant (`DATA-64`/`SEC-50`), 404 with the gate's own
+/// table sentence for a signed-in person whose tenant does not own the
+/// shared catalog (`DATA-64`/`SEC-50`), 503 with the shared catalog's own
+/// sentence when the deployment cannot count its tenants (`SEC-50` R5),
+/// 503 if the Lakekeeper token cannot be read, or 500 if the catalog
+/// refuses or fails the call for any reason other than "table not found",
+/// or the Iceberg read fails. The `DATA-64` tenant gate runs right after the
+/// mart name is validated and BEFORE the Lakekeeper token file or Iceberg
+/// is touched, so a caller whose reach does not cover the shared catalog
+/// learns nothing about the mart.
 pub async fn read_back(
     State(state): State<AppState>,
     Path(mart): Path<String>,
@@ -950,6 +959,15 @@ pub async fn read_back(
 
     let mart_ident =
         Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+
+    // DATA-64 / SEC-50: read-back reads the SHARED catalog, so the gate
+    // asks whose reach covers it — a signed-in person's own tenant, or the
+    // catalog's own tenant for a job with no user (`export`'s own rule,
+    // R4/D3). It runs BEFORE the Lakekeeper token file and the Iceberg read
+    // below, so a caller whose reach does not cover the shared catalog is
+    // refused with the gate's 404/422/503 and learns nothing about the mart.
+    let actor = gold_export_gate_actor(principal.as_ref().map(|Extension(p)| p), &headers);
+    let _ = gated_source_table(&state, mart_ident.as_str(), actor).await?;
 
     let token = read_catalog_token(&state.config.lakekeeper_gold_export_token_file).await?;
     let iceberg_config = gold_export::iceberg_config(
@@ -1016,8 +1034,15 @@ pub struct ExportsQuery {
 /// # Errors
 ///
 /// Returns 400 if `mart` is missing/blank or not a valid identifier,
-/// 401/503 from [`check_export_token`], or 500 if the `ClickHouse` query
-/// fails.
+/// 401/503 from [`check_export_token`], 422 with the tenant gate's fixed
+/// sentence when the deployment holds several tenants and names no
+/// catalog tenant (`DATA-64`/`SEC-50`), 404 with the gate's own table
+/// sentence for a signed-in person whose tenant does not own the shared
+/// catalog (`DATA-64`/`SEC-50`), 503 with the shared catalog's own
+/// sentence when the deployment cannot count its tenants (`SEC-50` R5), or
+/// 500 if the `ClickHouse` query fails. The `DATA-64` tenant gate runs
+/// right after the mart name is validated and BEFORE `ClickHouse` is
+/// touched, so history the caller may not read is never queried.
 pub async fn exports(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1034,6 +1059,15 @@ pub async fn exports(
 
     let mart_ident = Ident::new(query.mart.trim())
         .map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+
+    // DATA-64 / SEC-50: the history reveals the shared catalog mart's row
+    // counts and timing, so it is gated exactly as `read_back` is — the
+    // signed-in person as themselves, a job with no user as the catalog's
+    // own tenant (R4, D3). The gate runs BEFORE `ClickHouse` is read, so a
+    // caller whose reach does not cover the shared catalog gets the gate's
+    // 404/422/503 and no history query is issued.
+    let actor = gold_export_gate_actor(principal.as_ref().map(|Extension(p)| p), &headers);
+    let _ = gated_source_table(&state, mart_ident.as_str(), actor).await?;
 
     let runs = gold_export_history::list_export_runs(&state.clickhouse, mart_ident.as_str(), 50)
         .await
