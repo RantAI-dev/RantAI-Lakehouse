@@ -62,6 +62,17 @@ const SUMMARY = {
   services: { healthy: 1, degraded: 0, unhealthy: 0 },
 }
 
+const icebergTable = (namespace: string, name: string) => ({
+  namespace,
+  name,
+  formatVersion: 2,
+  currentSnapshotId: null,
+  lastUpdatedAt: null,
+  fileCount: null,
+  recordCount: null,
+  totalBytes: null,
+})
+
 /** Per-URL answers; a test overrides one to make that section fail. */
 let answers: Record<string, () => Response> = {}
 
@@ -88,6 +99,11 @@ function defaultAnswers(): Record<string, () => Response> {
           },
         ],
       }),
+    // DATA-45: the Iceberg tables list loads independently of the runs above.
+    // By default Bronze is the only namespace and its only table already has
+    // a run, so the subsection shows its honest "none without a run" line.
+    "/api/lakehouse/namespaces": () => json({ namespaces: [{ name: "bronze", tableCount: 1 }] }),
+    "/api/lakehouse/tables": () => json({ tables: [icebergTable("bronze", "orders")] }),
     "/api/governance/sla": () => json([]),
     "/api/overview": () => json(SUMMARY),
   }
@@ -96,8 +112,9 @@ function defaultAnswers(): Record<string, () => Response> {
 beforeEach(() => {
   answers = defaultAnswers()
   spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
-    const path = String(input).split("?")[0]
-    const answer = answers[path]
+    const url = String(input)
+    // A per-namespace answer wins; otherwise fall back to the path answer.
+    const answer = answers[url] ?? answers[url.split("?")[0]]
     return answer ? answer() : json({ error: "not stubbed" }, 404)
   }) as unknown as typeof fetch)
 })
@@ -173,6 +190,83 @@ describe("the System status page", () => {
 
     const link = await within(sectionById("maintenance")).findByRole("link", { name: "bronze.orders" })
     expect(link.getAttribute("href")).toBe("/lakehouse/tables/bronze/orders")
+  })
+
+  // DATA-45: the runs list only reaches tables that have a run. A Gold
+  // export table with no catalog entry and no run used to be reachable by
+  // URL alone; it must now be listed here with its real link.
+  it("lists an uncataloged Iceberg table with no run and links to its table page", async () => {
+    answers["/api/lakehouse/namespaces"] = () =>
+      json({ namespaces: [{ name: "gold", tableCount: 1 }] })
+    answers["/api/lakehouse/tables"] = () => json({ tables: [icebergTable("gold", "revenue_export")] })
+    render(<SystemStatusPage />)
+
+    const maintenance = within(sectionById("maintenance"))
+    const link = await maintenance.findByRole("link", { name: "gold.revenue_export" })
+    expect(link.getAttribute("href")).toBe("/lakehouse/tables/gold/revenue_export")
+    expect(maintenance.getByText("No run recorded yet")).toBeTruthy()
+    // No invented maintenance counts or status on the Gold table's own row.
+    const row = link.closest("tr")
+    expect(row).not.toBeNull()
+    expect(within(row as HTMLElement).queryByText(/data \/.*manifest/)).toBeNull()
+    expect(within(row as HTMLElement).getByText("No run recorded yet")).toBeTruthy()
+  })
+
+  it("still renders the existing maintenance run rows with their metrics and link", async () => {
+    render(<SystemStatusPage />)
+
+    const maintenance = within(sectionById("maintenance"))
+    const link = await maintenance.findByRole("link", { name: "bronze.orders" })
+    expect(link.getAttribute("href")).toBe("/lakehouse/tables/bronze/orders")
+    // Dry-run and applied columns of the one recorded run are unchanged.
+    expect(maintenance.getAllByText("1 data / 0 manifest").length).toBe(2)
+    expect(maintenance.getByText("expire_snapshots")).toBeTruthy()
+    // Bronze already has a run, so it is not repeated in the new list.
+    expect(maintenance.getByText("No Iceberg tables without a maintenance run were found.")).toBeTruthy()
+  })
+
+  it("reports a refused Lakekeeper list without hiding the maintenance runs", async () => {
+    answers["/api/lakehouse/namespaces"] = () =>
+      json({ error: "permission_denied: lakehouse:read" }, 403)
+    render(<SystemStatusPage />)
+
+    const maintenance = within(sectionById("maintenance"))
+    expect(await maintenance.findByText(/The Iceberg table list could not be loaded here/)).toBeTruthy()
+    expect(await maintenance.findByRole("link", { name: "bronze.orders" })).toBeTruthy()
+  })
+
+  it("handles an empty namespace list honestly, keeping the maintenance runs", async () => {
+    answers["/api/lakehouse/namespaces"] = () => json({ namespaces: [] })
+    render(<SystemStatusPage />)
+
+    const maintenance = within(sectionById("maintenance"))
+    expect(
+      await maintenance.findByText("No Iceberg tables without a maintenance run were found.")
+    ).toBeTruthy()
+    expect(await maintenance.findByRole("link", { name: "bronze.orders" })).toBeTruthy()
+  })
+
+  it("shows tables from namespaces that answered when one namespace fails", async () => {
+    answers["/api/lakehouse/namespaces"] = () =>
+      json({
+        namespaces: [
+          { name: "bronze", tableCount: 1 },
+          { name: "broken", tableCount: null },
+          { name: "gold", tableCount: 1 },
+        ],
+      })
+    answers["/api/lakehouse/tables?namespace=bronze"] = () =>
+      json({ tables: [icebergTable("bronze", "orders")] })
+    answers["/api/lakehouse/tables?namespace=broken"] = () => json({ error: "down" }, 503)
+    answers["/api/lakehouse/tables?namespace=gold"] = () =>
+      json({ tables: [icebergTable("gold", "revenue_export")] })
+    render(<SystemStatusPage />)
+
+    const maintenance = within(sectionById("maintenance"))
+    // The failing namespace is named, but its failure does not hide Gold.
+    expect(await maintenance.findByText(/Tables in broken could not be listed/)).toBeTruthy()
+    expect(await maintenance.findByRole("link", { name: "gold.revenue_export" })).toBeTruthy()
+    expect(await maintenance.findByRole("link", { name: "bronze.orders" })).toBeTruthy()
   })
 
   it("shrinks change capture to one line when no CDC connector reports a slot", async () => {

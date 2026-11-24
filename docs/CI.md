@@ -549,6 +549,35 @@ needs a human to explicitly decide to take it on and coordinate with anyone
 holding a local clone. The baseline makes it unnecessary for keeping the
 scan useful.
 
+## Security tool downloads (OPS-18)
+
+The security jobs install their scanners from pinned GitHub release assets:
+`gitleaks` v8.30.1 (`gitleaks_8.30.1_linux_x64.tar.gz`, in `security.yml`'s
+`gitleaks` and `history-scan` jobs and in `security-all-branches.yml`) and
+`cargo-deny` v0.22.0 (`cargo-deny-0.22.0-x86_64-unknown-linux-musl.tar.gz`,
+in `security.yml`'s `cargo deny check (all)` job — the same binary version
+`EmbarkStudios/cargo-deny-action@v2` used before OPS-18, now installed
+explicitly because that action's `curl | tar` had no retry).
+
+Every one of those downloads goes through `scripts/ci/retry_download.sh`:
+four attempts, `curl --connect-timeout 15 --max-time 120` per attempt, and a
+10/20/30-second backoff with no sleep after the last failure. Each attempt
+writes to a temporary file that is deleted on every exit path, so a truncated
+download can never be extracted and a partial archive is never published at
+the destination; extraction and the scan/run itself happen once, after a
+complete download. This is what the 2026-11-08 release-asset outage
+(16:02–17:35 WIB) showed was missing: `cargo-deny`, `gitleaks` and
+`history-scan` all failed before scanning anything. The job names — including
+the required status checks `cargo deny check (all)` and `gitleaks (working
+tree)` — are unchanged. `scripts/ci/tests/test_retry_download.sh` is run by
+the `Repo lints` job in `ci.yml`.
+
+`cargo audit (advisories)` is unchanged: the `cargo-audit` ref of
+`taiki-e/install-action` already wraps its release download in a `retry()`
+loop (10 attempts with a growing sleep) and passes `curl --retry 10`, so it
+needs no second retry here. OPS-18 covered `gitleaks` and `cargo-deny`; it did
+not report a `cargo-audit` download failure.
+
 ### Scan scope on PRs and `main` vs. the daily all-branch scan (`SEC-36`)
 
 Historically, `history-scan` fetched all remote branches and invoked `gitleaks`
