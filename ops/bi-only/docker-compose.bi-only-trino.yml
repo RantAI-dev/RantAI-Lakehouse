@@ -1,0 +1,207 @@
+# `BI-44` slice 1 — standalone BI-and-assistant-only installation,
+# federated engine variant. A deployment that reads its own source in place
+# needs the application database, one query engine, the API, the console
+# and the PDF renderer; nothing here copies data into a warehouse.
+#
+# The image references and the service settings are the ones from the root
+# `docker-compose.yml` (same tags, same digests, same image variables).
+# Build those two repository images from the root file before bringing this
+# one up — see `ops/bi-only/README.md`. The root file is deliberately not
+# changed by this slice.
+#
+# One engine per installation (owner decision 2026-11-11): this file names
+# no second engine and sets no second engine URL, so the API's fail-closed
+# config check and this deployment always agree. The coordinator is not
+# published on the host: it has no front door of its own, and callers reach
+# it through the API's guarded query routes.
+
+services:
+  # ── One-shot certificate bootstrap. Idempotent, and the Postgres service
+  # waits for it to COMPLETE rather than for a port to open: the image's
+  # init-phase server answers `pg_isready` before the real server starts.
+  postgres-cert-init:
+    image: postgres:16.15@sha256:1beaa3084eee2676f20a9cd9928f0bf2c5bf674f8e49f81017912183d377c61c
+    restart: "no"
+    volumes:
+      - lakehouse_postgres_tls:/tls
+      - lakehouse_postgres_ca:/ca
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        test -f /tls/ca.crt && test -f /tls/server.crt && test -f /tls/server.key || {
+        openssl req -x509 -newkey rsa:2048 -nodes -days 3650
+        -keyout /tls/ca.key -out /tls/ca.crt
+        -subj "/CN=postgres-ca"
+        -addext "basicConstraints=critical,CA:TRUE"
+        -addext "keyUsage=critical,keyCertSign,cRLSign" &&
+        openssl req -new -newkey rsa:2048 -nodes
+        -keyout /tls/server.key -out /tls/server.csr
+        -subj "/CN=postgres" &&
+        printf "subjectAltName=DNS:postgres\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\nkeyUsage=digitalSignature,keyEncipherment\n" > /tls/server.ext &&
+        openssl x509 -req -in /tls/server.csr -days 3650
+        -CA /tls/ca.crt -CAkey /tls/ca.key -CAcreateserial
+        -out /tls/server.crt
+        -extfile /tls/server.ext &&
+        rm -f /tls/server.csr /tls/server.ext /tls/ca.key /tls/ca.srl &&
+        chown postgres:postgres /tls/server.key /tls/server.crt /tls/ca.crt &&
+        chmod 0600 /tls/server.key &&
+        chmod 0644 /tls/server.crt /tls/ca.crt; } &&
+        rm -f /tls/ca.key /tls/ca.srl &&
+        cp -f /tls/ca.crt /ca/ca.crt &&
+        chmod 0644 /ca/ca.crt
+
+  # ── Application database: identities, dashboards, saved queries, history
+  # and governance metadata. Migrations run as the OWNER in the one-shot
+  # service below; this server never runs with a default password.
+  postgres:
+    image: postgres:16.15@sha256:1beaa3084eee2676f20a9cd9928f0bf2c5bf674f8e49f81017912183d377c61c
+    command:
+      [
+        "postgres",
+        "-c", "wal_level=logical",
+        "-c", "max_wal_senders=10",
+        "-c", "max_replication_slots=10",
+        "-c", "ssl=on",
+        "-c", "ssl_cert_file=/etc/postgresql/tls/server.crt",
+        "-c", "ssl_key_file=/etc/postgresql/tls/server.key",
+      ]
+    depends_on:
+      postgres-cert-init:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-lakehouse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - lakehouse_postgres_data:/var/lib/postgresql/data
+      - lakehouse_postgres_tls:/etc/postgresql/tls:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-lakehouse} -d ${POSTGRES_DB:-lakehouse}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── The one query engine of this installation. The coordinator reads
+  # customer-owned catalogs; properties for those catalogs come from the
+  # operator, mounted read-only. No warehouse catalog, no object store and
+  # no scheduled maintenance run alongside it.
+  trino:
+    image: trinodb/trino:483@sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534
+    volumes:
+      - ${BI_TRINO_CATALOG_DIR:-./catalog}:/etc/trino/catalog:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+  # ── Apply the schema with the OWNER's credentials, create the runtime
+  # role, then exit. The API's runtime role owns no table, so it cannot
+  # switch off the audit trail's append-only triggers.
+  lakehouse-db-migrate:
+    image: ${LAKEHOUSE_API_IMAGE:-rantai-lakehouse-api:local}
+    command: ["migrate"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${POSTGRES_DB:-lakehouse}
+      LAKEHOUSE_DB_APP_PASSWORD: ${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}
+
+  # ── The API. The two `LAKEHOUSE_*` variables are the installation mode
+  # and the engine; config resolution refuses to start if a second engine
+  # URL is also set. Governance rewrites and the read-only guard run here
+  # before a statement reaches the coordinator.
+  lakehouse-api:
+    image: ${LAKEHOUSE_API_IMAGE:-rantai-lakehouse-api:local}
+    ports:
+      - "${API_HOST_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      lakehouse-db-migrate:
+        condition: service_completed_successfully
+      trino:
+        condition: service_healthy
+    environment:
+      PORT: "8080"
+      APP_ENV: ${APP_ENV:-local}
+      GIT_SHA: ${GIT_SHA:-unknown}
+      LAKEHOUSE_INSTALL_MODE: bi-only
+      LAKEHOUSE_QUERY_ENGINE: trino
+      TRINO_URL: http://trino:8080
+      LLM_URL: ${LLM_URL:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_KEY: ${LLM_KEY:-}
+      GOTENBERG_URL: ${GOTENBERG_URL:-http://gotenberg:3000}
+      CONSOLE_INTERNAL_URL: ${CONSOLE_INTERNAL_URL:-http://console:3000}
+      RENDER_TOKEN_SECRET: ${RENDER_TOKEN_SECRET:-}
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      DATABASE_URL: ${DATABASE_URL:-postgres://lakehouse_app:${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${POSTGRES_DB:-lakehouse}}
+      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
+      CONNECTOR_TLS_CA_FILE: ${CONNECTOR_TLS_CA_FILE:-/run/certs/postgres/ca.crt}
+      CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS: ${CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS:-}
+      CONNECTOR_PROBE_ALLOWED_CIDRS: ${CONNECTOR_PROBE_ALLOWED_CIDRS:-}
+      CONNECTOR_SECRETS_KEY: ${CONNECTOR_SECRETS_KEY:?CONNECTOR_SECRETS_KEY is required - generate one with "openssl rand -base64 32" and set it in .env}
+      CONNECTOR_SECRETS_KEY_PREVIOUS: ${CONNECTOR_SECRETS_KEY_PREVIOUS:-}
+    volumes:
+      - lakehouse_connector_secrets:/run/secrets
+      - lakehouse_postgres_ca:/run/certs/postgres:ro
+      - ${SMTP_CA_DIR:-../../ops/smtp-ca}:/run/certs/smtp:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:8080/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Console. The image is built from the root file with the API proxy
+  # address baked in at build time; the runtime value below is for code
+  # that reads the environment directly.
+  console:
+    image: ${CONSOLE_IMAGE:-rantai-lakehouse-console:local}
+    ports:
+      - "${CONSOLE_HOST_PORT:-3000}:3000"
+    depends_on:
+      lakehouse-api:
+        condition: service_healthy
+    environment:
+      RUST_API_URL: ${CONSOLE_API_URL:-http://lakehouse-api:8080}
+      HOSTNAME: 0.0.0.0
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:3000/ || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  # ── PDF renderer. One gigabyte is the root stack's bound: Chromium plus
+  # two conversions fit, and a dashboard too large for it fails with a
+  # fixed sentence instead of taking the host down. No host port: it has
+  # no authentication and is reachable by service name only.
+  gotenberg:
+    image: gotenberg/gotenberg:8.37.0@sha256:f29984bd1e226bf1b93ba90af06000afa8b315853e99d27b9aaa41b93f15c769
+    command:
+      - gotenberg
+      - --api-timeout=70s
+      - --chromium-allow-list=^${CONSOLE_INTERNAL_URL:-http://console:3000}(/|$$)
+      - --chromium-disable-javascript=false
+      - --log-level=warn
+    mem_limit: 1g
+    restart: unless-stopped
+
+volumes:
+  lakehouse_postgres_data:
+  lakehouse_postgres_tls:
+  lakehouse_postgres_ca:
+  lakehouse_connector_secrets:

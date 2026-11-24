@@ -5,7 +5,10 @@
  * component-test harness (H0) does not exist on this branch.
  */
 import { formatBytes, formatRelativeTime } from "./format"
+import type { Measured } from "./measured"
 import type {
+  LakehouseCompactionStatus,
+  LakehouseCompactionTable,
   LakehouseMaintenance,
   LakehouseSnapshot,
 } from "@/services/contracts/lakehouse"
@@ -32,6 +35,74 @@ export function lakehouseMaintenanceUrl(namespace: string, table: string): strin
 
 export function lakehouseCapacityUrl(): string {
   return "/api/lakehouse/capacity"
+}
+
+export function lakehouseCompactionStatusUrl(): string {
+  return "/api/lakehouse/compaction-status"
+}
+
+/**
+ * Count at which measured small files need compaction (OPS-21). Mirrors the
+ * backend's `NEEDS_COMPACTION_FILE_COUNT`: the G3 measurement of 20 small
+ * files per day partition planning ~15-20x worse than a one-file control
+ * (`docs/plans/G3-RESULT.md`, ADR 0009). The System-status endpoint also
+ * sends this number; the table-detail response does not, so the console owns
+ * the same documented constant for that surface.
+ */
+export const NEEDS_COMPACTION_FILE_COUNT = 20
+
+/**
+ * The honest reason compaction cannot happen here. Names the `trino`
+ * Compose profile explicitly, because that is the fix a reader can act on;
+ * the other three engines genuinely cannot bin-pack small files (OPS-21).
+ */
+const COMPACTION_FIX =
+  "Small files are merged only by Trino in this deployment: pyiceberg and the iceberg crate cannot compact, and ClickHouse OPTIMIZE does not bin-pack. Start Compose with --profile trino (the trino profile) to enable compaction."
+
+/** Table-page warning copy, built from a real measured count. */
+export function tableCompactionWarningMessage(smallFileCount: number, thresholdBytes?: Measured): string {
+  const size =
+    thresholdBytes === null || thresholdBytes === undefined ? "" : ` below ${formatBytes(thresholdBytes)}`
+  return `${smallFileCount} live data files${size} in this table's current snapshot need compaction, but nothing here can merge them while the trino profile is off. ${COMPACTION_FIX}`
+}
+
+/** System-status warning copy for a set of affected tables. */
+export function systemCompactionWarningMessage(tableCount: number): string {
+  return `${tableCount} ${tableCount === 1 ? "table has" : "tables have"} measured small files that need compaction, but nothing here can merge them while the trino profile is off. ${COMPACTION_FIX}`
+}
+
+/**
+ * A table page warns only from a MEASURED count at or above the need count
+ * AND a confirmed-unavailable Trino (OPS-21). `null` (unmeasured), a
+ * below-threshold count, and `compactionAvailable !== false` (available, or
+ * an older API that did not send the flag) are all silent — never infer a
+ * warning from an absent measurement.
+ */
+export function tableNeedsCompactionWarning(table: {
+  smallFileCount: Measured
+  compactionAvailable?: boolean
+}): boolean {
+  return (
+    table.smallFileCount !== null &&
+    table.smallFileCount >= NEEDS_COMPACTION_FILE_COUNT &&
+    table.compactionAvailable === false
+  )
+}
+
+/**
+ * The Bronze tables the System-status warning lists (OPS-21). The backend
+ * already filters by its need count, but re-checking here means a future API
+ * change cannot make the console warn off an unmeasured or below-threshold
+ * row, and the `compactionAvailable === false` guard keeps the warning
+ * silent when Trino is on. Only measured rows are ever returned.
+ */
+export function tablesNeedingCompaction(
+  status: Pick<LakehouseCompactionStatus, "compactionAvailable" | "tables" | "needsCompactionFileCount">
+): LakehouseCompactionTable[] {
+  if (status.compactionAvailable !== false) return []
+  return status.tables
+    .filter((t) => t.smallFileCount >= status.needsCompactionFileCount)
+    .sort((a, b) => a.namespace.localeCompare(b.namespace) || a.name.localeCompare(b.name))
 }
 
 /**

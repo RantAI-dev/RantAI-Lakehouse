@@ -22,13 +22,6 @@
   { "name": "storage-get",              "method": "GET",  "path": "/api/storage" },
 
   {
-    "name": "ops-observability",
-    "method": "GET",
-    "path": "/api/ops/observability",
-    "comment": "WS1 T6: five metrics -> null. The hybrid re-capture's read-only ClickHouse user cannot read system.query_log this route queries. Re-capture in a full environment.",
-    "skip": true
-  },
-  {
     "name": "ops-usage",
     "method": "GET",
     "path": "/api/ops/usage",

@@ -3,6 +3,7 @@
 import * as React from "react";
 import { cn } from "@/lib/utils";
 import { dashboardLook } from "@/lib/dashboard-look";
+import { SurfaceThemeProvider } from "@/components/ui/surface-theme";
 import { issuedLine, paperContentWidth } from "@/lib/render-summary";
 import type { ReportingContext } from "@/lib/time-grain";
 import type { Report, ReportChartEntry } from "@/services/contracts/dashboard-reports";
@@ -97,6 +98,7 @@ export function ReportRenderView({ token }: { token: string }) {
   return (
     <ReportingProvider reporting={data.reporting ?? undefined}>
       <RenderModeProvider value={mode}>
+        <SurfaceThemeProvider themeClass={look.surfaceThemeClass}>
         <div
           className={cn("mx-auto min-h-screen bg-background p-2 text-foreground", look.className)}
           style={{ ...look.style, width }}
@@ -114,6 +116,7 @@ export function ReportRenderView({ token }: { token: string }) {
             <ReportBlocks blocks={data.report.blocks} charts={data.charts} dark={false} print loadMap={loadMap} />
           )}
         </div>
+        </SurfaceThemeProvider>
       </RenderModeProvider>
     </ReportingProvider>
   );

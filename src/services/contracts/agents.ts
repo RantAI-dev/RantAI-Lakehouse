@@ -157,10 +157,11 @@ export type DecideApprovalResult = {
 export interface AgentService {
   /**
    * Employee definitions are read by a run's detail page (`/agents/runs/[runId]`
-   * shows whose run it was). Run detail is the only remaining consumer: the
-   * employee list and detail pages were removed by `WEB-3` slice 1, along with
-   * their create/suspend/resume/revoke/run actions and the runs list. The
-   * backend routes stay registered (`WEB-3` D2, `WEB-4` retires them).
+   * shows whose run it was). Run detail is the only remaining console
+   * consumer: the employee list and detail pages were removed by `WEB-3`
+   * slice 1, along with their create/suspend/resume/revoke actions and the
+   * runs list. `WEB-4` retired those routes; the employee detail route stays
+   * because this page reads it (and Dagster reads the list/detail/run).
    */
   getEmployee(id: string, signal?: AbortSignal): Promise<DigitalEmployee>
   getRun(id: string, signal?: AbortSignal): Promise<AgentRun>

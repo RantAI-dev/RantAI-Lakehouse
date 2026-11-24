@@ -2348,6 +2348,7 @@ async fn apply_badges(state: &AppState, body: &mut Value, bronze_pairs: &[(Strin
 async fn mark_governance(
     state: &AppState,
     principal: &Principal,
+    headers: &HeaderMap,
     body: &mut Value,
     tables: &[String],
     names: &[String],
@@ -2357,7 +2358,10 @@ async fn mark_governance(
     let checks = catalog_governance::QualityIndex::load(state, Some(names))
         .await
         .checks_for(names);
-    let dependents = catalog_governance::dependents(state, principal, tables).await;
+    // SEC-54 review fix: the detail route's real headers travel here so
+    // the "used by" list is scoped to the tenant `X-Tenant` selects,
+    // not always the caller's first tenant.
+    let dependents = catalog_governance::dependents(state, principal, headers, tables).await;
     let (usage, recent_queries) =
         catalog_governance::usage(state, principal, tables, columns).await;
     if let Some(o) = body.as_object_mut() {
@@ -2697,6 +2701,7 @@ async fn clickhouse_asset_detail(
     mark_governance(
         state,
         principal,
+        headers,
         &mut body,
         std::slice::from_ref(&key),
         &[key.clone(), table.clone()],
@@ -2935,6 +2940,7 @@ async fn bronze_asset_detail_body(
     mark_governance(
         state,
         principal,
+        headers,
         &mut body,
         &tables,
         &names,
