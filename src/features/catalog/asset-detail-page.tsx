@@ -46,6 +46,7 @@ import {
 } from "@/services/contracts/assets"
 import { classificationTitle, healthTitle, layerTitle, tierTitle } from "./asset-badges"
 import { CertificationAction, DeprecationNotice } from "./asset-certification"
+import { AssetConnectDialog } from "./asset-connect-dialog"
 import { AssetDetailTabsView } from "./asset-detail-tabs"
 import { useIcebergTable } from "./asset-storage"
 import type { MeaningState } from "./asset-meaning"
@@ -80,6 +81,9 @@ export function AssetDetailPage() {
   // Read here, not in the Schema tab, so the header pill and the tab share one request.
   const meanings = useMeanings(state.status === "success" ? state.data : null)
   const [open, setOpen] = React.useState(false)
+  // P2 `reczz28d1eZjrBAZ`: the connect dialog is a separate header action —
+  // a compact trigger rather than inline connection details on the table.
+  const [connectOpen, setConnectOpen] = React.useState(false)
   const [permission, setPermission] = React.useState("")
   const [reason, setReason] = React.useState("")
   const [submitted, setSubmitted] = React.useState(false)
@@ -135,6 +139,9 @@ export function AssetDetailPage() {
               <CertificationAction asset={a} onChanged={state.reload} />
             ) : null}
             <MeaningBadge state={meanings} columns={a.schema.map((c) => c.name)} />
+            <Button variant="outline" size="sm" onClick={() => setConnectOpen(true)}>
+              Connect
+            </Button>
             {missingPermissions.length > 0 ? (
               <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
                 Request access
@@ -211,6 +218,7 @@ export function AssetDetailPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      <AssetConnectDialog asset={a} open={connectOpen} onOpenChange={setConnectOpen} />
     </div>
   )
 }

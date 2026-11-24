@@ -24,6 +24,7 @@ pub use smtp_ca::{CaBundleError, SmtpCaBundle};
 use std::future::Future;
 use std::pin::Pin;
 
+use lakehouse_core::secret::SecretValue;
 use lettre::message::{Attachment as MailAttachment, Mailbox, MultiPart, SinglePart, header};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
@@ -141,8 +142,10 @@ pub struct SmtpConfig {
     pub secure: bool,
     /// `SMTP_USER`. `None` means no `SMTP` auth is sent at all.
     pub user: Option<String>,
-    /// `SMTP_PASS`, default `""`.
-    pub pass: String,
+    /// `SMTP_PASS`, default `""`. Held as a `SecretValue` (`SEC-59`) so `Debug`
+    /// always renders `<redacted>`; the value is exposed only where the
+    /// credentials are handed to `lettre`.
+    pub pass: SecretValue,
     /// `SMTP_FROM` (already resolved with its `??` fallback chain by the
     /// caller).
     pub from: String,
@@ -432,7 +435,11 @@ impl EmailSender {
             builder = builder.tls(smtp_tls::mode(self.config.secure, parameters));
         }
         if let Some(user) = &self.config.user {
-            builder = builder.credentials(Credentials::new(user.clone(), self.config.pass.clone()));
+            // SEC-59: the one point where the password leaves its `SecretValue`.
+            builder = builder.credentials(Credentials::new(
+                user.clone(),
+                self.config.pass.expose_secret().to_owned(),
+            ));
         }
         let transport = builder.build();
 
@@ -719,10 +726,22 @@ mod tests {
             port: 587,
             secure: false,
             user: Some("bot@example.com".to_owned()),
-            pass: "hunter2".to_owned(),
+            pass: SecretValue::new("hunter2"),
             from: "rantai-lake@localhost".to_owned(),
             ca_bundle: None,
         }
+    }
+
+    /// `SEC-59`: a `Debug` of the config must never print the password, while
+    /// the non-secret fields stay visible for diagnosis.
+    #[test]
+    fn debug_redacts_the_password_but_keeps_the_non_secret_fields_visible() {
+        let config = cfg(Some("relay.example.com"));
+        let text = format!("{config:?}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+        assert!(text.contains("relay.example.com"), "{text}");
+        assert!(text.contains("rantai-lake@localhost"), "{text}");
     }
 
     /// `SEC-56` D9: the config keeps its `derive(Debug)`, and the bundle

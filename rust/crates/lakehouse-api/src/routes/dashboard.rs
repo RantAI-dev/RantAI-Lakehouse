@@ -2369,6 +2369,19 @@ pub struct FieldsQuery {
 
 /// `GET /api/dashboard/fields` — mart list, or one mart's columns split
 /// into dimensions/measures.
+///
+/// # Shared catalog names (SEC-58)
+///
+/// The mart list and every mart's columns come from `serving` tables of the
+/// deployment's single shared catalog. `SEC-20`/`SEC-50` gate ROWS; the names
+/// of those tables and columns are gated here by the exact
+/// [`crate::routes::catalog::catalog_tenant_refusal`] check the catalog uses.
+/// A caller whose tenant does not own the shared catalog gets the empty mart
+/// list (the shape `fields_body(…, None)` returns) or, when it names a mart,
+/// the same `404` a hidden mart answers — so neither a name nor the existence
+/// of a mart is confirmed. The `?source=` branch reads a saved SQL source, not
+/// shared catalog metadata: it is scoped by `viewer_for` (folder ACL and the
+/// GOV-17 hidden-source resolver), so it keeps its existing behaviour.
 pub async fn fields(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -2380,6 +2393,14 @@ pub async fn fields(
     if let Err(err) = require_entitled(&state, &principal).await {
         return crate::error::ApiRejection(err).into_response();
     }
+    // SEC-58: decide this once, before any `system.tables`/`system.columns`
+    // read behind the mart branches. An error is returned unchanged (fail
+    // closed: an invalid `X-Tenant` or a store failure is never softened).
+    let catalog_refusal =
+        match crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await {
+            Ok(refusal) => refusal,
+            Err(err) => return crate::error::ApiRejection(err).into_response(),
+        };
     // `GOV-7` D6: which tables the caller's roles hide, asked once per
     // request and applied to every list and detail below.
     let access = match crate::routes::catalog::table_access_for(&state, &principal).await {
@@ -2396,6 +2417,16 @@ pub async fn fields(
         return match source_fields_body(&state.clickhouse, &viewer, id).await {
             Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
             Err(err) => crate::error::ApiRejection(err).into_response(),
+        };
+    }
+    // SEC-58: a caller that does not own the shared catalog learns none of
+    // its names. The unqualified list is the empty list the builder already
+    // handles; a named mart (with or without joins) is the GOV-7 404, so an
+    // outsider cannot confirm the mart exists either.
+    if catalog_refusal.is_some() {
+        return match q.mart.as_deref() {
+            None => (StatusCode::OK, ApiJson(json!({ "marts": [] }))).into_response(),
+            Some(mart) => crate::error::ApiRejection(mart_not_found(mart)).into_response(),
         };
     }
     if let (Some(mart), Some(raw)) = (
@@ -2416,14 +2447,10 @@ pub async fn fields(
         Ok(mut body) => {
             retain_visible_marts(&access, &mut body);
             if q.mart.is_none() {
-                // PR #106 review R1 BLOCKER 2, SHOULD-FIX DATA-12 2:
-                // Only decorate marts if catalog_tenant_refusal allows it:
-                if let Ok(None) =
-                    crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers)
-                        .await
-                {
-                    mark_marts(&state, &mut body).await;
-                }
+                // PR #106 review R1 BLOCKER 2, SHOULD-FIX DATA-12 2: the
+                // tenant gate above already proved `catalog_refusal` is
+                // `None`, so decoration is safe without a second read.
+                mark_marts(&state, &mut body).await;
             }
             (StatusCode::OK, ApiJson(body)).into_response()
         }
@@ -2762,12 +2789,25 @@ pub struct JoinSuggestionsQuery {
 pub async fn join_suggestions(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Query(q): Query<JoinSuggestionsQuery>,
 ) -> Response {
     // BI-19 B2 (plan D8): "signed in" at the router; a person with neither
     // `dashboard:read` nor a rule is refused here, as the router refused them.
     if let Err(err) = crate::routes::dashboard_access::require_entitled(&state, &principal).await {
         return crate::error::ApiRejection(err).into_response();
+    }
+    // SEC-58: `system.columns` here names the columns of two `serving`
+    // marts — exactly the names `GET /api/dashboard/fields` lists. Gate them
+    // with the same SEC-20/SEC-50 check; an outsider gets the unknown-mart
+    // 404 (no column name, no confirmation that the mart exists).
+    match crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await {
+        Ok(Some(_)) => {
+            let name = q.left.as_deref().unwrap_or("");
+            return crate::error::ApiRejection(mart_not_found(name)).into_response();
+        }
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+        Ok(None) => {}
     }
     let access = match crate::routes::catalog::table_access_for(&state, &principal).await {
         Ok(access) => access,
@@ -4199,7 +4239,7 @@ pub async fn chart_export(
     // BI-19 part D (plan D13): an image is made by the renderer, not by a row
     // stream, so it has its own path (and its own audit action).
     if q.format.as_deref() == Some("png") {
-        return crate::routes::pdf_export::export_chart_png(&state, &principal, &q).await;
+        return crate::routes::pdf_export::export_chart_png(&state, &principal, &q, &headers).await;
     }
     export_chart(
         &state,
@@ -9556,6 +9596,336 @@ mod table_tiles {
         assert_eq!(tile["grain"], json!("month"));
         assert_eq!(tile["rows"].as_array().unwrap().len(), 2);
         assert_eq!(tile["rows"][1]["v"], json!("7"));
+    }
+}
+
+#[cfg(test)]
+mod sec58_mart_name_gate {
+    //! SEC-58: the shared `serving` catalog's table and column names must not
+    //! be listed to a tenant that does not own it. The gate is
+    //! `catalog::catalog_tenant_refusal` (SEC-20/SEC-50), already the one
+    //! catalog and pipelines use. These tests use the same two-harness shape
+    //! as `catalog::tenant_scoping`: a real seeded Postgres for the tenant
+    //! count and a wiremock `ClickHouse` for the `system.tables`/`system.columns`
+    //! reads that must never happen for an outsider.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use axum::Extension;
+    use axum::extract::{Query, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::Response;
+    use lakehouse_auth::{PermissionSet, Principal, PrincipalId};
+    use lakehouse_store::PgPool;
+    // Force-links the `#[ctor]` Postgres testcontainer bootstrap.
+    use lakehouse_test_support as _;
+    use uuid::Uuid;
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{FieldsQuery, JoinSuggestionsQuery, fields, join_suggestions};
+    use crate::config::Config;
+    use crate::state::AppState;
+
+    const TENANT_A: &str = "11111111-1111-4111-8111-000000000001";
+    const TENANT_B: &str = "11111111-1111-4111-8111-000000000002";
+
+    fn state_for(pool: &PgPool, ch_url: &str, catalog_tenant_id: Option<&str>) -> AppState {
+        let options = pool.connect_options();
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "DATABASE_URL".to_owned(),
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options.get_database().expect("a named test database"),
+            ),
+        );
+        env.insert("CH_URL".to_owned(), ch_url.to_owned());
+        if let Some(id) = catalog_tenant_id {
+            env.insert("CATALOG_TENANT_ID".to_owned(), id.to_owned());
+        }
+        AppState::new(Config::from_map(&env).expect("a valid test Config"))
+    }
+
+    fn principal(tenant_ids: &[Uuid], permissions: &str) -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::new_v4()),
+            tenant_ids: tenant_ids.to_vec(),
+            display_name: "Test Principal".to_owned(),
+            permissions: PermissionSet::parse(permissions),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// A `ClickHouse` that reports two `serving` marts and their columns, and
+    /// answers every other read (calculated fields, BI table setup) with an
+    /// empty but well-formed result.
+    async fn mock_serving_catalog() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM system.tables"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "name", "type": "String"},
+                    {"name": "total_rows", "type": "String"},
+                ],
+                "data": [
+                    {"name": "sales", "total_rows": "42"},
+                    {"name": "stock", "total_rows": "7"},
+                ],
+                "rows": 2,
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM system.columns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "name", "type": "String"},
+                    {"name": "type", "type": "String"},
+                    {"name": "position", "type": "UInt64"},
+                    {"name": "table", "type": "String"},
+                    {"name": "key", "type": "String"},
+                ],
+                "data": [
+                    {"name": "amount", "type": "UInt64", "position": "1", "table": "sales", "key": "0"},
+                    {"name": "region", "type": "String", "position": "2", "table": "sales", "key": "0"},
+                    {"name": "qty", "type": "UInt64", "position": "1", "table": "stock", "key": "0"},
+                ],
+                "rows": 3,
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [], "data": [], "rows": 0,
+            })))
+            .with_priority(10)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn json_of(resp: Response) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    async fn no_metadata_was_read(server: &MockServer) {
+        let queries: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert!(
+            !queries.iter().any(|q| q.contains("system.tables")),
+            "an outsider must not read system.tables: {queries:?}"
+        );
+        assert!(
+            !queries.iter().any(|q| q.contains("system.columns")),
+            "an outsider must not read system.columns: {queries:?}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_outsider_tenant_gets_an_empty_mart_list_and_no_metadata_query(pool: PgPool) {
+        let ch = mock_serving_catalog().await;
+        let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+        let outsider = principal(&[TENANT_B.parse().unwrap()], "dashboard:read");
+
+        let (status, body) = json_of(
+            fields(
+                State(state),
+                Extension(outsider),
+                HeaderMap::new(),
+                Query(FieldsQuery {
+                    mart: None,
+                    source: None,
+                    joins: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({ "marts": [] }));
+        no_metadata_was_read(&ch).await;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_outsider_naming_a_mart_or_joins_gets_the_hidden_mart_404(pool: PgPool) {
+        let ch = mock_serving_catalog().await;
+        let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+
+        for query in [
+            FieldsQuery {
+                mart: Some("sales".to_owned()),
+                source: None,
+                joins: None,
+            },
+            FieldsQuery {
+                mart: Some("sales".to_owned()),
+                source: None,
+                joins: Some(
+                    r#"[{"mart":"stock","type":"left","on":[{"left":"amount","op":"=","right":"qty"}]}]"#
+                        .to_owned(),
+                ),
+            },
+        ] {
+            let (status, body) = json_of(
+                fields(
+                    State(state.clone()),
+                    Extension(principal(&[TENANT_B.parse().unwrap()], "dashboard:read")),
+                    HeaderMap::new(),
+                    Query(query),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert!(
+                !body.to_string().contains("amount"),
+                "no column name may leak: {body}"
+            );
+            assert!(
+                !body.to_string().contains("qty"),
+                "no joined column name may leak: {body}"
+            );
+        }
+        no_metadata_was_read(&ch).await;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_forged_x_tenant_header_is_refused_before_any_metadata_query(pool: PgPool) {
+        let ch = mock_serving_catalog().await;
+        let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-tenant", TENANT_B.parse().unwrap());
+
+        let (status, _) = json_of(
+            fields(
+                State(state),
+                Extension(principal(&[TENANT_A.parse().unwrap()], "dashboard:read")),
+                headers,
+                Query(FieldsQuery {
+                    mart: None,
+                    source: None,
+                    joins: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        no_metadata_was_read(&ch).await;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_catalog_tenant_member_and_an_admin_still_see_marts_and_columns(pool: PgPool) {
+        let ch = mock_serving_catalog().await;
+        let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+        let callers = [
+            principal(&[TENANT_A.parse().unwrap()], "dashboard:read"),
+            principal(&[], "*:*"),
+        ];
+        for caller in callers {
+            let (status, body) = json_of(
+                fields(
+                    State(state.clone()),
+                    Extension(caller.clone()),
+                    HeaderMap::new(),
+                    Query(FieldsQuery {
+                        mart: None,
+                        source: None,
+                        joins: None,
+                    }),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let names: Vec<&str> = body["marts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(names, vec!["sales", "stock"]);
+
+            let (status, body) = json_of(
+                fields(
+                    State(state.clone()),
+                    Extension(caller.clone()),
+                    HeaderMap::new(),
+                    Query(FieldsQuery {
+                        mart: Some("sales".to_owned()),
+                        source: None,
+                        joins: None,
+                    }),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                body["columns"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c["name"] == "amount")
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_outsider_gets_no_join_suggestions_but_a_catalog_member_does(pool: PgPool) {
+        let ch = mock_serving_catalog().await;
+        let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+        let query = || {
+            Query(JoinSuggestionsQuery {
+                left: Some("sales".to_owned()),
+                right: Some("stock".to_owned()),
+            })
+        };
+
+        let (status, body) = json_of(
+            join_suggestions(
+                State(state.clone()),
+                Extension(principal(&[TENANT_B.parse().unwrap()], "dashboard:read")),
+                HeaderMap::new(),
+                query(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        let (status, body) = json_of(
+            join_suggestions(
+                State(state),
+                Extension(principal(&[TENANT_A.parse().unwrap()], "dashboard:read")),
+                HeaderMap::new(),
+                query(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["pairs"].is_array());
     }
 }
 

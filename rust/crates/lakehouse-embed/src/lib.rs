@@ -309,6 +309,16 @@ pub struct RenderClaims {
     pub report: Option<String>,
     /// The person who asked (`app_user.id`): the data is read as them.
     pub principal: String,
+    /// The tenant the person worked under when they asked (`X-Tenant`), as
+    /// a UUID string. `SEC-54` (SEC-50 slice 2 M5): without it the print view
+    /// reads the PDF or chart image under the person's FIRST tenant, which
+    /// can differ from the tenant on the screen they exported. Absent — and
+    /// therefore first-tenant — for tokens minted before this field existed
+    /// and for a scheduled job, which has no acting tenant of its own.
+    /// `#[serde(default)]` keeps those older tokens valid; membership is
+    /// checked again at render time by `tenant_scope::resolve`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
     /// The dashboard's filters, as the JSON list `GET /api/dashboard` takes in
     /// `filters` (one encoding, the page's own).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -644,6 +654,7 @@ mod tests {
             chart: None,
             report: None,
             principal: "7d1e1c52-2f6b-4f3a-9c58-0c5d1d3f9a11".to_owned(),
+            tenant: None,
             filters: Some(r#"[{"column":"region","values":["north"]}]"#.to_owned()),
             params: Some(r#"{"p":1}"#.to_owned()),
             grain: None,
@@ -665,6 +676,32 @@ mod tests {
             verify_render(&long, RENDER_SECRET, NOW),
             Err(TokenError::Lifetime)
         );
+    }
+
+    /// SEC-54: the token must carry the tenant the person worked under, so
+    /// the print view can read under that tenant instead of their first one.
+    #[test]
+    fn a_render_token_round_trips_the_tenant_it_was_minted_for() {
+        let mut claims = render_claims(NOW, NOW + 120.0);
+        claims.tenant = Some("11111111-1111-4111-8111-000000000002".to_owned());
+        let token = sign_render(&claims, RENDER_SECRET);
+        assert_eq!(verify_render(&token, RENDER_SECRET, NOW), Ok(claims));
+    }
+
+    /// SEC-54: a token minted before the tenant field existed must still
+    /// verify — `tenant` is absent, so the print view reads the person's
+    /// first tenant, as it always did.
+    #[test]
+    fn a_render_token_without_a_tenant_deserializes_as_none() {
+        let mut payload = serde_json::to_value(render_claims(NOW, NOW + 120.0)).unwrap();
+        payload.as_object_mut().unwrap().remove("tenant");
+        let header = b64url_json(&json!({ "alg": "HS256", "typ": "JWT" })).unwrap();
+        let data = format!("{header}.{}", b64url_json(&payload).unwrap());
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(RENDER_SECRET.as_bytes()).unwrap();
+        mac.update(data.as_bytes());
+        let token = format!("{data}.{}", b64url(&mac.finalize().into_bytes()));
+        let verified = verify_render(&token, RENDER_SECRET, NOW).unwrap();
+        assert_eq!(verified.tenant, None);
     }
 
     #[test]

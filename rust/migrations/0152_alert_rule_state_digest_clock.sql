@@ -1,0 +1,20 @@
+-- BI-65 (BI-19-AC12): when a dashboard digest was last due, so a digest runs on
+-- its schedule instead of on every 15-minute alerts tick.
+--
+-- Why a column here and not on `console.alert_rule`: the same reason as `0113`.
+-- The rule row lives in ClickHouse and is replaced whole on every save, so a
+-- send time written there would be lost by a rule edit made between two ticks,
+-- and every send would be a row rewrite. `alert_rule_state` is the one
+-- per-rule row the evaluator alone writes, in the store that can do an atomic
+-- conditional update, so two overlapping runners cannot both send the digest.
+--
+-- `digest_clock_at` is the instant the digest's schedule is counted from: the
+-- last time a send was claimed or, for a digest never seen before, the first
+-- tick that saw it (it is not sent then; its first send is the first schedule
+-- time after that). NULL for every rule that is not a digest, and for a digest
+-- nobody has checked yet. A digest's row has `state = 'ok'` and nothing else:
+-- the threshold state machine never reads it.
+--
+-- Additive and idempotent: a new nullable column, so a row written before this
+-- migration reads as "not seen yet" and starts its clock on the next tick.
+ALTER TABLE alert_rule_state ADD COLUMN IF NOT EXISTS digest_clock_at TIMESTAMPTZ;

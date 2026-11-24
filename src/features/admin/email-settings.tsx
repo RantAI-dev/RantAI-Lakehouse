@@ -68,8 +68,11 @@ export function EmailSettingsForm({ canWrite }: { canWrite: boolean }) {
     setUser(loaded.user.value ?? "")
     setFrom(loaded.from.value ?? "")
     setConsoleUrl(loaded.consolePublicUrl.value ?? "")
-    setPassword("")
-    setPasswordChoice("keep")
+    // REL-24: never reset the write-only password state here. It already
+    // starts as ""/"keep" and handleSave clears it after a save, so
+    // resetting on load is redundant — and a late flush of this effect would
+    // undo a Replace click that landed before it, dropping the control the
+    // person just asked for.
   }, [loaded])
 
   const portNumber = port.trim() === "" ? null : Number(port)

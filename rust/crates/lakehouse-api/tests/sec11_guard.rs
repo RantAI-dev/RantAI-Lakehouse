@@ -339,6 +339,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "an ApiError from routes::alerts' scope checks and visible_rules: fixed texts written in this repository, a store failure is already \"database error\"",
     ),
     (
+        "ai/tools/alerts.rs",
+        "The rule could not be read: {err}",
+        "serde error over the model's own tool arguments (BI-65): it names the unknown or mistyped field, not an upstream payload",
+    ),
+    (
         "ai/tools/connectors.rs",
         "Err(err) => return json!({ \"error\": err.to_string() })",
         "serialising our own serde_json::Value: infallible, not an upstream",

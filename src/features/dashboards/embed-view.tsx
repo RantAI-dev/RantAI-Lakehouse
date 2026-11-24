@@ -5,6 +5,7 @@ import * as React from "react";
 import { useTheme } from "next-themes";
 import { cn } from "@/lib/utils";
 import { dashboardLook } from "@/lib/dashboard-look";
+import { SurfaceThemeProvider } from "@/components/ui/surface-theme";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
 import { ReportingProvider } from "./reporting-context";
 import { TileBody } from "./tile-body";
@@ -216,6 +217,7 @@ export function EmbedView({
     }
     return (
       <ReportingProvider reporting={data?.reporting}>
+      <SurfaceThemeProvider themeClass={boardLook.surfaceThemeClass}>
       <div className={cn("flex h-screen flex-col overflow-hidden bg-transparent p-2", boardLook.className, look.transparent && "!bg-transparent")} style={boardLook.style}>
         <div className={cn("flex h-full flex-col overflow-hidden rounded-xl border border-border", look.transparent ? "bg-transparent" : "bg-card")}>
           <div className="flex items-center gap-2 border-b border-border px-3 py-1.5">
@@ -228,6 +230,7 @@ export function EmbedView({
           </div>
         </div>
       </div>
+      </SurfaceThemeProvider>
       </ReportingProvider>
     );
   }
@@ -245,6 +248,7 @@ export function EmbedView({
 
   return (
     <ReportingProvider reporting={data?.reporting}>
+    <SurfaceThemeProvider themeClass={boardLook.surfaceThemeClass}>
     <div className={cn("min-h-screen", boardLook.className, look.transparent ? "!bg-transparent" : "bg-background")} style={boardLook.style}>
       {/* BI-64: the padding is inside the measured root, so the posted height is the
           content's whole height and the frame does not scroll by the padding. */}
@@ -272,6 +276,7 @@ export function EmbedView({
       </footer>
       </div>
     </div>
+    </SurfaceThemeProvider>
     </ReportingProvider>
   );
 }

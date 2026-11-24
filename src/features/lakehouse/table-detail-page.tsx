@@ -29,6 +29,8 @@ import {
   maintenanceSummary,
   snapshotRelativeTime,
   snapshotsNewestFirst,
+  tableCompactionWarningMessage,
+  tableNeedsCompactionWarning,
 } from "@/lib/lakehouse-view"
 import { fmtMeasured } from "@/lib/measured"
 import { lakehouseService } from "@/services"
@@ -107,6 +109,20 @@ export function LakehouseTableDetailPage() {
   }
   const detail = detailState.data
   const snapshots = snapshotsNewestFirst(detail.snapshots)
+  const smallFileCount = detail.stats.smallFileCount
+  const smallFileThreshold = detail.stats.smallFileThresholdBytes
+  const smallFilesLabel =
+    smallFileThreshold === null ? "Small files" : `Small files (< ${formatBytes(smallFileThreshold)})`
+  // `smallFileCount !== null` narrows to a real measurement: an unmeasured
+  // table never reaches the warning message as a fabricated zero (OPS-21).
+  const compactionWarning =
+    smallFileCount !== null &&
+    tableNeedsCompactionWarning({
+      smallFileCount,
+      compactionAvailable: detail.compactionAvailable,
+    })
+      ? tableCompactionWarningMessage(smallFileCount, smallFileThreshold)
+      : null
 
   return (
     <div className="flex flex-col gap-4">
@@ -121,6 +137,19 @@ export function LakehouseTableDetailPage() {
           </Button>
         }
       />
+
+      {compactionWarning !== null ? (
+        // OPS-21: an honest, prominent warning from a MEASURED count. It is
+        // absent entirely when the count is null, below the need count, or
+        // Trino can compact — a reader is never told "Trino is off" on those.
+        <div
+          role="alert"
+          className="rounded-lg border border-destructive/40 bg-destructive/5 p-4 text-sm"
+        >
+          <p className="font-semibold text-destructive">Compaction needed, but nothing can do it</p>
+          <p className="mt-1 text-foreground">{compactionWarning}</p>
+        </div>
+      ) : null}
 
       <SectionCard size="sm" title="Schema">
         {detail.schema.length === 0 ? (
@@ -197,8 +226,8 @@ export function LakehouseTableDetailPage() {
             <dd>{fmtMeasured(detail.stats.fileCount)}</dd>
           </div>
           <div>
-            <dt className="text-xs text-muted-foreground">Small files</dt>
-            <dd>{fmtMeasured(detail.stats.smallFileCount)}</dd>
+            <dt className="text-xs text-muted-foreground">{smallFilesLabel}</dt>
+            <dd>{fmtMeasured(smallFileCount)}</dd>
           </div>
           <div>
             <dt className="text-xs text-muted-foreground">Records</dt>

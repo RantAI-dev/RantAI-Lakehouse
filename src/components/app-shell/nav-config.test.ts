@@ -222,6 +222,25 @@ describe("ADM-13 D7: nav-config access map and drift tests", () => {
       expect(item?.requires).toEqual(["usage:read"])
     })
 
+    // SEC-66: these two pages used to be `requires: []`, so any signed-in
+    // user — a Dashboard Viewer included — could open them by address while
+    // the API moved behind gold:read / agent:read. The map must follow the
+    // API, not the old sidebar omission.
+    it("opens the Gold and agent run pages only with their SEC-66 read grants", () => {
+      const dashboardViewer = (p: string) => p === "dashboard:read"
+      const goldReader = (p: string) => p === "gold:read"
+      const agentReader = (p: string) => p === "agent:read"
+
+      for (const path of ["/gold-exports", "/agents/runs/run-x"]) {
+        expect(canOpen(path, dashboardViewer)).toBe(false)
+      }
+
+      expect(canOpen("/gold-exports", goldReader)).toBe(true)
+      expect(canOpen("/gold-exports", agentReader)).toBe(false)
+      expect(canOpen("/agents/runs/run-x", agentReader)).toBe(true)
+      expect(canOpen("/agents/runs/run-x", goldReader)).toBe(false)
+    })
+
     it("supports any-of permission checks", () => {
       const hasAlertWrite = (p: string) => p === "alert:write"
       const hasAlertRead = (p: string) => p === "alert:read"
