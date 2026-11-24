@@ -42,9 +42,10 @@
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use lakehouse_auth::{PermissionSet, Principal};
+use lakehouse_auth::{PermissionSet, Principal, PrincipalId};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
+use lakehouse_store::StoreError;
 use lakehouse_store::agents::{
     self, AgentRun, AgentWorkflow, ApprovalItem, CreateEmployeeInput, CreateWorkflowInput,
     Decision, DigitalEmployee, LinkedApprovalRequest, RunStep,
@@ -206,6 +207,12 @@ pub struct CreateEmployeeBody {
     mode: Option<String>,
     #[serde(default)]
     permissions: Option<String>,
+    /// `SEC-68`: the agent's explicit table-access grant (role NAMES).
+    /// Optional at create time — an absent grant means no tables, fail
+    /// closed — and validated exactly like the dedicated read-roles
+    /// endpoint below.
+    #[serde(default, rename = "readRoles")]
+    read_roles: Option<Vec<String>>,
 }
 
 /// `POST /api/agents/employees` — create a digital employee. Returns 201.
@@ -257,6 +264,10 @@ pub async fn create_employee(
         .into());
     }
     check_permission_ceiling(&principal, body.permissions.as_deref())?;
+    // SEC-68: an agent created with a role grant is subject to the same
+    // unknown-name and no-escalation rules as the dedicated endpoint.
+    let read_roles = normalize_role_names(body.read_roles.as_deref().unwrap_or_default());
+    validate_read_roles(pool(&state)?, &principal, &read_roles).await?;
     let input = CreateEmployeeInput {
         name: required("name", &body.name)?,
         purpose: required("purpose", &body.purpose)?,
@@ -269,6 +280,7 @@ pub async fn create_employee(
         schedule_cron: body.schedule_cron,
         mode: body.mode,
         permissions: body.permissions,
+        read_roles,
     };
     let created = agents::create_employee(pool(&state)?, &input).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
@@ -307,6 +319,110 @@ fn check_permission_ceiling(creator: &Principal, asked: Option<&str>) -> Result<
         }
     }
     Ok(())
+}
+
+/// A role set is a set: trim, drop blanks, dedupe in first-seen order so the
+/// same name is never validated or stored twice (ADM-4 D1's shape, reused
+/// here rather than re-derived — `SEC-68`).
+fn normalize_role_names(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in raw {
+        let name = name.trim();
+        if !name.is_empty() && !out.iter().any(|held| held == name) {
+            out.push(name.to_owned());
+        }
+    }
+    out
+}
+
+/// `SEC-68` no-escalation check for an agent's explicit read grant.
+///
+/// 1. Every name must exist in Postgres `role` (`400` for an unknown name).
+///    Role names are readable by any authenticated user
+///    (`GET /api/identity/roles`), so answering `400` here leaks nothing.
+/// 2. A caller who is NOT unrestricted (`*:*`) and does NOT hold
+///    `identity:write` may grant ONLY roles it holds itself. This is the
+///    privilege ceiling: a person who may manage agents must not be able
+///    to let one read a table their own role hides. The `403` names the
+///    first role it tried to grant.
+///
+/// A grant of `[]` is valid and means "reads no tables" (fail closed) —
+/// there is nothing to escalate.
+///
+/// # Errors
+///
+/// `400` for an unknown role name; `403` for a role the caller does not hold;
+/// `500` (classified) if the role names cannot be read at all — a store that
+/// cannot say which roles exist must not be read as "any grant is fine".
+async fn validate_read_roles(
+    pg: &PgPool,
+    caller: &Principal,
+    requested: &[String],
+) -> Result<(), ApiError> {
+    if requested.is_empty() {
+        return Ok(());
+    }
+    // Names are bound, never formatted into the statement (rule 4).
+    let found: Vec<String> = sqlx::query_scalar("SELECT name FROM role WHERE name = ANY($1)")
+        .bind(requested)
+        .fetch_all(pg)
+        .await
+        .map_err(StoreError::from)?;
+    if found.len() != requested.len() {
+        let unknown = requested
+            .iter()
+            .find(|name| !found.iter().any(|existing| existing == *name))
+            .cloned()
+            .unwrap_or_default();
+        return Err(ApiError::BadRequest(format!(
+            "unknown role name: {}",
+            unknown.chars().take(64).collect::<String>()
+        )));
+    }
+    let may_escalate =
+        crate::routes::catalog::is_unrestricted(caller) || caller.has("identity:write");
+    if !may_escalate
+        && let Some(role) = requested
+            .iter()
+            .find(|name| !caller.role_names.iter().any(|held| held == *name))
+    {
+        return Err(ApiError::PermissionDenied(format!(
+            "you cannot grant the role {role} to an agent because you do not hold it"
+        )));
+    }
+    Ok(())
+}
+
+/// The `PUT /api/agents/employees/{id}/read-roles` body. A complete
+/// replacement, not a delta: omitting a role revokes it, and `[]` means the
+/// agent reads no tables at all.
+#[derive(Debug, Deserialize)]
+pub struct SetEmployeeReadRolesBody {
+    roles: Vec<String>,
+}
+
+/// `PUT /api/agents/employees/{id}/read-roles` — set an employee's explicit
+/// table-access grant (`SEC-68`). Needs `agent:manage` (`POLICY_TABLE`) AND
+/// passes [`validate_read_roles`]'s unknown-name and no-escalation checks.
+/// The central audit writer records the change under `agent.read_roles.set`.
+///
+/// # Errors
+///
+/// `400` on a malformed body or an unknown role name; `403` when a restricted
+/// caller names a role it does not hold; `404` if `id` is unknown; `503` with
+/// no Postgres pool; `500` (classified) on a storage failure.
+pub async fn set_employee_read_roles(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<DigitalEmployee>> {
+    let body: SetEmployeeReadRolesBody = parse_body(&body)?;
+    let roles = normalize_role_names(&body.roles);
+    let pg = pool(&state)?;
+    validate_read_roles(pg, &principal, &roles).await?;
+    let result = agents::set_employee_read_roles(pg, &id, &roles).await;
+    map_transition_result(&id, result)
 }
 
 fn map_transition_result(
@@ -1011,12 +1127,84 @@ enum RunAuth {
 /// the live principal the auth middleware built for this request, so
 /// `RunAuth::Principal` hands it back by reference and `RunAuth::Token`
 /// (a schedule or service token, with no interactive user behind it)
-/// yields `None`. `run_headless_loop` forwards this same value to every
-/// `ai_tools::run_tool` call for the run's whole duration.
+/// yields `None`. `SEC-68` now derives the run's actual tool principal from
+/// the employee's read grant instead, so this stays for the auth-shape
+/// tests only.
+#[cfg(test)]
 fn principal_for_run_auth(auth: &RunAuth) -> Option<&Principal> {
     match auth {
         RunAuth::Token => None,
         RunAuth::Principal(p) => Some(p),
+    }
+}
+
+/// `SEC-68`: the role names an agent run uses for table access, derived from
+/// the agent's OWN explicit grant — never from whatever the trigger happens
+/// to carry.
+///
+/// * A scheduled/service run (`RunAuth::Token`, no caller) uses strictly
+///   `grant`.
+/// * An unrestricted caller (`*:*`) or one holding `identity:write` also
+///   uses `grant` in full — they are allowed to manage agents whose tables
+///   exceed their own role's.
+/// * Any other human is intersected with the grant: the run can read only
+///   roles the human actually holds AND the agent was granted.
+/// * An empty result becomes [`NO_GRANT_ROLE`], a name no role carries, so
+///   every `for_roles` call site resolves it to ZERO tables. That is the
+///   fail-closed case: a grant-less agent run never becomes `All`.
+///
+/// [`NO_GRANT_ROLE`]: crate::table_access::NO_GRANT_ROLE
+fn effective_read_roles(grant: &[String], caller: Option<&Principal>) -> Vec<String> {
+    let may_exceed = caller.is_some_and(|principal| {
+        crate::routes::catalog::is_unrestricted(principal) || principal.has("identity:write")
+    });
+    let mut roles: Vec<String> = match caller {
+        None => grant.to_vec(),
+        Some(_) if may_exceed => grant.to_vec(),
+        Some(human) => grant
+            .iter()
+            .filter(|role| human.role_names.iter().any(|held| held == *role))
+            .cloned()
+            .collect(),
+    };
+    roles.dedup();
+    if roles.is_empty() {
+        vec![crate::table_access::NO_GRANT_ROLE.to_owned()]
+    } else {
+        roles
+    }
+}
+
+/// The [`Principal`] an agent run acts as for every tool call (`SEC-68`).
+///
+/// A human-triggered run keeps the human's identity, permissions and tenants
+/// (so tenant scoping and audit stay truthful) but carries the narrowed
+/// [`effective_read_roles`] as its role names. A scheduled run has no caller,
+/// so it gets a synthetic service principal carrying the same roles and the
+/// employee's own permission ceiling — tools that require a principal can
+/// now run, but only within the grant. Audit identity is derived separately
+/// from [`RunAuth`] and is unaffected.
+fn build_run_principal(
+    auth: &RunAuth,
+    roles: Vec<String>,
+    perms: &PermissionSet,
+    actor_label: &str,
+) -> Principal {
+    match auth {
+        RunAuth::Principal(human) => {
+            let mut run = human.clone();
+            run.role_names = roles;
+            run
+        }
+        RunAuth::Token => Principal {
+            id: PrincipalId::Service(Uuid::nil()),
+            tenant_ids: Vec::new(),
+            display_name: actor_label.to_owned(),
+            permissions: perms.clone(),
+            provider: "service".to_owned(),
+            must_change_password: false,
+            role_names: roles,
+        },
     }
 }
 
@@ -1974,13 +2162,22 @@ pub async fn run_employee(
 
     let (trigger, principal_id, principal_kind, actor) =
         run_employee_audit_identity(&auth, &config.name);
-    let principal = principal_for_run_auth(&auth);
+    let perms = PermissionSet::parse(&config.permissions);
+    let is_build = config.mode == "build";
+
+    // SEC-68: table access for this run comes from the agent's OWN explicit
+    // grant, narrowed further by a restricted human trigger. Resolve it
+    // BEFORE the run starts: a store that cannot say what the grant reads is
+    // a refusal (500, no upstream text), never an implicit "all tables".
+    let roles = effective_read_roles(
+        &config.read_roles,
+        principal.as_ref().map(|Extension(principal)| principal),
+    );
+    let run_principal = build_run_principal(&auth, roles, &perms, &actor);
+    crate::table_access::for_principal(state.pg.as_deref(), &run_principal).await?;
 
     let run_id = format!("run-emp-{}", Uuid::new_v4());
     agents::create_run(pg, &run_id, &id, trigger, &actor).await?;
-
-    let perms = PermissionSet::parse(&config.permissions);
-    let is_build = config.mode == "build";
 
     let outcome = run_headless_loop(
         &state,
@@ -1989,7 +2186,7 @@ pub async fn run_employee(
         &prompt,
         is_build,
         &perms,
-        principal,
+        Some(&run_principal),
         principal_id,
         principal_kind,
         &actor,
@@ -2118,8 +2315,154 @@ mod tests {
             schedule_cron: None,
             mode: None,
             permissions: None,
+            read_roles: None,
         };
         assert!(!VALID_AUTONOMY.contains(&body.autonomy.as_str()));
+    }
+
+    // ── SEC-68: runtime narrowing and grant validation ──────────────────
+
+    fn principal_with(permissions: &str, roles: &[&str]) -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(7)),
+            tenant_ids: Vec::new(),
+            display_name: "Tester".to_owned(),
+            permissions: PermissionSet::parse(permissions),
+            provider: "local".to_owned(),
+            must_change_password: false,
+            role_names: roles.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
+    fn grant(roles: &[&str]) -> Vec<String> {
+        roles.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// SEC-68 D1: a grant-less scheduled run carries the sentinel role, so
+    /// `for_roles` resolves it to ZERO tables — never `All`.
+    #[test]
+    fn a_grantless_scheduled_run_carries_the_no_grant_sentinel() {
+        assert_eq!(
+            effective_read_roles(&[], None),
+            vec![crate::table_access::NO_GRANT_ROLE.to_owned()]
+        );
+    }
+
+    /// SEC-68 D2: a scheduled run uses strictly its own grant; an empty grant
+    /// fails closed even when the trigger is a restricted human.
+    #[test]
+    fn a_scheduled_run_uses_only_the_agents_grant() {
+        assert_eq!(
+            effective_read_roles(&grant(&["Finance"]), None),
+            grant(&["Finance"])
+        );
+        assert_eq!(
+            effective_read_roles(&[], Some(&principal_with("agent:manage", &[]))),
+            vec![crate::table_access::NO_GRANT_ROLE.to_owned()]
+        );
+    }
+
+    /// SEC-68 D3: a restricted human cannot widen an agent past its grant OR
+    /// its own roles; an admin/identity writer keeps the whole grant.
+    #[test]
+    fn a_restricted_human_is_intersected_with_the_grant() {
+        let human = principal_with("agent:manage", &["Finance"]);
+        assert_eq!(
+            effective_read_roles(&grant(&["Finance", "HR"]), Some(&human)),
+            grant(&["Finance"])
+        );
+        let admin = principal_with("*:*", &["Finance"]);
+        assert_eq!(
+            effective_read_roles(&grant(&["Finance", "HR"]), Some(&admin)),
+            grant(&["Finance", "HR"])
+        );
+        let identity_writer = principal_with("identity:write", &[]);
+        assert_eq!(
+            effective_read_roles(&grant(&["HR"]), Some(&identity_writer)),
+            grant(&["HR"])
+        );
+    }
+
+    /// The tool principal carries the narrowed roles while keeping the
+    /// human's identity, and a scheduled run gets a synthetic service
+    /// principal bounded by the employee's permission ceiling.
+    #[test]
+    fn the_run_principal_carries_the_narrowed_roles() {
+        let human = principal_with("agent:manage, query:read", &["Finance"]);
+        let auth = RunAuth::Principal(human);
+        let run = build_run_principal(&auth, grant(&["Finance"]), &PermissionSet::parse(""), "x");
+        assert_eq!(run.role_names, grant(&["Finance"]));
+        assert_eq!(run.id, PrincipalId::User(Uuid::from_u128(7)));
+        assert!(run.has("query:read"));
+
+        let run = build_run_principal(
+            &RunAuth::Token,
+            grant(&[crate::table_access::NO_GRANT_ROLE]),
+            &PermissionSet::parse("query:read"),
+            "Scheduled Agent",
+        );
+        assert_eq!(run.id, PrincipalId::Service(Uuid::nil()));
+        assert_eq!(run.role_names, grant(&[crate::table_access::NO_GRANT_ROLE]));
+        assert!(run.has("query:read"));
+    }
+
+    async fn seed_role(pool: &PgPool, name: &str, permissions: &str) {
+        sqlx::query(
+            "INSERT INTO role (name, permissions) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING",
+        )
+        .bind(name)
+        .bind(permissions)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// An unknown role name is a 400, whatever the caller's own roles.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_unknown_role_name_is_a_bad_request(pool: PgPool) -> sqlx::Result<()> {
+        let admin = principal_with("identity:write", &[]);
+        let err = validate_read_roles(&pool, &admin, &["No Such Role".to_owned()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+        Ok(())
+    }
+
+    /// SEC-68 no-escalation: a restricted `agent:manage` caller may grant a
+    /// role it holds, but not one it does not.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_restricted_caller_cannot_grant_a_role_it_does_not_hold(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        seed_role(&pool, "Finance", "query:read").await;
+        seed_role(&pool, "HR", "query:read").await;
+        let manager = principal_with("agent:manage", &["Finance"]);
+        assert!(
+            validate_read_roles(&pool, &manager, &["Finance".to_owned()])
+                .await
+                .is_ok()
+        );
+        let err = validate_read_roles(&pool, &manager, &["HR".to_owned()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::PermissionDenied(_)), "{err:?}");
+        Ok(())
+    }
+
+    /// A caller holding `identity:write` may grant any EXISTING role, and an
+    /// empty grant is always valid (it means "reads no tables").
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_identity_writer_may_grant_any_existing_role(pool: PgPool) -> sqlx::Result<()> {
+        seed_role(&pool, "HR", "query:read").await;
+        let admin = principal_with("identity:write", &[]);
+        assert!(
+            validate_read_roles(&pool, &admin, &["HR".to_owned()])
+                .await
+                .is_ok()
+        );
+        let restricted = principal_with("agent:manage", &[]);
+        assert!(validate_read_roles(&pool, &restricted, &[]).await.is_ok());
+        Ok(())
     }
 
     #[test]
@@ -2330,6 +2673,7 @@ mod tests {
             schedule_cron: None,
             mode: Some("sleep".to_owned()),
             permissions: None,
+            read_roles: None,
         };
         assert!(!VALID_MODE.contains(&body.mode.as_deref().unwrap()));
     }
@@ -2615,6 +2959,7 @@ mod tests {
                 schedule_cron: None,
                 mode: Some("build".to_owned()),
                 permissions: Some("*:*".to_owned()),
+                read_roles: Vec::new(),
             };
             let employee = store_agents::create_employee(&pool, &input).await.unwrap();
             store_agents::create_run(&pool, "run-budget-1", &employee.id, "manual", "tester")
@@ -2694,6 +3039,7 @@ mod tests {
                 schedule_cron: None,
                 mode: Some("build".to_owned()),
                 permissions: Some("*:*".to_owned()),
+                read_roles: Vec::new(),
             };
             let employee = store_agents::create_employee(&pool, &input).await.unwrap();
             store_agents::create_run(&pool, "run-budget-2", &employee.id, "manual", "tester")
@@ -2767,6 +3113,7 @@ mod tests {
                 schedule_cron: None,
                 mode: Some("build".to_owned()),
                 permissions: Some("*:*".to_owned()),
+                read_roles: Vec::new(),
             };
             let employee = store_agents::create_employee(&pool, &input).await.unwrap();
             store_agents::create_run(&pool, "run-budget-3", &employee.id, "manual", "tester")

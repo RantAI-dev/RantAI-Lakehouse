@@ -438,6 +438,7 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("POST", "/api/knowledge/vector-jobs", Coverage::Central { action: "knowledge_vector_job.create", resource_kind: "knowledge_vector_job", id_param: IdParam::None }),
     ("POST", "/api/agents/workflows", Coverage::Central { action: "agent_workflow.create", resource_kind: "agent_workflow", id_param: IdParam::None }),
     ("POST", "/api/agents/employees", Coverage::Central { action: "digital_employee.create", resource_kind: "digital_employee", id_param: IdParam::None }),
+    ("PUT", "/api/agents/employees/{id}/read-roles", Coverage::Central { action: "agent.read_roles.set", resource_kind: "digital_employee", id_param: IdParam::Path("id") }),
     ("POST", "/api/agents/employees/{id}/suspend", Coverage::Central { action: "digital_employee.suspend", resource_kind: "digital_employee", id_param: IdParam::Path("id") }),
     ("POST", "/api/agents/employees/{id}/resume", Coverage::Central { action: "digital_employee.resume", resource_kind: "digital_employee", id_param: IdParam::Path("id") }),
     ("POST", "/api/agents/employees/{id}/revoke", Coverage::Central { action: "digital_employee.revoke", resource_kind: "digital_employee", id_param: IdParam::Path("id") }),

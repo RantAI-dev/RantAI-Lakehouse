@@ -1339,6 +1339,13 @@ fn agents_router() -> Router<AppState> {
             get(agents::list_employees).post(agents::create_employee),
         )
         .route("/api/agents/employees/{id}", get(agents::get_employee))
+        // SEC-68: set an employee's explicit table-access role grant. A
+        // dedicated live route on the employee store/read path — no
+        // dependency on the retired workflows/suspend/resume/revoke routes.
+        .route(
+            "/api/agents/employees/{id}/read-roles",
+            axum::routing::put(agents::set_employee_read_roles),
+        )
         .route(
             "/api/agents/employees/{id}/suspend",
             axum::routing::post(agents::suspend_employee),

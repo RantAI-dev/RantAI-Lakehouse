@@ -661,17 +661,16 @@ async fn system_prompt(
             // which roles may read what hides every table (fail closed) —
             // the map still renders, with none of its tables in it.
             let access = match principal {
+                // SEC-68: a role-less service identity is not a wildcard
+                // admin. `for_principal` answers zero tables for it, keeps a
+                // genuine `*:*` admin at `All`, and degrades to `All` only
+                // for a non-empty role set with no Postgres pool.
                 Some(principal) => {
-                    crate::table_access::for_roles(state.pg.as_deref(), &principal.role_names)
+                    crate::table_access::for_principal(state.pg.as_deref(), principal)
                         .await
-                        .unwrap_or_else(|_| {
-                            crate::table_access::TableAccess::Listed(
-                                std::collections::HashSet::new(),
-                                std::collections::HashSet::new(),
-                            )
-                        })
+                        .unwrap_or_else(|_| crate::table_access::TableAccess::none())
                 }
-                None => crate::table_access::TableAccess::All,
+                None => crate::table_access::TableAccess::none(),
             };
             // `SEC-20`, plan 97: the closing line of the map names registry
             // datasets, which another tenant's upload is one of. The reach is

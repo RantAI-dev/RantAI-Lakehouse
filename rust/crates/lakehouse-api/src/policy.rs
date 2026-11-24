@@ -1258,6 +1258,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // the gate (the handler also caps its permissions at the creator's).
     ("POST", "/api/agents/employees",                Policy::RequiresPermission("agent:manage")),
     ("GET",  "/api/agents/employees/{id}",           Policy::RequiresAuth),
+    // SEC-68: assigning an agent's explicit read grant is an agent:manage
+    // action, with the handler's own no-escalation check on top (a caller
+    // without *:*/identity:write may only grant roles it holds itself).
+    ("PUT",  "/api/agents/employees/{id}/read-roles", Policy::RequiresPermission("agent:manage")),
     ("POST", "/api/agents/employees/{id}/suspend",   Policy::RequiresPermission("agent:manage")),
     ("POST", "/api/agents/employees/{id}/resume",    Policy::RequiresPermission("agent:manage")),
     ("POST", "/api/agents/employees/{id}/revoke",    Policy::RequiresPermission("agent:manage")),
