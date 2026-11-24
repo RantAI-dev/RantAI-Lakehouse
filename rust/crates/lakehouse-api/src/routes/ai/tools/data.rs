@@ -89,7 +89,8 @@ pub(super) async fn run_sql(
             Err(crate::sql_rewrite::RewriteError::Unparseable) | Ok(()) => {}
             Err(refusal) => {
                 let message = crate::policy_engine::refusal_message(&refusal).to_owned();
-                let refused: ApiResult<ApiJson<Value>> = Err(ApiError::Unprocessable(message).into());
+                let refused: ApiResult<ApiJson<Value>> =
+                    Err(ApiError::Unprocessable(message).into());
                 return api_result_to_value(refused).await;
             }
         }
@@ -679,7 +680,13 @@ async fn bi_only_list_datasets(state: &AppState, args: &Map<String, Value>) -> V
     };
     let tables = match outcome {
         Ok(tables) => tables,
-        Err(err) => return json!({ "error": err.to_string() }),
+        Err(err) => {
+            // `IntrospectionError` is already classified by `upstream_error`:
+            // render its `ApiError` through the same JSON body the routes use,
+            // so the SEC-11 guard sees no error text interpolated here.
+            let failed: ApiResult<ApiJson<Value>> = Err(err.into_api_error().into());
+            return api_result_to_value(failed).await;
+        }
     };
     let term = arg_str(args, "search").trim().to_lowercase();
     let hits: Vec<Value> = tables
@@ -726,13 +733,8 @@ async fn bi_only_describe_dataset(state: &AppState, args: &Map<String, Value>) -
                     "error": "an in-place Trino table is named catalog.schema.table",
                 });
             }
-            crate::in_place::introspect_trino_columns(
-                &state.trino,
-                parts[0],
-                parts[1],
-                parts[2],
-            )
-            .await
+            crate::in_place::introspect_trino_columns(&state.trino, parts[0], parts[1], parts[2])
+                .await
         }
         crate::config::QueryEngine::ClickHouse => {
             if parts.len() != 2 || parts.iter().any(|p| p.is_empty()) {
@@ -746,7 +748,13 @@ async fn bi_only_describe_dataset(state: &AppState, args: &Map<String, Value>) -
     };
     let columns = match outcome {
         Ok(columns) => columns,
-        Err(err) => return json!({ "error": err.to_string() }),
+        Err(err) => {
+            // `IntrospectionError` is already classified by `upstream_error`:
+            // render its `ApiError` through the same JSON body the routes use,
+            // so the SEC-11 guard sees no error text interpolated here.
+            let failed: ApiResult<ApiJson<Value>> = Err(err.into_api_error().into());
+            return api_result_to_value(failed).await;
+        }
     };
     json!({
         "slug": slug,

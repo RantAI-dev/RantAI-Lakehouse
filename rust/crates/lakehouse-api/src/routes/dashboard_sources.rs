@@ -529,12 +529,8 @@ async fn preview_bi_only_trino(
         )
         .into());
     }
-    let normalized = check_sql_source_for_mode(
-        &body.sql,
-        InstallMode::BiOnly,
-        QueryEngine::Trino,
-    )
-    .map_err(|r| ApiError::Unprocessable(r.message().to_owned()))?;
+    let normalized = check_sql_source_for_mode(&body.sql, InstallMode::BiOnly, QueryEngine::Trino)
+        .map_err(|r| ApiError::Unprocessable(r.message().to_owned()))?;
     let trino_dialect = crate::sql_rewrite::TrinoDialect::default();
     let gate = crate::routes::query::StatementGate::new(
         state,

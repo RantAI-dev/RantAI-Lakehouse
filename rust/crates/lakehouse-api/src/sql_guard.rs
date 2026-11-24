@@ -1183,12 +1183,7 @@ mod sql_source_for_mode_rules {
     /// `serving.<table>` and refuses an external table.
     #[test]
     fn full_mode_still_requires_serving_tables() {
-        assert!(check_sql_source_for_mode(
-            "SELECT * FROM serving.mart_a",
-            FULL.0,
-            FULL.1,
-        )
-        .is_ok());
+        assert!(check_sql_source_for_mode("SELECT * FROM serving.mart_a", FULL.0, FULL.1,).is_ok());
         for sql in [
             "SELECT * FROM erp_pg.public.customers",
             "SELECT * FROM public.customers",

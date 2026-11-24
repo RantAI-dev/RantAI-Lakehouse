@@ -1162,13 +1162,19 @@ mod tests {
         let trino = bi_only_engine_rules(QueryEngine::Trino);
         assert!(trino.contains("BI-ONLY ENGINE RULES"));
         assert!(trino.contains("Trino SQL"), "{trino}");
-        assert!(trino.contains("never reference, target or suggest a ClickHouse SQL"), "{trino}");
+        assert!(
+            trino.contains("never reference, target or suggest a ClickHouse SQL"),
+            "{trino}"
+        );
         assert!(trino.contains("read in place"), "{trino}");
         assert!(!trino.contains("target a ClickHouse SQL table"), "{trino}");
 
         let ch = bi_only_engine_rules(QueryEngine::ClickHouse);
         assert!(ch.contains("ClickHouse SQL"), "{ch}");
-        assert!(ch.contains("never reference, target or suggest a Trino SQL"), "{ch}");
+        assert!(
+            ch.contains("never reference, target or suggest a Trino SQL"),
+            "{ch}"
+        );
     }
 
     #[test]

@@ -621,31 +621,10 @@ async fn system_prompt(
     let latest_user = user_messages.last().copied().unwrap_or_default();
     // `BI-44` slice 3: a `bi-only` install has no lakehouse DATA MAP, and
     // the map builder below reads `ClickHouse` and Lakekeeper, which that
-    // deployment never started. Build the one-engine prompt here instead:
-    // `full` mode never enters this branch, so its prompt stays byte for
-    // byte what `AI-32` pinned. The reply-language line stays last.
+    // deployment never started. `full` mode never enters this helper, so
+    // its prompt stays byte for byte what `AI-32` pinned.
     if state.config.is_bi_only() {
-        let base = if is_build {
-            format!("{}{}", prompt::SYSTEM_BASE, prompt::SYSTEM_BUILD_SUFFIX)
-        } else {
-            format!("{}{}", prompt::SYSTEM_BASE, prompt::SYSTEM_ASK_SUFFIX)
-        };
-        let mut rules = String::new();
-        if state.config.ai_ask_back && asking {
-            rules.push_str(prompt::ASK_BACK_RULES);
-        }
-        if state.config.ai_sql_help && sql_help {
-            rules.push_str(prompt::SQL_HELP_RULES);
-        }
-        if state.config.ai_semantic_layer {
-            rules.push_str(prompt::DISTINCT_COUNT_RULES);
-        }
-        return format!(
-            "{base}{rules}{}\n\nDATA MAP: unavailable in a bi-only installation. Call list_datasets and describe_dataset to explore the external tables.{}{}",
-            prompt::bi_only_engine_rules(state.config.query_engine),
-            page_context_line(context),
-            prompt::closing(latest_user, state.config.ai_default_reply_language)
-        );
+        return bi_only_system_prompt(state, is_build, asking, sql_help, context, latest_user);
     }
     let withheld = withheld_by_policy(state).await;
     let terms = users_terms(state, principal).await;
@@ -754,6 +733,41 @@ async fn system_prompt(
     } + &words
         + &ctx_line
         + &prompt::closing(latest_user, state.config.ai_default_reply_language))
+}
+
+/// The `bi-only` prompt: the measured base and the same switch-controlled
+/// rules, plus [`prompt::bi_only_engine_rules`] and an honest "no DATA MAP"
+/// line instead of the lakehouse catalog (which this install does not have).
+/// The reply-language line stays last, as in `full` mode.
+fn bi_only_system_prompt(
+    state: &AppState,
+    is_build: bool,
+    asking: bool,
+    sql_help: bool,
+    context: &str,
+    latest_user: &str,
+) -> String {
+    let base = if is_build {
+        format!("{}{}", prompt::SYSTEM_BASE, prompt::SYSTEM_BUILD_SUFFIX)
+    } else {
+        format!("{}{}", prompt::SYSTEM_BASE, prompt::SYSTEM_ASK_SUFFIX)
+    };
+    let mut rules = String::new();
+    if state.config.ai_ask_back && asking {
+        rules.push_str(prompt::ASK_BACK_RULES);
+    }
+    if state.config.ai_sql_help && sql_help {
+        rules.push_str(prompt::SQL_HELP_RULES);
+    }
+    if state.config.ai_semantic_layer {
+        rules.push_str(prompt::DISTINCT_COUNT_RULES);
+    }
+    format!(
+        "{base}{rules}{}\n\nDATA MAP: unavailable in a bi-only installation. Call list_datasets and describe_dataset to explore the external tables.{}{}",
+        prompt::bi_only_engine_rules(state.config.query_engine),
+        page_context_line(context),
+        prompt::closing(latest_user, state.config.ai_default_reply_language)
+    )
 }
 
 /// Plan 17: an Explain turn offers no tool. The console's Explain sends the
@@ -3262,11 +3276,22 @@ mod tests {
             false,
         )
         .await;
-        assert!(trino_prompt.contains("BI-ONLY ENGINE RULES"), "{trino_prompt}");
-        assert!(trino_prompt.contains("Trino SQL"), "{trino_prompt}");
-        assert!(!trino_prompt.contains("ClickHouse SQL"), "{trino_prompt}");
         assert!(
-            trino_prompt.find("BI-ONLY ENGINE RULES").unwrap_or_default()
+            trino_prompt.contains("BI-ONLY ENGINE RULES"),
+            "{trino_prompt}"
+        );
+        assert!(
+            trino_prompt.contains("This installation runs Trino SQL only."),
+            "{trino_prompt}"
+        );
+        assert!(
+            !trino_prompt.contains("This installation runs ClickHouse SQL"),
+            "the inactive engine is named only as not installed: {trino_prompt}"
+        );
+        assert!(
+            trino_prompt
+                .find("BI-ONLY ENGINE RULES")
+                .unwrap_or_default()
                 < trino_prompt.find("LANGUAGE:").unwrap_or_default(),
             "the reply-language line stays last"
         );
@@ -3291,8 +3316,14 @@ mod tests {
             false,
         )
         .await;
-        assert!(ch_prompt.contains("ClickHouse SQL"), "{ch_prompt}");
-        assert!(!ch_prompt.contains("Trino SQL"), "{ch_prompt}");
+        assert!(
+            ch_prompt.contains("This installation runs ClickHouse SQL only."),
+            "{ch_prompt}"
+        );
+        assert!(
+            !ch_prompt.contains("This installation runs Trino SQL"),
+            "{ch_prompt}"
+        );
     }
 
     #[tokio::test]
