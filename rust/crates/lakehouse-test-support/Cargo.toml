@@ -16,7 +16,10 @@ publish = false
 # `reusable-containers`: every test process shares one labelled Postgres
 # container instead of leaving one behind per test binary (see lib.rs).
 testcontainers = { version = "0.27", features = ["reusable-containers"] }
-testcontainers-modules = { version = "0.15", features = ["postgres"] }
+# `clickhouse`: `REL-14`'s shared `ClickHouse` harness lives here too, so the
+# image's env trio, tag and bounded start retry are defined in one place
+# instead of in eight test modules.
+testcontainers-modules = { version = "0.15", features = ["postgres", "clickhouse"] }
 ctor = "1.0"
 # The readiness wait (`wait_until_ready`): a TCP connect cannot tell a
 # Postgres still starting up from a ready one, and `SELECT 1` is what the

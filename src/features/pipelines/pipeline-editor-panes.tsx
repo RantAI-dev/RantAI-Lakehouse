@@ -35,10 +35,11 @@ import type {
   PipelineStepCondition,
 } from "@/services/contracts/pipelines"
 import { formatSql } from "@/lib/sql-format"
-import { lakehouseService } from "@/services"
+import { assetService, lakehouseService } from "@/services"
 import { COLUMNS_APPEAR_LATER, ColumnField, ZoneField } from "./pipeline-pickers"
 import { BRONZE_ZONE } from "./pipeline-reupload-trigger"
 import { TransformRows } from "./pipeline-transform-rows"
+import { catalogNamespaceForZone } from "./pipeline-zones"
 
 /**
  * The panes of the pipeline editor (BLD-1 part 1 D17): one for an input,
@@ -146,8 +147,7 @@ export function InputPane({
   canRemove,
   connector,
   zones,
-  zoneNote,
-  icebergZones,
+  zoneLabels,
   columns,
   problem,
   invalid,
@@ -162,9 +162,10 @@ export function InputPane({
   index: number
   canRemove: boolean
   connector: ConnectorSource | null
-  zones: string[] | null
-  zoneNote?: string
-  icebergZones: ReadonlySet<string>
+  /** The medallion zones this input may use. */
+  zones: readonly string[] | null
+  /** Human labels for the zone values (`serving` reads "Gold"). */
+  zoneLabels?: Readonly<Record<string, string>>
   columns: Column[] | null
   problem: React.ReactNode
   /** Which control the pane's problem is about (R1-S10). */
@@ -175,16 +176,31 @@ export function InputPane({
   onRemove: () => void
 }) {
   const fromConnector = connector !== null && index === 0
-  // DATA-19 D4: the zone's real table names as SUGGESTIONS only, for a
-  // zone the lakehouse lists as an Iceberg namespace; a ClickHouse zone
-  // has none to list, and typing stays allowed either way.
+  // DATA-19 D4: the zone's real table names as SUGGESTIONS only — a datalist
+  // never narrows, so a table the catalog has not caught up with can still be
+  // typed. Bronze is an Iceberg namespace (Lakekeeper); Silver and Gold
+  // (`serving`) are ClickHouse tables listed by the catalog the rest of the
+  // console uses. The read is keyed on the zone, so `useService` aborts an old
+  // zone's list and cannot let it overwrite the new zone's suggestions.
   const zone = input.zone.trim()
-  const listable = !fromConnector && icebergZones.has(zone)
-  const tables = useService(
-    (signal) => (listable ? lakehouseService.listTables(zone, undefined, signal) : Promise.resolve([])),
-    [zone, listable]
+  const catalogNamespace = catalogNamespaceForZone(zone)
+  const icebergListable = !fromConnector && zone === BRONZE_ZONE
+  const catalogListable = !fromConnector && catalogNamespace !== null
+  const tableSource = useService<string[]>(
+    (signal) => {
+      if (icebergListable) {
+        return lakehouseService.listTables(zone, undefined, signal).then((tables) => tables.map((t) => t.name))
+      }
+      if (catalogListable && catalogNamespace !== null) {
+        return assetService.listAssets({}, signal).then((assets) =>
+          assets.filter((asset) => asset.namespace === catalogNamespace).map((asset) => asset.name)
+        )
+      }
+      return Promise.resolve([])
+    },
+    [zone, icebergListable, catalogListable, catalogNamespace]
   )
-  const suggestions = tables.status === "success" ? tables.data.map((table) => table.name).sort() : []
+  const suggestions = tableSource.status === "success" ? [...tableSource.data].sort() : []
   const tableControl =
     !fromConnector || (connector !== null && !connector.failed && connector.targets !== null && connector.targets.length > 0)
 
@@ -224,7 +240,7 @@ export function InputPane({
             value={input.zone}
             onChange={onZone}
             zones={zones}
-            note={zoneNote}
+            zoneLabels={zoneLabels}
             describedBy={tie(invalid, "zone")["aria-describedby"]}
           />
         )}
@@ -1492,7 +1508,7 @@ export function OutputPane({
   targetZone,
   targetTable,
   zones,
-  zoneNote,
+  zoneLabels,
   writtenFrom,
   plainCopy,
   plainCopyAllowed,
@@ -1504,8 +1520,10 @@ export function OutputPane({
 }: {
   targetZone: string
   targetTable: string
-  zones: string[] | null
-  zoneNote?: string
+  /** The medallion zones this output may use (never Bronze). */
+  zones: readonly string[] | null
+  /** Human labels for the zone values (`serving` reads "Gold"). */
+  zoneLabels?: Readonly<Record<string, string>>
   /** What the output is written from, said for the state it is in (`outputSourceLine`). */
   writtenFrom: string
   plainCopy: boolean
@@ -1525,8 +1543,9 @@ export function OutputPane({
         <p className="text-sm">{writtenFrom}</p>
       </div>
       <div className="grid gap-3 sm:grid-cols-2">
-        {/* WEB-8 D8: the zone is one the lakehouse lists. The table stays
-            free text: this pipeline creates it. */}
+        {/* The zone is one of the output medallion zones (Silver or Gold);
+            Bronze is an input only, and the table stays free text because
+            this pipeline creates it. */}
         <ZoneField
           id="pipeline-target-zone"
           label="Output zone"
@@ -1534,7 +1553,7 @@ export function OutputPane({
           value={targetZone}
           onChange={onZone}
           zones={zones}
-          note={zoneNote}
+          zoneLabels={zoneLabels}
           describedBy={tie(invalid, "output-zone")["aria-describedby"]}
         />
         <div className="space-y-1.5">

@@ -11,21 +11,21 @@ import {
   Combobox, ComboboxContent, ComboboxEmpty, ComboboxInput, ComboboxItem, ComboboxList,
 } from "@/components/ui/combobox";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
 import { useService, useServiceAction } from "@/hooks/use-service";
 import { normalizeFilters } from "@/lib/dashboard-filter-state";
 import { cn } from "@/lib/utils";
 import { reportService } from "@/services";
 import type { FilterDef } from "@/services";
 import type {
-  ReportSchedule,
   ReportSubscription,
   ReportSubscriptionInput,
 } from "@/services/contracts/reports";
 import type { ReadState } from "./chart-download";
-import { clock, describeAttachments, describeNotSent, describeSchedule, describeStatus, WEEKDAYS } from "./report-words";
+import { describeAttachments, describeNotSent, describeSchedule, describeStatus } from "./report-words";
+import {
+  DEFAULT_SCHEDULE, draftFromSchedule, ScheduleFields, scheduleOfDraft, zoneOfDraft, type ScheduleDraft,
+} from "./schedule-fields";
 import { ReportRecipientsField, type ChosenRecipient } from "./report-recipients-field";
-import { TimeZoneSelect } from "@/components/patterns/time-zone-select";
 
 /**
  * What a report is made as (feature decision 1). Shown above the recipient list
@@ -40,21 +40,6 @@ export const ALWAYS_SENT_SENTENCE =
 
 /** Shown while the deployment has no `SMTP_HOST` (feature decision 9). */
 export const EMAIL_NOT_SET_UP = "Email is not set up on this deployment.";
-
-/** `WEB-9` D3: the schedule choices, in the order the form always offered them. */
-const REPEAT_OPTIONS = [
-  { value: "hourly", label: "Every hour" },
-  { value: "daily", label: "Every day" },
-  { value: "weekly", label: "Every week" },
-  { value: "monthly", label: "Every month" },
-];
-
-const WEEKDAY_OPTIONS = WEEKDAYS.map((d, i) => ({ value: String(i + 1), label: d }));
-
-const MONTH_DAY_OPTIONS = [
-  ...Array.from({ length: 28 }, (_, i) => ({ value: String(i + 1), label: String(i + 1) })),
-  { value: "last", label: "The last day" },
-];
 
 const PAPER_OPTIONS = [
   { value: "a4", label: "A4" },
@@ -304,8 +289,6 @@ function History({ subscription }: { readonly subscription: ReportSubscription }
   );
 }
 
-type Kind = ReportSchedule["kind"];
-
 function SubscriptionForm({
   board, existing, charts, readState, reportZone, pdfSupported, onDirtyChange, onSaved,
 }: {
@@ -319,16 +302,11 @@ function SubscriptionForm({
   readonly onDirtyChange: (dirty: boolean) => void;
   readonly onSaved: () => void;
 }) {
-  const sched = existing?.schedule ?? null;
-  const [kind, setKind] = React.useState<Kind>(sched?.kind ?? "weekly");
-  const [minute, setMinute] = React.useState(sched?.minute ?? 0);
-  const [time, setTime] = React.useState(sched && "hour" in sched ? clock(sched.hour, sched.minute) : "08:00");
-  const [weekday, setWeekday] = React.useState(sched?.kind === "weekly" ? sched.weekday : 1);
-  const [monthDay, setMonthDay] = React.useState<number | "last">(sched?.kind === "monthly" ? sched.monthDay : 1);
   // A new subscription starts in the deployment's report time zone (the
   // `reportZone` prop, Admin > Settings); the picker offers the browser's own
   // zone first. An existing one keeps the zone it was saved with.
-  const [zone, setZone] = React.useState(existing?.timeZone ?? reportZone);
+  const [draft, setDraft] = React.useState<ScheduleDraft>(() =>
+    draftFromSchedule(existing?.schedule ?? DEFAULT_SCHEDULE, existing?.timeZone ?? reportZone));
   const [pdf, setPdf] = React.useState(existing ? Boolean(existing.attachments.pdf) : pdfSupported);
   const [paper, setPaper] = React.useState(existing?.attachments.pdf?.paper ?? "a4");
   const [orientation, setOrientation] = React.useState(existing?.attachments.pdf?.orientation ?? "portrait");
@@ -353,18 +331,11 @@ function SubscriptionForm({
   const shownError = error ?? saveAction.error?.message ?? null;
   const ids = React.useId();
 
-  const [hh, mm] = time.split(":").map((n) => Number.parseInt(n, 10));
-  const schedule: ReportSchedule | null = (() => {
-    if (kind === "hourly") return { kind, minute };
-    if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
-    if (kind === "daily") return { kind, hour: hh, minute: mm };
-    if (kind === "weekly") return { kind, weekday, hour: hh, minute: mm };
-    return { kind, monthDay, hour: hh, minute: mm };
-  })();
-  const effectiveZone = zone.trim() || reportZone;
+  const schedule = scheduleOfDraft(draft);
+  const effectiveZone = zoneOfDraft(draft, reportZone);
 
   // What leaving would lose: the form's choices, compared with how it opened.
-  const snapshot = JSON.stringify([kind, minute, time, weekday, monthDay, effectiveZone, pdf, paper, orientation, files, values, skip, recipients.map((r) => r.key), filters]);
+  const snapshot = JSON.stringify([draft.kind, draft.minute, draft.time, draft.weekday, draft.monthDay, effectiveZone, pdf, paper, orientation, files, values, skip, recipients.map((r) => r.key), filters]);
   const opened = React.useRef(snapshot);
   React.useEffect(() => { onDirtyChange(snapshot !== opened.current); }, [snapshot, onDirtyChange]);
 
@@ -390,44 +361,10 @@ function SubscriptionForm({
 
   const summary = schedule ? describeSchedule(schedule, effectiveZone) : "";
   const filterCount = filters?.length ?? 0;
-  // Owner QA 2026-11-16: the When fields sit in two even columns, labels on
-  // the left above their controls; with three fields the zone takes the row.
-  const whenFields = kind === "hourly" || kind === "daily" ? 3 : 4;
-
   return (
     <div className="flex min-w-0 flex-col gap-6">
       <FormGroup title="When">
-        <div className="grid grid-cols-[minmax(0,1fr)] gap-3 sm:grid-cols-2">
-          <FormField id={`${ids}-repeat`} label="Repeat">
-            <SelectField id={`${ids}-repeat`} className="w-full" value={kind} options={REPEAT_OPTIONS}
-              onValueChange={(next) => setKind(next as Kind)} />
-          </FormField>
-          {kind === "weekly" ? (
-            <FormField id={`${ids}-weekday`} label="Day">
-              <SelectField id={`${ids}-weekday`} className="w-full" value={String(weekday)} options={WEEKDAY_OPTIONS}
-                onValueChange={(next) => setWeekday(Number(next))} />
-            </FormField>
-          ) : null}
-          {kind === "monthly" ? (
-            <FormField id={`${ids}-month-day`} label="Day of the month">
-              <SelectField id={`${ids}-month-day`} className="w-full" value={String(monthDay)} options={MONTH_DAY_OPTIONS}
-                onValueChange={(next) => setMonthDay(next === "last" ? "last" : Number(next))} />
-            </FormField>
-          ) : null}
-          {kind === "hourly" ? (
-            <FormField id={`${ids}-minute`} label="Minutes past the hour">
-              <Input id={`${ids}-minute`} type="number" inputMode="numeric" min={0} max={59} value={minute}
-                onChange={(e) => setMinute(Math.min(59, Math.max(0, Number(e.target.value) || 0)))} className="tabular-nums" />
-            </FormField>
-          ) : (
-            <FormField id={`${ids}-time`} label="Time">
-              <Input id={`${ids}-time`} type="time" value={time} onChange={(e) => setTime(e.target.value)} className="tabular-nums" />
-            </FormField>
-          )}
-          <FormField id={`${ids}-zone`} label="Time zone" className={cn(whenFields === 3 && "sm:col-span-2")}>
-            <TimeZoneSelect id={`${ids}-zone`} value={effectiveZone} onValueChange={setZone} />
-          </FormField>
-        </div>
+        <ScheduleFields id={ids} draft={draft} onChange={setDraft} reportZone={reportZone} />
         {summary ? (
           <p className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground" aria-live="polite">
             <CalendarClock className="size-4 shrink-0" aria-hidden />

@@ -5,6 +5,7 @@ import { Menu as MenuPrimitive } from "@base-ui/react/menu"
 import { Check, ChevronRight } from "lucide-react"
 
 import { cn } from "@/lib/utils"
+import { useSurfaceThemeClass } from "@/components/ui/surface-theme"
 
 function DropdownMenu({ ...props }: Readonly<MenuPrimitive.Root.Props>) {
   return <MenuPrimitive.Root data-slot="dropdown-menu" {...props} />
@@ -43,6 +44,8 @@ function DropdownMenuContent({
   children,
   ...props
 }: Readonly<MenuPrimitive.Popup.Props & Pick<MenuPrimitive.Positioner.Props, "sideOffset" | "align">>) {
+  // WEB-10: the portal stays on <body>; copy the opener's theme onto the popup.
+  const surfaceThemeClass = useSurfaceThemeClass()
   return (
     <DropdownMenuPortal>
       <MenuPrimitive.Positioner sideOffset={sideOffset} align={align} className="z-50 outline-none">
@@ -50,6 +53,7 @@ function DropdownMenuContent({
           data-slot="dropdown-menu-content"
           className={cn(
             "min-w-40 origin-(--transform-origin) rounded-lg border border-border bg-popover p-1 text-sm text-popover-foreground shadow-lg outline-none transition-[opacity,scale,translate] duration-150 ease-ui data-ending-style:scale-[0.97] data-ending-style:opacity-0 data-ending-style:duration-100 data-starting-style:scale-[0.97] data-starting-style:opacity-0",
+            surfaceThemeClass,
             className
           )}
           {...props}
@@ -165,6 +169,8 @@ function DropdownMenuSubContent({
   children,
   ...props
 }: Readonly<MenuPrimitive.Popup.Props & Pick<MenuPrimitive.Positioner.Props, "sideOffset" | "alignOffset" | "align">>) {
+  // WEB-10: sub-menus are portalled too (and can outlive the parent tree).
+  const surfaceThemeClass = useSurfaceThemeClass()
   return (
     <DropdownMenuPortal>
       <MenuPrimitive.Positioner sideOffset={sideOffset} alignOffset={alignOffset} align={align} className="z-50 outline-none">
@@ -172,6 +178,7 @@ function DropdownMenuSubContent({
           data-slot="dropdown-menu-sub-content"
           className={cn(
             "min-w-34 origin-(--transform-origin) rounded-lg border border-border bg-popover p-1 text-sm text-popover-foreground shadow-lg outline-none transition-[opacity,scale,translate] duration-150 ease-ui data-ending-style:scale-[0.97] data-ending-style:opacity-0 data-ending-style:duration-100 data-starting-style:scale-[0.97] data-starting-style:opacity-0",
+            surfaceThemeClass,
             className
           )}
           {...props}

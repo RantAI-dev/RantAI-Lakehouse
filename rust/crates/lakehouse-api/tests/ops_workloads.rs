@@ -32,9 +32,6 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use lakehouse_clickhouse::{ChClient, QueryOptions};
 use serde_json::{Map, Value, json};
-use testcontainers::ImageExt;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::clickhouse::ClickHouse;
 use tower::ServiceExt;
 
 use common::{
@@ -46,31 +43,13 @@ struct Engine {
     /// The address the API is pointed at (`CH_URL`).
     url: String,
     /// Kept alive for the test: dropping it removes the container.
-    container: testcontainers::ContainerAsync<ClickHouse>,
+    container: lakehouse_test_support::clickhouse::Container,
 }
 
 impl Engine {
     async fn start() -> Self {
-        // The compose service's env trio (the compose file's own
-        // local-dev default); all three are required, see
-        // `tests/gold_publication.rs`.
-        let container = ClickHouse::default()
-            .with_env_var("CLICKHOUSE_USER", "default")
-            .with_env_var("CLICKHOUSE_PASSWORD", "")
-            .with_env_var("CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT", "1")
-            .with_tag("26.8")
-            .start()
-            .await
-            .expect("start the ClickHouse testcontainer");
-        let host = container.get_host().await.expect("container host");
-        let port = container
-            .get_host_port_ipv4(8123)
-            .await
-            .expect("container HTTP port");
-        Self {
-            url: format!("http://{host}:{port}"),
-            container,
-        }
+        let (url, container) = lakehouse_test_support::clickhouse::start().await;
+        Self { url, container }
     }
 
     /// A client for this engine, for the test's own reads.
