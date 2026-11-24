@@ -50,18 +50,17 @@ pub(super) fn table_key(asset: &str) -> Option<String> {
 ///
 /// # Errors
 ///
-/// `503`/`500` on a store failure.
+/// `403` for a caller outside the tenant that owns the shared catalog;
+/// `503`/`500` on a store or table-access failure.
 pub async fn list_schedules(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     headers: HeaderMap,
 ) -> ApiResult<ApiJson<Value>> {
-    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4
-    if let Some(reason) =
-        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await?
-    {
-        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
-    }
+    // GOV-16: the one GOV-15 gate — catalog tenant first, role table access
+    // second — so the list cannot be used to learn which tables a role hides.
+    let access =
+        crate::routes::quality::quality_table_access(&state, Some(&principal), &headers).await?;
     let schedules = quality::list_schedules(pool(&state)?).await?;
     // `SEC-20` (plan ai-118): a schedule names the table it belongs to, and
     // the schedules of every tenant's upload are in the list, so the ones
@@ -71,9 +70,12 @@ pub async fn list_schedules(
     let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
     let assets: Vec<String> = schedules.iter().map(|s| s.asset.clone()).collect();
     let readable = crate::routes::query::reachable_names(&state, reach, &assets).await?;
+    // GOV-16: a schedule names the table it belongs to, so a narrowed caller
+    // does not see the schedules of tables their role cannot read.
     let schedules: Vec<_> = schedules
         .into_iter()
         .filter(|s| readable.contains(&s.asset))
+        .filter(|s| crate::routes::quality::asset_readable(&access, Some(&s.asset)))
         .collect();
     Ok(ApiJson(json!({
         "schedules": schedules,
