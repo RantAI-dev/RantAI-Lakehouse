@@ -714,6 +714,11 @@ jobs:
       # OPS-24 R12: each attempt is bounded by `timeout 180` (a pull that hangs
       # would otherwise hold the job for its 30-minute limit), and the last
       # attempt is not followed by a sleep nothing waits for.
+      # REL-14: pre-pulling `clickhouse/clickhouse-server:26.8` here is the CI
+      # half of the "bytes remaining on stream" fix — a test that finds the
+      # image locally never pulls it. The Rust half is the bounded start
+      # retry in `lakehouse-test-support::clickhouse`, which covers jobs
+      # that do not pre-pull and local runs.
       - name: Pull the test images (the pull is retried, a test never is)
         if: needs.changes.outputs.proven != 'true'
         run: |
