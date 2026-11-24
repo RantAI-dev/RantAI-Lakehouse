@@ -74,10 +74,9 @@ export function EmbedFilterBar({
           <label key={f.column} className="flex items-center gap-1.5 text-xs text-muted-foreground">
             <span>{f.column}</span>
             {/* WEB-9 D2: "All" is a real choice that clears the filter, so it
-                stays an option with the empty value. D6: the open list is
-                portalled to `<body>`, outside this dashboard's `.theme-light`
-                subtree, so it takes the console's tokens — exactly what the
-                `Select`s already on this surface do. */}
+                stays an option with the empty value. WEB-10: the list is still
+                portalled to `<body>`, but it copies the surface's `.theme-light`
+                from `SurfaceThemeProvider`, so it is light on a light board. */}
             <SelectField
               aria-label={f.column}
               value={current}

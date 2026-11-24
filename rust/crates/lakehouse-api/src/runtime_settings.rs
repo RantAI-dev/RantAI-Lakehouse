@@ -209,9 +209,10 @@ pub struct EffectiveEmail {
 }
 
 impl EffectiveEmail {
-    /// The [`SmtpConfig`] a sender consumes. The password is materialized
-    /// here, from the [`SecretValue`], only because [`SmtpConfig`]'s shape
-    /// predates this resolver; it is never logged or returned.
+    /// The [`SmtpConfig`] a sender consumes. The password stays a
+    /// [`SecretValue`] (`SEC-59`) — [`SmtpConfig`] holds it as one too — so it
+    /// is never materialized into a `String` here, let alone logged or
+    /// returned.
     #[must_use]
     pub fn smtp(&self) -> SmtpConfig {
         SmtpConfig {
@@ -219,7 +220,7 @@ impl EffectiveEmail {
             port: self.port,
             secure: self.security.secure(),
             user: self.user.clone(),
-            pass: self.password.expose_secret().to_owned(),
+            pass: self.password.clone(),
             from: self.from.clone(),
             ca_bundle: self.ca_bundle.clone(),
         }
