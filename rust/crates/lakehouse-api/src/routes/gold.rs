@@ -172,81 +172,6 @@ fn zone_lock_key(zone: PublishZone, mart: &str) -> String {
     format!("{}:{mart}", zone.namespace_name())
 }
 
-#[cfg(test)]
-mod zone_tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-
-    use super::*;
-
-    #[test]
-    fn an_absent_or_gold_zone_is_gold() {
-        assert_eq!(parse_zone(None).unwrap(), PublishZone::Gold);
-        assert_eq!(parse_zone(Some("gold")).unwrap(), PublishZone::Gold);
-        assert_eq!(parse_zone(Some("serving")).unwrap(), PublishZone::Gold);
-        assert_eq!(parse_zone(Some("silver")).unwrap(), PublishZone::Silver);
-    }
-
-    #[test]
-    fn an_unknown_zone_answers_a_fixed_message_that_does_not_echo_it() {
-        let err = parse_zone(Some("<script>alert(1)</script>")).unwrap_err();
-        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
-        let text = err.to_string();
-        assert_eq!(
-            text,
-            "invalid zone: expected one of silver, gold or serving"
-        );
-        assert!(!text.contains("script"), "{text}");
-    }
-
-    #[test]
-    fn the_single_flight_lock_is_scoped_by_zone_and_mart() {
-        assert_eq!(zone_lock_key(PublishZone::Gold, "orders"), "gold:orders");
-        assert_eq!(
-            zone_lock_key(PublishZone::Silver, "orders"),
-            "silver:orders"
-        );
-        assert_ne!(
-            zone_lock_key(PublishZone::Silver, "orders"),
-            zone_lock_key(PublishZone::Gold, "orders")
-        );
-    }
-
-    #[test]
-    fn the_read_back_body_names_the_requested_zone_and_namespace() {
-        let silver = read_back_body_for_zone("orders", None, PublishZone::Silver);
-        assert_eq!(silver["zone"], "silver");
-        assert_eq!(silver["namespace"], "silver");
-        assert!(!silver.is_null());
-        assert_eq!(silver["published"], false);
-
-        let gold = read_back_body("orders", None);
-        assert_eq!(gold["zone"], "gold");
-        assert_eq!(gold["namespace"], lakehouse_iceberg::gold::GOLD_NAMESPACE);
-    }
-
-    #[tokio::test]
-    async fn silver_and_gold_exports_of_the_same_mart_can_run_concurrently() {
-        let locks = crate::gold_lock::MartLocks::default();
-        let silver = locks
-            .try_acquire(&zone_lock_key(PublishZone::Silver, "orders"))
-            .await
-            .expect("the Silver export takes its own lock");
-        let gold = locks
-            .try_acquire(&zone_lock_key(PublishZone::Gold, "orders"))
-            .await
-            .expect("the Gold export is not blocked by the Silver one");
-        assert!(
-            locks
-                .try_acquire(&zone_lock_key(PublishZone::Gold, "orders"))
-                .await
-                .is_err(),
-            "a second Gold export still conflicts"
-        );
-        drop(silver);
-        drop(gold);
-    }
-}
-
 /// DATA-10 review SHOULD-FIX 2 / DATA-10 / DATA-1: `?ifChanged=true` skip decision.
 ///
 /// Pure function so the outcomes are unit-tested without any server.
@@ -2402,5 +2327,80 @@ mod tests {
             matches!(result.unwrap_err(), ApiError::Unavailable(_)),
             "an unreachable ClickHouse is classified as Unavailable"
         );
+    }
+}
+
+#[cfg(test)]
+mod zone_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn an_absent_or_gold_zone_is_gold() {
+        assert_eq!(parse_zone(None).unwrap(), PublishZone::Gold);
+        assert_eq!(parse_zone(Some("gold")).unwrap(), PublishZone::Gold);
+        assert_eq!(parse_zone(Some("serving")).unwrap(), PublishZone::Gold);
+        assert_eq!(parse_zone(Some("silver")).unwrap(), PublishZone::Silver);
+    }
+
+    #[test]
+    fn an_unknown_zone_answers_a_fixed_message_that_does_not_echo_it() {
+        let err = parse_zone(Some("<script>alert(1)</script>")).unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+        let text = err.to_string();
+        assert_eq!(
+            text,
+            "invalid zone: expected one of silver, gold or serving"
+        );
+        assert!(!text.contains("script"), "{text}");
+    }
+
+    #[test]
+    fn the_single_flight_lock_is_scoped_by_zone_and_mart() {
+        assert_eq!(zone_lock_key(PublishZone::Gold, "orders"), "gold:orders");
+        assert_eq!(
+            zone_lock_key(PublishZone::Silver, "orders"),
+            "silver:orders"
+        );
+        assert_ne!(
+            zone_lock_key(PublishZone::Silver, "orders"),
+            zone_lock_key(PublishZone::Gold, "orders")
+        );
+    }
+
+    #[test]
+    fn the_read_back_body_names_the_requested_zone_and_namespace() {
+        let silver = read_back_body_for_zone("orders", None, PublishZone::Silver);
+        assert_eq!(silver["zone"], "silver");
+        assert_eq!(silver["namespace"], "silver");
+        assert!(!silver.is_null());
+        assert_eq!(silver["published"], false);
+
+        let gold = read_back_body("orders", None);
+        assert_eq!(gold["zone"], "gold");
+        assert_eq!(gold["namespace"], lakehouse_iceberg::gold::GOLD_NAMESPACE);
+    }
+
+    #[tokio::test]
+    async fn silver_and_gold_exports_of_the_same_mart_can_run_concurrently() {
+        let locks = crate::gold_lock::MartLocks::default();
+        let silver = locks
+            .try_acquire(&zone_lock_key(PublishZone::Silver, "orders"))
+            .await
+            .expect("the Silver export takes its own lock");
+        let gold = locks
+            .try_acquire(&zone_lock_key(PublishZone::Gold, "orders"))
+            .await
+            .expect("the Gold export is not blocked by the Silver one");
+        assert!(
+            locks
+                .try_acquire(&zone_lock_key(PublishZone::Gold, "orders"))
+                .await
+                .is_err(),
+            "a second Gold export still conflicts"
+        );
+        drop(silver);
+        drop(gold);
     }
 }
