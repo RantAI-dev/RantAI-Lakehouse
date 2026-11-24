@@ -5,6 +5,7 @@
 // no value the API did not send (S2-D2: "Not measured").
 mock.module("next/navigation", () => ({
   usePathname: () => "/health",
+  useParams: () => ({}),
   useSearchParams: () => new URLSearchParams(""),
   useRouter: () => ({
     push: () => {},
@@ -86,6 +87,17 @@ function defaultAnswers(): Record<string, () => Response> {
       ]),
     "/api/lakehouse/capacity": () =>
       json({ buckets: [], clickhouse: { bytesOnDisk: 2048 }, growth7d: null }),
+    // OPS-21: no measured table needs compaction by default, so the warning
+    // is absent; individual tests override this to exercise the warning.
+    "/api/lakehouse/compaction-status": () =>
+      json({
+        compactionAvailable: false,
+        smallFileThresholdBytes: 32 * 1024 * 1024,
+        needsCompactionFileCount: 20,
+        tables: [],
+        measuredTables: 0,
+        unmeasuredTables: 0,
+      }),
     "/api/governance/replication": () => json({ replicationSlots: [] }),
     "/api/governance/maintenance": () =>
       json({
@@ -267,6 +279,69 @@ describe("the System status page", () => {
     expect(await maintenance.findByText(/Tables in broken could not be listed/)).toBeTruthy()
     expect(await maintenance.findByRole("link", { name: "gold.revenue_export" })).toBeTruthy()
     expect(await maintenance.findByRole("link", { name: "bronze.orders" })).toBeTruthy()
+  })
+
+  it("warns with the affected tables and measured counts, naming the trino profile, when Trino is off", async () => {
+    answers["/api/lakehouse/compaction-status"] = () =>
+      json({
+        compactionAvailable: false,
+        smallFileThresholdBytes: 32 * 1024 * 1024,
+        needsCompactionFileCount: 20,
+        tables: [
+          { namespace: "bronze", name: "orders", smallFileCount: 42 },
+          { namespace: "bronze", name: "events", smallFileCount: 20 },
+          { namespace: "bronze", name: "clean", smallFileCount: 3 },
+        ],
+        measuredTables: 3,
+        unmeasuredTables: 1,
+      })
+    render(<SystemStatusPage />)
+
+    const alert = await screen.findByRole("alert")
+    expect(within(alert).getByText("Compaction needed, but nothing can do it")).toBeTruthy()
+    expect(within(alert).getByText(/--profile trino/)).toBeTruthy()
+    expect(within(alert).getByText(/trino profile/)).toBeTruthy()
+    expect(within(alert).getByText(/42 small files/)).toBeTruthy()
+    expect(within(alert).getByText(/20 small files/)).toBeTruthy()
+    // The below-threshold table is not listed; the unmeasured one is counted.
+    expect(within(alert).queryByText(/clean/)).toBeNull()
+    expect(within(alert).getByText(/1 more table was not measured/)).toBeTruthy()
+    const orders = within(alert).getByRole("link", { name: "bronze.orders" })
+    const events = within(alert).getByRole("link", { name: "bronze.events" })
+    expect(orders.getAttribute("href")).toBe("/lakehouse/tables/bronze/orders")
+    expect(events.getAttribute("href")).toBe("/lakehouse/tables/bronze/events")
+  })
+
+  it("is silent about compaction when Trino can compact, however high the counts", async () => {
+    answers["/api/lakehouse/compaction-status"] = () =>
+      json({
+        compactionAvailable: true,
+        smallFileThresholdBytes: 32 * 1024 * 1024,
+        needsCompactionFileCount: 20,
+        tables: [{ namespace: "bronze", name: "orders", smallFileCount: 99 }],
+        measuredTables: 1,
+        unmeasuredTables: 0,
+      })
+    render(<SystemStatusPage />)
+
+    await screen.findByText("The one probed service is up.")
+    expect(screen.queryByRole("alert")).toBeNull()
+  })
+
+  it("is silent about compaction when no measured table reaches the need count", async () => {
+    answers["/api/lakehouse/compaction-status"] = () =>
+      json({
+        compactionAvailable: false,
+        smallFileThresholdBytes: 32 * 1024 * 1024,
+        needsCompactionFileCount: 20,
+        tables: [{ namespace: "bronze", name: "orders", smallFileCount: 19 }],
+        measuredTables: 1,
+        unmeasuredTables: 3,
+      })
+    render(<SystemStatusPage />)
+
+    await screen.findByText("The one probed service is up.")
+    expect(screen.queryByRole("alert")).toBeNull()
   })
 
   it("shrinks change capture to one line when no CDC connector reports a slot", async () => {

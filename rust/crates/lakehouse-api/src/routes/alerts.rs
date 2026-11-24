@@ -2773,6 +2773,7 @@ mod tests {
     /// run id must not re-deliver, via `pipeline_run_event`).
     mod late_pass {
         use lakehouse_clickhouse::ChClient;
+        use lakehouse_core::secret::SecretValue;
         use lakehouse_notify::{EmailSender, SmtpConfig};
         use wiremock::MockServer;
         use wiremock::matchers::method;
@@ -2787,7 +2788,7 @@ mod tests {
                 port: 587,
                 secure: false,
                 user: None,
-                pass: String::new(),
+                pass: SecretValue::new(String::new()),
                 from: String::new(),
                 ca_bundle: None,
             })

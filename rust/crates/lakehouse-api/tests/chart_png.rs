@@ -55,6 +55,7 @@ struct Fixture {
     app: TestApp,
     gotenberg: MockServer,
     cookie: String,
+    user: uuid::Uuid,
     _ch: MockServer,
 }
 
@@ -89,6 +90,7 @@ async fn fixture(env: &[(&str, Option<&str>)], shot: ResponseTemplate) -> Fixtur
         app,
         gotenberg,
         cookie,
+        user,
         _ch: ch,
     }
 }
@@ -106,6 +108,34 @@ async fn get(f: &Fixture, uri: &str) -> (StatusCode, axum::http::HeaderMap, Vec<
             Request::builder()
                 .uri(uri)
                 .header("cookie", &f.cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, headers, bytes)
+}
+
+async fn get_as(
+    f: &Fixture,
+    uri: &str,
+    tenant: &str,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let resp = f
+        .app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("cookie", &f.cookie)
+                .header("x-tenant", tenant)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -176,6 +206,49 @@ async fn the_png_request_opens_only_the_chart_view_with_a_token_for_that_chart_a
     assert_eq!(claims.principal, user_id);
     assert_eq!(args["tile"], "c_bar");
     assert_eq!(args["scale"], 2);
+}
+
+/// `SEC-54`: the chart image's token carries the tenant the caller worked
+/// under, so the print view draws that tenant's tile and not the first one.
+#[tokio::test]
+async fn the_chart_token_carries_the_second_tenant_the_caller_exported_under() {
+    let f = fixture(
+        &[("CATALOG_TENANT_ID", Some(common::CATALOG_TENANT))],
+        ok_png(),
+    )
+    .await;
+    let second = "11111111-1111-4111-8111-000000000002";
+    common::in_the_catalog_tenant(&f.app.pool, f.user).await;
+    sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(f.user)
+    .bind(second.parse::<uuid::Uuid>().unwrap())
+    .execute(&f.app.pool)
+    .await
+    .unwrap();
+
+    let (status, _, body) = get_as(
+        &f,
+        "/api/dashboard/chart-export?chart=c_bar&format=png",
+        second,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let sent = f.gotenberg.received_requests().await.unwrap();
+    let form = String::from_utf8_lossy(&sent[0].body).into_owned();
+    let url_line = form
+        .split("name=\"url\"\r\n\r\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\r\n").next())
+        .unwrap();
+    let token = url_line
+        .strip_prefix(&format!("{CONSOLE}/render/chart/"))
+        .unwrap();
+    let claims =
+        lakehouse_embed::verify_render(token, SECRET, lakehouse_embed::unix_now()).unwrap();
+    assert_eq!(claims.tenant.as_deref(), Some(second), "{claims:?}");
+    assert_eq!(claims.chart.as_deref(), Some("c_bar"));
 }
 
 #[tokio::test]

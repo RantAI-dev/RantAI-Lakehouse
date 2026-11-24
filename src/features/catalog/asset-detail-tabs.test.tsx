@@ -129,6 +129,7 @@ const TABLE = {
     snapshotCount: 1,
     metadataLogCount: 1,
   },
+  compactionAvailable: false,
 }
 
 /**
