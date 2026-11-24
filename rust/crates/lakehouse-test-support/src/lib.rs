@@ -170,6 +170,12 @@
 //! environment running `cargo test`. If it is not, the constructor panics
 //! with a clear message instead of silently skipping tests.
 
+// `REL-14`: the one place that starts the `ClickHouse` testcontainer, with a
+// bounded retry around a failed start (a broken image-pull stream used to
+// fail whichever test started first). The Postgres harness below is a
+// different arrangement — one reused, labelled container — and stays as is.
+pub mod clickhouse;
+
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};

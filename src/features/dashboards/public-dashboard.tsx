@@ -5,6 +5,7 @@ import * as React from "react";
 import { useTheme } from "next-themes";
 import { cn } from "@/lib/utils";
 import { dashboardLook } from "@/lib/dashboard-look";
+import { SurfaceThemeProvider } from "@/components/ui/surface-theme";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
 import { ReportingProvider } from "./reporting-context";
 import { TileBody } from "./tile-body";
@@ -125,6 +126,7 @@ export function PublicDashboard({ token }: { token: string }) {
 
   return (
     <ReportingProvider reporting={data?.reporting}>
+    <SurfaceThemeProvider themeClass={look.surfaceThemeClass}>
     <div className={cn("min-h-screen bg-muted/25", look.className)} style={look.style}>
       {/* Compact header — brand + title + theme toggle */}
       <header className="sticky top-0 z-10 flex items-center gap-3 border-b border-border bg-card/80 px-4 py-3 backdrop-blur-md sm:px-6">
@@ -176,6 +178,7 @@ export function PublicDashboard({ token }: { token: string }) {
         {PRODUCT_BYLINE}
       </footer>
     </div>
+    </SurfaceThemeProvider>
     </ReportingProvider>
   );
 }

@@ -50,7 +50,9 @@
 //! 2. Every name is an `Ident` of at most 48 characters (D2), not starting
 //!    with `__`, and unique across inputs and steps without regard to case.
 //! 3. Every zone and table is an `Ident` (F2: the API checks the names it
-//!    stores, instead of leaving it to the orchestrator at run time).
+//!    stores, instead of leaving it to the orchestrator at run time). A
+//!    legacy `gold` zone is read as `serving` (BLD-19): Gold marts live in
+//!    the `serving` database the catalog lists.
 //! 4. A `transform` step reads an input or an earlier step, and each of its
 //!    transform strings parses (D2, D4).
 //! 5. A SQL step is one read-only statement (D5, [`check_pipeline_step_sql`]),
@@ -71,6 +73,21 @@ use lakehouse_store::pipelines::{PipelineInput, PipelineStep};
 use crate::pipeline_forms;
 use crate::sql_guard::check_pipeline_step_sql;
 use crate::transform_grammar::{Transform, parse_transform};
+
+/// BLD-19: the `ClickHouse` database that holds Gold is `serving`, not
+/// `gold`. `routes::catalog` lists only `silver` and `serving` (returning
+/// `serving.<name>` with `layer: "gold"`), and `routes::lineage::zone_node`
+/// maps both spellings to `table:serving.<name>`. A pipeline still storing
+/// `gold` would otherwise make the orchestrator create an orphan `gold`
+/// database that neither the catalog nor lineage lists. Normalising here as
+/// well as at every API write boundary means such a row reads
+/// `serving.<table>` without a migration. `bronze` is deliberately left
+/// alone so [`crate::routes::authored_pipelines::validate_target_zone`]
+/// still refuses a Bronze target.
+#[must_use]
+pub fn canonical_clickhouse_zone(zone: &str) -> &str {
+    if zone == "gold" { "serving" } else { zone }
+}
 
 /// At most 5 inputs per pipeline (decision 4).
 pub const MAX_INPUTS: usize = 5;
@@ -310,8 +327,11 @@ pub fn validate_and_compile(
 ) -> Result<String, DefinitionError> {
     let compiled = compile(inputs, steps, None, catalog_db)?;
     if let Some((zone, table)) = target {
+        // BLD-19: `gold` and `serving` name the same Gold table, so a legacy
+        // spelling cannot hide an output that is also an input.
+        let zone = canonical_clickhouse_zone(zone);
         for (index, input) in inputs.iter().enumerate() {
-            if input.zone == zone && input.table == table {
+            if canonical_clickhouse_zone(&input.zone) == zone && input.table == table {
                 return Err(DefinitionError::input(index, OUTPUT_IS_INPUT));
             }
         }
@@ -656,19 +676,21 @@ fn check_step_tables(
 /// The `FROM` expression for one input: `bronze` is read through the catalog
 /// database as `` <catalog>.`bronze.<table>` ``, every other zone as
 /// `` <zone>.`<table>` `` — the rule the orchestrator's `_resolve_source` used
-/// to own (D4).
+/// to own (D4). BLD-19: a legacy `gold` zone is read from `serving`, the
+/// Gold database the catalog and lineage both name.
 fn input_source(
     input: &PipelineInput,
     index: usize,
     catalog_db: Option<&str>,
 ) -> Result<String, DefinitionError> {
-    if input.zone == "bronze" {
+    let zone = canonical_clickhouse_zone(&input.zone);
+    if zone == "bronze" {
         let Some(db) = catalog_db else {
             return Err(DefinitionError::input(index, BRONZE_NEEDS_CATALOG));
         };
         return Ok(format!("{db}.`bronze.{}`", input.table));
     }
-    Ok(format!("{}.`{}`", input.zone, input.table))
+    Ok(format!("{zone}.`{}`", input.table))
 }
 
 /// One step's CTE entry, without the name (the caller adds it): D4's port of
@@ -894,7 +916,7 @@ pub fn render_transform_step(from: &str, transforms: &[Transform]) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::{DefinitionError, compile, validate_and_compile};
+    use super::{DefinitionError, canonical_clickhouse_zone, compile, validate_and_compile};
 
     fn input(name: &str, zone: &str, table: &str) -> lakehouse_store::pipelines::PipelineInput {
         lakehouse_store::pipelines::PipelineInput {
@@ -1009,6 +1031,36 @@ mod tests {
     fn a_bronze_input_without_a_catalog_database_is_refused() {
         let inputs = vec![input("g3a_orders", "bronze", "g3a_orders")];
         let err = compile(&inputs, &[], None, None).unwrap_err();
+        assert_eq!(err.path(), "inputs[0]");
+    }
+
+    /// BLD-19: Gold lives in `serving`, so both spellings of an input read
+    /// the same `ClickHouse` database and no text can create an orphan
+    /// `gold` one. `bronze` must not be touched: its refusal is the
+    /// target-zone rule's business, not this normalisation's.
+    #[test]
+    fn a_serving_or_legacy_gold_input_reads_serving_and_bronze_is_untouched() {
+        assert_eq!(canonical_clickhouse_zone("gold"), "serving");
+        assert_eq!(canonical_clickhouse_zone("serving"), "serving");
+        assert_eq!(canonical_clickhouse_zone("silver"), "silver");
+        assert_eq!(canonical_clickhouse_zone("bronze"), "bronze");
+        for zone in ["serving", "gold"] {
+            let inputs = vec![input("orders", zone, "orders")];
+            assert_eq!(
+                compile(&inputs, &[], None, None).unwrap(),
+                "SELECT * FROM serving.`orders`",
+                "zone {zone} must read the Gold database the catalog lists"
+            );
+        }
+    }
+
+    /// BLD-19: the legacy spelling cannot slip past the output-is-input
+    /// check just because the target is written `gold` and the input
+    /// `serving` (or the other way round).
+    #[test]
+    fn a_legacy_gold_target_is_compared_to_a_serving_input() {
+        let inputs = vec![input("orders", "serving", "orders")];
+        let err = validate_and_compile(&inputs, &[], Some(("gold", "orders")), None).unwrap_err();
         assert_eq!(err.path(), "inputs[0]");
     }
 
