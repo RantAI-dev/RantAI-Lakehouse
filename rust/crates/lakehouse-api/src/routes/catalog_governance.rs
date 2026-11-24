@@ -22,6 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use axum::http::HeaderMap;
 use lakehouse_auth::Principal;
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::AuditScope;
@@ -199,6 +200,7 @@ fn bare_name(table_key: &str) -> &str {
 pub(crate) async fn dependents(
     state: &AppState,
     principal: &Principal,
+    headers: &HeaderMap,
     tables: &[String],
 ) -> Vec<Value> {
     let mut out = Vec::new();
@@ -207,18 +209,13 @@ pub(crate) async fn dependents(
     {
         // `SEC-20`: the saved queries listed here are the caller's
         // tenant's, and the rows that belong to no tenant when that
-        // tenant owns the shared catalog. The dependents list resolves
-        // its own scope: the catalog route has no `X-Tenant` header to
-        // pass, so the tenant is the caller's first one. A scope that
-        // cannot be resolved lists no saved query — the list fails
-        // closed.
-        let scope = match crate::routes::query::saved_query_scope(
-            state,
-            principal,
-            &axum::http::HeaderMap::new(),
-        )
-        .await
-        {
+        // tenant owns the shared catalog. `SEC-54` review fix: the
+        // detail route DOES receive `X-Tenant`, so pass the real
+        // headers to the same scope resolver every other reader uses —
+        // a multi-tenant caller's chosen tenant is not necessarily its
+        // first one. A scope that cannot be resolved lists no saved
+        // query — the list fails closed.
+        let scope = match crate::routes::query::saved_query_scope(state, principal, headers).await {
             Ok(scope) => scope,
             Err(err) => {
                 tracing::warn!(
