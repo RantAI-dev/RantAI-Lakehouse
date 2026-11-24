@@ -2,7 +2,9 @@ import { strict as assert } from "node:assert"
 import { test } from "node:test"
 import type { PlatformService } from "@/services/contracts/ops"
 import type { MaintenanceRun, ReplicationSlot } from "@/services/contracts/governance"
+import type { LakehouseTableSummary } from "@/services/contracts/lakehouse"
 import {
+  icebergTablesWithoutRuns,
   latestRunPerTable,
   latestSlotReadings,
   maintenanceTableHref,
@@ -113,4 +115,61 @@ test("maintenanceTableHref gives no link for a name that does not split", () => 
   for (const name of ["orders", ".orders", "bronze."]) {
     assert.equal(maintenanceTableHref(name), null)
   }
+})
+
+function icebergTable(namespace: string, name: string): LakehouseTableSummary {
+  return {
+    namespace,
+    name,
+    formatVersion: 2,
+    currentSnapshotId: null,
+    lastUpdatedAt: null,
+    fileCount: null,
+    recordCount: null,
+    totalBytes: null,
+  }
+}
+
+test("icebergTablesWithoutRuns lists a table with no run, including a Gold export", () => {
+  const rows = icebergTablesWithoutRuns(
+    [icebergTable("gold", "revenue_export")],
+    [run("bronze.orders", "2026-11-04T02:00:00Z")]
+  )
+  assert.deepEqual(
+    rows.map((t) => `${t.namespace}.${t.name}`),
+    ["gold.revenue_export"]
+  )
+})
+
+test("icebergTablesWithoutRuns hides a table that already has a run", () => {
+  const rows = icebergTablesWithoutRuns(
+    [icebergTable("bronze", "orders"), icebergTable("gold", "revenue_export")],
+    [run("bronze.orders", "2026-11-04T02:00:00Z")]
+  )
+  assert.deepEqual(
+    rows.map((t) => `${t.namespace}.${t.name}`),
+    ["gold.revenue_export"]
+  )
+})
+
+test("icebergTablesWithoutRuns sorts stably by namespace then name", () => {
+  const rows = icebergTablesWithoutRuns(
+    [
+      icebergTable("silver", "orders"),
+      icebergTable("gold", "zeta"),
+      icebergTable("gold", "alpha"),
+    ],
+    []
+  )
+  assert.deepEqual(
+    rows.map((t) => `${t.namespace}.${t.name}`),
+    ["gold.alpha", "gold.zeta", "silver.orders"]
+  )
+})
+
+test("icebergTablesWithoutRuns returns nothing when every table has a run", () => {
+  const rows = icebergTablesWithoutRuns([icebergTable("bronze", "orders")], [
+    run("bronze.orders", "2026-11-04T02:00:00Z"),
+  ])
+  assert.equal(rows.length, 0)
 })

@@ -2667,13 +2667,21 @@ filtered per tenant, because nothing in the schema associates them with one:
 
 Rather than show every tenant the same shared list and call it scoped, both
 are **refused** for any principal without the unrestricted (`*:*`) grant once
-the deployment has more than one tenant.
+the deployment has more than one tenant. The same gate covers every statement
+against the Silver and Gold tables as well: a shared table belongs to no
+tenant, and only the tenant named here may read one. So with this setting
+unset, a principal without `*:*` also loses **every** Silver and Gold query —
+dashboards, Query Studio, the assistant, alerts and reports — to the fixed
+"Table not found or not available to your organisation" 404. It is not just
+two lists: the catalog, the job list and the shared warehouse all fail closed
+together.
 
 **What this means for an existing deployment.** `0002_seed_identity.sql` seeds
 four tenants, and its users belong to several of them — so on upgrade,
-Analysts, Data Engineers and Governance Admins lose the catalog and the job
-list until you say who owns them. `lakehousectl install` writes this setting
-as the group tenant on a fresh install, and `lakehousectl update` fills it
+Analysts, Data Engineers and Governance Admins lose the catalog, the job list
+and every Silver and Gold query until you say who owns them. `lakehousectl
+install` writes this setting as the group tenant on a fresh install, and
+`lakehousectl update` fills it
 when the line is empty — so a stack made or updated by the tool needs no hand
 edit (`REL-10`). Set it by hand only on a stack not made by `lakehousectl`,
 where a value is not already there:
@@ -2684,8 +2692,9 @@ CATALOG_TENANT_ID=<the id of the tenant that owns this deployment's shared catal
 
 For a stack that still runs the seeded identities, that is the group tenant in
 `0002_seed_identity.sql`. Members of that tenant then see both surfaces exactly
-as before; everyone else keeps getting `{"supported": false, "reason": …}`,
-which names this setting.
+as before and their Silver and Gold queries work again; everyone else keeps
+getting `{"supported": false, "reason": …}` for the two lists — which names
+this setting — and the fixed table-not-available 404 for Silver and Gold.
 
 A **single-tenant** deployment is unaffected — there is no other tenant's data
 to leak into a shared list, so nothing is refused whether or not the setting is

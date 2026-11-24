@@ -159,6 +159,12 @@ and a change it may not make is refused with the permission it lacks.
   already run a query. It takes the most likely reading and says which.
 - A word the assistant cannot place is asked back with two to four options
   (`AI-17`, `chat-ask-back.md`).
+- 2026-11-20 (AI-34): a non-streamed chat turn ends at 9/10 of
+  `AI_CHAT_TIMEOUT_SECS` with a one-sentence time reply naming the tools
+  that ran. A streamed turn (the console's default) has no hard end, and
+  stops starting new rounds at 3/4 of the timeout. The product owner
+  decides on a hard end for streamed turns after AI-35 is measured on
+  staging.
 
 ## Acceptance checklist
 

@@ -160,7 +160,7 @@ pub(crate) struct SubscriptionInput {
     pub paused: Option<bool>,
 }
 
-fn schedule_of(input: &ScheduleInput) -> Result<Schedule, ApiError> {
+pub(crate) fn schedule_of(input: &ScheduleInput) -> Result<Schedule, ApiError> {
     let bad = || ApiError::BadRequest("That schedule is not valid.".to_owned());
     let minute = input.minute.unwrap_or(0);
     let hour = || input.hour.ok_or_else(bad);

@@ -387,6 +387,7 @@ impl QueryRun {
             // query route's, whose cells are text already.
             quote_decimals: false,
             max_memory_usage: None,
+            params: Vec::new(),
         }
     }
 }

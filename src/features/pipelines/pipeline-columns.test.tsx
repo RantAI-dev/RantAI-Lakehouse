@@ -121,15 +121,25 @@ describe("pipeline-columns schedule column (BLD-11 F2/D3)", () => {
     expect(screen.getByText("Within 10 min of its inputs")).toBeTruthy()
     expect(screen.queryByText("Hourly")).toBeNull()
   })
+
+  // BLD-18: the lag chip carries the same `· paused` cue as a cron chip.
+  it("a paused target-lag row says paused on its trigger chip", () => {
+    const p = makePipeline({ status: "paused", targetLag: { kind: "lag", minutes: 15 } })
+    render(<>{scheduleCell(p)}</>)
+    expect(screen.getByText("Within 15 min of its inputs")).toBeTruthy()
+    expect(screen.getByText(/· paused/)).toBeTruthy()
+  })
 })
 
 describe("pipeline-columns honest list cells (BLD-11 F8/F9/D12)", () => {
   function cellFor(
     id: string,
     pipeline: Pipeline,
-    onTrigger?: (p: Pipeline) => void
+    onTrigger?: (p: Pipeline) => void,
+    onPause?: (p: Pipeline) => void,
+    onResume?: (p: Pipeline) => void
   ): React.ReactNode {
-    const column = getPipelineColumns({ onTrigger }).find((c) => c.id === id) as AccessorFnColumnDef<Pipeline>
+    const column = getPipelineColumns({ onTrigger, onPause, onResume }).find((c) => c.id === id) as AccessorFnColumnDef<Pipeline>
     return (column.cell as (ctx: { row: { original: Pipeline } }) => React.ReactNode)({
       row: { original: pipeline },
     })
@@ -172,6 +182,26 @@ describe("pipeline-columns honest list cells (BLD-11 F8/F9/D12)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Pipeline actions" }))
     const item = screen.getByRole("menuitem", { name: /mark it ready first/i })
     expect(item.getAttribute("aria-disabled")).toBe("true")
+  })
+
+  // BLD-18: the list menu no longer hides Pause for a target-lag row.
+  it("a ready target-lag row offers Pause and clicking it calls onPause", () => {
+    const paused: Pipeline[] = []
+    const p = makePipeline({ id: "pl-lag-ready", status: "ready", targetLag: { kind: "lag", minutes: 10 } })
+    render(<>{cellFor("actions", p, undefined, (row) => paused.push(row))}</>)
+    fireEvent.click(screen.getByRole("button", { name: "Pipeline actions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pause" }))
+    expect(paused.map((row) => row.id)).toEqual(["pl-lag-ready"])
+  })
+
+  it("a paused target-lag row offers Resume and clicking it calls onResume", () => {
+    const resumed: Pipeline[] = []
+    const p = makePipeline({ id: "pl-lag-paused", status: "paused", targetLag: { kind: "lag", minutes: 10 } })
+    render(<>{cellFor("actions", p, undefined, undefined, (row) => resumed.push(row))}</>)
+    fireEvent.click(screen.getByRole("button", { name: "Pipeline actions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "Resume" }))
+    expect(resumed.map((row) => row.id)).toEqual(["pl-lag-paused"])
+    expect(screen.queryByRole("menuitem", { name: "Pause" })).toBeNull()
   })
 
   it("the Origin tooltip does not say an authored pipeline cannot run", async () => {

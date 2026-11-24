@@ -34,13 +34,33 @@ describe("ZoneField", () => {
     expect(onChange.mock.calls[0][0]).toBe("silver")
   })
 
-  it("offers a stored zone the list does not have, marked, instead of dropping it", async () => {
-    render(<ZoneField id="zone" label="Target zone" value="gold" onChange={() => {}} zones={["bronze", "silver"]} />)
+  it("shows human labels for the zone values while keeping the exact stored value", async () => {
+    const onChange = mock<(next: string) => void>(() => {})
+    render(
+      <ZoneField
+        id="zone"
+        label="Source zone"
+        value="bronze"
+        onChange={onChange}
+        zones={["bronze", "silver", "serving"]}
+        zoneLabels={{ bronze: "Bronze", silver: "Silver", serving: "Gold" }}
+      />
+    )
+    const trigger = screen.getByRole("combobox", { name: "Source zone" })
+    expect(trigger.textContent).toContain("Bronze")
+    fireEvent.click(trigger)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["Bronze", "Silver", "Gold"])
+    pickOption(screen.getByRole("option", { name: "Gold" }))
+    expect(onChange.mock.calls[0][0]).toBe("serving")
+  })
+
+  it("offers a stored zone the list does not have, marked as legacy, instead of dropping it", async () => {
+    render(<ZoneField id="zone" label="Target zone" value="gold" onChange={() => {}} zones={["silver", "serving"]} />)
     const trigger = screen.getByRole("combobox", { name: "Target zone" })
-    expect(trigger.textContent).toContain("gold (not a namespace this lakehouse lists)")
+    expect(trigger.textContent).toContain("gold (legacy zone, not offered here)")
     fireEvent.click(trigger)
     expect(screen.getAllByRole("option").map((o) => o.textContent)).toContain(
-      "gold (not a namespace this lakehouse lists)"
+      "gold (legacy zone, not offered here)"
     )
   })
 

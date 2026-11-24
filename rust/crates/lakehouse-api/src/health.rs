@@ -33,6 +33,15 @@
 //! see [`unknown`]'s doc comment. `RustFS`'s two credential refs are the
 //! same story: unset means "never dialed," not "dialed and failed."
 //!
+//! # `bi-only` installations probe only ONE engine (`BI-44`)
+//!
+//! A `bi-only` installation does not deploy `RustFS`, Lakekeeper,
+//! `OpenFGA`, `Dagster` or the unused engine. Reporting those as unhealthy
+//! would invent an outage for services that were never meant to exist, so
+//! [`probe_all`] builds their rows with [`unknown`] — `checked: false`,
+//! label `"unknown"` — and dials only the chosen engine. The full stack's
+//! six probes are untouched.
+//!
 //! # The 15 s cache
 //!
 //! [`cached_probe_all`] never serves a result whose own `checked_at` is
@@ -576,13 +585,75 @@ async fn probe_lakekeeper_if_configured(
     probe_lakekeeper(http, &lakekeeper_probe_base(catalog_uri)).await
 }
 
+/// Which engines this installation actually runs, as far as the health
+/// probe is concerned. `BI-44`'s one-engine rule is applied here, once, so
+/// the reported rows and the dials can never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EngineProbePlan {
+    /// Whether `ClickHouse` is deployed here.
+    clickhouse: bool,
+    /// Whether `Trino` is deployed here.
+    trino: bool,
+}
+
+/// The engine plan for a config. Only `bi-only` narrows it: the full stack
+/// keeps the two independently-configured probes exactly as before.
+fn engine_probe_plan(config: &Config) -> EngineProbePlan {
+    if !config.is_bi_only() {
+        return EngineProbePlan {
+            clickhouse: true,
+            trino: true,
+        };
+    }
+    match config.query_engine {
+        crate::config::QueryEngine::ClickHouse => EngineProbePlan {
+            clickhouse: true,
+            trino: false,
+        },
+        crate::config::QueryEngine::Trino => EngineProbePlan {
+            clickhouse: false,
+            trino: true,
+        },
+    }
+}
+
 /// Probe all six services concurrently, in this fixed, documented order:
 /// `clickhouse, dagster, lakekeeper, rustfs, openfga, trino`. "No fixed
 /// list" in the grand plan means the ROUTE does not hardcode a subset for
 /// the reader to filter — not that the probe set itself is dynamic; these
 /// six are exactly `docker-compose.yml`'s core stack plus the two
 /// genuinely optional services.
+///
+/// In `bi-only` mode the six ROWS stay (the console reads them by id), but
+/// only the chosen engine's row is a real probe; the rest are honest
+/// `checked: false` rows, including the engine that was not started.
 pub async fn probe_all(state: &AppState) -> Vec<ServiceHealth> {
+    if state.config.is_bi_only() {
+        let plan = engine_probe_plan(&state.config);
+        let now = OffsetDateTime::now_utc();
+        let clickhouse = if plan.clickhouse {
+            probe_clickhouse(&state.clickhouse).await
+        } else {
+            unknown("clickhouse", "ClickHouse (Hot analytical store)", now)
+        };
+        let trino = if plan.trino {
+            // Config resolution already required an explicit TRINO_URL for
+            // this mode, so `trino_url` is the operator's address, not the
+            // baked-in default of a profile that may never be started.
+            probe_trino(&reqwest::Client::new(), &state.config.trino_url).await
+        } else {
+            unknown("trino", "Trino (Federated query engine)", now)
+        };
+        let not_installed = |id, name| unknown(id, name, now);
+        return vec![
+            clickhouse,
+            not_installed("dagster", "Dagster (Orchestration)"),
+            not_installed("lakekeeper", "Iceberg + Lakekeeper (Open tables)"),
+            not_installed("rustfs", "RustFS (Object storage)"),
+            not_installed("openfga", "OpenFGA (Authorization)"),
+            trino,
+        ];
+    }
     let http = reqwest::Client::new();
     let dagster_server_info_url = format!(
         "{}/server_info",
@@ -637,6 +708,23 @@ pub async fn cached_probe_all(state: &AppState) -> Vec<ServiceHealth> {
         probe_all(state)
     })
     .await
+}
+
+/// The single definition of "Trino compaction is available on this
+/// deployment", used by OPS-21's table-detail warning and the
+/// `/api/lakehouse/compaction-status` summary.
+///
+/// `trino_health_url` is set in compose even when the `trino` profile is off
+/// (`TRINO_URL` has a host-agnostic default), so config alone cannot tell
+/// "profile enabled" from "profile never started". The cached probe set is
+/// the same one `/api/ops/services` and `/api/overview` report: `checked`
+/// rules out "never configured", and `ok` rules out "configured but the
+/// coordinator is not running". Both must hold before the console may say
+/// Trino can compact — otherwise it would be telling a reader that the
+/// profile is on while the Services table shows it unreachable.
+#[must_use]
+pub fn trino_compaction_available(probes: &[ServiceHealth]) -> bool {
+    probes.iter().any(|h| h.id == "trino" && h.checked && h.ok)
 }
 
 #[cfg(test)]
@@ -781,6 +869,39 @@ mod tests {
         );
     }
 
+    // OPS-21: "Trino can compact" is `checked && ok`, never `ok` alone and
+    // never an env-var guess. The three rows below are exactly the three
+    // states the probe set produces.
+    #[test]
+    fn trino_compaction_available_only_when_the_probe_ran_and_succeeded() {
+        fn trino(checked: bool, ok: bool) -> ServiceHealth {
+            ServiceHealth {
+                id: "trino",
+                name: "trino",
+                ok,
+                checked,
+                latency_ms: None,
+                version: None,
+                checked_at: "2026-11-23T00:00:00Z".to_owned(),
+                error: None,
+            }
+        }
+
+        assert!(trino_compaction_available(&[trino(true, true)]));
+        assert!(
+            !trino_compaction_available(&[trino(true, false)]),
+            "configured but unreachable (the `trino` profile is off) is not available"
+        );
+        assert!(
+            !trino_compaction_available(&[trino(false, false)]),
+            "never configured is not available either"
+        );
+        assert!(
+            !trino_compaction_available(&[]),
+            "no probe row means nothing measured, not available"
+        );
+    }
+
     /// WS5 plan review U5 -- an unconfigured `RustFS` credential must never
     /// be dialed or reported as an outage.
     #[tokio::test]
@@ -870,6 +991,46 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "a read past the 15s window must re-probe"
+        );
+    }
+
+    /// `BI-44`: only one engine is dialed in a `bi-only` installation,
+    /// while the full stack keeps both probes (and its unchanged posture
+    /// of config-gated optional services).
+    #[test]
+    fn a_bi_only_installation_probes_only_the_chosen_engine() {
+        let config = crate::config::Config::from_map(&std::collections::HashMap::new()).unwrap();
+        assert_eq!(
+            engine_probe_plan(&config),
+            EngineProbePlan {
+                clickhouse: true,
+                trino: true
+            }
+        );
+        let config = crate::config::Config::from_map(&std::collections::HashMap::from([
+            ("LAKEHOUSE_INSTALL_MODE".to_owned(), "bi-only".to_owned()),
+            ("LAKEHOUSE_QUERY_ENGINE".to_owned(), "trino".to_owned()),
+            ("TRINO_URL".to_owned(), "http://trino:8080".to_owned()),
+        ]))
+        .unwrap();
+        assert_eq!(
+            engine_probe_plan(&config),
+            EngineProbePlan {
+                clickhouse: false,
+                trino: true
+            }
+        );
+        let config = crate::config::Config::from_map(&std::collections::HashMap::from([(
+            "LAKEHOUSE_INSTALL_MODE".to_owned(),
+            "bi-only".to_owned(),
+        )]))
+        .unwrap();
+        assert_eq!(
+            engine_probe_plan(&config),
+            EngineProbePlan {
+                clickhouse: true,
+                trino: false
+            }
         );
     }
 }

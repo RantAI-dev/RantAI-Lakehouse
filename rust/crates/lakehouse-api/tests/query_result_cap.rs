@@ -21,9 +21,6 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use lakehouse_clickhouse::ChClient;
 use serde_json::{Value, json};
-use testcontainers::ImageExt;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::clickhouse::ClickHouse;
 use tower::ServiceExt;
 
 use common::{
@@ -77,28 +74,13 @@ const ENGINE_ROW_BOUND: usize = 130_000;
 
 /// ONE `ClickHouse` per test binary; see `tests/gold_publication.rs` for why
 /// per-test containers race. The container is never stopped by the test.
-static CLICKHOUSE: tokio::sync::OnceCell<(String, testcontainers::ContainerAsync<ClickHouse>)> =
+static CLICKHOUSE: tokio::sync::OnceCell<lakehouse_test_support::clickhouse::Started> =
     tokio::sync::OnceCell::const_new();
 
-async fn shared_clickhouse() -> &'static (String, testcontainers::ContainerAsync<ClickHouse>) {
+async fn shared_clickhouse() -> &'static lakehouse_test_support::clickhouse::Started {
     CLICKHOUSE
         .get_or_init(|| async {
-            // The compose service's env trio; all three are required, see
-            // `tests/gold_publication.rs`.
-            let container = ClickHouse::default()
-                .with_env_var("CLICKHOUSE_USER", "default")
-                .with_env_var("CLICKHOUSE_PASSWORD", "")
-                .with_env_var("CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT", "1")
-                .with_tag("26.8")
-                .start()
-                .await
-                .expect("start the ClickHouse testcontainer");
-            let host = container.get_host().await.expect("container host");
-            let port = container
-                .get_host_port_ipv4(8123)
-                .await
-                .expect("container HTTP port");
-            let url = format!("http://{host}:{port}");
+            let (url, container) = lakehouse_test_support::clickhouse::start().await;
             seed_huge_table(&ChClient::new(
                 url.clone(),
                 "default".to_owned(),
