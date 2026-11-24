@@ -53,6 +53,14 @@ describe("FormPage (WEB-7 D1)", () => {
     expect(calls).toEqual({ submit: 1, cancel: 1 })
   })
 
+  it("leaves Cancel out when the page gives no onCancel, and hands the back arrow to onBack", () => {
+    let backs = 0
+    renderForm({ onCancel: undefined, onBack: () => { backs += 1 } })
+    expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull()
+    fireEvent.click(screen.getByRole("link", { name: /Back/ }))
+    expect(backs).toBe(1)
+  })
+
   it("says the page's submitting label while saving, never 'Creating…' on an edit page", () => {
     renderForm({
       title: "Edit Role",

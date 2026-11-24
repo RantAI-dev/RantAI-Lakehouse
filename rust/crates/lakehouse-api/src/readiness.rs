@@ -27,10 +27,19 @@
 //!   (`GET {catalog}/v1/config?warehouse=…`), the same call the catalog
 //!   client makes when it connects.
 //!
+//! # `bi-only` installations check only their engine (`BI-44`)
+//!
+//! A `bi-only` installation does not run Lakekeeper or (by owner decision)
+//! both query engines at once. Reporting a service that was never deployed
+//! as `"failed"` would fabricate an outage, so those checks are `"skipped"`
+//! and excluded from the readiness verdict. The chosen engine's check is
+//! the one that decides; the `full` stack's three checks are unchanged.
+//!
 //! # The body carries no upstream text
 //!
-//! Every check is `"ok"` or `"failed"` and nothing else (AGENTS.md rule 4:
-//! upstream error text never reaches a response). The reason a check failed
+//! Every check is `"ok"`, `"failed"` or `"skipped"` (the last only for a
+//! service a `bi-only` installation never deployed) and nothing else
+//! (AGENTS.md rule 4: upstream error text never reaches a response). The reason a check failed
 //! is in the log, under the same line the probe wrote, not in the response:
 //! a readiness route is public, so its body is read by anything that can
 //! reach the port.
@@ -95,8 +104,10 @@ const READER_TOKEN_ENV_VAR: &str = "LAKEKEEPER_READ_TOKEN_FILE";
 
 /// One check's outcome.
 ///
-/// Only two values, and neither carries a reason: `"ok"` or `"failed"`.
-/// The reason is in the log (AGENTS.md rule 4).
+/// Two values in the full stack, and neither carries a reason: `"ok"` or
+/// `"failed"`. The reason is in the log (AGENTS.md rule 4). `BI-44` adds
+/// `"skipped"` for a service a `bi-only` installation never deployed: an
+/// honest third word, never a fabricated failure and never a pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Check {
@@ -104,6 +115,9 @@ pub enum Check {
     Ok,
     /// The check failed, timed out, or could not run at all.
     Failed,
+    /// This installation does not run the service, so no probe happened
+    /// (`BI-44`). Excluded from [`Checks::all_ok`].
+    Skipped,
 }
 
 impl Check {
@@ -114,23 +128,38 @@ impl Check {
     }
 }
 
-/// The three dependencies this service needs to be ready.
+/// The dependencies this service needs to be ready.
+///
+/// The three original fields keep their names and their JSON keys so every
+/// existing caller is unchanged. `trino` is the `BI-44` addition and is
+/// absent (not `"skipped"`) in the full stack, where the `/api/ops/services`
+/// probe is the honest source for an optional Trino profile.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Checks {
     /// The application database, at this build's schema version.
     pub postgres: Check,
-    /// The analytical store.
+    /// The analytical store, or `"skipped"` when a `bi-only` installation
+    /// chose Trino.
     pub clickhouse: Check,
-    /// The Iceberg REST catalog.
+    /// The Iceberg REST catalog, or `"skipped"` in a `bi-only` installation.
     pub lakekeeper: Check,
+    /// The Trino check in a `bi-only` installation that chose Trino;
+    /// absent in every other installation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trino: Option<Check>,
 }
 
 impl Checks {
-    /// Whether every check passed — the whole answer of this route.
+    /// Whether every DEPLOYED dependency passed — the whole answer of this
+    /// route. A skipped check was never probed, so it cannot fail the
+    /// verdict; a present `trino` check always counts.
     #[must_use]
     pub fn all_ok(self) -> bool {
-        self.postgres.is_ok() && self.clickhouse.is_ok() && self.lakekeeper.is_ok()
+        let clickhouse_ok = self.clickhouse == Check::Skipped || self.clickhouse.is_ok();
+        let lakekeeper_ok = self.lakekeeper == Check::Skipped || self.lakekeeper.is_ok();
+        let trino_ok = self.trino.is_none_or(Check::is_ok);
+        self.postgres.is_ok() && clickhouse_ok && lakekeeper_ok && trino_ok
     }
 }
 
@@ -246,11 +275,29 @@ where
     fresh
 }
 
-/// Probe the three dependencies, concurrently.
+/// Probe the deployed dependencies. The full stack's three are concurrent;
+/// a `bi-only` installation probes Postgres and its one engine.
 ///
 /// Each probe is bounded by [`PROBE_TIMEOUT`], so the whole answer takes
 /// about as long as the slowest dependency, not the sum.
 async fn probe(state: &AppState) -> Checks {
+    if state.config.is_bi_only() {
+        let postgres = probe_postgres(state).await;
+        return match state.config.query_engine {
+            crate::config::QueryEngine::ClickHouse => Checks {
+                postgres,
+                clickhouse: probe_clickhouse(state).await,
+                lakekeeper: Check::Skipped,
+                trino: None,
+            },
+            crate::config::QueryEngine::Trino => Checks {
+                postgres,
+                clickhouse: Check::Skipped,
+                lakekeeper: Check::Skipped,
+                trino: Some(probe_trino(state).await),
+            },
+        };
+    }
     let (postgres, clickhouse, lakekeeper) = tokio::join!(
         probe_postgres(state),
         probe_clickhouse(state),
@@ -260,6 +307,7 @@ async fn probe(state: &AppState) -> Checks {
         postgres,
         clickhouse,
         lakekeeper,
+        trino: None,
     }
 }
 
@@ -325,6 +373,40 @@ async fn probe_clickhouse(state: &AppState) -> Check {
         }
         Err(_) => {
             tracing::warn!("the readiness probe timed out querying ClickHouse");
+            Check::Failed
+        }
+    }
+}
+
+/// Does the chosen `Trino` coordinator answer `/v1/info`? (`BI-44`.)
+///
+/// The same bounded, non-redirecting client the catalog probe uses: a
+/// readiness route is public, so no token is sent and no upstream text is
+/// returned. Config resolution already required an explicit `TRINO_URL`
+/// for this mode, so the address is the operator's, never the baked-in
+/// default.
+async fn probe_trino(state: &AppState) -> Check {
+    let Some(http) = http_client() else {
+        tracing::warn!("the readiness probe has no HTTP client; the Trino check cannot run");
+        return Check::Failed;
+    };
+    let base = state.config.trino_url.trim_end_matches('/');
+    let url = format!("{base}/v1/info");
+    match tokio::time::timeout(PROBE_TIMEOUT, http.get(url).send()).await {
+        Ok(Ok(resp)) if resp.status().is_success() => Check::Ok,
+        Ok(Ok(resp)) => {
+            tracing::warn!(
+                status = resp.status().as_u16(),
+                "the readiness probe got a non-success answer from Trino"
+            );
+            Check::Failed
+        }
+        Ok(Err(err)) => {
+            tracing::warn!(error = ?err, "the readiness probe could not reach Trino");
+            Check::Failed
+        }
+        Err(_) => {
+            tracing::warn!("the readiness probe timed out reaching Trino");
             Check::Failed
         }
     }
@@ -432,6 +514,7 @@ mod tests {
             postgres: Check::Ok,
             clickhouse: Check::Ok,
             lakekeeper: Check::Ok,
+            trino: None,
         };
         let body = ReadyBody::new(checks);
         assert!(body.ready);
@@ -458,6 +541,7 @@ mod tests {
             postgres: Check::Ok,
             clickhouse: Check::Failed,
             lakekeeper: Check::Ok,
+            trino: None,
         });
         assert!(!body.ready);
         assert_eq!(body.checks.clickhouse, Check::Failed);
@@ -472,6 +556,7 @@ mod tests {
             postgres: Check::Failed,
             clickhouse: Check::Failed,
             lakekeeper: Check::Failed,
+            trino: None,
         });
         let text = serde_json::to_string(&body).unwrap();
         assert!(text.contains("\"failed\""));
@@ -676,6 +761,7 @@ mod tests {
                     postgres: Check::Ok,
                     clickhouse: Check::Ok,
                     lakekeeper: Check::Ok,
+                    trino: None,
                 })
             }
         };
@@ -743,5 +829,56 @@ mod tests {
         fn advance(&mut self, seconds: u64) {
             self.0 += Duration::from_secs(seconds);
         }
+    }
+
+    /// `BI-44`: a Trino-only installation reports the two services it does
+    /// not run as `"skipped"`, reports Trino's real check, and is ready
+    /// when its engine and the app database answered.
+    #[test]
+    fn a_bi_only_trino_installation_reports_skipped_services_and_the_trino_check() {
+        let body = ReadyBody::new(Checks {
+            postgres: Check::Ok,
+            clickhouse: Check::Skipped,
+            lakekeeper: Check::Skipped,
+            trino: Some(Check::Ok),
+        });
+        assert!(body.ready);
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({
+                "ready": true,
+                "version": VERSION,
+                "checks": {
+                    "postgres": "ok",
+                    "clickhouse": "skipped",
+                    "lakekeeper": "skipped",
+                    "trino": "ok",
+                },
+            })
+        );
+        let failed = ReadyBody::new(Checks {
+            postgres: Check::Ok,
+            clickhouse: Check::Skipped,
+            lakekeeper: Check::Skipped,
+            trino: Some(Check::Failed),
+        });
+        assert!(!failed.ready);
+    }
+
+    /// The full stack's body has exactly three check keys — the `trino`
+    /// field is absent, not `"skipped"`, so an older console sees the same
+    /// shape it always did.
+    #[test]
+    fn a_skipped_check_and_an_absent_trino_check_are_not_the_same_thing() {
+        assert_eq!(serde_json::to_value(Check::Skipped).unwrap(), "skipped");
+        let full = serde_json::to_value(ReadyBody::new(Checks {
+            postgres: Check::Ok,
+            clickhouse: Check::Ok,
+            lakekeeper: Check::Ok,
+            trino: None,
+        }))
+        .unwrap();
+        assert_eq!(full["checks"].as_object().unwrap().len(), 3);
+        assert!(full["checks"].get("trino").is_none());
     }
 }

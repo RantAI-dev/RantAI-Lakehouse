@@ -1,0 +1,65 @@
+# REL-17: verify that every pinned third-party image in the deployment
+# template still resolves upstream AND that its config names the version the
+# pin's tag claims.
+#
+# Why this is a SCHEDULED workflow, not a pull-request check:
+# It talks to Docker Hub, quay.io, ghcr.io and MCR. Docker Hub rate-limits
+# anonymous pulls (HTTP 429) and registries have 5xx incidents; neither is a
+# defect in a PR's diff. `Repo lints` is a required check on EVERY pull
+# request, so putting a live registry call there would block unrelated merges
+# on somebody else's outage. This job runs daily and on manual dispatch; its
+# unit tests (no network) run in `Repo lints` via unittest discovery.
+#
+# What a red run means:
+# Either a pinned digest no longer resolves (a 404 after a retry, e.g. the
+# withdrawn `quay.io/debezium/connect:3.8@sha256:d67d…` from #264), the
+# manifest bytes no longer hash to the pin, or the image config declares a
+# product version that contradicts the tag (e.g. `3.8` naming
+# `3.8.0.Alpha1`). Re-pin in `docker-compose.yml` and investigate why the
+# upstream image changed; do not silence the check.
+
+name: Image pins (REL-17)
+
+on:
+  schedule:
+    # Daily at 04:41 UTC: after the 03:17 all-branch secret scan and well
+    # before the 06:23 staging cache prune. The odd minute keeps it off the
+    # top of the hour when other crons fire.
+    - cron: '41 4 * * *'
+  workflow_dispatch:  # manual trigger from GitHub UI
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-pins
+  # A scheduled run must not replace a manual run somebody started to
+  # investigate a red pin; let the manual one finish.
+  cancel-in-progress: false
+
+jobs:
+  verify-pins:
+    name: Resolve pinned digests and compare config versions to tags
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The checker uses only the standard library; the pin is to match the
+      # release tooling's Python in ci.yml rather than to rely on whatever
+      # interpreter happens to be on the runner.
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # `IMAGE_PIN_ATTEMPTS` bounds retries of transient 429/5xx answers.
+      # A 404 (withdrawn digest) or a version mismatch is NOT retried: those
+      # are the finding. The script writes a PASS/FAIL table to the job
+      # summary when GITHUB_STEP_SUMMARY is set (GitHub sets it for every job).
+      - name: Verify pinned image digests and versions (REL-17)
+        env:
+          IMAGE_PIN_ATTEMPTS: "3"
+          IMAGE_PIN_TIMEOUT: "30"
+        run: python3 ops/lint/check_image_pin_resolution.py

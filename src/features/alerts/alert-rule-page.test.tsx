@@ -37,7 +37,7 @@ mock.module("@/features/auth/auth-provider", () => ({
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
-import { alertRuleService, assetService, connectorService, dashboardService, metricService } from "@/services"
+import { alertRuleService, assetService, connectorService, dashboardService, metricService, settingsService } from "@/services"
 import { ServiceError } from "@/services/errors"
 import type { AlertRule } from "@/services/contracts/alerts"
 import { AlertRulePage } from "./alert-rule-page"
@@ -80,6 +80,8 @@ function stubReads(rules: AlertRule[] = []) {
   spyOn(dashboardService, "listMartMeasures").mockResolvedValue(["jumlah", "nights"])
   spyOn(connectorService, "listConnectors").mockResolvedValue([])
   spyOn(metricService, "list").mockResolvedValue([])
+  // BI-65: a digest's schedule opens in the report time zone.
+  spyOn(settingsService, "getReporting").mockResolvedValue({ timeZone: "Asia/Jakarta" } as never)
   // WEB-8 D8: the table pickers read the catalog.
   // Shaped like the API's list rows (`DATA-54`): a Silver row's `id` is its
   // table key; a Bronze row's `id` is a registry slug and its table is named
@@ -114,10 +116,9 @@ describe("the alert rule page (WEB-7 T7)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create" }))
 
     await waitFor(() => expect(create).toHaveBeenCalledTimes(1))
-    // A threshold rule goes out as the form holds it (`alertRuleSaveInput`
-    // returns the older kinds unchanged; only the load rules are trimmed).
+    // A threshold rule goes out as the form holds it, but only the fields the
+    // API takes (BI-65: it refuses the rest).
     expect(create.mock.calls[0]?.[0]).toEqual({
-      id: "",
       name: "  Visitors in Bali ",
       type: "alert",
       agg: "sum",
@@ -127,7 +128,7 @@ describe("the alert rule page (WEB-7 T7)", () => {
       target: " https://hooks.example.com/x ",
       enabled: true,
     })
-    await waitFor(() => expect(pushed).toEqual(["/alerts"]))
+    await waitFor(() => expect(pushed).toEqual(["/alerts?tab=rules"]))
   })
 
   it("loads a saved rule by id and writes the change back with its id", async () => {
@@ -151,7 +152,42 @@ describe("the alert rule page (WEB-7 T7)", () => {
       name: "Visitors in Jakarta",
       channel: "email",
     })
-    await waitFor(() => expect(pushed).toEqual(["/alerts"]))
+    await waitFor(() => expect(pushed).toEqual(["/alerts?tab=rules"]))
+  })
+
+  it("has no Cancel button: the back arrow is the one way out, and it leaves without asking when nothing changed", async () => {
+    stubReads([RULE])
+    render(<AlertRulePage ruleId="al_1234" />)
+    await screen.findByDisplayValue("Visitors in Bali")
+    expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull()
+    fireEvent.click(screen.getByText("Back to Alerts"))
+    expect(pushed).toEqual(["/alerts?tab=rules"])
+    expect(screen.queryByText("Discard your changes?")).toBeNull()
+  })
+
+  it("asks before the back arrow throws away unsaved changes", async () => {
+    stubReads([RULE])
+    render(<AlertRulePage ruleId="al_1234" />)
+    fireEvent.change(await screen.findByDisplayValue("Visitors in Bali"), { target: { value: "Visitors in Jakarta" } })
+    fireEvent.click(screen.getByText("Back to Alerts"))
+    expect(pushed).toEqual([])
+    expect(await screen.findByText("Discard your changes?")).toBeTruthy()
+    fireEvent.click(await screen.findByText("Discard changes"))
+    expect(pushed).toEqual(["/alerts?tab=rules"])
+  })
+
+  it("shows the dashboard's name, not its id, on a saved digest", async () => {
+    const DIGEST: AlertRule = {
+      id: "al_digest", name: "Weekly", type: "digest", board: "b_813fc488", channel: "email",
+      target: "sari@meridian.example", enabled: true,
+      schedule: { kind: "daily", hour: 8, minute: 0 },
+    } as AlertRule
+    stubReads([DIGEST])
+    spyOn(dashboardService, "listBoards").mockResolvedValue([{ id: "b_813fc488", name: "qa-accept delivery" }])
+    render(<AlertRulePage ruleId="al_digest" />)
+    const trigger = await screen.findByRole("combobox", { name: /dashboard/i })
+    await waitFor(() => expect(trigger.textContent).toContain("qa-accept delivery"))
+    expect(trigger.textContent).not.toContain("b_813fc488")
   })
 
   it("shows the not-found state for an id nothing has", async () => {
@@ -159,7 +195,7 @@ describe("the alert rule page (WEB-7 T7)", () => {
     render(<AlertRulePage ruleId="gone" />)
 
     expect(await screen.findByText("Rule not found")).toBeDefined()
-    expect(screen.getByText("Back to Alerts").closest("a")?.getAttribute("href")).toBe("/alerts")
+    expect(screen.getByText("Back to Alerts").closest("a")?.getAttribute("href")).toBe("/alerts?tab=rules")
   })
 
   // DEC-16 (QA LH-SRC-7-04, SRC-42): the API sends a rule without its target to
@@ -176,7 +212,7 @@ describe("the alert rule page (WEB-7 T7)", () => {
       )
     ).toBeDefined()
     expect(screen.queryByRole("button", { name: "Save" })).toBeNull()
-    expect(screen.getByText("Back to Alerts").closest("a")?.getAttribute("href")).toBe("/alerts")
+    expect(screen.getByText("Back to Alerts").closest("a")?.getAttribute("href")).toBe("/alerts?tab=rules")
   })
 
   it("still renders the form for a rule whose target is returned", async () => {
@@ -420,6 +456,30 @@ describe("required-field indicators on the alert rule page (UX-1-R9)", () => {
     expectRequiredField("Dashboard")
     await chooseRuleType("Connector run failed")
     expectRequiredField("Connector")
+  })
+
+  it("saves a digest with its schedule: weekly on Monday at 08:00 in the report time zone to start", async () => {
+    stubReads()
+    spyOn(dashboardService, "listBoards").mockResolvedValue([{ id: "b_sales", name: "Sales" }])
+    const create = spyOn(alertRuleService, "createRule").mockResolvedValue(RULE)
+    render(<AlertRulePage />)
+    fireEvent.change(await screen.findByPlaceholderText("e.g. Foreign visitors dropped"), { target: { value: "Monday digest" } })
+    await chooseRuleType("Dashboard digest")
+    // The same fields the Subscriptions dialog has.
+    expect(screen.getByText("Repeat")).toBeTruthy()
+    expect(screen.getByText("Time zone")).toBeTruthy()
+    expect((screen.getByLabelText("Time") as HTMLInputElement).value).toBe("08:00")
+    fireEvent.click(screen.getByRole("combobox", { name: /dashboard/i }))
+    pickOption(await screen.findByRole("option", { name: "Sales" }))
+    fireEvent.change(screen.getByPlaceholderText("https://hooks.slack.com/services/…"), { target: { value: "https://hooks.example.com/x" } })
+    fireEvent.click(screen.getByRole("button", { name: "Create" }))
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1))
+    expect(create.mock.calls[0]?.[0]).toMatchObject({
+      type: "digest",
+      board: "b_sales",
+      schedule: { kind: "weekly", weekday: 1, hour: 8, minute: 0 },
+      timeZone: "Asia/Jakarta",
+    })
   })
 
   it("stars the table picker on a freshness and a quality rule without a false button attribute", async () => {
