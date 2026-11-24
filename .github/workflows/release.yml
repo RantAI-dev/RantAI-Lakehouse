@@ -1480,10 +1480,18 @@ jobs:
       - name: Cut the runner off from the registries
         run: |
           set -euo pipefail
+          # The hosts sinkhole is kept as belt-and-suspenders (REL-12):
+          # it catches name resolution, and the firewall below catches
+          # a cached answer or a direct-IP pull that bypasses DNS.
           for host in registry-1.docker.io auth.docker.io index.docker.io \
             ghcr.io quay.io production.cloudflare.docker.com; do
             echo "0.0.0.0 $host" | sudo tee -a /etc/hosts
           done
+          # REL-12: the real cutoff. `dockerd`/`containerd` leave the host
+          # in OUTPUT as uid 0; blocking only that uid's 80/443 leaves
+          # Runner.Worker's HTTPS (non-root), loopback and container
+          # traffic (FORWARD/DOCKER-USER, owned by REL-16) untouched.
+          sudo bash ops/release/airgap_firewall.sh enable
           if docker pull alpine:3.20; then
             echo "::error::the runner can still pull from a registry: the proof is not air-gapped"
             exit 1
@@ -1600,6 +1608,17 @@ jobs:
         if: always()
         run: |
           docker compose -p rantai-lakehouse ps || true
+
+      - name: Restore outbound firewall rules
+        if: always()
+        run: |
+          set -euo pipefail
+          # REL-12: the air gap is job-scoped. Remove it even when a
+          # proof step failed, so the chain never outlives this job.
+          # The guard covers a failed checkout: no script, no chain.
+          if [ -f ops/release/airgap_firewall.sh ]; then
+            sudo bash ops/release/airgap_firewall.sh disable
+          fi
 
   update-proof:
     name: Proof · the update moves the stack, and rolls back
@@ -1993,10 +2012,19 @@ jobs:
       - name: Cut the runner off from the registries
         run: |
           set -euo pipefail
+          # The hosts sinkhole is kept as belt-and-suspenders (REL-12):
+          # it catches name resolution, and the firewall below catches
+          # a cached answer or a direct-IP pull that bypasses DNS.
           for host in registry-1.docker.io auth.docker.io index.docker.io \
             ghcr.io quay.io production.cloudflare.docker.com; do
             echo "0.0.0.0 $host" | sudo tee -a /etc/hosts
           done
+          # REL-12: the real cutoff. `dockerd`/`containerd` leave the host
+          # in OUTPUT as uid 0; blocking only that uid's 80/443 leaves
+          # Runner.Worker's HTTPS (non-root), loopback and the local
+          # throwaway registry on localhost:5000 untouched. Container
+          # egress (FORWARD/DOCKER-USER) is REL-16's concern.
+          sudo bash ops/release/airgap_firewall.sh enable
           if docker pull alpine:3.20; then
             echo "::error::the runner can still pull from a registry: the proof is not air-gapped"
             exit 1
@@ -2411,3 +2439,14 @@ jobs:
         if: always()
         run: |
           docker compose -p rantai-lakehouse ps || true
+
+      - name: Restore outbound firewall rules
+        if: always()
+        run: |
+          set -euo pipefail
+          # REL-12: the air gap is job-scoped. Remove it even when a
+          # proof step failed, so the chain never outlives this job.
+          # The guard covers a failed checkout: no script, no chain.
+          if [ -f ops/release/airgap_firewall.sh ]; then
+            sudo bash ops/release/airgap_firewall.sh disable
+          fi

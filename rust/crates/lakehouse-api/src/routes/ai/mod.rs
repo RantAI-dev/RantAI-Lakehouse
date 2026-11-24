@@ -684,6 +684,7 @@ async fn system_prompt(
                 None => tools::data::RegistryReach::nothing(state),
             };
             data_map::data_map(
+                &state.data_map_cache,
                 &state.clickhouse,
                 withheld,
                 &notes,

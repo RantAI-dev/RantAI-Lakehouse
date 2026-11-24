@@ -278,7 +278,9 @@ jobs:
       - name: Check every compose image is pinned by digest (REL-2)
         run: python3 ops/lint/check_image_digests.py
 
-      # The unit tests of that check and of the gates' registry and result
+      # The unit tests of that check, of the REL-17 pin-resolution checker
+      # (its live registry calls belong to the scheduled image-pins workflow,
+      # not to this required PR check), and of the gates' registry and result
       # table module (no network, no containers; seconds).
       #
       # `ops/bench` too (DATA-24 T2): the catalog-search bench's own tests
@@ -289,6 +291,13 @@ jobs:
           python3 -m unittest discover -s ops/lint -p 'test_*.py'
           python3 -m unittest discover -s ops/gates -p 'test_*.py'
           python3 -m unittest discover -s ops/bench -p 'test_*.py'
+
+      # OPS-18: the bounded retry helper used by the security workflows to
+      # download gitleaks and cargo-deny. Its self-test stubs curl and sleep,
+      # so success-on-retry, the bounded-failure exit code and the missing
+      # trailing sleep are proved without network access or real waiting.
+      - name: Test the CI download retry helper (OPS-18)
+        run: bash ./scripts/ci/tests/test_retry_download.sh
 
       # REL-2 S2-T1 … S2-T3: the release tooling (the version check, the
       # Compose renderer, the manifest). Its own tests are pytest cases;
@@ -705,6 +714,11 @@ jobs:
       # OPS-24 R12: each attempt is bounded by `timeout 180` (a pull that hangs
       # would otherwise hold the job for its 30-minute limit), and the last
       # attempt is not followed by a sleep nothing waits for.
+      # REL-14: pre-pulling `clickhouse/clickhouse-server:26.8` here is the CI
+      # half of the "bytes remaining on stream" fix — a test that finds the
+      # image locally never pulls it. The Rust half is the bounded start
+      # retry in `lakehouse-test-support::clickhouse`, which covers jobs
+      # that do not pre-pull and local runs.
       - name: Pull the test images (the pull is retried, a test never is)
         if: needs.changes.outputs.proven != 'true'
         run: |

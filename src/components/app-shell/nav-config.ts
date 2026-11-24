@@ -320,8 +320,10 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
   // B). The sidebar entry and `/catalog` stay `catalog:read`.
   { pattern: "/data/assets/[assetId]", requires: ["catalog:read", "query:read"] },
   { pattern: "/lakehouse/tables/[namespace]/[table]", requires: ["catalog:read"] },
-  // ADM-13 review round 1, S4: gold-exports requires [] (any signed-in user, RequiresAuth on GET)
-  { pattern: "/gold-exports", requires: [] },
+  // SEC-66: GET /api/gold/* is no longer RequiresAuth — the same gold:read
+  // grant the API checks now opens the page. A Dashboard Viewer must not be
+  // able to open it by address.
+  { pattern: "/gold-exports", requires: ["gold:read"] },
 
   // Query Studio
   { pattern: "/query-studio", requires: ["query:read"] },
@@ -373,8 +375,9 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
   { pattern: "/alerts/rules/[id]/edit", requires: ["alert:write"] },
 
   // Intelligence / Agents
-  // ADM-13 review round 1, S4: agent runs requires [] (any signed-in user, RequiresAuth on GET)
-  { pattern: "/agents/runs/[runId]", requires: [] },
+  // SEC-66: GET /api/agents/runs* now requires agent:read, so the run detail
+  // page follows that grant instead of opening for any signed-in user.
+  { pattern: "/agents/runs/[runId]", requires: ["agent:read"] },
 
   // Administration
   { pattern: "/admin/users", requires: ["identity:read"] },
