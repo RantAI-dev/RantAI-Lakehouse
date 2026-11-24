@@ -76,6 +76,19 @@
 //! the same act as editing a chart (`dashboard:write`, which is not enough).
 //! Listing, validating and the usage of a metric need `dashboard:read` only.
 //!
+//! # `gold:read` / `agent:read` (SEC-66)
+//!
+//! The read side of Gold exports and of agent runs was `RequiresAuth`, so a
+//! signed-in Dashboard Viewer could open `/gold-exports` and
+//! `/agents/runs/[runId]` by address. These two read-only strings close that
+//! hole; `migrations/0153_sec66_read_permissions.sql` grants them on upgrade
+//! to every built-in role except the two people whose remit is dashboards
+//! and the assistant (Dashboard Viewer, Assistant only). Platform Admin's
+//! `*:*` already satisfies both. Gold's GETs keep `gold:export` as a second
+//! accepted grant so a principal that could publish before the upgrade can
+//! still read, and the shared-token/service-identity path is preserved by
+//! seeding `gold:read` on the `gold-export-scheduler` identity.
+//!
 //! # `agent:manage` / `workload:cancel` / `storage:restore` / `alert:write`
 //!
 //! Four more route groups had the identical problem: any authenticated
@@ -529,33 +542,39 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST",   "/api/alerts/run",  Policy::RequiresAuth),
 
     // ── Gold export (ADR 0010, Rust/Phase-P6-only — no TypeScript route to
-    //    port): same "floor" shape as `/api/alerts/run` — `RequiresAuth`
-    //    here, PLUS `routes::gold::check_export_token`'s own stricter D4
-    //    guard inside the handler (shared-token match, or a service-
-    //    identity principal when `GOLD_EXPORT_RUN_TOKEN` is unset). ──────
-    ("GET",  "/api/gold/export/{mart}",  Policy::RequiresAuth),
+    //    port): the WRITE still has the "floor" shape of `/api/alerts/run`
+    //    — `RequiresAuth` here, PLUS `routes::gold::check_export_token`'s
+    //    own stricter D4 guard inside the handler (shared-token match, or
+    //    a service-identity principal when `GOLD_EXPORT_RUN_TOKEN` is
+    //    unset). The GETs are SEC-66's dedicated read grant: a signed-in
+    //    user without `gold:read` must not read an export by address.
+    //    `gold:export` also passes them — it is the strictly wider grant
+    //    and its holders (custom roles, service identities) must not lose
+    //    a read they had before the permission existed. The token and
+    //    service-identity paths stay intact: `gold-export-scheduler` is
+    //    seeded with `gold:read` (see `lib.rs`) and the handler's token
+    //    branch is unchanged. ────────────────────────────────────────────
+    ("GET",  "/api/gold/export/{mart}",  Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
     ("POST", "/api/gold/export/{mart}",  Policy::RequiresAuth),
-    // History (WS6 item 3): same RequiresAuth floor as export/read-back —
-    // row counts and run timing, not public data.
-    ("GET",  "/api/gold/exports",        Policy::RequiresAuth),
+    // History (WS6 item 3): the same read grant as read-back — row counts
+    // and run timing, not public data.
+    ("GET",  "/api/gold/exports",        Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
     // Consumers (WS6 item 4): an honest supported:false stub — no
-    // ClickHouse/Iceberg/Trino data is ever returned, but the floor stays
-    // RequiresAuth (not a public route) to match every other route under
-    // /api/gold/export/{mart}.
-    ("GET",  "/api/gold/export/{mart}/consumers", Policy::RequiresAuth),
+    // ClickHouse/Iceberg/Trino data is ever returned, but the route stays
+    // permission-gated (not public) to match every other gold GET.
+    ("GET",  "/api/gold/export/{mart}/consumers", Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
 
     // DATA-1 — per-mart publish-to-Iceberg switches. `publications` is
-    // what the scheduler reads (RequiresAuth floor PLUS
-    // `check_export_token` in the handler, same two-layer shape as the
-    // export routes above); the detail GET is read-only state for the
-    // asset page (RequiresAuth floor, `canEdit` reports — never implies —
-    // the permission); the PUT is the one WRITE, floored at the existing
-    // `gold:export` permission so whoever may trigger an export by hand
-    // is exactly who may switch automatic publishing on. Switching off
-    // flips a flag only; no route under /api/gold ever drops Iceberg
-    // data.
-    ("GET", "/api/gold/publications",              Policy::RequiresAuth),
-    ("GET",  "/api/gold/export/{mart}/publication", Policy::RequiresAuth),
+    // what the scheduler reads (same SEC-66 read grant PLUS
+    // `check_export_token` in the handler); the detail GET is read-only
+    // state for the asset page (`canEdit` reports — never implies — the
+    // `gold:export` permission); the PUT is the one WRITE, floored at the
+    // existing `gold:export` permission so whoever may trigger an export
+    // by hand is exactly who may switch automatic publishing on.
+    // Switching off flips a flag only; no route under /api/gold ever
+    // drops Iceberg data.
+    ("GET", "/api/gold/publications",              Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
+    ("GET",  "/api/gold/export/{mart}/publication", Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
     ("PUT",  "/api/gold/export/{mart}/publication", Policy::RequiresPermission("gold:export")),
 
     // ── Query: seeded Analyst permission `query:read`. ───────────────────
@@ -1286,8 +1305,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // POST /api/agents/tools removed (WS7 item G4): the real tool
     // registry (ai_registry::TOOLS) has no "register" concept.
     ("GET",  "/api/agents/tools",                    Policy::RequiresAuth),
-    ("GET",  "/api/agents/runs",                     Policy::RequiresAuth),
-    ("GET",  "/api/agents/runs/{id}",                Policy::RequiresAuth),
+    // SEC-66: a run's list and detail are read-only but were open to any
+    // signed-in user. `agent:read` now gates them; `agent:approve` and
+    // `agent:manage` holders are deliberately NOT widened here — the two
+    // are decision/lifecycle powers, not a licence to read every run.
+    ("GET",  "/api/agents/runs",                     Policy::RequiresPermission("agent:read")),
+    ("GET",  "/api/agents/runs/{id}",                Policy::RequiresPermission("agent:read")),
     ("GET",  "/api/agents/approvals",                Policy::RequiresPermission("agent:approve")),
     ("POST", "/api/agents/approvals/{id}/decide",    Policy::RequiresPermission("agent:approve")),
 
@@ -2003,6 +2026,99 @@ mod tests {
                 "an Approver (agent:approve only)",
                 &PermissionSet::parse("*:*"),
                 "a Platform Admin (*:*)",
+            );
+        }
+    }
+
+    /// `SEC-66`: the Gold GETs are no longer open to any signed-in user.
+    /// A Dashboard Viewer is refused; both the new `gold:read` grant and
+    /// the pre-existing `gold:export` grant still read (no reader loses
+    /// access on upgrade), and the two WRITE routes keep their old gates.
+    #[test]
+    fn gold_read_routes_refuse_a_dashboard_viewer_and_accept_both_gold_grants() {
+        use lakehouse_auth::PermissionSet;
+
+        const GOLD_GETS: [&str; 5] = [
+            "/api/gold/export/{mart}",
+            "/api/gold/exports",
+            "/api/gold/export/{mart}/consumers",
+            "/api/gold/publications",
+            "/api/gold/export/{mart}/publication",
+        ];
+        let viewer = PermissionSet::parse("dashboard:read");
+        let reader = PermissionSet::parse("gold:read");
+        let exporter = PermissionSet::parse("gold:export");
+        let admin = PermissionSet::parse("*:*");
+
+        for path in GOLD_GETS {
+            let Some(Policy::RequiresAnyPermission(perms)) = policy_for("GET", path) else {
+                panic!("GET {path} must require a Gold read permission");
+            };
+            assert_eq!(perms.len(), 2, "GET {path} must name both Gold grants");
+            assert_eq!(perms[0], "gold:read");
+            assert_eq!(perms[1], "gold:export");
+            assert!(
+                !perms.iter().any(|perm| viewer.has(perm)),
+                "a Dashboard Viewer must be denied GET {path}"
+            );
+            assert!(
+                perms.iter().any(|perm| reader.has(perm)),
+                "a gold:read holder must be allowed GET {path}"
+            );
+            assert!(
+                perms.iter().any(|perm| exporter.has(perm)),
+                "a gold:export holder must keep its read of GET {path}"
+            );
+            assert!(
+                perms.iter().any(|perm| admin.has(perm)),
+                "a Platform Admin (*:*) must be allowed GET {path}"
+            );
+        }
+
+        assert_eq!(
+            policy_for("POST", "/api/gold/export/{mart}"),
+            Some(Policy::RequiresAuth),
+            "the export WRITE keeps its token-guarded auth floor"
+        );
+        assert_eq!(
+            policy_for("PUT", "/api/gold/export/{mart}/publication"),
+            Some(Policy::RequiresPermission("gold:export")),
+            "the publication WRITE stays gold:export-only"
+        );
+    }
+
+    /// `SEC-66`: agent-run reads require their own `agent:read` grant. A
+    /// Dashboard Viewer (and a person holding only `agent:approve`, a
+    /// narrower decision power) is refused; `agent:read` and `*:*` pass.
+    #[test]
+    fn agent_run_read_routes_refuse_a_dashboard_viewer_and_accept_agent_read() {
+        use lakehouse_auth::PermissionSet;
+
+        for path in ["/api/agents/runs", "/api/agents/runs/{id}"] {
+            assert_eq!(
+                policy_for("GET", path),
+                Some(Policy::RequiresPermission("agent:read")),
+                "GET {path} must require agent:read"
+            );
+            assert_denied_then_allowed(
+                "GET",
+                path,
+                &PermissionSet::parse("dashboard:read"),
+                "a Dashboard Viewer",
+                &PermissionSet::parse("agent:read"),
+                "an agent:read holder",
+            );
+            assert_denied_then_allowed(
+                "GET",
+                path,
+                &PermissionSet::parse("agent:approve"),
+                "an Approver (agent:approve only)",
+                &PermissionSet::parse("agent:read"),
+                "an agent:read holder",
+            );
+            assert!(
+                PermissionSet::parse("*:*").has("agent:read"),
+                "a Platform Admin (*:*) must satisfy agent:read on {path}"
             );
         }
     }

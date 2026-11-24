@@ -289,6 +289,24 @@ fn check_export_token(
     }
 }
 
+/// `SEC-66`: the read-only Gold routes accept `gold:read` where
+/// [`check_export_token`] used to demand `gold:export`. The shared-token
+/// match and the service-identity fallback are delegated to that guard
+/// unchanged, so the scheduler's `x-run-token` path and the no-token
+/// service path behave exactly as before. The WRITE route still calls
+/// [`check_export_token`] directly: `gold:read` must never open an export.
+fn check_gold_read_token(
+    configured: Option<&str>,
+    header_token: Option<&str>,
+    query_token: Option<&str>,
+    principal: Option<&Principal>,
+) -> Result<(), ApiError> {
+    if principal.is_some_and(|p| p.has("gold:read")) {
+        return Ok(());
+    }
+    check_export_token(configured, header_token, query_token, principal)
+}
+
 /// Reads the `gold-export` principal's Lakekeeper bearer token from
 /// [`crate::config::Config::lakekeeper_gold_export_token_file`].
 ///
@@ -929,19 +947,20 @@ fn millis_to_rfc3339(ms: i64) -> Option<String> {
 ///
 /// # Errors
 ///
-/// Returns 401/503 from [`check_export_token`] (same guard as `POST` —
-/// this still reveals row counts, not public data), 422 with the tenant
-/// gate's fixed sentence when the deployment holds several tenants and
-/// names no catalog tenant (`DATA-64`/`SEC-50`), 404 with the gate's own
-/// table sentence for a signed-in person whose tenant does not own the
-/// shared catalog (`DATA-64`/`SEC-50`), 503 with the shared catalog's own
-/// sentence when the deployment cannot count its tenants (`SEC-50` R5),
-/// 503 if the Lakekeeper token cannot be read, or 500 if the catalog
-/// refuses or fails the call for any reason other than "table not found",
-/// or the Iceberg read fails. The `DATA-64` tenant gate runs right after the
-/// mart name is validated and BEFORE the Lakekeeper token file or Iceberg
-/// is touched, so a caller whose reach does not cover the shared catalog
-/// learns nothing about the mart.
+/// Returns 401/503 from [`check_gold_read_token`] (`SEC-66`: the read-side
+/// guard also accepts `gold:read`; this still reveals row counts, not
+/// public data), 422 with the tenant gate's fixed sentence when the
+/// deployment holds several tenants and names no catalog tenant
+/// (`DATA-64`/`SEC-50`), 404 with the gate's own table sentence for a
+/// signed-in person whose tenant does not own the shared catalog
+/// (`DATA-64`/`SEC-50`), 503 with the shared catalog's own sentence when
+/// the deployment cannot count its tenants (`SEC-50` R5), 503 if the
+/// Lakekeeper token cannot be read, or 500 if the catalog refuses or fails
+/// the call for any reason other than "table not found", or the Iceberg
+/// read fails. The `DATA-64` tenant gate runs right after the mart name is
+/// validated and BEFORE the Lakekeeper token file or Iceberg is touched,
+/// so a caller whose reach does not cover the shared catalog learns
+/// nothing about the mart.
 pub async fn read_back(
     State(state): State<AppState>,
     Path(mart): Path<String>,
@@ -950,7 +969,7 @@ pub async fn read_back(
     principal: Option<Extension<Principal>>,
 ) -> ApiResult<ApiJson<Value>> {
     let header_token = headers.get("x-run-token").and_then(|v| v.to_str().ok());
-    check_export_token(
+    check_gold_read_token(
         state.config.gold_export_run_token.as_deref(),
         header_token,
         query.token.as_deref(),
@@ -1021,8 +1040,8 @@ pub(crate) fn read_back_body(mart: &str, readback: Option<&gold_export::GoldRead
 #[derive(Debug, Deserialize)]
 pub struct ExportsQuery {
     mart: String,
-    /// Same shared-token/permission gate as `export`/`read_back` — see
-    /// [`check_export_token`].
+    /// Same shared-token/permission gate as `read_back` — see
+    /// [`check_gold_read_token`].
     token: Option<String>,
 }
 
@@ -1034,15 +1053,16 @@ pub struct ExportsQuery {
 /// # Errors
 ///
 /// Returns 400 if `mart` is missing/blank or not a valid identifier,
-/// 401/503 from [`check_export_token`], 422 with the tenant gate's fixed
-/// sentence when the deployment holds several tenants and names no
-/// catalog tenant (`DATA-64`/`SEC-50`), 404 with the gate's own table
-/// sentence for a signed-in person whose tenant does not own the shared
-/// catalog (`DATA-64`/`SEC-50`), 503 with the shared catalog's own
-/// sentence when the deployment cannot count its tenants (`SEC-50` R5), or
-/// 500 if the `ClickHouse` query fails. The `DATA-64` tenant gate runs
-/// right after the mart name is validated and BEFORE `ClickHouse` is
-/// touched, so history the caller may not read is never queried.
+/// 401/503 from [`check_gold_read_token`] (`SEC-66`: the read-side guard
+/// also accepts `gold:read`), 422 with the tenant gate's fixed sentence
+/// when the deployment holds several tenants and names no catalog tenant
+/// (`DATA-64`/`SEC-50`), 404 with the gate's own table sentence for a
+/// signed-in person whose tenant does not own the shared catalog
+/// (`DATA-64`/`SEC-50`), 503 with the shared catalog's own sentence when
+/// the deployment cannot count its tenants (`SEC-50` R5), or 500 if the
+/// `ClickHouse` query fails. The `DATA-64` tenant gate runs right after
+/// the mart name is validated and BEFORE `ClickHouse` is touched, so
+/// history the caller may not read is never queried.
 pub async fn exports(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1050,7 +1070,7 @@ pub async fn exports(
     principal: Option<Extension<Principal>>,
 ) -> ApiResult<ApiJson<Value>> {
     let header_token = headers.get("x-run-token").and_then(|v| v.to_str().ok());
-    check_export_token(
+    check_gold_read_token(
         state.config.gold_export_run_token.as_deref(),
         header_token,
         query.token.as_deref(),
@@ -1363,17 +1383,17 @@ fn pool(state: &AppState) -> Result<&sqlx::PgPool, ApiError> {
 /// deployment publishes exactly this list, which is empty until a
 /// `gold:export` principal switches a mart on.
 ///
-/// The floor is `RequiresAuth` (see `POLICY_TABLE`) PLUS
-/// [`check_export_token`] in the handler, same two-layer shape as the
-/// export routes: the scheduler authenticates with its run token or
-/// service identity; a human session needs `gold:export`. A publication
-/// list is not secret the way row data is, but it does reveal what a
-/// deployment considers its "open format" copy — same posture as
-/// `GET /api/gold/exports`.
+/// The floor is the SEC-66 read grant (`gold:read`, or the wider
+/// `gold:export`) in `POLICY_TABLE` PLUS [`check_gold_read_token`] in the
+/// handler, same two-layer shape as the other Gold GETs: the scheduler
+/// authenticates with its run token or service identity; a human session
+/// needs one of the two Gold grants. A publication list is not secret the
+/// way row data is, but it does reveal what a deployment considers its
+/// "open format" copy — same posture as `GET /api/gold/exports`.
 ///
 /// # Errors
 ///
-/// Returns 401/503 from [`check_export_token`], 503 when Postgres is not
+/// Returns 401/503 from [`check_gold_read_token`], 503 when Postgres is not
 /// configured ([`pool`]; this feature is Postgres-backed, unlike the
 /// export routes), or 500 for a store failure (classified, never raw
 /// upstream text).
@@ -1384,7 +1404,7 @@ pub async fn publications(
     principal: Option<Extension<Principal>>,
 ) -> ApiResult<ApiJson<Value>> {
     let header_token = headers.get("x-run-token").and_then(|v| v.to_str().ok());
-    check_export_token(
+    check_gold_read_token(
         state.config.gold_export_run_token.as_deref(),
         header_token,
         query.token.as_deref(),
@@ -1664,6 +1684,55 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// `SEC-66`: a person holding the read grant can open the Gold GETs
+    /// whether or not a run token is configured, without presenting one —
+    /// the policy gate admits them and this handler guard must not undo it.
+    #[test]
+    fn gold_read_permission_passes_the_read_guard_with_or_without_a_configured_token() {
+        assert!(
+            check_gold_read_token(None, None, None, Some(&human_principal_with("gold:read")))
+                .is_ok()
+        );
+        assert!(
+            check_gold_read_token(
+                Some("secret"),
+                None,
+                None,
+                Some(&human_principal_with("gold:read")),
+            )
+            .is_ok()
+        );
+    }
+
+    /// `SEC-66`: the read grant stays read-only — the export WRITE still
+    /// calls `check_export_token` directly and must refuse it.
+    #[test]
+    fn gold_read_permission_does_not_pass_the_write_guard() {
+        assert!(
+            check_export_token(None, None, None, Some(&human_principal_with("gold:read"))).is_err()
+        );
+        assert!(
+            check_export_token(
+                Some("secret"),
+                None,
+                None,
+                Some(&human_principal_with("gold:read")),
+            )
+            .is_err()
+        );
+    }
+
+    /// `SEC-66`: the scheduler's two token paths are unchanged by the new
+    /// read guard — the shared token and an unscoped service principal
+    /// still pass exactly as they did through `check_export_token`.
+    #[test]
+    fn read_guard_still_accepts_the_shared_token_and_an_unscoped_service_principal() {
+        assert!(check_gold_read_token(Some("secret"), Some("secret"), None, None).is_ok());
+        let mut service = service_principal();
+        service.permissions = PermissionSet::parse("");
+        assert!(check_gold_read_token(None, None, None, Some(&service)).is_ok());
     }
 
     #[test]

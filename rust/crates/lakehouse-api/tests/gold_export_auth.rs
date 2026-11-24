@@ -18,8 +18,8 @@
 //! that function is private to the `bin` crate and an integration test
 //! cannot call it — the established constraint and precedent is
 //! `security_regressions.rs`'s `seed_agent_run_service_credential`. The
-//! identity's fixed name and empty-scope shape are pinned by `main.rs`'s
-//! own unit tests, which DO call the real function.
+//! identity's fixed name and `gold:read` scope (SEC-66) are pinned by
+//! `lib.rs`'s own unit tests, which DO call the real function.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -52,16 +52,19 @@ const CATALOG_TENANT: &str = "11111111-1111-4111-8111-000000000001";
 
 /// Seeds the `gold-export-scheduler` identity + credential exactly the way
 /// `main::bootstrap_gold_export_service` does — same production
-/// functions, same fixed name, EMPTY scopes (see that function's "Why
-/// this identity gets NO scopes" doc section for why) — because that
-/// function is private to the `bin` crate and this HTTP-level harness
-/// cannot call it directly.
+/// functions, same fixed name, the single scope `gold:read` (SEC-66 made
+/// the Gold GETs permission-gated; see that function's doc comment for
+/// why) — because that function is private to the `bin` crate and this
+/// HTTP-level harness cannot call it directly. Matching the production
+/// scope matters: a no-scope principal authenticates but is refused at
+/// `auth_gate` with `403 permission_denied: gold:read, gold:export` on
+/// `GET /api/gold/export/{mart}` and `GET /api/gold/exports`.
 async fn seed_gold_export_service_credential(pool: &sqlx::PgPool, token: &str) {
     let identity = lakehouse_store::identity::create_service_identity(
         pool,
         &lakehouse_store::identity::CreateServiceIdentityInput {
             name: "gold-export-scheduler".to_owned(),
-            scopes: Vec::new(),
+            scopes: vec!["gold:read".to_owned()],
             environment: "test".to_owned(),
         },
     )

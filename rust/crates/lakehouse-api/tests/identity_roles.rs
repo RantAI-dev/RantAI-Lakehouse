@@ -942,13 +942,13 @@ mod identity {
             let arr = body.as_array().expect("array of permissions");
             // `ADM-13` D2 added five catalogue entries in this branch
             // (`assistant:use`, `assistant:ask`, `ops:read`, `governance:read`,
-            // `alert:read`), and `OPS-8` added `usage:read`, so the catalogue
-            // is 35 and the fixture `tests/fixtures/permissions.json` holds
-            // the same 35
+            // `alert:read`), `OPS-8` added `usage:read`, and `SEC-66` added
+            // `gold:read` and `agent:read`, so the catalogue is 37 and the
+            // fixture `tests/fixtures/permissions.json` holds the same 37
             // (`permission_catalog::the_committed_fixture_equals_the_catalog`).
             // The count is still literal on purpose: a route that listed a
             // different catalogue would fail here.
-            assert_eq!(arr.len(), 35);
+            assert_eq!(arr.len(), 37);
             assert_eq!(arr[0]["name"], json!("catalog:read"));
             assert_eq!(arr[0]["area"], json!("Data"));
             assert!(arr[0]["description"].is_string());
