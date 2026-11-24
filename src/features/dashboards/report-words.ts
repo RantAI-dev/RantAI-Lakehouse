@@ -77,3 +77,48 @@ export function describeStatus(s: ReportSubscription): string {
   const word = d.status === "sent" ? "Sent" : d.status === "skipped" ? "Skipped" : "Failed"
   return d.reason ? `${word}. ${d.reason}` : word
 }
+
+/**
+ * The short name of `zone` now: `WIB`, `EST`, or `UTC+7` when the runtime has
+ * no letters for it. Tried in English first and in Indonesian second, because
+ * only the Indonesian data names `Asia/Jakarta` `WIB`.
+ */
+export function zoneAbbreviation(zone: string): string {
+  for (const locale of ["en", "id"]) {
+    try {
+      const name = new Intl.DateTimeFormat(locale, { timeZone: zone, timeZoneName: "short" })
+        .formatToParts(new Date())
+        .find((p) => p.type === "timeZoneName")?.value
+      if (name && /^[A-Z]{2,5}$/.test(name)) return name
+    } catch {
+      return zone
+    }
+  }
+  try {
+    const name = new Intl.DateTimeFormat("en", { timeZone: zone, timeZoneName: "shortOffset" })
+      .formatToParts(new Date())
+      .find((p) => p.type === "timeZoneName")?.value
+    return name ? name.replace(/^GMT/, "UTC") : zone
+  } catch {
+    return zone
+  }
+}
+
+/**
+ * A digest's schedule in one short line for the Alerts list (`BI-65`):
+ * "Mondays · 08:00 WIB". A digest saved before schedules has none and is sent
+ * daily at 08:00 in the report time zone, which the line says.
+ */
+export function describeDigestSchedule(s: ReportSchedule | null | undefined, timeZone: string | null | undefined): string {
+  if (!s) return "Daily · 08:00 (report time zone)"
+  if (s.kind === "hourly") return `Hourly · :${two(s.minute)}`
+  const at = `${clock(s.hour, s.minute)}${timeZone ? ` ${zoneAbbreviation(timeZone)}` : ""}`
+  switch (s.kind) {
+    case "daily":
+      return `Daily · ${at}`
+    case "weekly":
+      return `${WEEKDAYS[s.weekday - 1] ?? "Weekly"}s · ${at}`
+    case "monthly":
+      return `${s.monthDay === "last" ? "Last day of the month" : `Monthly on the ${ordinal(s.monthDay)}`} · ${at}`
+  }
+}

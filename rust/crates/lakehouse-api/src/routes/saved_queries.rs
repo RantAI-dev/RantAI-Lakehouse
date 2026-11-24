@@ -1976,16 +1976,16 @@ mod tests {
     //! any other, so the personal space has to be a wall for it too: a
     //! personal query of one person is never in the answer about another.
     //!
-    //! The test lives HERE, and not in `routes/catalog_governance.rs`,
-    //! because that file is held by an open pull request and this step
-    //! does not touch it. `dependents` is `pub(crate)`, so a unit test in
-    //! this crate can call it directly — and the catalog's own detail
-    //! route needs `ClickHouse`, which this test does not.
+    //! The tests live HERE, and not in `routes/catalog_governance.rs`,
+    //! because `dependents` is `pub(crate)`, so a unit test in this crate
+    //! can call it directly — and the catalog's own detail route needs
+    //! `ClickHouse`, which these tests do not.
 
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::collections::HashMap;
 
+    use axum::http::HeaderMap;
     use lakehouse_auth::{PermissionSet, Principal, PrincipalId};
     use lakehouse_store::PgPool;
     use lakehouse_store::queries::{
@@ -2035,6 +2035,11 @@ mod tests {
     /// Meridian Group, the tenant both of them act for.
     fn group_tenant() -> Uuid {
         Uuid::parse_str("11111111-1111-4111-8111-000000000001").expect("the group tenant id")
+    }
+
+    /// Meridian Retail, the seeded second tenant of the same organisation.
+    fn retail_tenant() -> Uuid {
+        Uuid::parse_str("11111111-1111-4111-8111-000000000002").expect("the retail tenant id")
     }
 
     /// One query in the author's personal space and one in the shared
@@ -2099,9 +2104,13 @@ mod tests {
             role_names: Vec::new(),
         };
 
-        let listed =
-            crate::routes::catalog_governance::dependents(&state, &principal, &[TABLE.to_owned()])
-                .await;
+        let listed = crate::routes::catalog_governance::dependents(
+            &state,
+            &principal,
+            &HeaderMap::new(),
+            &[TABLE.to_owned()],
+        )
+        .await;
 
         assert!(
             !listed.iter().any(|entry| entry["id"] == personal_id),
@@ -2110,6 +2119,120 @@ mod tests {
         assert!(
             listed.iter().any(|entry| entry["id"] == shared_id),
             "CONTROL: the shared space is a dependent: {listed:?}"
+        );
+        Ok(())
+    }
+
+    /// `SEC-54`: the catalog's "used by" list is scoped to the tenant the
+    /// caller selected with `X-Tenant`, not to their first tenant. A member
+    /// of two tenants must be able to see the second tenant's saved query.
+    ///
+    /// CONTROL: without a header the first tenant's query is listed, so the
+    /// test cannot pass by an empty list. A tenant the caller does not
+    /// belong to is refused by the same resolver and lists nothing.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_catalogs_used_by_follows_the_tenant_the_header_selects(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let group = group_tenant();
+        let retail = retail_tenant();
+        let group_viewer = SavedQueryViewer {
+            id: Some(rina()),
+            role_names: Vec::new(),
+            tenant_id: Some(group),
+            all: false,
+        };
+        let retail_viewer = SavedQueryViewer {
+            id: Some(rina()),
+            role_names: Vec::new(),
+            tenant_id: Some(retail),
+            all: false,
+        };
+        let group_query = create_saved_query_at(
+            &pool,
+            &group_viewer,
+            "Group's read",
+            "SELECT * FROM silver.orders",
+            "Rina Wijaya",
+            &[],
+            SavedQueryPlacement::SharedSpace,
+        )
+        .await
+        .expect("the group tenant's query is written");
+        let retail_query = create_saved_query_at(
+            &pool,
+            &retail_viewer,
+            "Retail's read",
+            "SELECT * FROM silver.orders",
+            "Rina Wijaya",
+            &[],
+            SavedQueryPlacement::SharedSpace,
+        )
+        .await
+        .expect("the retail tenant's query is written");
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("CH_URL".to_owned(), "http://127.0.0.1:1".to_owned());
+        let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+
+        // The caller belongs to both; group is first, retail is second.
+        let principal = Principal {
+            id: PrincipalId::User(rina()),
+            tenant_ids: vec![group, retail],
+            display_name: "Rina Wijaya".to_owned(),
+            permissions: PermissionSet::parse("query:read"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
+
+        let first = crate::routes::catalog_governance::dependents(
+            &state,
+            &principal,
+            &HeaderMap::new(),
+            &[TABLE.to_owned()],
+        )
+        .await;
+        assert!(
+            first.iter().any(|e| e["id"] == group_query.id),
+            "CONTROL: no header lists the first tenant's query: {first:?}"
+        );
+        assert!(
+            !first.iter().any(|e| e["id"] == retail_query.id),
+            "no header does not list the second tenant's query: {first:?}"
+        );
+
+        let selected_headers = crate::tenant_scope::headers_for_tenant(retail)
+            .expect("a tenant id is a valid header value");
+        let selected = crate::routes::catalog_governance::dependents(
+            &state,
+            &principal,
+            &selected_headers,
+            &[TABLE.to_owned()],
+        )
+        .await;
+        assert!(
+            selected.iter().any(|e| e["id"] == retail_query.id),
+            "X-Tenant lists the second tenant's query: {selected:?}"
+        );
+        assert!(
+            !selected.iter().any(|e| e["id"] == group_query.id),
+            "X-Tenant does not list the first tenant's query: {selected:?}"
+        );
+
+        let foreign_headers = crate::tenant_scope::headers_for_tenant(Uuid::new_v4())
+            .expect("a tenant id is a valid header value");
+        let refused = crate::routes::catalog_governance::dependents(
+            &state,
+            &principal,
+            &foreign_headers,
+            &[TABLE.to_owned()],
+        )
+        .await;
+        assert!(
+            refused.is_empty(),
+            "a tenant the caller does not belong to lists nothing: {refused:?}"
         );
         Ok(())
     }

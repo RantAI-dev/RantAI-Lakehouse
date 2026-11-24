@@ -304,7 +304,9 @@ export function AssetQuality({
     if (!deleting) return
     const ok = await remove.run(deleting.id)
     if (ok === null) {
-      notifyError("The rule could not be deleted", remove.error)
+      // WEB-6: `remove.error` in this closure is stale (null on the first
+      // failure); `getError()` is the error of the invocation just awaited.
+      notifyError("The rule could not be deleted", remove.getError())
       return
     }
     notifySuccess(`Deleted rule ${deleting.name}`)

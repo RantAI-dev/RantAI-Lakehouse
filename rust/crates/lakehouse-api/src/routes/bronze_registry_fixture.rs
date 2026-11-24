@@ -25,9 +25,6 @@ use std::time::Duration;
 
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ident::SqlLiteral;
-use testcontainers::ImageExt;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::clickhouse::ClickHouse;
 
 use crate::config::Config;
 use crate::state::AppState;
@@ -39,23 +36,10 @@ use crate::state::AppState;
 /// Panics when the container cannot start or the server inside it never
 /// answers — a fixture that cannot be built fails the test that asked for
 /// it, which is the only honest outcome.
-pub(crate) async fn clickhouse() -> (String, testcontainers::ContainerAsync<ClickHouse>) {
-    // The compose service's env trio; all three are required, see
-    // `tests/gold_publication.rs`.
-    let container = ClickHouse::default()
-        .with_env_var("CLICKHOUSE_USER", "default")
-        .with_env_var("CLICKHOUSE_PASSWORD", "")
-        .with_env_var("CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT", "1")
-        .with_tag("26.8")
-        .start()
-        .await
-        .expect("start the ClickHouse testcontainer");
-    let host = container.get_host().await.expect("container host");
-    let port = container
-        .get_host_port_ipv4(8123)
-        .await
-        .expect("container HTTP port");
-    let url = format!("http://{host}:{port}");
+pub(crate) async fn clickhouse() -> lakehouse_test_support::clickhouse::Started {
+    // The env trio, the 26.8 tag and `REL-14`'s bounded start retry all live
+    // in the shared harness now.
+    let (url, container) = lakehouse_test_support::clickhouse::start().await;
     let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
     wait_until_ready(&ch).await;
     create_registry(&ch).await;

@@ -38,6 +38,8 @@ const json = (body: unknown, status = 200) =>
 let writesSeen: unknown[][] = []
 /** How many times the stub was asked for the quality incidents (`DATA-54`). */
 let incidentReads = 0
+/** How many times the stub was asked for the schedules list (`DATA-46` reload). */
+let scheduleReads = 0
 /** How the stub answers a schedule reset; a test may swap it for a failure. */
 let resetAnswer: () => Response = () => new Response(null, { status: 204 })
 
@@ -63,6 +65,7 @@ function stubApi(
 ) {
   writesSeen = []
   incidentReads = 0
+  scheduleReads = 0
   let sessionRead: () => void = () => {}
   const done = new Promise<void>((resolve) => {
     sessionRead = resolve
@@ -106,7 +109,10 @@ function stubApi(
       writesSeen.push([init?.method, path, body])
       return json({ asset: "silver.orders", updatedBy: "u1", updatedAt: "2026-11-04T00:00:00.000Z", ...body })
     }
-    if (path.includes("/api/governance/quality/schedules")) return json({ schedules, defaultIntervalMinutes: 60 })
+    if (path.includes("/api/governance/quality/schedules")) {
+      scheduleReads += 1
+      return json({ schedules, defaultIntervalMinutes: 60 })
+    }
     if (path.includes("/api/governance/sla")) {
       const method = init?.method ?? "GET"
       if (method === "GET") return json(targets)
@@ -396,12 +402,133 @@ describe("DataQualityPage: Schedules tab (WEB-3 S3-D5)", () => {
     ])
   })
 
-  it("offers no Edit or Reset without governance:write", async () => {
+  it("offers Add schedule with governance:write", async () => {
+    search = new URLSearchParams("tab=schedules")
+    stubApi(["governance:write"])
+    renderPage()
+    expect(await screen.findByRole("button", { name: "Add schedule" })).toBeTruthy()
+  })
+
+  it("adds a schedule for a table picked from the catalog and reloads the list (DATA-46)", async () => {
+    search = new URLSearchParams("tab=schedules")
+    stubApi(["governance:write"], {
+      schedules: [schedule({})],
+      catalog: [
+        // Shaped like the API's list rows (`DATA-54`): a Silver row's `id`
+        // is its table key; a Bronze row names its table in `tableKey`.
+        { id: "silver.orders", name: "Orders", namespace: "silver" },
+        { id: "silver.customers", name: "Customers", namespace: "silver" },
+        { id: "raw-orders", name: "Raw Orders", namespace: "primer", tableKey: "bronze.raw_orders" },
+      ],
+    })
+    renderPage()
+    expect(await screen.findByText("Every 3 hours.")).toBeTruthy()
+    expect(scheduleReads).toBe(1)
+
+    fireEvent.click(screen.getByRole("button", { name: "Add schedule" }))
+    const dialog = await screen.findByRole("dialog")
+    // The table that already has a schedule is not offered a second time.
+    fireEvent.click(within(dialog).getByRole("button", { name: "Table" }))
+    const list = await screen.findByRole("listbox")
+    expect(within(list).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "bronze.raw_orders",
+      "silver.customers",
+    ])
+    fireEvent.click(within(list).getByText("silver.customers"))
+
+    // The shared control appears once a table is chosen, starting on the
+    // default interval; saving sends the PUT the asset page would send.
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save schedule" }))
+    await waitFor(() => expect(writesSeen.length).toBe(1))
+    expect(writesSeen[0]).toEqual([
+      "PUT",
+      "/api/governance/quality/schedules/silver.customers",
+      { mode: "interval", intervalMinutes: 60 },
+    ])
+    // The dialog closes and the list is read again, so the new row shows.
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull())
+    await waitFor(() => expect(scheduleReads).toBe(2))
+  })
+
+  it("says so when every catalog table already has a schedule (DATA-46)", async () => {
+    search = new URLSearchParams("tab=schedules")
+    stubApi(["governance:write"], {
+      schedules: [schedule({})],
+      catalog: [{ id: "silver.orders", name: "Orders", namespace: "silver" }],
+    })
+    renderPage()
+    fireEvent.click(await screen.findByRole("button", { name: "Add schedule" }))
+    const dialog = await screen.findByRole("dialog")
+    expect(within(dialog).getByText(/Every catalog table already has a schedule/)).toBeTruthy()
+    fireEvent.click(within(dialog).getByRole("button", { name: "Table" }))
+    const list = await screen.findByRole("listbox")
+    expect(within(list).queryAllByRole("option")).toHaveLength(0)
+    expect(writesSeen).toEqual([])
+  })
+
+  it("says so when the catalog lists no tables (DATA-46)", async () => {
+    search = new URLSearchParams("tab=schedules")
+    stubApi(["governance:write"], { schedules: [], catalog: [] })
+    renderPage()
+    fireEvent.click(await screen.findByRole("button", { name: "Add schedule" }))
+    const dialog = await screen.findByRole("dialog")
+    expect(within(dialog).getByText("The catalog lists no tables to schedule.")).toBeTruthy()
+    fireEvent.click(within(dialog).getByRole("button", { name: "Table" }))
+    const list = await screen.findByRole("listbox")
+    expect(within(list).queryAllByRole("option")).toHaveLength(0)
+  })
+
+  it("falls back to a typed table name when the catalog cannot be read (DATA-46)", async () => {
+    search = new URLSearchParams("tab=schedules")
+    // No `catalog` answer: the stub refuses the read, the way a tenant with
+    // no catalog access is refused. The picker says so instead of showing
+    // an empty list that would read as "this deployment has no tables".
+    stubApi(["governance:write"], { schedules: [] })
+    renderPage()
+    fireEvent.click(await screen.findByRole("button", { name: "Add schedule" }))
+    const dialog = await screen.findByRole("dialog")
+    expect(await within(dialog).findByText(/Could not read the catalog's tables/)).toBeTruthy()
+    fireEvent.change(within(dialog).getByLabelText("Table"), { target: { value: "silver.customers" } })
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save schedule" }))
+    await waitFor(() => expect(writesSeen.length).toBe(1))
+    expect(writesSeen[0]).toEqual([
+      "PUT",
+      "/api/governance/quality/schedules/silver.customers",
+      { mode: "interval", intervalMinutes: 60 },
+    ])
+  })
+
+  it("names the picker's loading state instead of inventing options (DATA-46)", async () => {
+    search = new URLSearchParams("tab=schedules")
+    // Hold the catalog read open so the picker stays in its loading state.
+    spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.startsWith("/api/catalog")) return new Promise<Response>(() => {})
+      if (path.includes("/api/auth/me")) {
+        return json({ id: "u1", name: "Reader", email: null, roles: [], permissions: ["governance:write"], tenants: [] })
+      }
+      if (path.includes("/api/governance/quality/incidents")) return json({ incidents: [] })
+      if (path.includes("/api/governance/quality/schedules")) {
+        scheduleReads += 1
+        return json({ schedules: [], defaultIntervalMinutes: 60 })
+      }
+      if (path.includes("/api/governance/quality")) return json({ quality: [] })
+      return json({ error: "not stubbed" }, 404)
+    }) as unknown as typeof fetch)
+    renderPage()
+    fireEvent.click(await screen.findByRole("button", { name: "Add schedule" }))
+    const dialog = await screen.findByRole("dialog")
+    expect(within(dialog).getByText(/Loading the catalog's tables/)).toBeTruthy()
+    expect(within(dialog).queryByRole("listbox")).toBeNull()
+  })
+
+  it("offers no Add, Edit or Reset without governance:write", async () => {
     search = new URLSearchParams("tab=schedules")
     const done = stubApi(["catalog:read"], { schedules: [schedule({})] })
     renderPage()
     await sessionSettled(done)
     expect(await screen.findByText("Every 3 hours.")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Add schedule" })).toBeNull()
     expect(screen.queryByRole("button", { name: /Edit the schedule/ })).toBeNull()
     expect(screen.queryByRole("button", { name: /Reset the schedule/ })).toBeNull()
   })
