@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
-import { afterEach, describe, expect, it, mock } from "bun:test"
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
 
 // `LoginPage` calls `useRouter()` at the top of the component, which
 // throws (or expects a Next.js AppRouter context) in a bare happy-dom
@@ -38,7 +38,11 @@ mock.module("next/font/local", () => ({
 mock.module("next/dynamic", () => ({ default: () => () => null }))
 
 import { AuthProvider } from "@/features/auth/auth-provider"
-import { PRODUCT_NAME } from "@/lib/product-branding"
+import {
+  PRODUCT_LOGO_DARK,
+  PRODUCT_LOGO_LIGHT,
+  PRODUCT_NAME,
+} from "@/lib/product-branding"
 
 // WEB-15: imported after the mocks, not statically. The empty
 // `next/font/local` entry has no default export, and a static import links
@@ -48,6 +52,17 @@ import { PRODUCT_NAME } from "@/lib/product-branding"
 const { LoginPage } = await import("./login-page")
 
 const originalFetch = global.fetch
+
+beforeEach(() => {
+  // happy-dom starts on `about:blank`: a relative URL has no base to
+  // resolve against, so a picture with a relative source counts as broken
+  // and the branding falls back to the product's own file. The pictures
+  // must resolve the way they do in a browser (the same setup as
+  // `public-dashboard.test.tsx`).
+  ;(window as unknown as { happyDOM: { setURL: (url: string) => void } }).happyDOM.setURL(
+    "http://localhost/",
+  )
+})
 
 afterEach(() => {
   // Same non-auto-cleanup rationale as sessions-page.test.tsx: without
@@ -396,6 +411,47 @@ describe("the sign-in page shows the workspace's own branding (ADM-2)", () => {
     // file stands in for it.
     expect(shown[0].getAttribute("src")).toBe("/logo-light.svg")
   })
+
+  it("shows no logo at all while the branding answer is on its way", async () => {
+    let answer: (response: Response) => void = () => {}
+    const pending = new Promise<Response>((resolve) => {
+      answer = resolve
+    })
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url.includes("/api/auth/me")) return new Response(null, { status: 401 })
+      if (url.includes("/api/branding")) return pending
+      return new Response("{}", { status: 200 })
+    }) as unknown as typeof fetch
+    const { container } = renderLoginPage()
+
+    // The form is up (the session check answered); the branding is not.
+    await screen.findByLabelText("Username or email")
+
+    // No picture at all while the answer is on its way: the product's own
+    // logo must not stand on the page for a moment before the workspace's
+    // own logo lands (`adm-120`).
+    expect(container.querySelectorAll("img")).toHaveLength(0)
+    expect(container.innerHTML).not.toContain(PRODUCT_LOGO_LIGHT)
+    expect(container.innerHTML).not.toContain(PRODUCT_LOGO_DARK)
+
+    answer(
+      new Response(
+        JSON.stringify({
+          workspaceName: "Acme Data",
+          logo: { type: "image/png", version: "v1" },
+          logoDark: { type: "image/png", version: "v2" },
+          icon: null,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+    await waitFor(() => expect(pictures(container)).toHaveLength(2))
+    expect(pictures(container).map((p) => p.getAttribute("src"))).toEqual([
+      "/api/branding/images/logo?v=v1",
+      "/api/branding/images/logo-dark?v=v2",
+    ])
+  })
 })
 
 /**
@@ -428,9 +484,17 @@ describe("LoginPage form (WEB-15 T1)", () => {
     // WEB-15 spec: "the password is selected for retyping".
     const password = screen.getByLabelText("Password") as HTMLInputElement
     expect(password.getAttribute("aria-describedby")).toBe("login-error")
+    // Focus and selection run in a passive `useEffect` after `error` commits,
+    // whereas `findByRole("alert")` resolves on the commit's MutationObserver
+    // microtask before passive effects flush. Compare the reference as a
+    // boolean inside `waitFor` so a pre-effect miss does not format a massive
+    // happy-dom/React-Fiber element diff on retry.
+    await waitFor(() => {
+      expect(document.activeElement === password).toBe(true)
+      expect(password.selectionStart).toBe(0)
+      expect(password.selectionEnd).toBe("wrong-password".length)
+    })
     expect(document.activeElement).toBe(password)
-    expect(password.selectionStart).toBe(0)
-    expect(password.selectionEnd).toBe("wrong-password".length)
 
     // The 240 ms shake is a class on the form (the motion itself is CSS, and
     // sits inside `prefers-reduced-motion: no-preference`).

@@ -31,11 +31,12 @@ import {
  *
  * Their rule is the same in each case and is the reason they exist: a picker
  * never invents an option and never hides a stored one. The zone list is the
- * namespaces the page loaded; the column list is the table's own schema. When
- * that list is not available the field goes back to free text with a line
- * saying so — never an empty picker that reads as "there is nothing to pick".
- * A value the pipeline already holds that is not in the list is offered as its
- * own entry, so opening the picker cannot silently replace it.
+ * pipeline's medallion zones (`pipeline-zones.ts`), shown with the console's
+ * layer labels; the column list is the table's own schema. When a list is not
+ * available the field goes back to free text with a line saying so — never an
+ * empty picker that reads as "there is nothing to pick". A value the pipeline
+ * already holds that is not in the list is offered as its own entry, marked as
+ * legacy, so opening the picker cannot silently replace it.
  */
 
 /** The line under a column field while the source table is not known. */
@@ -47,9 +48,10 @@ function heldOption(value: string, offered: readonly string[], suffix: string) {
 }
 
 /**
- * A zone: a `Select` over the namespaces the page loaded, or a text input
- * when there is no list (`namespaces === null`) — with `note` saying why, when
- * the read failed.
+ * A zone: a `Select` over the medallion zones it is given, or a text input
+ * when there is no list (`zones === null`) — with `note` saying why. `value`
+ * is always the exact stored string (`bronze`/`silver`/`serving`, or a legacy
+ * one); `zoneLabels` only changes what an option reads.
  */
 export function ZoneField({
   id,
@@ -57,6 +59,7 @@ export function ZoneField({
   value,
   onChange,
   zones,
+  zoneLabels,
   note,
   describedBy,
   required,
@@ -65,8 +68,10 @@ export function ZoneField({
   label: string
   value: string
   onChange: (next: string) => void
-  /** The namespaces the lakehouse listed, or `null` when there is no list to pick from. */
-  zones: string[] | null
+  /** The zone values to offer, or `null` when there is no list to pick from. */
+  zones: readonly string[] | null
+  /** Human label for each value (e.g. `serving` -> "Gold"); a value without one reads as itself. */
+  zoneLabels?: Readonly<Record<string, string>>
   /** Shown under the field when there is no list: why, and that typing is allowed. */
   note?: string
   /** The id of a sentence about this field, when the page has one (BLD-1 part 1 S3 review R1-S10). */
@@ -90,13 +95,17 @@ export function ZoneField({
       </div>
     )
   }
-  const held = heldOption(value, zones, "(not a namespace this lakehouse lists)")
+  // A stored value outside the medallion zones (an older `gold`, or a custom
+  // zone) stays selectable and marked, so loading an old pipeline cannot
+  // silently blank it. The label is the only thing that is friendly: the
+  // stored `value` sent on save is always the exact one from the option.
+  const held = heldOption(value, zones, "(legacy zone, not offered here)")
   const choices = held === null ? zones : [...zones, value]
   // `items` is what the trigger reads its own label from: a value the list
   // does not hold would otherwise show as the bare string, without the mark
-  // that says it is not a namespace this lakehouse lists.
+  // that says it is not one of this pipeline's zones.
   const labels = Object.fromEntries(
-    choices.map((zone) => [zone, zone === value && held !== null ? held : zone])
+    choices.map((zone) => [zone, zone === value && held !== null ? held : (zoneLabels?.[zone] ?? zone)])
   )
   return (
     <div className="space-y-1.5">

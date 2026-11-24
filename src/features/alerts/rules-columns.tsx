@@ -24,6 +24,7 @@ import { Switch } from "@/components/ui/switch"
 import { cn } from "@/lib/utils"
 import { displayColumn } from "@/lib/chart-joins"
 import { formatDateTime } from "@/lib/format"
+import { describeDigestSchedule } from "@/features/dashboards/report-words"
 import { deliverySummary } from "@/features/overview/alert-delivery"
 import { LOAD_ALERT_KINDS, QUALITY_ALERT_KIND, type AlertRule } from "@/services/contracts/alerts"
 
@@ -270,7 +271,14 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
           )
         }
         const boardName = boards.find((b) => b.id === r.board)?.name ?? r.board
-        return <span className="text-sm text-muted-foreground">{boardName}</span>
+        if (r.type !== "digest") return <span className="text-sm text-muted-foreground">{boardName}</span>
+        // BI-65: a digest says when it is sent, in one short line.
+        return (
+          <div className="flex flex-col gap-0.5">
+            <span className="text-sm text-muted-foreground">{boardName}</span>
+            <span className="text-xs text-muted-foreground">{describeDigestSchedule(r.schedule, r.timeZone)}</span>
+          </div>
+        )
       },
     },
     {

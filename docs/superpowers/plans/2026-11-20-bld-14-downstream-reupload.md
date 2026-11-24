@@ -98,7 +98,7 @@ Made by the planner from the code (not product choices):
   `_after` does is unchanged: a manual or scheduled upstream run still
   triggers it as today.
 - **D8. The reason is a stored record, shown on the pipeline's page.**
-  New table `pipeline_chain_step` (migration `0153`). The chain sensor posts
+  New table `pipeline_chain_step` (migration `0154`). The chain sensor posts
   one record per (re-upload, pipeline) to an orchestrator-only route; the
   pipeline page reads the newest one and shows one sentence (section 4). The
   record holds codes and ids, never orchestrator or engine text (principle
@@ -170,11 +170,12 @@ no `tool_schemas.json` change.
 
 ## 4. Contracts
 
-**Migration `0153_pipeline_chain_step.sql`.** `0151` is the highest on
-`main`, `0152` is reserved by `data-4-silver-publish`; no open branch has
-`0153` (checked over every `origin/*` branch on 2026-11-20). Recheck before
-the PR opens; if `0153` is taken, use the next free number and say so in the
-handoff. Why-header (BLD-14, DEC-22, D8, P9), then:
+**Migration `0154_pipeline_chain_step.sql`.** When the branch was built, `0153`
+was free (`0151` was the highest on `main`, `0152` reserved by
+`data-4-silver-publish`). Before PR #633 opened, `0153` was taken by SEC-66
+(`0153_sec66_read_permissions.sql` on `origin/fix/sec-66-gold-and-agent-run-read-perms`),
+so this migration was renumbered to `0154` — the next free number — with zero
+collision. Why-header (BLD-14, DEC-22, D8, P9), then:
 
 ```sql
 CREATE TABLE pipeline_chain_step (
@@ -314,7 +315,7 @@ cites `BLD-14` and the decision (`D7`, `P4`, …) it implements.
 
 ### Rust (T1 to T4, one sitting: the migration lands with its code)
 
-**T1. Migration and store.** `rust/migrations/0153_pipeline_chain_step.sql`
+**T1. Migration and store.** `rust/migrations/0154_pipeline_chain_step.sql`
 (section 4). New module `lakehouse-store/src/pipeline_chain.rs`
 (`pub mod pipeline_chain;` in `lib.rs`, module doc with the why): a
 `ChainStep` input type, a `ChainStepView` output type (serde camelCase),
@@ -601,14 +602,17 @@ the stack is needed only for T9.
 Developer: `Hy4 flash` (OpenCode). Branch `bld-14-downstream-reupload` off
 `a438555d0` (the plan commit on `c7cd01a76`). All anchors were re-read by
 their quoted text before each task; every one matched. Migration `0153`
-was still free (highest on the branch was `0151`). No mismatch with the plan.
+was free when the branch was built (highest on the branch was `0151`); it was
+renumbered to `0154` when SEC-66 claimed `0153` before PR #633 opened.
+No mismatch with the plan.
 Every commit was pushed after `git status` showed only the intended files;
 no generated files were staged.
 
 ### Commits (one per task, in order)
 
 1. `8a7ce635b` — T1, `feat(store): record a re-upload chain step once (BLD-14, D8, P9)`.
-   Migration `0153`, `pipeline_chain.rs`, seven store tests. The module and
+   Migration `0153` at build time (renumbered to `0154` before PR #633 opened),
+   `pipeline_chain.rs`, seven store tests. The module and
    table do not exist on the parent (`git grep` on `HEAD`), so all seven
    tests fail to compile there.
 2. `f46639c6a` — T2, `feat(api): record a re-upload chain step (BLD-14, D8)`.
@@ -776,7 +780,7 @@ same tenant; cycles removed (Tarjan) before reach (P2); paused and
 target-lag pipelines excluded (P1); fan-in waits for every parent; each
 parent is looked up by its run tagged with this re-upload; fixed `run_key`
 per re-upload and pipeline; P6 and P10 as planned; routes gated and asserted
-both ways; migration `0153` with a why-header; Python rules kept. The two
+both ways; migration `0154` with a why-header; Python rules kept. The two
 Dagster failures in the handoff do not touch this change.
 
 **R1 BLOCKER: a re-upload can leave the sensor's view and is lost without

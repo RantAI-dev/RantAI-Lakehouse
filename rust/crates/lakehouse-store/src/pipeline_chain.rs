@@ -1,5 +1,5 @@
 //! The stored outcomes of a re-upload's downstream pipeline chain (`BLD-14`,
-//! `DEC-22`, D8; migration `0153_pipeline_chain_step.sql` -- read its header).
+//! `DEC-22`, D8; migration `0154_pipeline_chain_step.sql` -- read its header).
 //!
 //! A chain sensor reports one outcome per (re-upload, pipeline) through the
 //! orchestrator-only route; [`record_chain_step`] writes it once and keeps the

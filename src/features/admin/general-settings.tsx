@@ -11,6 +11,7 @@ import { useBrandingState } from "@/hooks/use-branding"
 import { useSeededState } from "@/hooks/use-seeded-state"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
+import { PICTURE_TYPES, pictureRefusal } from "@/lib/picture-rules"
 import { PRODUCT_NAME } from "@/lib/product-branding"
 import {
   brandingImageUrl,
@@ -32,7 +33,8 @@ type PictureKey = "logo" | "logoDark" | "icon"
  * The three pictures and the rule each one follows (`ADM-2` decision 3). The
  * server reads the type from the file's first bytes and refuses a file that
  * breaks its rule with a sentence of its own; the hint here only says what
- * the server accepts.
+ * the server accepts, and the types the picker offers are the ones the
+ * server sniffs (`@/lib/picture-rules`).
  */
 const PICTURES: {
   kind: BrandingImageKind
@@ -46,21 +48,21 @@ const PICTURES: {
     key: "logo",
     label: "Logo",
     hint: "PNG, JPEG or WebP, at most 512 KB.",
-    accept: "image/png,image/jpeg,image/webp",
+    accept: PICTURE_TYPES.logo.join(","),
   },
   {
     kind: "logo-dark",
     key: "logoDark",
     label: "Dark-mode logo",
     hint: "PNG, JPEG or WebP, at most 512 KB.",
-    accept: "image/png,image/jpeg,image/webp",
+    accept: PICTURE_TYPES["logo-dark"].join(","),
   },
   {
     kind: "icon",
     key: "icon",
     label: "Browser-tab icon",
     hint: "PNG, at most 64 KB.",
-    accept: "image/png",
+    accept: PICTURE_TYPES.icon.join(","),
   },
 ]
 
@@ -113,6 +115,10 @@ export function GeneralSettings() {
 
   const loaded = state.status === "success" ? state.data : null
   const publicView = branding.branding
+  // What the console tells about the newest picture: the refusal it gave
+  // before sending it, or the server's answer when the request went out.
+  const [refusal, setRefusal] = React.useState<string | null>(null)
+  const pictureMessage = refusal ?? upload.error?.message ?? null
   // `adm-121`: the settings fill the name field until the person first types
   // in it, so a picture change that reads the settings again does not
   // overwrite an unsaved name.
@@ -129,6 +135,12 @@ export function GeneralSettings() {
   }
 
   async function uploadPicture(kind: BrandingImageKind, file: File) {
+    // The API is the authority; the console sniffs the same first bytes the
+    // API sniffs, so it refuses exactly what the API would refuse, in the
+    // API's own sentence, and sends nothing for it (adm-120).
+    const refused = await pictureRefusal(kind, file)
+    setRefusal(refused)
+    if (refused !== null) return
     const result = await upload.run(kind, file)
     if (result) {
       state.reload()
@@ -239,9 +251,9 @@ export function GeneralSettings() {
                 </div>
               )
             })}
-            {upload.error ? (
+            {pictureMessage ? (
               <p role="alert" className="text-xs text-destructive">
-                {upload.error.message}
+                {pictureMessage}
               </p>
             ) : null}
             {remove.error ? (

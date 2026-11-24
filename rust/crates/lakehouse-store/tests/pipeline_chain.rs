@@ -1,5 +1,5 @@
 //! Integration tests for `lakehouse_store::pipeline_chain` against a real
-//! Postgres (`BLD-14`, D8; migration `0153`). They pin the write-once key, the
+//! Postgres (`BLD-14`, D8; migration `0154`). They pin the write-once key, the
 //! P9 retention, the same-tenant cause scope and the table's CHECKs.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]

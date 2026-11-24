@@ -3,6 +3,7 @@
 import { Tooltip as TooltipPrimitive } from "@base-ui/react/tooltip"
 
 import { cn } from "@/lib/utils"
+import { useSurfaceThemeClass } from "@/components/ui/surface-theme"
 
 function TooltipProvider({
   delay = 0,
@@ -38,6 +39,8 @@ function TooltipContent({
     TooltipPrimitive.Positioner.Props,
     "align" | "alignOffset" | "side" | "sideOffset"
   >) {
+  // WEB-10: the portal stays on <body>; copy the opener's theme onto the popup.
+  const surfaceThemeClass = useSurfaceThemeClass()
   return (
     <TooltipPrimitive.Portal>
       <TooltipPrimitive.Positioner
@@ -47,10 +50,16 @@ function TooltipContent({
         sideOffset={sideOffset}
         className="isolate z-50"
       >
+        {/* Micro-interaction audit 2026-11-14 (emil): a transition, not keyframes, so a
+            tooltip that closes while it opens reverses from where it is; it grows from
+            its trigger (`--transform-origin`); leaving is faster than arriving; and once
+            one tooltip is open the next opens with no animation (`data-instant`, the
+            provider's skip window), so moving along a toolbar reads at once. */}
         <TooltipPrimitive.Popup
           data-slot="tooltip-content"
           className={cn(
-            "z-50 inline-flex w-fit max-w-xs origin-(--transform-origin) items-center gap-1.5 rounded-md bg-foreground px-3 py-1.5 text-xs text-background has-data-[slot=kbd]:pr-1.5 data-[side=bottom]:slide-in-from-top-2 data-[side=inline-end]:slide-in-from-left-2 data-[side=inline-start]:slide-in-from-right-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 **:data-[slot=kbd]:relative **:data-[slot=kbd]:isolate **:data-[slot=kbd]:z-50 **:data-[slot=kbd]:rounded-sm data-[state=delayed-open]:animate-in data-[state=delayed-open]:fade-in-0 data-[state=delayed-open]:zoom-in-95 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
+            "z-50 inline-flex w-fit max-w-xs origin-(--transform-origin) items-center gap-1.5 rounded-md bg-foreground px-3 py-1.5 text-xs text-background has-data-[slot=kbd]:pr-1.5 **:data-[slot=kbd]:relative **:data-[slot=kbd]:isolate **:data-[slot=kbd]:z-50 **:data-[slot=kbd]:rounded-sm transition-[opacity,scale,translate] duration-150 ease-ui data-ending-style:scale-[0.97] data-ending-style:opacity-0 data-ending-style:duration-100 data-instant:duration-0! data-starting-style:scale-[0.97] data-starting-style:opacity-0",
+            surfaceThemeClass,
             className
           )}
           {...props}

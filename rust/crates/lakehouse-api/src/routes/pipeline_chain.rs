@@ -1,5 +1,5 @@
 //! Orchestrator-only recording of a re-upload's downstream chain outcomes
-//! (`BLD-14`, `DEC-22`, D8; migration `0153_pipeline_chain_step.sql`).
+//! (`BLD-14`, `DEC-22`, D8; migration `0154_pipeline_chain_step.sql`).
 //!
 //! The Dagster chain sensor posts one outcome per (re-upload, pipeline) here
 //! so the pipeline page can say why a pipeline did or did not run. The route

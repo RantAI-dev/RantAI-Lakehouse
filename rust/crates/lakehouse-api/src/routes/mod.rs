@@ -87,6 +87,10 @@ mod notifications;
 mod ops;
 mod overview;
 pub(crate) mod params;
+// The picture route's drain (`ADM-2`, plan adm-120): reads the request body
+// an early answer left behind, so the client is not left writing into a
+// closed connection. See the module's own doc comment.
+mod picture_drain;
 pub(crate) mod pipeline_chain;
 mod pipeline_preview;
 mod pipelines;
@@ -126,7 +130,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
-use axum::middleware::{Next, from_fn_with_state};
+use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use lakehouse_core::ApiError;
@@ -1900,9 +1904,11 @@ pub fn router(state: AppState) -> Router {
         )
         // A picture arrives as a form, so this route alone takes a body of
         // 1 MiB (the 512 KB logo limit and the form's framing); the layer on
-        // the `PUT` keeps the raised limit off every other route.
+        // the `PUT` keeps the raised limit off every other route. The path
+        // is the one constant `routes::picture_drain` reads too, so the
+        // drain and the route cannot name different paths.
         .route(
-            "/api/settings/general/images/{kind}",
+            picture_drain::PICTURE_ROUTE_PATTERN,
             put(settings::put_general_image)
                 .layer(DefaultBodyLimit::max(settings::PICTURE_BODY_LIMIT_BYTES))
                 .delete(settings::delete_general_image),
@@ -1999,6 +2005,16 @@ pub fn router(state: AppState) -> Router {
 /// before it (the query scope) would run per query inside the handler's
 /// response instead. Like the gate, it is added before the two fallbacks, so
 /// a `404` or `405` writes nothing.
+///
+/// `ADM-2` (plan adm-120): the picture route's drain sits between the gate
+/// and the fallbacks, so it wraps the gate but not the fallbacks. It is
+/// outside `auth_gate` because the gate's `401` is one of the early answers
+/// the drain exists for — an unauthenticated caller must get the JSON error
+/// on a connection that is still usable, not a reset — and it is inside
+/// `timeout_middleware` because the time it spends draining a body counts
+/// against the request's deadline. `route_layer` (not `layer`) because it
+/// must not touch the fallbacks: a `404` or `405` writes nothing and reads
+/// nothing.
 fn gated(routes: Router<AppState>, state: AppState) -> Router {
     routes
         // Task 3.2: the one authorization gate every route (bar the four
@@ -2022,6 +2038,9 @@ fn gated(routes: Router<AppState>, state: AppState) -> Router {
             crate::audit_coverage::audit_gate,
         ))
         .layer(from_fn_with_state(state.clone(), auth_gate))
+        // `ADM-2` (plan adm-120): the picture route's drain, outside the
+        // gate and inside the timeout. See `routes::picture_drain`.
+        .route_layer(from_fn(picture_drain::drain))
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(no_such_address)
         .layer(from_fn_with_state(state.clone(), timeout_middleware))
@@ -2152,9 +2171,13 @@ async fn ready(State(state): State<AppState>) -> Response {
 ///
 /// Two responses have no route of their own to render this through: the
 /// request timeout ([`timeout_middleware`]) and the 405 for a method no
-/// handler serves ([`method_not_allowed`]).
+/// handler serves ([`method_not_allowed`]). The picture route's drain
+/// (`routes::picture_drain`) renders its 413 through it as well.
+///
+/// `pub(crate)`, not private: the drain is a sibling module and needs the
+/// same envelope for its own answer.
 #[derive(Debug, Serialize)]
-struct FixedErrorBody {
+pub(crate) struct FixedErrorBody {
     error: String,
 }
 

@@ -30,6 +30,7 @@ from dispar_orchestrate.gold_export import (
     gold_export_job,
     gold_export_schedule,
 )
+from dispar_orchestrate.gold_latest_copy import gold_latest_copy_job
 from dispar_orchestrate.ingest_factory import ingest_job, ingest_schedule_sensor
 from dispar_orchestrate.maintenance import (
     bronze_maintenance_job,
@@ -115,6 +116,10 @@ defs = Definitions(
         bronze_maintenance_job,
         replication_slot_check_job,
         gold_export_job,
+        # DATA-6 (D6): launched only by `routes::gold::export`, with one
+        # publish's run config — no schedule, no sensor, same reason as
+        # `file_ingest_job` above.
+        gold_latest_copy_job,
         agent_run_job,
         alerts_run_job,
         capacity_snapshot_job,
