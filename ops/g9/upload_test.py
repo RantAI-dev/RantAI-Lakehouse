@@ -1566,9 +1566,10 @@ def _dagster_lists_sensor(requests, sensor_name: str) -> bool:
 
 
 def step_create_gold_after_silver(api, requests, silver_table: str, gold_table: str) -> tuple[str, str]:
-    """Author a `silver.<table>_clean` -> `gold.<table>_daily` pipeline with
+    """Author a `silver.<table>_clean` -> `serving.<table>_daily` pipeline with
     NO `dependsOn`: only BLD-14's chain can start it on a re-upload. Wait
-    for both its job and its `_chain` sensor to be built (BLD-14 D6)."""
+    for both its job and its `_chain` sensor to be built (BLD-14 D6).
+    Gold lives in ClickHouse `serving` since BLD-19."""
     resp = api.post(
         f"{API_URL}/api/pipelines",
         json={
@@ -1578,7 +1579,7 @@ def step_create_gold_after_silver(api, requests, silver_table: str, gold_table: 
             "sourceTable": silver_table,
             "incrementalColumn": "",
             "transforms": [],
-            "targetZone": "gold",
+            "targetZone": "serving",
             "targetTable": gold_table,
             "schedule": "manual",
             "dependsOn": [],
@@ -1697,11 +1698,11 @@ def step_reupload_runs_the_chain(
     def gold_shows_change() -> bool:
         body = run_query(
             api,
-            f"SELECT {', '.join(columns)} FROM gold.`{gold_table}` WHERE 1 ORDER BY material",
+            f"SELECT {', '.join(columns)} FROM serving.`{gold_table}` WHERE 1 ORDER BY material",
         )
         return any(row.get("qty") == CHANGED_QTY for row in body["rows"])
 
-    _wait_for(f"gold.{gold_table} shows the changed row", gold_shows_change, VISIBLE_TIMEOUT_S)
+    _wait_for(f"serving.{gold_table} shows the changed row", gold_shows_change, VISIBLE_TIMEOUT_S)
 
     def recorded_started() -> bool:
         step = _chain_step(api, gold_pipeline_id)
