@@ -1721,11 +1721,18 @@ def step_reupload_runs_the_chain(
     _delete_upload(api, upload_id, state)
 
 
-def _silver_update_body(api, silver_pipeline_id: str, silver_table: str, qty: str) -> dict:
-    """The stored definition, with a SQL step that throws on `qty = <qty>`.
-    A SQL step must parse as one SELECT and name only the pipeline's input
+def _silver_update_body(api, silver_pipeline_id: str, silver_table: str, qty: str) -> tuple[dict, list]:
+    """The stored definition's clean v2 shape, with a SQL step that throws on
+    `qty = <qty>`.
+
+    `PUT /api/pipelines/{id}` refuses a body that mixes the legacy
+    `sourceZone`/`sourceTable`/`transforms` fields with the `inputs`/`steps`
+    pair (`definition_form`, D3), so only the v2 fields are sent. A SQL step
+    must parse as one SELECT and name only the pipeline's input
     (`pipeline_compile::check_pipeline_step_sql`, D5/D6), so the throw is a
-    `throwIf` in the SELECT list rather than a statement of its own."""
+    `throwIf` in the SELECT list rather than a statement of its own. The
+    second element of the return is the definition's original steps, used to
+    restore the pipeline afterwards."""
     current = _expect(
         api.get(f"{API_URL}/api/pipelines/{silver_pipeline_id}", timeout=60),
         200,
@@ -1735,18 +1742,21 @@ def _silver_update_body(api, silver_pipeline_id: str, silver_table: str, qty: st
     inputs = definition.get("inputs") or []
     if not inputs or not inputs[0].get("name"):
         raise G9Failure(f"the Silver definition has no named input: {definition}")
-    return {
+    body = {
         "kind": current.get("kind") or "batch",
-        "sourceZone": definition.get("sourceZone") or "bronze",
-        "sourceTable": definition.get("sourceTable") or "",
+        # `incrementalColumn` is an accepted v2 `UpdateBody` field, not one of
+        # the legacy-source fields, so it is preserved when the stored
+        # definition carries one (an absent/empty value is ignored server-side).
         "incrementalColumn": definition.get("incrementalColumn") or "",
-        "transforms": [],
         "inputs": inputs,
         "steps": [
             {
                 "name": "boom",
                 "kind": "sql",
-                "sql": f"SELECT *, throwIf(qty = '{qty}') AS bad FROM {inputs[0]['name']}",
+                "sql": (
+                    f"SELECT *, throwIf(ifNull(toString(qty), '') = '{qty}', 'g9 boom') AS bad "
+                    f"FROM {inputs[0]['name']}"
+                ),
             }
         ],
         "fbicEnabled": bool(definition.get("fbicEnabled")),
@@ -1755,6 +1765,7 @@ def _silver_update_body(api, silver_pipeline_id: str, silver_table: str, qty: st
         "schedule": current.get("schedule") or "manual",
         "dependsOn": current.get("dependsOn") or ["file_ingest_job"],
     }
+    return body, definition.get("steps") or []
 
 
 def step_failed_silver_stops_the_chain(
@@ -1771,12 +1782,16 @@ def step_failed_silver_stops_the_chain(
     """BLD-14 D2/D9: a failed Silver run stops Gold and records the cause
     on Gold's chain route. The Silver step is restored on every path.
 
-    The failure is a SQL step with `throwIf(qty = 'boom')` (a SELECT, which
-    is the only shape `check_pipeline_step_sql` accepts), and the upload
-    carries `boom` in the row the gate changes."""
-    original = _silver_update_body(api, silver_pipeline_id, silver_table, CHANGED_QTY)
+    The failure is a SQL step with
+    `throwIf(ifNull(toString(qty), '') = '<BOOM_QTY>', 'g9 boom')` (a SELECT,
+    which is the only shape `check_pipeline_step_sql` accepts), and the upload
+    carries the same integer quantity in the row the gate changes. That value
+    must stay a valid integer: Bronze's `qty` column is typed, so a string like
+    `boom` would fail at ingest rather than in the Silver step this test is
+    proving."""
+    original, original_steps = _silver_update_body(api, silver_pipeline_id, silver_table, BOOM_QTY)
     restore = dict(original)
-    restore["steps"] = []
+    restore["steps"] = original_steps
     state["silver_step_restore"] = (silver_pipeline_id, restore)
     try:
         _expect(
@@ -1786,7 +1801,7 @@ def step_failed_silver_stops_the_chain(
         )
         before_silver = {r.get("id") for r in _pipeline_runs(api, silver_pipeline_id)}
         before_gold = {r.get("id") for r in _pipeline_runs(api, gold_pipeline_id)}
-        upload_id = upload_changed_copy(api, expected, state, qty="boom")
+        upload_id = upload_changed_copy(api, expected, state, qty=BOOM_QTY)
         step_load(
             api,
             upload_id,
@@ -1845,6 +1860,11 @@ def _restore_silver_step(api, state: dict) -> None:
 # row the gate asserts on. The original says `4`; the changed copy says
 # `9001`, which no other fixture and no earlier step mentions.
 CHANGED_QTY = "9001"
+# The quantity BLD-14's failing Silver step uploads. It stays a valid integer
+# (Bronze's `qty` column is typed) and is distinct from both `4` and
+# `CHANGED_QTY`, so the re-upload has different bytes from the fixture's other
+# two copies without failing at ingest.
+BOOM_QTY = "9002"
 # The last data row of the fixture, as tab-separated cells.
 _CHANGED_ROW = ["8250", "0000200", "PP BAND", CHANGED_QTY]
 
@@ -1876,7 +1896,7 @@ def changed_fixture_bytes(expected: dict, qty: str = CHANGED_QTY) -> bytes:
 def upload_changed_copy(api, expected: dict, state: dict, qty: str = CHANGED_QTY) -> str:
     """Upload the changed copy of the fixture as a new upload of its own
     (the same bytes would be refused as a duplicate). `qty` is what the
-    last data row carries; BLD-14's failure step uploads `"boom"`. """
+    last data row carries; BLD-14's failure step uploads `BOOM_QTY`. """
     raw = changed_fixture_bytes(expected, qty)
     resp = api.post(
         f"{API_URL}/api/uploads",
