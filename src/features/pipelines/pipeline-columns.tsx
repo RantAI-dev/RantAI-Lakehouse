@@ -39,15 +39,12 @@ import type { Pipeline, PipelineKind } from "@/services/contracts/pipelines"
 import { knownStatus } from "./pipeline-detail-header"
 import { describeCron, isLagTrigger, isScheduleRunning, parseSchedule, triggerSummary } from "./pipeline-schedule"
 
-// `PipelineKind` widens to `string` on `Pipeline.kind` (rows authored
-// before WS1 may still carry `"document"`/`"vector"`, which the database
-// constraint still permits) — the filter offers those legacy values too,
-// so its own value type must widen the same way.
+// BLD-12: only the two kinds a pipeline may be authored as remain in the
+// filter. `Pipeline.kind` still widens to `string` so a legacy row that
+// reports `document`/`vector` renders safely (it just has no filter option).
 export const PIPELINE_KIND_OPTIONS: { value: PipelineKind | string; label: string }[] = [
-  { value: "batch", label: "Batch" },
+  { value: "batch", label: "Full rebuild" },
   { value: "incremental", label: "Incremental" },
-  { value: "document", label: "Document" },
-  { value: "vector", label: "Vector" },
 ]
 
 export const PIPELINE_STATUS_OPTIONS: { value: EntityStatus; label: string }[] =
@@ -121,11 +118,22 @@ export function getPipelineColumns({
       header: ({ column }) => (
         <DataTableColumnHeader column={column} label="Kind" />
       ),
-      cell: ({ row }) => (
-        <Badge variant="outline" className="capitalize text-xs font-normal">
-          {row.original.kind}
-        </Badge>
-      ),
+      cell: ({ row }) => {
+        const pipeline = row.original
+        const incremental = pipeline.kind === "incremental"
+        return (
+          <div className="flex flex-col gap-0.5">
+            <Badge variant="outline" className="text-xs font-normal">
+              {pipeline.kind === "batch" ? "Full rebuild" : pipeline.kind}
+            </Badge>
+            {incremental ? (
+              <span className="text-[11px] text-muted-foreground">
+                Incremental · {pipeline.incrementalStrategy === "partition_replace" ? "Partition" : "Append"}
+              </span>
+            ) : null}
+          </div>
+        )
+      },
       enableColumnFilter: true,
       enableSorting: true,
       meta: {

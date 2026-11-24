@@ -97,6 +97,14 @@ export const dagsterPipelineService: PipelineService = {
   async triggerRun(id, signal) {
     return getJson<PipelineRun>(`/api/pipelines/${encodeURIComponent(id)}/trigger`, { method: "POST", signal });
   },
+  async triggerPipeline(id, options) {
+    const { fullRefresh, signal } = options ?? {};
+    return postJson<PipelineRun>(
+      `/api/pipelines/${encodeURIComponent(id)}/trigger`,
+      fullRefresh ? { fullRefresh: true } : undefined,
+      signal
+    );
+  },
   // WS4 item F1: `GET /api/pipelines/{id}` now returns the real detail
   // (engine, op graph, config, authored definition) directly — no more
   // reconstructing a partial detail from the list + runs endpoints, the

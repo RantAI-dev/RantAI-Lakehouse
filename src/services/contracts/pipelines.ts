@@ -1,8 +1,21 @@
 import type { Measured } from "@/lib/measured"
 import type { EntityStatus } from "@/lib/status"
 
-/** The kinds a pipeline can be authored as. */
+/** The kinds a pipeline can be authored as (BLD-12). Legacy rows may still carry `document` or `vector`, which is why `Pipeline.kind` widens with `| string`. */
 export type PipelineKind = "batch" | "incremental"
+
+/** How an incremental run materializes its output (BLD-12). */
+export type IncrementalStrategy = "append" | "partition_replace"
+
+/** The partition boundary of a `partition_replace` target (BLD-12). */
+export type PartitionGranularity = "day" | "month"
+
+/** The body of a manual full-refresh trigger (BLD-12). */
+export type TriggerPipelineOptions = {
+  /** Rebuild the whole target atomically instead of applying the incremental strategy. */
+  fullRefresh?: boolean
+  signal?: AbortSignal
+}
 
 /** Target lag setting (BLD-2 D2, widened with | string). */
 export type TargetLag =
@@ -43,6 +56,12 @@ export type Pipeline = {
   /** Null until WS2 derives freshness from Iceberg snapshot timestamps. */
   freshnessLagSeconds: Measured
   incrementalColumn?: string
+  /** BLD-12: how an incremental run materializes its output. */
+  incrementalStrategy?: IncrementalStrategy
+  /** BLD-12: the partition granularity of a `partition_replace` target. */
+  partitionGranularity?: PartitionGranularity
+  /** BLD-12: hours of lookback included in a replaced partition window. */
+  lookbackHours?: number
   transforms?: string[]
   fbicEnabled?: boolean
   targetLag?: TargetLag | null
@@ -277,6 +296,12 @@ export type AuthoredDefinition = {
   sourceZone: string
   sourceTable: string
   incrementalColumn: string | null
+  /** BLD-12: produced from `pipeline_definition.incremental_strategy` (migration 0156). Optional for a legacy fixture written before the column existed. */
+  incrementalStrategy?: IncrementalStrategy
+  /** BLD-12: produced from `pipeline_definition.partition_granularity`. */
+  partitionGranularity?: PartitionGranularity
+  /** BLD-12: produced from `pipeline_definition.lookback_hours`. */
+  lookbackHours?: number
   transforms: string[]
   fbicEnabled: boolean
   targetZone: string
@@ -371,6 +396,12 @@ export type CreatePipelineInput = {
   /** BLD-1 part 1 / D1: 0 to 20 steps; none means a plain copy of the one input. */
   steps: PipelineStep[]
   incrementalColumn?: string
+  /** BLD-12: defaults to `append` when omitted. Required to be valid when `kind` is `incremental`. */
+  incrementalStrategy?: IncrementalStrategy
+  /** BLD-12: defaults to `day` when omitted; only read by `partition_replace`. */
+  partitionGranularity?: PartitionGranularity
+  /** BLD-12: 0..720, defaults to 0. */
+  lookbackHours?: number
   fbicEnabled?: boolean
   targetZone: string
   targetTable: string
@@ -419,6 +450,12 @@ export type UpdatePipelineInput = {
    * value back (BLD-1 part 1 S3 review R1-B1).
    */
   incrementalColumn?: string
+  /** BLD-12: a `batch` save resets this to `append` server-side. */
+  incrementalStrategy?: IncrementalStrategy
+  /** BLD-12: a `batch` save resets this to `day` server-side. */
+  partitionGranularity?: PartitionGranularity
+  /** BLD-12: a `batch` save resets this to 0 server-side. */
+  lookbackHours?: number
   fbicEnabled?: boolean
   targetZone: string
   targetTable: string
@@ -505,6 +542,13 @@ export interface PipelineService {
   listRuns(pipelineId: string, signal?: AbortSignal): Promise<PipelineRun[]>
   createPipeline(input: CreatePipelineInput, signal?: AbortSignal): Promise<Pipeline>
   triggerRun(id: string, signal?: AbortSignal): Promise<PipelineRun>
+  /**
+   * `POST /api/pipelines/{id}/trigger`. BLD-12 adds `fullRefresh`: for an
+   * incremental authored pipeline it launches the op with `full_refresh =
+   * true`, which rebuilds the whole target atomically instead of applying
+   * the configured incremental strategy.
+   */
+  triggerPipeline(id: string, options?: TriggerPipelineOptions): Promise<PipelineRun>
   cancelRun(runId: string, signal?: AbortSignal): Promise<PipelineRun>
   /** `POST /api/pipelines/runs/{runId}/retry`; `strategy` defaults to every step. */
   retryRun(runId: string, signal?: AbortSignal, strategy?: RetryStrategy): Promise<PipelineRun>
