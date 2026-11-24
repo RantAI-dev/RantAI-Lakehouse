@@ -1461,7 +1461,14 @@ services:
   # no separate self-registration call is needed for `admin` here (unlike
   # the other principals, see `lakekeeper-authz-init` below).
   lakekeeper-warehouse-init:
-    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+    # REL-16: curl and jq are baked into this image at build time (see
+    # ops/init/Dockerfile), so starting the job on an air-gapped host needs
+    # no Alpine package mirror. Both `image:` and `build:` are set the same
+    # way as the other first-party images: local/CI compose builds it,
+    # `render_compose.py` replaces it with the published digest in a release.
+    image: ${LAKEHOUSE_INIT_IMAGE:-rantai-lakehouse-init:local}
+    build:
+      context: ./ops/init
     depends_on:
       lakekeeper:
         condition: service_healthy
@@ -1492,7 +1499,7 @@ services:
     command:
       - |
         set -eu
-        apk add --no-cache curl jq >/dev/null
+        # REL-16: curl and jq are in the image; no apk at start.
         base="http://lakekeeper:8181"
         admin_token="$$(cat /tokens/admin.jwt)"
         auth="Authorization: Bearer $$admin_token"
@@ -1624,7 +1631,10 @@ services:
   #   - `unauthorized-test`: registered (Lakekeeper knows who it is) but
   #     NEVER granted anything — the negative-test principal.
   lakekeeper-authz-init:
-    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+    # REL-16: same offline init image as lakekeeper-warehouse-init.
+    image: ${LAKEHOUSE_INIT_IMAGE:-rantai-lakehouse-init:local}
+    build:
+      context: ./ops/init
     depends_on:
       lakekeeper-warehouse-init:
         condition: service_completed_successfully
@@ -1699,7 +1709,7 @@ services:
     command:
       - |
         set -eu
-        apk add --no-cache curl jq >/dev/null
+        # REL-16: curl and jq are in the image; no apk at start.
         base="http://lakekeeper:8181"
         admin_token="$$(cat /tokens/admin.jwt)"
         admin_auth="Authorization: Bearer $$admin_token"
@@ -2164,7 +2174,10 @@ services:
   # and warehouse name baked into the JSON body.
   lakekeeper-warehouse-init-seaweedfs:
     profiles: ["seaweedfs"]
-    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+    # REL-16: same offline init image as lakekeeper-warehouse-init.
+    image: ${LAKEHOUSE_INIT_IMAGE:-rantai-lakehouse-init:local}
+    build:
+      context: ./ops/init
     depends_on:
       lakekeeper:
         condition: service_healthy
@@ -2190,7 +2203,7 @@ services:
     command:
       - |
         set -eu
-        apk add --no-cache curl jq >/dev/null
+        # REL-16: curl and jq are in the image; no apk at start.
         base="http://lakekeeper:8181"
         admin_token="$$(cat /tokens/admin.jwt)"
         auth="Authorization: Bearer $$admin_token"
@@ -2249,7 +2262,10 @@ services:
   # per-warehouse); this job only grants.
   lakekeeper-authz-init-seaweedfs:
     profiles: ["seaweedfs"]
-    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+    # REL-16: same offline init image as lakekeeper-warehouse-init.
+    image: ${LAKEHOUSE_INIT_IMAGE:-rantai-lakehouse-init:local}
+    build:
+      context: ./ops/init
     depends_on:
       lakekeeper-warehouse-init-seaweedfs:
         condition: service_completed_successfully
@@ -2269,7 +2285,7 @@ services:
     command:
       - |
         set -eu
-        apk add --no-cache curl jq >/dev/null
+        # REL-16: curl and jq are in the image; no apk at start.
         base="http://lakekeeper:8181"
         admin_token="$$(cat /tokens/admin.jwt)"
         admin_auth="Authorization: Bearer $$admin_token"
@@ -4225,7 +4241,13 @@ services:
   # dial in this gate connects by) so the real, unrelaxed verification
   # path is what gets exercised end-to-end, not a weakened one.
   mssql-g6-cert-init:
-    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+    # REL-16: openssl is baked into this image at build time, so this job
+    # (and the G6 gate that depends on it) no longer needs the Alpine CDN
+    # at start. Gate-only, so `render_compose.py` drops it from a release;
+    # the local/CI compose file still builds it from ops/init.
+    image: ${LAKEHOUSE_INIT_IMAGE:-rantai-lakehouse-init:local}
+    build:
+      context: ./ops/init
     profiles: ["g6", "g6-sql"]
     restart: "no"
     volumes:
@@ -4242,7 +4264,9 @@ services:
     # NOT a real security gap, an artifact of regenerating the file out
     # from under an already-running server). Skips regeneration when a
     # cert already exists in the volume.
-    # `apk add` is retried: a one-off package-mirror error failed this
+    # REL-16: openssl comes from the init image. There is no runtime
+    # package-install retry loop here any more: an offline start has no
+    # mirror to retry against, and a runtime install was what failed this
     # job and, through `depends_on`, the whole gate stack.
     # PR #192 review BLOCKER 11: mint CA cert (`ca.crt`) and server pair
     # (`mssql-g6.pem`, `mssql-g6.key`) signed by CA with basicConstraints=CA:FALSE,
@@ -4251,8 +4275,7 @@ services:
     command:
       - >
         test -f /out/ca.crt && test -f /out/mssql-g6.pem && test -f /out/mssql-g6.key ||
-        { for i in 1 2 3 4 5; do apk add --no-cache openssl >/dev/null && break; sleep 3; done;
-        command -v openssl >/dev/null &&
+        {
         openssl req -x509 -newkey rsa:2048 -nodes -days 3650
         -keyout /out/ca.key -out /out/ca.crt
         -subj "/CN=mssql-g6-ca"

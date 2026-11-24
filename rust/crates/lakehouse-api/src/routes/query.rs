@@ -3989,6 +3989,7 @@ pub async fn download(
         // `BI-34` covers the dashboard's downloads; Query Studio's keeps the
         // engine's default until it has its own decision.
         max_memory_usage: None,
+        params: Vec::new(),
     };
     let statement = download_statement(&rewritten);
 

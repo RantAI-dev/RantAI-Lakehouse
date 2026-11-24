@@ -68,8 +68,25 @@ class ReleaseImagesTest(unittest.TestCase):
         for name in mapping():
             self.assertTrue(name.startswith("rantai-lakehouse-"), name)
 
-    def test_the_mapping_holds_the_four_images_a_release_publishes(self) -> None:
-        self.assertEqual(len(mapping()), 4)
+    def test_the_mapping_holds_the_five_images_a_release_publishes(self) -> None:
+        self.assertEqual(len(mapping()), 5)
+
+    def test_the_offline_init_image_runs_every_product_init_service(self) -> None:
+        """REL-16: one built image for all of the stack's init jobs.
+
+        The G6 certificate job uses the same image in the template but is
+        gate-only, so `render_compose.py` drops it from a release and it is
+        deliberately NOT mapped here.
+        """
+        self.assertEqual(
+            set(mapping()["rantai-lakehouse-init"]),
+            {
+                "lakekeeper-warehouse-init",
+                "lakekeeper-authz-init",
+                "lakekeeper-warehouse-init-seaweedfs",
+                "lakekeeper-authz-init-seaweedfs",
+            },
+        )
 
 
 if __name__ == "__main__":

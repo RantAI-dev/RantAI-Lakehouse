@@ -269,6 +269,48 @@ async fn another_users_conversation_is_not_found_for_get_rename_and_delete() {
 }
 
 #[tokio::test]
+async fn a_conversation_with_quotes_backslashes_and_like_wildcards_round_trips() {
+    let (app, owner, _other, _owner_id, _other_id) = app_with_two_users().await;
+    // A quote, a backslash, a newline and both LIKE wildcards in one message.
+    // The write is a JSONEachRow body; the search binds `q` as a ClickHouse
+    // parameter, so `%` and `_` are ordinary characters, not wildcards.
+    let text = "it's C:\\data 100%_wild\nand a quote ' at the end";
+    let id = save(&app.router, &owner, text).await;
+    save(&app.router, &owner, "an ordinary conversation").await;
+
+    let (status, opened) = send(
+        &app.router,
+        "GET",
+        &format!("{SESSIONS}?id={id}"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "open answered {opened}");
+    assert_eq!(opened["session"]["messages"][0]["content"], json!(text));
+
+    let mut search = url::Url::parse("http://localhost/api/ai/sessions").unwrap();
+    search
+        .query_pairs_mut()
+        .append_pair("q", r"it's C:\data 100%_wild");
+    let uri = format!("{}?{}", search.path(), search.query().unwrap());
+
+    let (status, found) = send(&app.router, "GET", &uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "search answered {found}");
+    let ids: Vec<&str> = found["sessions"]
+        .as_array()
+        .expect("sessions is a list")
+        .iter()
+        .map(|s| s["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(
+        ids,
+        [id.as_str()],
+        "the quote, backslash, % and _ were matched literally: {found}"
+    );
+}
+
+#[tokio::test]
 async fn the_list_is_newest_first_and_holds_only_the_callers() {
     let (app, owner, other, _owner_id, _other_id) = app_with_two_users().await;
     let first = save(&app.router, &owner, "Percakapan pertama").await;
