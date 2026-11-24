@@ -4,9 +4,9 @@
 //! or a dialect is chosen. The full stack's behaviour is covered by the
 //! existing query tests.
 //!
-//! The harness always sets `CH_URL`, so a Trino-only test explicitly
+//! The harness always sets `CH_URL`, so a `Trino`-only test explicitly
 //! overrides it with an empty value — "unset" in config terms. That is the
-//! same shape the standalone Trino compose file produces.
+//! same shape the standalone `Trino` compose file produces.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -53,7 +53,7 @@ async fn run_query(
     (status, body)
 }
 
-/// A ClickHouse-only installation refuses an explicit Trino request on
+/// A `ClickHouse`-only installation refuses an explicit `Trino` request on
 /// both routes and names the one engine it actually runs.
 #[tokio::test]
 async fn a_clickhouse_only_installation_refuses_trino_on_run_and_estimate() {
@@ -73,8 +73,8 @@ async fn a_clickhouse_only_installation_refuses_trino_on_run_and_estimate() {
     }
 }
 
-/// The mirror case: a Trino-only installation refuses an explicit
-/// ClickHouse request. The message names Trino, never the engine that was
+/// The mirror case: a `Trino`-only installation refuses an explicit
+/// `ClickHouse` request. The message names `Trino`, never the engine that was
 /// not started.
 #[tokio::test]
 async fn a_trino_only_installation_refuses_clickhouse_on_run_and_estimate() {
