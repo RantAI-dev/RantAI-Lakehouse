@@ -292,6 +292,13 @@ jobs:
           python3 -m unittest discover -s ops/gates -p 'test_*.py'
           python3 -m unittest discover -s ops/bench -p 'test_*.py'
 
+      # OPS-18: the bounded retry helper used by the security workflows to
+      # download gitleaks and cargo-deny. Its self-test stubs curl and sleep,
+      # so success-on-retry, the bounded-failure exit code and the missing
+      # trailing sleep are proved without network access or real waiting.
+      - name: Test the CI download retry helper (OPS-18)
+        run: bash ./scripts/ci/tests/test_retry_download.sh
+
       # REL-2 S2-T1 … S2-T3: the release tooling (the version check, the
       # Compose renderer, the manifest). Its own tests are pytest cases;
       # `setup-python` pins the interpreter because the version check

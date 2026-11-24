@@ -3214,13 +3214,26 @@ pub async fn create(
     // so the new pipeline is on the list the create form returns to. It
     // used to be inserted unassigned, which no tenant-scoped read shows.
     let tenant_id = crate::tenant_scope::resolve(&principal, &headers)?;
-    let body: CreatePipelineBody = parse_body(&body)?;
+    let mut body: CreatePipelineBody = parse_body(&body)?;
+    // BLD-19: a legacy `gold` target is written as `serving` — the Gold
+    // database `routes::catalog` lists and `routes::lineage` names. This is
+    // the one door the console, an older script and the assistant's
+    // `create_pipeline` tool all come through, so no caller can persist an
+    // orphan `gold` target. Input zones are normalised by `definition_form`
+    // below; `bronze` is left alone for the refusal that follows.
+    body.target_zone =
+        crate::routes::authored_pipelines::canonical_clickhouse_zone(&body.target_zone).to_owned();
     // BLD-3 / D4: refuse a `bronze` target before anything is written.
     // Same validator (and same message) as `authored_pipelines::update`
     // and `authored_pipelines::restore_version` run; the assistant's
     // `create_pipeline` tool lands here too, so it is refused with the
     // same wording its schema enum no longer offers.
     crate::routes::authored_pipelines::validate_target_zone(&body.target_zone)?;
+    // BLD-21: the output table is held to the same name rule the compiler
+    // applies to inputs and steps, before the store is touched. The
+    // assistant's `create_pipeline` tool lands here too, so it gets the
+    // same 400 and the same message as a console save.
+    crate::routes::authored_pipelines::validate_target_table(&body.target_table)?;
     // BLD-1 part 1 / D3: whichever of the two body forms this is, one
     // function turns it into D1's shape. A body that sends both is refused
     // here, before anything else reads them.
@@ -3407,8 +3420,14 @@ pub struct GeneratePipelineBody {
 /// words, non-alnum stripped, lowercased) — used both as the final
 /// fallback when the LLM is unavailable/returns nothing usable, and to
 /// sanitize whatever name the LLM does propose.
+///
+/// BLD-21: the fallback `target_table` is `<name>_out`, so the derived name
+/// must itself satisfy `crate::pipeline_compile::valid_name` with room for
+/// that suffix. A prompt beginning with a digit or made of four long words
+/// would otherwise author a pipeline the engine refuses on its next run —
+/// a valid prompt must still produce a saveable pipeline.
 fn derive_pipeline_name(text: &str) -> String {
-    let name: String = text
+    let mut name: String = text
         .split_whitespace()
         .take(4)
         .collect::<Vec<_>>()
@@ -3418,9 +3437,23 @@ fn derive_pipeline_name(text: &str) -> String {
         .collect::<String>()
         .to_lowercase();
     if name.is_empty() {
-        "agentic_pipeline".to_owned()
-    } else {
+        return "agentic_pipeline".to_owned();
+    }
+    // Strip the reserved `__` prefix and a leading digit, then leave room
+    // for `_out` within `MAX_NAME_CHARS`. The guard below is the defence in
+    // depth: an unexpected shape falls back to a name known to be valid.
+    name = name.trim_start_matches("__").to_owned();
+    if name.starts_with(|c: char| c.is_ascii_digit()) {
+        name.insert(0, 'p');
+    }
+    let name: String = name
+        .chars()
+        .take(crate::pipeline_compile::MAX_NAME_CHARS - 4)
+        .collect();
+    if crate::pipeline_compile::valid_name(&name) {
         name
+    } else {
+        "agentic_pipeline".to_owned()
     }
 }
 
@@ -3445,8 +3478,10 @@ fn derive_pipeline_name(text: &str) -> String {
 ///
 /// # Errors
 ///
-/// 400 on a malformed body; 409 if the derived name collides; 503/500 as
-/// above.
+/// 400 on a malformed body, a Bronze `database`, or a transform the model
+/// proposed that is outside the grammar; 422 when the compiled draft names a
+/// table its author may not read; 409 if the derived name collides; 503/500
+/// as above. BLD-13: all of these happen before any row is stored.
 pub async fn generate(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -3456,12 +3491,17 @@ pub async fn generate(
     // Same tenant rule as `create`: the draft lands in the caller's tenant.
     let tenant_id = crate::tenant_scope::resolve(&principal, &headers)?;
     let body: GeneratePipelineBody = parse_body(&body)?;
+    // BLD-19: the draft's source and target are the same zone, so both
+    // spellings must name `serving` for a Gold draft — the catalog only
+    // lists `silver` and `serving`.
+    let database =
+        crate::routes::authored_pipelines::canonical_clickhouse_zone(&body.database).to_owned();
     // The draft used to be a name and nothing else: every generated
     // pipeline arrived reading `source_table` → `target_table`, kind
     // "incremental", schedule "On demand", whatever had been asked for.
     // The model now proposes the shape too, and every field it does not
     // give falls back to something derived rather than invented.
-    let draft = llm_pipeline_draft(&state, &body.instruction, &body.database).await;
+    let draft = llm_pipeline_draft(&state, &body.instruction, &database).await;
     let fallback_name = derive_pipeline_name(&body.instruction);
     let name = draft
         .as_ref()
@@ -3480,28 +3520,79 @@ pub async fn generate(
         .as_ref()
         .and_then(|d| d.target_table.clone())
         .unwrap_or_else(|| format!("{fallback_name}_out"));
+    // BLD-21: a model may propose any string for `targetTable`, so the same
+    // guard a person's save goes through runs here too. The derived
+    // fallback is already a valid name (see `derive_pipeline_name`), so a
+    // valid prompt is never refused for a name this route made up.
+    crate::routes::authored_pipelines::validate_target_table(&target_table)?;
     let schedule = draft
         .as_ref()
         .and_then(|d| d.schedule.clone())
         .unwrap_or_else(|| "On demand".to_owned());
+    // BLD-13: a drafted pipeline must pass the SAME checks `create` runs
+    // before a row is written. The canonicalised zone (`database`, BLD-19)
+    // is both the source and the target zone of a generated draft, so
+    // Bronze is refused here with the same message `create` answers:
+    // Bronze is written by ingestion and by nothing else.
+    crate::routes::authored_pipelines::validate_target_zone(&database)?;
+    // BLD-13: parse and normalize whatever the model proposed into D1's
+    // shape through the very same form `create` uses. A transform the model
+    // invented that is outside the grammar is refused with the same 400
+    // (naming its index); a valid draft now stores populated inputs/steps
+    // instead of two empty arrays that would compile into a bare copy.
+    let transforms = draft
+        .as_ref()
+        .map(|d| d.transforms.clone())
+        .unwrap_or_default();
+    let form = crate::routes::authored_pipelines::definition_form(
+        None,
+        None,
+        Some(database.as_str()),
+        Some(source_table.as_str()),
+        Some(&transforms),
+    )?;
+    // BLD-13: the first-input guard `create` runs. `generate` never wires
+    // upstreams, names a connector or sets a target lag, so the other
+    // `create` checks (`validate_per_table_upstream`, `validate_upstreams`,
+    // `check_connector_for_definition`, `validate_target_lag`, `max_retries`)
+    // have nothing to act on here — a comment, not a silently dropped check.
+    let first = crate::routes::authored_pipelines::first_input(&form)?;
+    crate::routes::authored_pipelines::validate_per_table_upstream(&first.zone, Some(&[]))?;
+    // BLD-13: compile, gate and rewrite as the author BEFORE the row exists,
+    // exactly as `create` does. A model that names a table its author may
+    // not read is refused now, not when someone tries to run the draft.
+    crate::routes::authored_pipelines::compile_and_save_check(
+        &state,
+        tenant_id,
+        author_id(&principal),
+        &form.inputs,
+        &form.steps,
+        (&database, &target_table),
+    )
+    .await?;
     let input = CreatePipelineInput {
-        inputs: Vec::new(),
-        steps: Vec::new(),
+        inputs: form.inputs,
+        steps: form.steps,
         name,
         kind,
-        source_zone: body.database.clone(),
-        source_table,
+        // BLD-13: the source is the form's first input (the legacy shape
+        // `generate` builds carries `database`/`source_table`, so this is
+        // the same value `create`-era code stored), read from the parsed
+        // form rather than re-derived, so the stored row and the compiled
+        // definition cannot disagree. BLD-19: the zone is the canonical
+        // `serving` for a Gold draft, because the form was built from it.
+        source_zone: first.zone.clone(),
+        source_table: first.table.clone(),
         // The draft LLM call proposes an incremental column/transforms too
         // (see `PipelineDraft` below); nothing asks it for FBIC, so that
         // stays the same honest "not configured" default `create` uses
         // when a human author leaves it unset.
         incremental_column: draft.as_ref().and_then(|d| d.incremental_column.clone()),
-        transforms: draft
-            .as_ref()
-            .map(|d| d.transforms.clone())
-            .unwrap_or_default(),
+        // BLD-13: the grammar-checked transforms from the form, so the
+        // stored legacy strings and the stored steps say the same thing.
+        transforms: form.legacy_transforms.unwrap_or_default(),
         fbic_enabled: false,
-        target_zone: body.database,
+        target_zone: database,
         target_table,
         schedule,
         owner: Some("Agentic Builder".to_owned()),
@@ -3693,9 +3784,12 @@ struct SetStatusBody {
 /// [`ALLOWED_TRANSITIONS`] (checked before any store call — no read, no
 /// write); 409 if `status` is a known target but the pipeline's CURRENT
 /// status is not an allowed source for it (checked after a read, before any
-/// WRITE). A genuine store failure below that point (e.g. a database
-/// outage) keeps `StoreError`'s existing classification via `?` — it is
-/// never folded into 400, since an outage is not a caller error.
+/// WRITE); BLD-13: on a `ready` target, 400/422 when the stored definition
+/// fails the same checks `create` runs (Bronze target, a bad transform, an
+/// unauthorized source, …), with the status left untouched. A genuine store
+/// failure below that point (e.g. a database outage) keeps `StoreError`'s
+/// existing classification via `?` — it is never folded into 400, since an
+/// outage is not a caller error.
 pub async fn set_status_route(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -3741,6 +3835,66 @@ pub async fn set_status_route(
             current.status, body.status
         ))
         .into());
+    }
+
+    // BLD-13: `draft -> ready` is where a stored row becomes runnable, so it
+    // must carry the same checks `create` applied when the row was written.
+    // A legacy/corrupt draft (Bronze target, bad transform, a source its
+    // author may not read) is refused here instead of failing at run time.
+    // Only the `"ready"` target is gated: pausing or demoting a broken
+    // pipeline goes through `pause`/`authored_status` and must still work.
+    if body.status == "ready" {
+        let pool = pool(&state)?;
+        // `get_definition` does the same legacy conversion as the store's
+        // migration `0140`: an old row with empty inputs/steps is rebuilt
+        // from its source zone/table and transforms, so the checks below
+        // see the definition the row actually means.
+        let stored = pipelines::get_definition(pool, &id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
+        crate::routes::authored_pipelines::validate_target_zone(&stored.target_zone)?;
+        let first = crate::routes::authored_pipelines::first_of(&stored.inputs)?;
+        crate::routes::authored_pipelines::validate_per_table_upstream(
+            &first.zone,
+            Some(&current.depends_on),
+        )?;
+        // `depends_on` is checked against the authored graph and Dagster
+        // exactly as `create` checks it; an unreachable Dagster degrades to
+        // "no Dagster upstreams", never a 500. An empty chain is a no-op.
+        crate::routes::authored_pipelines::validate_upstreams(
+            &state,
+            &id,
+            &current.depends_on,
+            "ready",
+        )
+        .await?;
+        crate::routes::authored_pipelines::validate_target_lag(current.target_lag)?;
+        // The connector was checked for tenant and source when it was set;
+        // `Keep` re-checks the source rule against today's inputs without
+        // re-running the tenant check (`update` does the same on a kept one).
+        if let Some(connector_id) = current.connector_id.as_deref() {
+            crate::routes::authored_pipelines::check_connector_for_definition(
+                pool,
+                &lakehouse_store::pipelines::ConnectorChange::Keep,
+                Some(connector_id),
+                current.tenant_id,
+                &stored.inputs,
+            )
+            .await?;
+        }
+        // BLD-13: compile, gate and rewrite as the stored author, the same
+        // save-time check `create` ran. `run_as = None` is an honest "no
+        // author" (D2): the check stores nothing new about the identity and
+        // does not block the promotion, exactly as it does not block create.
+        crate::routes::authored_pipelines::compile_and_save_check(
+            &state,
+            current.tenant_id,
+            current.run_as,
+            &stored.inputs,
+            &stored.steps,
+            (&stored.target_zone, &stored.target_table),
+        )
+        .await?;
     }
 
     // Only NOW, after both checks pass, does a write happen. A StoreError
@@ -4932,6 +5086,84 @@ mod tests {
             err.0.to_string(),
             crate::routes::authored_pipelines::BRONZE_TARGET_REFUSED
         );
+    }
+
+    /// BLD-21: `POST /api/pipelines` refuses an output table name the
+    /// compiler would refuse on an input or a step, with the shared message.
+    /// `state_without_pool()` proves the guard runs before any store,
+    /// orchestrator or tenant lookup decides anything. The assistant's
+    /// `create_pipeline` tool calls this same handler, so it is refused too.
+    #[tokio::test]
+    async fn create_with_an_invalid_target_table_is_refused_before_the_store() {
+        let body = Bytes::from_static(
+            br#"{"name":"pl-bad-target-table","kind":"batch","sourceZone":"silver","sourceTable":"s","targetZone":"gold","targetTable":"a; DROP TABLE b","schedule":"manual","transforms":[]}"#,
+        );
+        let err = create(
+            State(state_without_pool()),
+            Extension(fixture_user_principal()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect_err("an invalid target table must be refused");
+        assert_eq!(err.0.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.0.to_string(),
+            crate::routes::authored_pipelines::TARGET_TABLE_REFUSED
+        );
+    }
+
+    /// BLD-21 positive control: a valid `targetTable` passes the new guard
+    /// and reaches the store, which without a pool answers 503. Without this
+    /// test a guard that refused every name would still make the negative
+    /// test green. The closed local port keeps the unit test off any real
+    /// `Dagster` host.
+    #[tokio::test]
+    async fn create_with_a_valid_target_table_passes_the_guard_and_reaches_the_store() {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+        env.insert(
+            "DAGSTER_URL".to_owned(),
+            "http://127.0.0.1:1/graphql".to_owned(),
+        );
+        let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        let body = Bytes::from_static(
+            br#"{"name":"pl-good-target-table","kind":"batch","sourceZone":"silver","sourceTable":"s","targetZone":"gold","targetTable":"orders_clean","schedule":"manual","transforms":[]}"#,
+        );
+        let err = create(
+            State(state),
+            Extension(fixture_user_principal()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect_err("no pool configured: the store answers 503");
+        assert_eq!(err.0.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// BLD-21: `generate` derives its fallback target table from this name,
+    /// so a leading digit, a reserved `__` prefix, four very long words or
+    /// an empty result must all still yield a name the compiler accepts —
+    /// with room for the `_out` suffix.
+    #[test]
+    fn derive_pipeline_name_always_yields_a_name_the_compiler_accepts() {
+        for text in [
+            "2026 sales report build",
+            "a_very_long_word another_very_long_word third_very_long_word fourth_very_long_word",
+            "__internal secret data",
+            "!!!",
+            "orders by country",
+        ] {
+            let name = derive_pipeline_name(text);
+            assert!(
+                crate::pipeline_compile::valid_name(&name),
+                "{text:?} derived {name:?}, which the compiler would refuse"
+            );
+            assert!(
+                crate::pipeline_compile::valid_name(&format!("{name}_out")),
+                "{text:?} derived a fallback target table {name:?}_out that is too long"
+            );
+        }
     }
 
     /// WS5 item D4, failing-test-first: `pipeline_audit_event` did not
@@ -8113,7 +8345,333 @@ mod tests {
                 "an invalid transform must write nothing to pipeline_definition"
             );
         }
+
+        /// BLD-19: `serving` is the Gold zone the catalog lists, so a
+        /// pipeline created with that target is stored verbatim. The stored
+        /// `pipeline_definition.target` is what Dagster reads to pick the
+        /// `ClickHouse` database, so this is the value that matters.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_stores_a_serving_target_as_serving(pool: sqlx::PgPool) {
+            lakehouse_store::uploads::claim_table(
+                &pool,
+                super::SEED_TENANT.parse().unwrap(),
+                "orders",
+                "upload-bld19-serving",
+            )
+            .await
+            .expect("claim the bronze source table");
+            let name = format!("create-serving-test-{}", uuid::Uuid::new_v4());
+            let body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "name": name,
+                    "kind": "batch",
+                    "sourceZone": "bronze",
+                    "sourceTable": "orders",
+                    "transforms": [],
+                    "targetZone": "serving",
+                    "targetTable": "mart_bld19_serving",
+                    "schedule": "manual",
+                }))
+                .expect("serialize"),
+            );
+            let (_, ApiJson(created)) = create(
+                State(state_for(&pool)),
+                Extension(super::fixture_member_principal()),
+                HeaderMap::new(),
+                body,
+            )
+            .await
+            .expect("a serving target is accepted");
+            assert_eq!(created.target, "serving.mart_bld19_serving");
+            let row: (String,) =
+                sqlx::query_as("SELECT target FROM pipeline_definition WHERE id = $1")
+                    .bind(&created.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("query the stored target");
+            assert_eq!(row.0, "serving.mart_bld19_serving");
+        }
+
+        /// BLD-19: an older client (or script) still sending `gold` gets
+        /// its pipeline stored as `serving` — never as an orphan `gold`
+        /// database that the catalog and lineage do not list.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_normalizes_a_legacy_gold_target_to_serving(pool: sqlx::PgPool) {
+            lakehouse_store::uploads::claim_table(
+                &pool,
+                super::SEED_TENANT.parse().unwrap(),
+                "orders",
+                "upload-bld19-gold",
+            )
+            .await
+            .expect("claim the bronze source table");
+            let name = format!("create-gold-test-{}", uuid::Uuid::new_v4());
+            let body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "name": name,
+                    "kind": "batch",
+                    "sourceZone": "bronze",
+                    "sourceTable": "orders",
+                    "transforms": [],
+                    "targetZone": "gold",
+                    "targetTable": "mart_bld19_gold",
+                    "schedule": "manual",
+                }))
+                .expect("serialize"),
+            );
+            let (_, ApiJson(created)) = create(
+                State(state_for(&pool)),
+                Extension(super::fixture_member_principal()),
+                HeaderMap::new(),
+                body,
+            )
+            .await
+            .expect("a legacy gold target must be accepted as serving");
+            assert_eq!(created.target, "serving.mart_bld19_gold");
+            let row: (String,) =
+                sqlx::query_as("SELECT target FROM pipeline_definition WHERE id = $1")
+                    .bind(&created.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("query the stored target");
+            assert_eq!(row.0, "serving.mart_bld19_gold");
+        }
     }
+
+    /// BLD-13 — `POST /api/pipelines/generate` now runs the same checks
+    /// `create` runs. A draft is refused before a row is written, and a
+    /// valid one stores the compiled definition, not two empty arrays.
+    mod generate_route {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use lakehouse_test_support as _;
+
+        use crate::config::Config;
+        use crate::state::AppState;
+
+        use super::*;
+
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database"),
+            )
+        }
+
+        /// An [`AppState`] on the test database. `catalog_tenant`, when
+        /// given, is the tenant that owns the shared catalog: a generated
+        /// draft reads an unclaimed Silver table, which only that tenant
+        /// may reach. Leaving it out makes the author's own tenant (a
+        /// non-catalog one) unable to read that table — the save-time gate
+        /// then refuses the draft.
+        fn state_for(pool: &sqlx::PgPool, catalog_tenant: Option<&str>) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
+            if let Some(catalog_tenant) = catalog_tenant {
+                env.insert("CATALOG_TENANT_ID".to_owned(), catalog_tenant.to_owned());
+            }
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        /// Same state, with the model pointed at a mock that answers every
+        /// chat completion with `draft` as its content.
+        async fn state_with_draft(
+            pool: &sqlx::PgPool,
+            catalog_tenant: Option<&str>,
+            draft: serde_json::Value,
+        ) -> AppState {
+            let llm = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "choices": [{ "message": {
+                        "role": "assistant",
+                        "content": draft.to_string(),
+                    } }],
+                })))
+                .mount(&llm)
+                .await;
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
+            env.insert("LLM_URL".to_owned(), llm.uri());
+            if let Some(catalog_tenant) = catalog_tenant {
+                env.insert("CATALOG_TENANT_ID".to_owned(), catalog_tenant.to_owned());
+            }
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        fn generate_body(instruction: &str, database: &str) -> Bytes {
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "instruction": instruction,
+                    "database": database,
+                }))
+                .expect("serialize"),
+            )
+        }
+
+        async fn row_named(pool: &sqlx::PgPool, name: &str) -> Option<(String,)> {
+            sqlx::query_as("SELECT id FROM pipeline_definition WHERE name = $1")
+                .bind(name)
+                .fetch_optional(pool)
+                .await
+                .expect("query should succeed")
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn generate_refuses_a_bronze_database_and_stores_nothing(pool: sqlx::PgPool) {
+            let state = state_for(&pool, None);
+            let instruction = "load the daily sales files";
+
+            let err = generate(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                generate_body(instruction, "bronze"),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.0.status(), 400, "the Bronze refusal is a caller error");
+            assert!(
+                err.0
+                    .to_string()
+                    .contains(authored_pipelines::BRONZE_TARGET_REFUSED),
+                "the same message `create` uses: {err:?}"
+            );
+            assert!(
+                row_named(&pool, &derive_pipeline_name(instruction))
+                    .await
+                    .is_none(),
+                "a refused draft must not be stored"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn generate_refuses_an_unparseable_transform_and_stores_nothing(pool: sqlx::PgPool) {
+            // The model invented a transform outside the grammar — the
+            // dangerous shape is one that carries SQL inside an argument.
+            let state = state_with_draft(
+                &pool,
+                Some(SEED_TENANT),
+                json!({
+                    "name": "bad_transform",
+                    "kind": "batch",
+                    "sourceTable": "sales",
+                    "targetTable": "sales_out",
+                    "schedule": "On demand",
+                    "incrementalColumn": null,
+                    "transforms": ["filter(1=1; DROP TABLE x)"],
+                }),
+            )
+            .await;
+
+            let err = generate(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                generate_body("load the daily sales files", "silver"),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.0.status(), 400);
+            let message = err.0.to_string();
+            assert!(
+                message.contains("transforms[0]"),
+                "the refusal names the entry by index: {message:?}"
+            );
+            assert!(
+                !message.contains("DROP TABLE"),
+                "the model's text is never echoed into a response: {message:?}"
+            );
+            assert!(
+                row_named(&pool, "bad_transform").await.is_none(),
+                "a refused draft must not be stored"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn generate_refuses_a_draft_the_author_may_not_read_and_stores_nothing(
+            pool: sqlx::PgPool,
+        ) {
+            // CATALOG_TENANT_ID names a DIFFERENT tenant, so the author's
+            // own tenant owns no shared table and the save-time gate (D9)
+            // refuses the unclaimed Silver source before the row exists.
+            let other_tenant = "11111111-1111-4111-8111-000000000002";
+            let state = state_for(&pool, Some(other_tenant));
+            let instruction = "load the daily sales files";
+
+            let err = generate(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                generate_body(instruction, "silver"),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(
+                err.0.status(),
+                422,
+                "the save-time gate's refusal is an unprocessable definition: {err:?}"
+            );
+            assert!(
+                row_named(&pool, &derive_pipeline_name(instruction))
+                    .await
+                    .is_none(),
+                "a refused draft must not be stored"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn generate_stores_a_compiled_definition_for_a_valid_draft(pool: sqlx::PgPool) {
+            let state = state_with_draft(
+                &pool,
+                Some(SEED_TENANT),
+                json!({
+                    "name": "generated_sales",
+                    "kind": "incremental",
+                    "sourceTable": "sales",
+                    "targetTable": "sales_out",
+                    "schedule": "On demand",
+                    "incrementalColumn": null,
+                    "transforms": ["filter(status = 'active')"],
+                }),
+            )
+            .await;
+
+            let (status, ApiJson(created)) = generate(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                generate_body("load the daily sales files", "silver"),
+            )
+            .await
+            .expect("a valid draft succeeds");
+
+            assert_eq!(status, StatusCode::CREATED);
+            let definition = pipelines::get_definition(&pool, &created.id)
+                .await
+                .expect("read the stored definition")
+                .expect("the row exists");
+            assert_eq!(definition.inputs.len(), 1, "the form's input is stored");
+            assert_eq!(definition.steps.len(), 1, "the form's step is stored");
+            assert_eq!(definition.inputs[0].table, "sales");
+            assert_eq!(definition.target_zone, "silver");
+            assert_eq!(definition.transforms, vec!["filter(status = 'active')"]);
+        }
+    }
+
     /// WS4 item D4 — `POST /api/pipelines/{id}/status`'s
     /// `ALLOWED_TRANSITIONS` table, exercised against a real Postgres.
     mod status_route {
@@ -8560,6 +9118,200 @@ mod tests {
                 404,
                 "a non-pl- id has no from-state to look up"
             );
+        }
+
+        /// BLD-13: a stored draft can predate the Bronze-target refusal.
+        /// Promoting it must run the same target-zone check `create` runs,
+        /// and leave the status alone when the check refuses.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn ready_refuses_a_legacy_draft_with_a_bronze_target(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let pipeline = create_draft(&state).await;
+            sqlx::query(
+                "UPDATE pipeline_definition SET target = 'bronze.corrupt_out' WHERE id = $1",
+            )
+            .bind(&pipeline.id)
+            .execute(&pool)
+            .await
+            .expect("seed a legacy Bronze-target draft");
+
+            let err = set_status_route(
+                State(state),
+                Some(Extension(fixture_unrestricted_principal())),
+                HeaderMap::new(),
+                Path(pipeline.id.clone()),
+                status_body("ready"),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.0.status(), 400);
+            assert!(
+                err.0
+                    .to_string()
+                    .contains(authored_pipelines::BRONZE_TARGET_REFUSED)
+            );
+            let current = pipelines::get_pipeline(&pool, &pipeline.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row exists");
+            assert_eq!(current.status, "draft", "the refusal wrote nothing");
+        }
+
+        /// BLD-13: a legacy row whose transforms cannot be parsed is rebuilt
+        /// into a step by `get_definition` and refused by the compiler the
+        /// same way `create` refuses a bad transform at write time.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn ready_refuses_a_draft_with_an_unparseable_transform(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let pipeline = create_draft(&state).await;
+            sqlx::query(
+                "UPDATE pipeline_definition SET inputs = '[]', steps = '[]', \
+                 transforms = '[\"filter(1=1; DROP TABLE x)\"]' WHERE id = $1",
+            )
+            .bind(&pipeline.id)
+            .execute(&pool)
+            .await
+            .expect("seed a draft with a bad legacy transform");
+
+            let err = set_status_route(
+                State(state),
+                Some(Extension(fixture_unrestricted_principal())),
+                HeaderMap::new(),
+                Path(pipeline.id.clone()),
+                status_body("ready"),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.0.status(), 400);
+            assert!(
+                !err.0.to_string().contains("DROP TABLE"),
+                "the bad transform's own text is never echoed"
+            );
+            let current = pipelines::get_pipeline(&pool, &pipeline.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row exists");
+            assert_eq!(current.status, "draft", "the refusal wrote nothing");
+        }
+
+        /// BLD-13: a draft whose source table belongs to another tenant is
+        /// refused by the same save-time gate `create` runs. The caller is
+        /// unrestricted; the check deliberately uses the STORED author, so
+        /// an admin cannot promote a pipeline whose author may not read its
+        /// own source.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn ready_refuses_a_draft_whose_source_is_not_its_authors_table(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let pipeline = create_draft(&state).await;
+            lakehouse_store::uploads::claim_table(
+                &pool,
+                "11111111-1111-4111-8111-000000000002".parse().unwrap(),
+                "foreign_table",
+                "upload-bld13",
+            )
+            .await
+            .expect("claim the table to another tenant");
+            sqlx::query(
+                "UPDATE pipeline_definition SET source = 'bronze.foreign_table', \
+                 inputs = '[{\"name\":\"foreign_table\",\"zone\":\"bronze\",\"table\":\"foreign_table\"}]', \
+                 steps = '[]', transforms = '[]' WHERE id = $1",
+            )
+            .bind(&pipeline.id)
+            .execute(&pool)
+            .await
+            .expect("seed a draft reading another tenant's table");
+
+            let err = set_status_route(
+                State(state),
+                Some(Extension(fixture_unrestricted_principal())),
+                HeaderMap::new(),
+                Path(pipeline.id.clone()),
+                status_body("ready"),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(
+                err.0.status(),
+                422,
+                "the save-time gate refuses an unreadable source: {err:?}"
+            );
+            let current = pipelines::get_pipeline(&pool, &pipeline.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row exists");
+            assert_eq!(current.status, "draft", "the refusal wrote nothing");
+        }
+
+        /// BLD-13: a draft whose definition passes every check still moves
+        /// to `ready`, and the stored definition is the one that was checked.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn ready_accepts_a_valid_draft_and_stores_its_checked_definition(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let pipeline = create_draft(&state).await;
+            let definition = pipelines::get_definition(&pool, &pipeline.id)
+                .await
+                .expect("read the definition")
+                .expect("the row exists");
+            assert_eq!(definition.inputs.len(), 1);
+
+            let ApiJson(updated) = set_status_route(
+                State(state),
+                Some(Extension(fixture_unrestricted_principal())),
+                HeaderMap::new(),
+                Path(pipeline.id.clone()),
+                status_body("ready"),
+            )
+            .await
+            .expect("a valid draft is promoted");
+
+            assert_eq!(updated.status, "ready");
+            let current = pipelines::get_pipeline(&pool, &pipeline.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row exists");
+            assert_eq!(current.status, "ready");
+        }
+
+        /// BLD-13: gating only the `"ready"` target keeps the escape hatch
+        /// open — a broken pipeline that is already running can still be
+        /// paused through `pause`/`authored_status`, which never runs the
+        /// write-time checks.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn pausing_a_broken_ready_pipeline_still_succeeds(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let pipeline = create_draft(&state).await;
+            // Bypass the route the way an old row would have been written:
+            // a Bronze target that `ready` now refuses, and a ready status.
+            sqlx::query(
+                "UPDATE pipeline_definition SET target = 'bronze.corrupt_out', \
+                 status = 'ready' WHERE id = $1",
+            )
+            .bind(&pipeline.id)
+            .execute(&pool)
+            .await
+            .expect("seed a broken ready pipeline");
+
+            let response = pause(
+                State(state),
+                Some(Extension(fixture_unrestricted_principal())),
+                HeaderMap::new(),
+                Path(pipeline.id.clone()),
+            )
+            .await;
+
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a broken pipeline can still be paused"
+            );
+            let current = pipelines::get_pipeline(&pool, &pipeline.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row exists");
+            assert_eq!(current.status, "paused");
         }
     }
 

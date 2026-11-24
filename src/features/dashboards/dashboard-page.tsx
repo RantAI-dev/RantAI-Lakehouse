@@ -10,6 +10,7 @@ import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { SurfaceThemeProvider } from "@/components/ui/surface-theme";
 import { cn } from "@/lib/utils";
 import { dashboardDestination, queryDestination, urlDestination } from "@/lib/click-destination";
 import { binRangeFilter, isLastBin, toggleBinFilter } from "@/lib/chart-bins";
@@ -1285,9 +1286,12 @@ export function DashboardPage({ boardId }: { boardId: string }) {
 
   // `dark` on the container themes the dashboard alone (the tokens and the
   // `dark:` variants key off an ancestor with the class); the rest of the
-  // console, and anything portalled out of this element, keeps its theme.
+  // console keeps its theme. WEB-10: portals still land on <body> (never inside
+  // this scrolling pane), but the surface's theme class travels with them so a
+  // popup opened from a light board is light too.
   return (
     <ReportingProvider reporting={data?.reporting}>
+    <SurfaceThemeProvider themeClass={look.surfaceThemeClass}>
     <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6", look.className || (fullscreen && fsDark && "dark"), look.className && !fullscreen && "rounded-lg p-4")} style={look.style}>
       <PageHeader
         title={
@@ -1624,6 +1628,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ) : null}
       <ChartLineagePanel chart={lineageChart} onOpenChange={(next) => { if (!next) setLineageChart(null); }} />
     </div>
+    </SurfaceThemeProvider>
     </ReportingProvider>
   );
 }

@@ -30,10 +30,9 @@ import type {
   GoldReadBack,
   GoldTrimSummary,
 } from "@/services/contracts/gold"
-
-function trimmedMart(assetId: string): string {
-  return assetId.startsWith("serving.") ? assetId.slice("serving.".length) : assetId
-}
+// Shared with the asset "Connect" dialog: both name the mart the Gold export
+// routes use, not the `serving.`-prefixed catalog id.
+import { martFromAssetId as trimmedMart } from "./asset-connect-snippets"
 
 function LastFiveRuns({ mart, runsKey }: { mart: string; runsKey: number }) {
   const state = useService<GoldExportRun[]>(
