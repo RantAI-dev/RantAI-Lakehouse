@@ -120,7 +120,7 @@ const SK_PHONE = { l: 104, r: 256, font: 15, bend: 72 };
 export function SankeyTile({ tile }: { tile: Tiles["sankey"] }) {
   return (
     <>
-      <SankeyDrawing tile={tile} geo={SK_DESKTOP} className="max-lg:hidden" rules />
+      <SankeyDrawing tile={tile} geo={SK_DESKTOP} className="max-lg:hidden" interactive />
       <SankeyDrawing tile={tile} geo={SK_PHONE} className="lg:hidden" />
     </>
   );
@@ -130,13 +130,17 @@ function SankeyDrawing({
   tile,
   geo,
   className,
-  rules: withRules = false,
+  interactive = false,
 }: {
   tile: Tiles["sankey"];
   geo: typeof SK_DESKTOP;
   className: string;
-  /** The hover rules are global, so only one of the two drawings writes them. */
-  rules?: boolean;
+  /**
+   * The pointer's part (O18): the hover rules (global, so written once), the node hit areas and
+   * the tooltips. Only the desktop drawing has it: a phone has no pointer to follow, and the
+   * page's HTML stays smaller (the phone drawing is server-rendered twice, as HTML and as data).
+   */
+  interactive?: boolean;
 }) {
   const { l: SK_L, r: SK_R, font, bend } = geo;
   const left = [
@@ -183,7 +187,7 @@ function SankeyDrawing({
   ].join("");
   return (
     <svg {...svgProps} aria-label={tile.aria} className={`${svgProps.className} lk-sankey ${className}`}>
-      {withRules && <style>{rules}</style>}
+      {interactive && <style>{rules}</style>}
       {paths.map((p, i) => (
         <g key={i} className="lk-flowgrp" data-i={i} data-from={p.from} data-to={p.to}>
           <path
@@ -214,12 +218,14 @@ function SankeyDrawing({
           pointerEvents="none"
         />
       ))}
-      {left.map((n, i) => (
-        <rect key={`l${i}`} className="lk-node" data-l={i} x={SK_L - 4} y={n.y} width="16" height={n.h} rx="3" fill="transparent" />
-      ))}
-      {right.map((n, i) => (
-        <rect key={`r${i}`} className="lk-node" data-r={i} x={SK_R - 4} y={n.y} width="16" height={n.h} rx="3" fill="transparent" />
-      ))}
+      {interactive &&
+        left.map((n, i) => (
+          <rect key={`l${i}`} className="lk-node" data-l={i} x={SK_L - 4} y={n.y} width="16" height={n.h} rx="3" fill="transparent" />
+        ))}
+      {interactive &&
+        right.map((n, i) => (
+          <rect key={`r${i}`} className="lk-node" data-r={i} x={SK_R - 4} y={n.y} width="16" height={n.h} rx="3" fill="transparent" />
+        ))}
       {left.map((n, i) => (
         <rect key={`lv${i}`} x={SK_L} y={n.y} width="8" height={n.h} rx="3" fill={FOAM} fillOpacity="0.85" pointerEvents="none" />
       ))}
@@ -238,17 +244,17 @@ function SankeyDrawing({
         </text>
       ))}
       {/* Tooltips last, so they sit above every band; shown by the hovered band or node. */}
-      {paths.map((p, i) => (
+      {interactive && paths.map((p, i) => (
         <g key={`t${i}`} className="lk-flowtip" data-i={i}>
           <SvgTip x={(SK_L + SK_R) / 2} y={(p.y0 + p.y1) / 2} top={`${tile.from[p.from]} → ${tile.to[p.to]}`} bottom={count(p.w)} width={128} />
         </g>
       ))}
-      {left.map((n, i) => (
+      {interactive && left.map((n, i) => (
         <g key={`tl${i}`} className="lk-nodetip" data-l={i}>
           <SvgTip x={SK_L + 16} y={n.y + n.h / 2 + 20} top={tile.from[i]} bottom={`${count(totalL[i])} ${tile.total}`} width={96} />
         </g>
       ))}
-      {right.map((n, i) => (
+      {interactive && right.map((n, i) => (
         <g key={`tr${i}`} className="lk-nodetip" data-r={i}>
           <SvgTip x={SK_R - 8} y={n.y + n.h / 2 + 20} top={tile.to[i]} bottom={`${count(totalR[i])} ${tile.total}`} width={96} />
         </g>
