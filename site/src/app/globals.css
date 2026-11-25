@@ -3504,3 +3504,25 @@ html[data-tod="day"] footer .lk-wm [class*="text-[#E8F4FF]/[0.12]"] {
     mask-image: none;
   }
 }
+
+/* M10: readable text inside the mocks is at least 12 px below 1024 px. The depths cards'
+   labels (they carried 10-11 px, and 10 px on a narrow card), and the KPI tile's delta
+   (14 of 360 drawing units, ~11.5 px on a phone's tile). The sankey has a phone drawing of its
+   own (dashboard-tiles.tsx). */
+@media (max-width: 1023.98px) {
+  .lk-depth-head,
+  .lk-depth-count,
+  .lk-depth-legend,
+  .lk-depth-badge,
+  .lk-depth-lag,
+  .lk-depth-feeds,
+  .lk-depth-total > span:first-child,
+  .lk-depth-tip,
+  .lk-depth-empty,
+  .lk-depth-twice {
+    font-size: 12px;
+  }
+  .lk-kpi svg text {
+    font-size: 15.5px;
+  }
+}

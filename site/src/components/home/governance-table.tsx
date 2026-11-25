@@ -160,7 +160,7 @@ function PiiTag({ copy }: { copy: GovernanceCopy }) {
       <span
         tabIndex={0}
         aria-describedby={id}
-        className="rounded-sm text-[10px] font-semibold tracking-[0.08em] text-[#8fcbff]/70 outline-none focus-visible:ring-2 focus-visible:ring-[#44A6FA]"
+        className="rounded-sm text-[10px] font-semibold tracking-[0.08em] text-[#8fcbff]/70 max-lg:text-[12px] outline-none focus-visible:ring-2 focus-visible:ring-[#44A6FA]"
       >
         {copy.pii}
       </span>
@@ -184,7 +184,7 @@ function Avatar({ name, masked }: { name: string; masked: boolean }) {
     <span
       aria-hidden="true"
       className={cn(
-        "grid size-7 shrink-0 place-items-center rounded-full text-[10.5px] font-semibold transition-colors duration-300 ease-out",
+        "grid size-7 shrink-0 place-items-center rounded-full text-[10.5px] font-semibold max-lg:text-[12px] transition-colors duration-300 ease-out",
         masked ? "bg-white/[0.07] text-white/45" : "bg-[#44A6FA]/20 text-[#bfe0ff]",
       )}
     >
@@ -246,7 +246,7 @@ function Cell({
         <span className="sr-only">, {tip}</span>
         <span
           aria-hidden="true"
-          className="pointer-events-none absolute bottom-full left-0 z-10 mb-1.5 w-max rounded-lg bg-[var(--lk-n-bg)]/95 px-2 py-1 text-[11px] text-[#E8F4FF] opacity-0 shadow-[inset_0_0_0_1px_rgba(232,244,255,0.2)] transition-opacity duration-200 group-hover/mask:opacity-100"
+          className="pointer-events-none absolute bottom-full left-0 z-10 mb-1.5 w-max rounded-lg bg-[var(--lk-n-bg)]/95 px-2 py-1 text-[11px] text-[#E8F4FF] max-lg:text-[12px] opacity-0 shadow-[inset_0_0_0_1px_rgba(232,244,255,0.2)] transition-opacity duration-200 group-hover/mask:opacity-100"
         >
           {tip}
         </span>

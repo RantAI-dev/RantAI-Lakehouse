@@ -121,11 +121,11 @@ function Audit({ text }: { text: Bento["audit"] }) {
           <span className="min-w-0 flex-1 truncate">{r}</span>
           {i === text.rows.length - 1 ? (
             <span className="relative inline-grid shrink-0">
-              <span className="lk-gv-wait col-start-1 row-start-1 inline-flex items-center gap-1 rounded-full bg-[#F2C14E]/12 px-2 py-0.5 text-[11px] font-medium text-[#F2C14E]">
+              <span className="lk-gv-wait col-start-1 row-start-1 inline-flex items-center gap-1 rounded-full bg-[#F2C14E]/12 px-2 py-0.5 text-[11px] font-medium text-[#F2C14E] max-md:text-[12px]">
                 <span className="lk-pulse size-1.5 rounded-full bg-[#F2C14E]" />
                 {text.awaiting}
               </span>
-              <span className="lk-gv-ok col-start-1 row-start-1 inline-flex items-center gap-1 justify-self-end rounded-full bg-[#7be0b0]/12 px-2 py-0.5 text-[11px] font-medium text-[#7be0b0]">
+              <span className="lk-gv-ok col-start-1 row-start-1 inline-flex items-center gap-1 justify-self-end rounded-full bg-[#7be0b0]/12 px-2 py-0.5 text-[11px] font-medium text-[#7be0b0] max-md:text-[12px]">
                 <Check className="size-3" />
                 {text.approved}
               </span>
@@ -153,12 +153,12 @@ function Catalog({ text }: { text: Bento["catalog"] }) {
       </div>
       <div className="lk-gv-result flex items-center gap-2 rounded-xl px-3 py-1">
         <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-[#E8F4FF]">gold.revenue_by_city</span>
-        <span className="rounded-full bg-[#7be0b0]/12 px-2 py-0.5 text-[10.5px] font-medium text-[#7be0b0]">{text.certified}</span>
-        <span className="rounded-full bg-white/8 px-2 py-0.5 text-[10.5px] text-white/75">#{text.tag}</span>
+        <span className="rounded-full bg-[#7be0b0]/12 px-2 py-0.5 text-[10.5px] font-medium text-[#7be0b0] max-md:text-[12px]">{text.certified}</span>
+        <span className="rounded-full bg-white/8 px-2 py-0.5 text-[10.5px] text-white/75 max-md:text-[12px]">#{text.tag}</span>
       </div>
       <div className="lk-gv-result flex items-center gap-2 rounded-xl px-3 py-1 opacity-60" style={{ animationDelay: "1.6s" }}>
         <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-white/70 line-through decoration-white/30">silver.revenue_old</span>
-        <span className="rounded-full bg-[#F2C14E]/12 px-2 py-0.5 text-[10.5px] font-medium text-[#F2C14E]">{text.deprecated}</span>
+        <span className="rounded-full bg-[#F2C14E]/12 px-2 py-0.5 text-[10.5px] font-medium text-[#F2C14E] max-md:text-[12px]">{text.deprecated}</span>
       </div>
     </div>
   );
@@ -174,8 +174,8 @@ function Access({ text }: { text: Bento["access"] }) {
           {f}
           {i === 1 && (
             <div className="ml-auto flex -space-x-1.5">
-              <span className="grid size-6 place-items-center rounded-full bg-[#44A6FA]/25 text-[10px] font-semibold text-[#bfe0ff] ring-2 ring-[#0b1a2d]">A</span>
-              <span className="grid size-6 place-items-center rounded-full bg-white/12 text-[10px] font-semibold text-white/80 ring-2 ring-[#0b1a2d]">An</span>
+              <span className="grid size-6 place-items-center rounded-full bg-[#44A6FA]/25 text-[10px] font-semibold text-[#bfe0ff] ring-2 max-md:text-[12px] ring-[#0b1a2d]">A</span>
+              <span className="grid size-6 place-items-center rounded-full bg-white/12 text-[10px] font-semibold text-white/80 ring-2 max-md:text-[12px] ring-[#0b1a2d]">An</span>
             </div>
           )}
         </div>
@@ -184,11 +184,11 @@ function Access({ text }: { text: Bento["access"] }) {
         <LayoutDashboard className="size-4 text-white/70" />
         {text.dashboard}
         <span className="relative ml-auto inline-grid">
-          <span className="lk-gv-closed col-start-1 row-start-1 inline-flex items-center gap-1 text-[11.5px] text-[#8fcbff]">
+          <span className="lk-gv-closed col-start-1 row-start-1 inline-flex items-center gap-1 text-[11.5px] text-[#8fcbff] max-md:text-[12px]">
             <Lock className="size-3.5" />
             {text.closed}
           </span>
-          <span className="lk-gv-open col-start-1 row-start-1 inline-flex items-center gap-1 justify-self-end text-[11.5px] text-[#7be0b0]">
+          <span className="lk-gv-open col-start-1 row-start-1 inline-flex items-center gap-1 justify-self-end text-[11.5px] text-[#7be0b0] max-md:text-[12px]">
             <LockOpen className="size-3.5" />
             {text.open}
           </span>

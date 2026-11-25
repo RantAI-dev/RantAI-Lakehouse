@@ -416,3 +416,10 @@
     transition: none !important;
   }
 }
+
+/* WEB-5 M10 (phone pass): readable text is at least 12 px below 1024 px. */
+@media (max-width: 1023.98px) {
+  .lk-otr-badge {
+    font-size: 12px;
+  }
+}

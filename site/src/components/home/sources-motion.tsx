@@ -129,7 +129,7 @@ export const stagger = (count: number): number => (count > 1 ? Math.min(0.034, 0
  * fall drives the pill's `transform` and colours inline.
  */
 const PILL_CLASS =
-  "group/pill inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] text-[#E8F4FF] transition-[translate,border-color] duration-200 ease-out hover:-translate-y-0.5 hover:border-[#8fcbff]/70! motion-reduce:transition-none md:gap-2 md:px-4 md:py-2 md:text-[13px]";
+  "group/pill inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[12px] text-[#E8F4FF] transition-[translate,border-color] duration-200 ease-out hover:-translate-y-0.5 hover:border-[#8fcbff]/70! motion-reduce:transition-none md:gap-2 md:px-4 md:py-2 md:text-[13px]";
 
 function PillContent({ label, mark }: { label: string; mark: React.ReactNode }) {
   return (

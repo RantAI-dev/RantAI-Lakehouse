@@ -285,7 +285,7 @@ function ApprovalCard({ copy }: { copy: AssistantCopy }) {
       <div className="relative mt-4 h-9">
         <div className="lk-ast-decide absolute inset-0 flex items-center justify-between gap-2">
           <span className="flex min-w-0 items-center gap-2 text-[13px] leading-5 text-[#E8F4FF]/65">
-            <span className="lk-ast-admin grid size-6 shrink-0 place-items-center rounded-full text-[11px] font-semibold text-[#E8F4FF]">A</span>
+            <span className="lk-ast-admin grid size-6 shrink-0 place-items-center rounded-full text-[11px] font-semibold text-[#E8F4FF] max-lg:text-[12px]">A</span>
             {/* "Admin" is the console's role name, the same in both languages; a phone shows only it. */}
             <span className="lk-ast-reviewer truncate">{copy.reviewer}</span>
             <span className="lk-ast-reviewer-short">Admin</span>

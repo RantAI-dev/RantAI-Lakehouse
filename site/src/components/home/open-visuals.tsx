@@ -202,21 +202,21 @@ export function ConsoleHome({ windowTitle }: { windowTitle: string }) {
             <div className="lk-cv lk-cv-dash flex h-full flex-col">
               <div className="flex items-center justify-between">
                 <span className="text-[13px] leading-5 font-medium text-[#E8F4FF]/90">Visits by region</span>
-                <span className="rounded-full bg-[#E8F4FF]/[0.08] px-2 py-0.5 text-[10.5px] leading-4 text-[#E8F4FF]/60">Illustrative</span>
+                <span className="rounded-full bg-[#E8F4FF]/[0.08] px-2 py-0.5 text-[10.5px] leading-4 text-[#E8F4FF]/60 max-lg:text-[12px]">Illustrative</span>
               </div>
               <div className="mt-3 grid flex-1 grid-cols-3 gap-2">
                 <div className="lk-cv-tile flex flex-col justify-between rounded-xl bg-[#E8F4FF]/[0.06] p-2.5" style={{ "--i": 0 } as React.CSSProperties}>
-                  <span className="text-[10.5px] leading-4 text-[#E8F4FF]/55">Visits</span>
+                  <span className="text-[10.5px] leading-4 text-[#E8F4FF]/55 max-lg:text-[12px]">Visits</span>
                   <span data-count="12.4" className="text-[20px] leading-6 font-medium text-[#E8F4FF] tabular-nums">12.4k</span>
                 </div>
                 <div className="lk-cv-tile flex flex-col justify-between rounded-xl bg-[#E8F4FF]/[0.06] p-2.5" style={{ "--i": 1 } as React.CSSProperties}>
-                  <span className="text-[10.5px] leading-4 text-[#E8F4FF]/55">Trend</span>
+                  <span className="text-[10.5px] leading-4 text-[#E8F4FF]/55 max-lg:text-[12px]">Trend</span>
                   <svg viewBox="0 0 80 32" className="h-8 w-full overflow-visible" fill="none">
                     <path className="lk-cv-line" d="M2 26 C 14 24, 18 12, 30 14 S 48 24, 56 12 S 70 4, 78 4" stroke="#44A6FA" strokeWidth="2" strokeLinecap="round" pathLength={1} />
                   </svg>
                 </div>
                 <div className="lk-cv-tile flex flex-col justify-between rounded-xl bg-[#E8F4FF]/[0.06] p-2.5" style={{ "--i": 2 } as React.CSSProperties}>
-                  <span className="text-[10.5px] leading-4 text-[#E8F4FF]/55">By region</span>
+                  <span className="text-[10.5px] leading-4 text-[#E8F4FF]/55 max-lg:text-[12px]">By region</span>
                   <span className="flex h-8 items-end gap-1">
                     {[100, 74, 62, 42].map((h, k) => (
                       <span key={h} className="lk-cv-bar w-full rounded-sm bg-[#44A6FA]" style={{ height: `${h}%`, opacity: 1 - k * 0.18, "--k": k } as React.CSSProperties} />
@@ -228,13 +228,13 @@ export function ConsoleHome({ windowTitle }: { windowTitle: string }) {
             <div className="lk-cv lk-cv-src flex h-full flex-col">
               <div className="flex items-center justify-between">
                 <span className="text-[13px] leading-5 font-medium text-[#E8F4FF]/90">Connect a source</span>
-                <span className="rounded-full bg-[#E8F4FF]/[0.08] px-2 py-0.5 text-[10.5px] leading-4 text-[#E8F4FF]/60">Illustrative</span>
+                <span className="rounded-full bg-[#E8F4FF]/[0.08] px-2 py-0.5 text-[10.5px] leading-4 text-[#E8F4FF]/60 max-lg:text-[12px]">Illustrative</span>
               </div>
               <ul className="mt-3 flex flex-1 flex-col justify-center gap-2">
                 {SOURCES.map((name, i) => (
                   <li key={name} className="lk-cv-chip flex items-center gap-2 rounded-xl bg-[#E8F4FF]/[0.06] px-3 py-2 text-[13px] leading-5 text-[#E8F4FF]/90" data-state="connected" style={{ "--i": i } as React.CSSProperties}>
                     {name}
-                    <span className="lk-cv-state ml-auto inline-flex items-center gap-1 text-[11.5px] font-medium">
+                    <span className="lk-cv-state ml-auto inline-flex items-center gap-1 text-[11.5px] font-medium max-lg:text-[12px]">
                       <span className="lk-cv-wait text-[#E8F4FF]/50">Connecting…</span>
                       <span className="lk-cv-ok inline-flex items-center gap-1 text-[#7be0b0]">
                         <Check aria-hidden="true" className="size-3" strokeWidth={2.75} />

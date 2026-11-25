@@ -109,10 +109,36 @@ export function LineChartTile({ tile }: { tile: Tiles["line"] }) {
 }
 
 /** Audit #23: the nodes sit inward, so each side has room for its labels. */
-const SK_L = 76;
-const SK_R = 276;
+const SK_DESKTOP = { l: 76, r: 276, font: 11, bend: 110 };
+/**
+ * WEB-5 M10 (phone pass): a phone's tile draws the drawing at ~300 px, so 11-unit labels came out
+ * at 8-10 px. Its own geometry: the nodes further in, so labels of 15 units (12 px or more at
+ * 360 px) fit on both sides, "Media sosial" and "Dokumentasi" included.
+ */
+const SK_PHONE = { l: 104, r: 256, font: 15, bend: 72 };
 
 export function SankeyTile({ tile }: { tile: Tiles["sankey"] }) {
+  return (
+    <>
+      <SankeyDrawing tile={tile} geo={SK_DESKTOP} className="max-lg:hidden" rules />
+      <SankeyDrawing tile={tile} geo={SK_PHONE} className="lg:hidden" />
+    </>
+  );
+}
+
+function SankeyDrawing({
+  tile,
+  geo,
+  className,
+  rules: withRules = false,
+}: {
+  tile: Tiles["sankey"];
+  geo: typeof SK_DESKTOP;
+  className: string;
+  /** The hover rules are global, so only one of the two drawings writes them. */
+  rules?: boolean;
+}) {
+  const { l: SK_L, r: SK_R, font, bend } = geo;
   const left = [
     { y: 28, h: 50 },
     { y: 92, h: 38 },
@@ -138,7 +164,7 @@ export function SankeyTile({ tile }: { tile: Tiles["sankey"] }) {
     const y1 = right[f.to].y + usedR[f.to] + f.w / 2;
     usedL[f.from] += f.w * 0.9;
     usedR[f.to] += f.w * 0.9;
-    return { ...f, y0, y1, d: `M${SK_L + 8} ${y0} C${SK_L + 110} ${y0} ${SK_R - 110} ${y1} ${SK_R} ${y1}`, sw: f.w * 0.9 };
+    return { ...f, y0, y1, d: `M${SK_L + 8} ${y0} C${SK_L + bend} ${y0} ${SK_R - bend} ${y1} ${SK_R} ${y1}`, sw: f.w * 0.9 };
   });
   /** Illustrative counts: a band's width in tenths of thousands. */
   const count = (w: number) => `${(w / 10).toFixed(1)}k`;
@@ -156,8 +182,8 @@ export function SankeyTile({ tile }: { tile: Tiles["sankey"] }) {
     ),
   ].join("");
   return (
-    <svg {...svgProps} aria-label={tile.aria} className={`${svgProps.className} lk-sankey`}>
-      <style>{rules}</style>
+    <svg {...svgProps} aria-label={tile.aria} className={`${svgProps.className} lk-sankey ${className}`}>
+      {withRules && <style>{rules}</style>}
       {paths.map((p, i) => (
         <g key={i} className="lk-flowgrp" data-i={i} data-from={p.from} data-to={p.to}>
           <path
@@ -202,12 +228,12 @@ export function SankeyTile({ tile }: { tile: Tiles["sankey"] }) {
       ))}
       {/* Audit #23: every node is named, sources on the left, pages on the right. */}
       {left.map((n, i) => (
-        <text key={`ln${i}`} x={SK_L - 8} y={n.y + n.h / 2} textAnchor="end" dominantBaseline="central" fontSize="11" fill={FOAM} fillOpacity="0.72" pointerEvents="none">
+        <text key={`ln${i}`} x={SK_L - 8} y={n.y + n.h / 2} textAnchor="end" dominantBaseline="central" fontSize={font} fill={FOAM} fillOpacity="0.72" pointerEvents="none">
           {tile.from[i]}
         </text>
       ))}
       {right.map((n, i) => (
-        <text key={`rn${i}`} className="lk-fade" style={{ animationDelay: "0.7s" }} x={SK_R + 16} y={n.y + n.h / 2} dominantBaseline="central" fontSize="11" fill={FOAM} fillOpacity="0.72" pointerEvents="none">
+        <text key={`rn${i}`} className="lk-fade" style={{ animationDelay: "0.7s" }} x={SK_R + 16} y={n.y + n.h / 2} dominantBaseline="central" fontSize={font} fill={FOAM} fillOpacity="0.72" pointerEvents="none">
           {tile.to[i]}
         </text>
       ))}
