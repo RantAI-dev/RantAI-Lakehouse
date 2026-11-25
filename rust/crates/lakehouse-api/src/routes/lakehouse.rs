@@ -1575,6 +1575,45 @@ mod tests {
         );
     }
 
+    /// OPS-21 / owner decision 2026-11-24: the need count is the G3-measured
+    /// 20 small files per day partition (~15-20x worse planning time than a
+    /// one-file control; `docs/plans/G3-RESULT.md`, ADR 0009), not a guessed
+    /// tolerance. Moving this bar is an owner decision, not a refactor.
+    #[test]
+    fn needs_compaction_file_count_is_pinned_at_the_measured_twenty() {
+        assert_eq!(
+            NEEDS_COMPACTION_FILE_COUNT, 20,
+            "the 20-file bar is measured (`docs/plans/G3-RESULT.md`, ADR 0009); changing it is an owner decision"
+        );
+    }
+
+    /// OPS-21: literal counts on both sides of the bar, so changing the
+    /// constant cannot quietly move which tables the status endpoint warns
+    /// about. 19 is below the measured need count; 20 is at it.
+    #[test]
+    fn compaction_status_warns_at_twenty_but_not_nineteen_files() {
+        let candidates = vec!["nineteen".to_owned(), "twenty".to_owned()];
+        let counts = HashMap::from([
+            ("nineteen".to_owned(), 19_u64),
+            ("twenty".to_owned(), 20_u64),
+        ]);
+
+        let body = compaction_status_body(false, &candidates, &counts);
+
+        assert_eq!(body["needsCompactionFileCount"], json!(20));
+        let names: Vec<&str> = body["tables"]
+            .as_array()
+            .expect("tables is an array")
+            .iter()
+            .map(|t| t["name"].as_str().expect("name is a string"))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["twenty"],
+            "19 measured files stay silent; 20 measured files appear in tables"
+        );
+    }
+
     #[test]
     fn compaction_status_is_silent_when_trino_is_available() {
         let body = compaction_status_body(

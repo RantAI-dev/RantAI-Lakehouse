@@ -372,7 +372,9 @@ describe("a column's row", () => {
     const marksBesideName = nameLine(row).lastElementChild as HTMLElement
     expect(marksBesideName.textContent).toBe("sort key")
     expect(marksBesideName.classList.contains("hidden")).toBe(true)
-    expect(marksBesideName.classList.contains("@lg:flex")).toBe(true)
+    // UX-8 browser review: from @lg the marks are `contents`, so each is an item of the
+    // name's one-line wrapping line and drops whole when it does not fit, never squeezing the name.
+    expect(marksBesideName.classList.contains("@lg:contents")).toBe(true)
     expect(marksBesideName.classList.contains("flex")).toBe(false)
 
     // On the type's line below @lg, after the type, and gone from @lg up. The type is what
@@ -558,9 +560,16 @@ describe("opening a column", () => {
 })
 
 describe("what the card shows without a profile", () => {
+  // UX-8 browser review: one short line; the server's engine detail is the ⓘ, read out as its name.
+  it("keeps the server's reason for no statistics in the ⓘ, not in the line", () => {
+    renderCard(ROWS, { kind: "unsupported", reason: "no ClickHouse table and no Iceberg table" })
+    expect(screen.getByRole("button", { name: "no ClickHouse table and no Iceberg table" })).toBeTruthy()
+    expect(screen.queryByText(/no ClickHouse table/)).toBeNull()
+  })
+
   const states: [string, ProfileState, string][] = [
     ["restricted", { kind: "restricted" }, "Column statistics are read from the data, so they need the query:read permission."],
-    ["unsupported", { kind: "unsupported", reason: "no table to read" }, "No column statistics: no table to read"],
+    ["unsupported", { kind: "unsupported", reason: "no table to read" }, "No column statistics yet"],
     ["failed", { kind: "error", message: "boom", retry: () => {} }, "Column statistics failed to load: boom"],
   ]
 

@@ -3,6 +3,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import { GitBranch } from "lucide-react"
 import {
+  activeNavHref,
   canOpen,
   filterNavSectionsForInstallMode,
   isHiddenInBiOnly,
@@ -299,6 +300,27 @@ describe("ADM-13 D7: nav-config access map and drift tests", () => {
   })
 })
 
+// WEB-18 (owner 2026-11-14): the chats are listed in a conversation's sidebar, so History has
+// no entry and no page; its old address is a redirect, open to whoever reaches it.
+describe("WEB-18: no History page", () => {
+  it("has no History entry, and a conversation highlights no menu row", () => {
+    const hrefs = NAV_GROUPS.flatMap((g) => g.items.map((it) => it.href))
+    expect(hrefs).not.toContain("/copilot/history")
+    expect(NAV_GROUPS.map((g) => g.label)).not.toContain("History")
+    expect(activeNavHref("/copilot")).toBeUndefined()
+  })
+
+  it("keeps /copilot/history only as an HTTP redirect to the newest conversation", async () => {
+    // A page calling `redirect()` would be swallowed by `RouteGuard` for an unlisted address,
+    // so the redirect is the server's (`next.config.ts`), and there is no page and no entry.
+    const { default: nextConfig } = await import("../../../next.config")
+    const redirects = (await nextConfig.redirects?.()) ?? []
+    expect(redirects).toContainEqual({ source: "/copilot/history", destination: "/copilot?open=latest", permanent: false })
+    expect(fs.existsSync("src/app/copilot/history/page.tsx")).toBe(false)
+    expect(ROUTE_ACCESS.some((e) => e.pattern === "/copilot/history")).toBe(false)
+  })
+})
+
 describe("BI-44: navigation in a bi-only installation", () => {
   it("recognises warehouse-only hrefs, including their child routes", () => {
     for (const href of ["/pipelines", "/storage", "/lakehouse", "/uploads", "/gold", "/gold-exports"]) {
@@ -309,9 +331,10 @@ describe("BI-44: navigation in a bi-only installation", () => {
   })
 
   it("keeps the BI, governance and administration hrefs visible", () => {
+    // WEB-18 removed the History nav entry (its redirect is covered above), so it is not
+    // in NAV_GROUPS any more; the other BI-visible hrefs stay.
     for (const href of [
       "/",
-      "/copilot/history",
       "/dashboards",
       "/catalog",
       "/query-studio",
@@ -342,7 +365,6 @@ describe("BI-44: navigation in a bi-only installation", () => {
     expect(filtered.some((group) => group.label === "Build")).toBe(false)
     for (const kept of [
       "/",
-      "/copilot/history",
       "/dashboards",
       "/catalog",
       "/query-studio",

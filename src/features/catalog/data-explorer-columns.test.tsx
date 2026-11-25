@@ -2,12 +2,13 @@
 // row sits under its name, and the Owner and Tags columns filter through a
 // `filters` parameter the API accepts (`routes/catalog_query.rs`: `tags` is
 // filterable and refused as a sort or group field).
-import { render, screen } from "@testing-library/react"
+import { cleanup, render, screen } from "@testing-library/react"
 import type { ColumnDef } from "@tanstack/react-table"
 import { describe, expect, it } from "bun:test"
 import { getDefaultFilterOperator } from "@/lib/data-table"
 import { filterParam } from "@/lib/table-filter-link"
 import type { Asset } from "@/services/contracts/assets"
+import { getAssetActions } from "./data-explorer-actions"
 import { getDataExplorerColumns } from "./data-explorer-columns"
 
 const columns = getDataExplorerColumns({ onOpen: () => {} })
@@ -130,3 +131,18 @@ describe("Data Explorer certification mark (DATA-12)", () => {
   })
 })
 
+
+describe("the Catalog's address and row actions (UX-8)", () => {
+  it("shows the table's address under the name: the table key, else the id", () => {
+    render(<>{cellOf("name", { name: "Orders", id: "orders", tableKey: "bronze.orders" })}</>)
+    expect(screen.getByText("bronze.orders")).toBeTruthy()
+    cleanup()
+    render(<>{cellOf("name", { name: "Mart", id: "serving.mart_wisman" })}</>)
+    expect(screen.getByText("serving.mart_wisman")).toBeTruthy()
+  })
+
+  it("offers open, copy table name, copy asset ID and copy namespace, in that order", () => {
+    const actions = getAssetActions({ id: "silver.orders", namespace: "silver" } as Asset, { onOpen: () => {} })
+    expect(actions.map((a) => a.label)).toEqual(["Open asset", "Copy table name", "Copy asset ID", "Copy namespace"])
+  })
+})

@@ -9,6 +9,7 @@ import {
   Download,
   GripVertical,
   Layers2,
+  MoreHorizontal,
   RefreshCw,
   RotateCcw,
   Settings2,
@@ -62,6 +63,18 @@ interface DataTableSettingsMenuProps<TData> {
    * nothing sensible to call the file, so the export item stays hidden.
    */
   exportName?: string;
+  /**
+   * `"page"` draws this menu as the page's own ⋯ in the page frame
+   * (`UX-8`, `DESIGN.md` §3: title, search, ⋯, primary on one row): a ghost
+   * ⋯ button named `label`, with "Columns" for the column picker. The items
+   * are the same, so a page that moves the menu up loses none of them.
+   * `"settings"` (the default) is the toolbar's gear, as every other table has.
+   */
+  variant?: "settings" | "page";
+  /** The ⋯ button's accessible name in the `"page"` variant. */
+  label?: string;
+  /** Page items, under their own divider after the table's (e.g. the Catalog's dropped tables). */
+  extraItems?: React.ReactNode;
 }
 
 export function DataTableSettingsMenu<TData>({
@@ -71,7 +84,11 @@ export function DataTableSettingsMenu<TData>({
   columnControls = true,
   disabled,
   exportName,
+  variant = "settings",
+  label = "More actions",
+  extraItems,
 }: DataTableSettingsMenuProps<TData>) {
+  const page = variant === "page";
   const resetLayout = table.options.meta?.resetLayout;
   const groupBy = table.options.meta?.groupBy ?? null;
   const setGroupBy = table.options.meta?.setGroupBy;
@@ -166,27 +183,39 @@ export function DataTableSettingsMenu<TData>({
         <TooltipTrigger
           render={
             <DropdownMenuTrigger asChild>
-              <Button
-                aria-label="Table settings"
-                variant="outline"
-                size="icon"
-                disabled={disabled}
-              >
-                <Settings2 className="text-muted-foreground" />
-              </Button>
+              {page ? (
+                <Button
+                  aria-label={label}
+                  variant="ghost"
+                  size="icon"
+                  disabled={disabled}
+                  className="text-muted-foreground data-[state=open]:bg-muted"
+                >
+                  <MoreHorizontal />
+                </Button>
+              ) : (
+                <Button
+                  aria-label="Table settings"
+                  variant="outline"
+                  size="icon"
+                  disabled={disabled}
+                >
+                  <Settings2 className="text-muted-foreground" />
+                </Button>
+              )}
             </DropdownMenuTrigger>
           }
         />
-        <TooltipContent>Settings</TooltipContent>
+        <TooltipContent>{page ? "More" : "Settings"}</TooltipContent>
       </Tooltip>
 
-      <DropdownMenuContent align="end" className="w-44">
+      <DropdownMenuContent align="end" className={page ? "w-52" : "w-44"}>
         {columnControls && (
           <>
             <DropdownMenuSub>
               <DropdownMenuSubTrigger>
                 <Columns3 className="text-muted-foreground" />
-                View
+                {page ? "Columns" : "View"}
               </DropdownMenuSubTrigger>
               <DropdownMenuPortal>
                 <DropdownMenuSubContent className="max-h-72 w-48 overflow-y-auto">
@@ -386,6 +415,13 @@ export function DataTableSettingsMenu<TData>({
             Refresh data
           </DropdownMenuItem>
         )}
+
+        {extraItems ? (
+          <>
+            <DropdownMenuSeparator />
+            {extraItems}
+          </>
+        ) : null}
 
         {columnControls && resetLayout && (
           <>

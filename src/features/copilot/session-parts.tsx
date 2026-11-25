@@ -47,9 +47,11 @@ export function SessionModeIcon({ mode, className }: { readonly mode: string; re
 }
 
 /**
- * The recent-conversations list shared by the header history menus: recent
- * sessions, then "View all history" and "New chat". Managing a session
- * (rename, delete) lives on the history page, not in a menu row.
+ * The recent-conversations list of the AI Copilot panel's history menu:
+ * recent sessions, then "View all chats" and "New chat". All the chats, and
+ * renaming or deleting one, are in the sidebar of a conversation (`WEB-18`),
+ * so "View all chats" opens one (the open one, or the newest) rather than a
+ * History page, which is gone.
  */
 export function RecentSessionsMenuContent({
   sessions,
@@ -64,6 +66,7 @@ export function RecentSessionsMenuContent({
   readonly onNew: () => void;
   readonly limit?: number;
 }) {
+  const allChatsId = activeId ?? sessions[0]?.id ?? null;
   return (
     <>
       {sessions.length > 0 ? (
@@ -93,10 +96,12 @@ export function RecentSessionsMenuContent({
         <div className="px-3 py-4 text-center text-xs text-muted-foreground">No conversations yet</div>
       )}
       <DropdownMenuSeparator />
-      <DropdownMenuItem render={<Link href="/copilot/history" />} className="text-xs">
-        <Search className="size-3.5" />
-        View all history
-      </DropdownMenuItem>
+      {allChatsId ? (
+        <DropdownMenuItem render={<Link href={`/copilot?id=${encodeURIComponent(allChatsId)}`} />} className="text-xs">
+          <Search className="size-3.5" />
+          View all chats
+        </DropdownMenuItem>
+      ) : null}
       <DropdownMenuItem onClick={onNew} className="text-xs">
         <Plus className="size-3.5" />
         New chat
@@ -163,15 +168,23 @@ export function RenameSessionDialog({
   );
 }
 
-/** The ⋯ menu on a conversation row: Rename and Delete (confirmed first). */
+/**
+ * The ⋯ menu on a conversation row: Rename and Delete (confirmed first).
+ *
+ * `trigger` replaces the default ghost icon button, so a row that has its own
+ * action slot (the sidebar's chat list, `SidebarMenuAction`) keeps its look;
+ * it receives the menu's props and the ⋯ icon.
+ */
 export function SessionActionsMenu({
   session,
   onRename,
   onDelete,
+  trigger,
 }: {
   readonly session: SessionMeta;
   readonly onRename: (title: string) => Promise<boolean>;
   readonly onDelete: () => Promise<boolean>;
+  readonly trigger?: React.ReactElement;
 }) {
   const [renaming, setRenaming] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
@@ -181,13 +194,15 @@ export function SessionActionsMenu({
     <>
       <DropdownMenu>
         <DropdownMenuTrigger
+          aria-label={`Actions for ${session.title}`}
           render={
-            <Button
-              variant="ghost"
-              size="icon"
-              className="size-8 text-muted-foreground hover:text-foreground"
-              aria-label={`Actions for ${session.title}`}
-            />
+            trigger ?? (
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-8 text-muted-foreground hover:text-foreground"
+              />
+            )
           }
         >
           <MoreHorizontal className="size-4" />
