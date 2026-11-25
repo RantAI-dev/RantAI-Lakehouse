@@ -1363,7 +1363,8 @@ fn agents_router() -> Router<AppState> {
         // are absent from `POLICY_TABLE` too, so they answer 404 — pinned
         // by `tests/route_auth.rs`'s `web4_retired_paths_are_not_registered`.
         //
-        // The three employee routes that remain are live consumers, not
+        // Four employee routes remain, all with live consumers (the fourth
+        // is SEC-68's `PUT /employees/{id}/read-roles`, noted below) — not
         // console leftovers: `GET /employees` is read at code-load by
         // Dagster's schedule factory
         // (`dagster/dispar_orchestrate/agent_runs.py`), `GET /employees/{id}`
@@ -1373,6 +1374,13 @@ fn agents_router() -> Router<AppState> {
         // creates a real `agent_run` and its page shows the trace.
         .route("/api/agents/employees", get(agents::list_employees))
         .route("/api/agents/employees/{id}", get(agents::get_employee))
+        // SEC-68: set an employee's explicit table-access role grant. A
+        // dedicated live route on the employee store/read path — no
+        // dependency on the retired workflows/suspend/resume/revoke routes.
+        .route(
+            "/api/agents/employees/{id}/read-roles",
+            axum::routing::put(agents::set_employee_read_roles),
+        )
         .route(
             "/api/agents/employees/{id}/run",
             axum::routing::post(agents::run_employee),
