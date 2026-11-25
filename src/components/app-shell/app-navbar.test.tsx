@@ -155,6 +155,15 @@ describe("the account menu", () => {
 // Owner 2026-11-14 ("AI ini bisa ditempatkan di paling kanan dan kasih label dong"): the AI Copilot
 // is the navbar's last item, named, with the assistant's mark, and pressed while its panel is open.
 describe("AppNavbar AI Copilot entry", () => {
+  // PR #541 review 1: the click below opens the Copilot, and `setExpanded`
+  // persists `copilot-dock-exp=1`. localStorage is shared by every file in a
+  // `bun test` process, so a later file that renders the dock (per-role
+  // navigation) would mount with it open and fail on the pill-to-box handover.
+  // Clear what this describe left behind, as `dashboard-refused-param.test.tsx` does.
+  afterEach(() => {
+    window.localStorage.clear()
+  })
+
   it("is the last button, labelled, and toggles its pressed state", async () => {
     spyOn(globalThis, "fetch").mockImplementation(((input: RequestInfo | URL) => {
       if (String(input).includes("/api/auth/me")) {
