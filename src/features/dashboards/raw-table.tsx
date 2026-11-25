@@ -117,7 +117,7 @@ export function RawTable({
             ) : rows.map((r, i) => (
               <tr key={i} className="border-b border-border/40 last:border-0">
                 {shown.map((c) => (
-                  <td key={c} style={{ ...columnStyle(settings[c]), ...conditionalCss(def?.conditional, c, r[c], domains) }} className={cellClass(settings[c])}><CellValue value={r[c]} setting={settings[c]} format={def?.valueFormats?.[c] ?? def?.format} /></td>
+                  <td key={c} style={{ ...columnStyle(settings[c]), ...conditionalCss(def?.conditional, c, r[c], domains) }} className={cellClass(settings[c])}><CellValue value={r[c]} setting={settings[c]} format={def?.valueFormats?.[c] ?? def?.format} column={c} /></td>
                 ))}
               </tr>
             ))}

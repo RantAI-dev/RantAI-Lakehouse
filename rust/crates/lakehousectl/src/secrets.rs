@@ -57,6 +57,8 @@ use std::path::Path;
 use base64::Engine as _;
 use rand::Rng;
 
+use crate::cli::{InstallModeArg, QueryEngineArg};
+
 /// The template the `.env` is written from.
 ///
 /// The repository's `.env.example` is the list of keys (REL-2 decision
@@ -95,6 +97,19 @@ const TENANT_SECRET_KEY: &str = "TENANT_WAREHOUSE_S3_SECRET_KEY";
 const HEX_BYTES: usize = 24;
 /// How many bytes the base64 value holds.
 const BASE64_BYTES: usize = 32;
+
+/// The two variables the API reads to learn the install's shape (`BI-44`).
+pub const INSTALL_MODE_VARIABLE: &str = "LAKEHOUSE_INSTALL_MODE";
+pub const QUERY_ENGINE_VARIABLE: &str = "LAKEHOUSE_QUERY_ENGINE";
+/// The address of the federated coordinator in a `bi-only+trino` install.
+pub const TRINO_URL_VARIABLE: &str = "TRINO_URL";
+pub const TRINO_URL_VALUE: &str = "http://trino:8080";
+/// The names that would point at a second engine.
+///
+/// `lakehouse-api` names the built-in engine's address `CH_URL`; the longer
+/// spelling is refused nowhere, so both are commented out in a federated
+/// install. A commented-out line sets nothing (see `env::name_of`).
+pub const OTHER_ENGINE_URL_VARIABLES: [&str; 2] = ["CH_URL", "CLICKHOUSE_URL"];
 
 /// The variable Compose reads the profiles from.
 ///
@@ -176,7 +191,31 @@ pub struct Secrets {
 ///
 /// Returns the error the operating system gave when the file could not
 /// be written.
+#[cfg(test)]
 pub fn write_env(path: &Path) -> Result<Secrets, std::io::Error> {
+    // The unchanged default: no new lines in a full install's `.env`.
+    // Production installs call `write_env_with_mode` with the parsed flags;
+    // this entry point stays for the existing full-mode tests.
+    write_env_with_mode(path, InstallModeArg::Full, QueryEngineArg::ClickHouse)
+}
+
+/// Write the install's `.env` for a given install mode and engine (`BI-44`).
+///
+/// A `bi-only` answer is written into the SAME file, still mode 0600 and
+/// still without overwriting an operator's values: the two mode variables
+/// and the one engine's URL are the only lines this function adds, and a
+/// line that would name the other engine is commented out. A `full` answer
+/// runs the original writer unchanged, byte for byte.
+///
+/// # Errors
+///
+/// Returns the error the operating system gave when the file could not
+/// be written.
+pub fn write_env_with_mode(
+    path: &Path,
+    mode: InstallModeArg,
+    engine: QueryEngineArg,
+) -> Result<Secrets, std::io::Error> {
     if path.exists() {
         // Never overwritten. The mode is still set: a `.env` an
         // operator copied around must not be readable by anyone else.
@@ -197,11 +236,12 @@ pub fn write_env(path: &Path) -> Result<Secrets, std::io::Error> {
         // more than one tenant refuses every job with no user until it
         // is set. An operator's own value is never changed.
         let with_tenant = with_the_catalog_tenant(&with_profiles);
-        if with_tenant != text {
-            write_replacing(path, &with_tenant)?;
+        let with_mode = with_install_mode(&with_tenant, mode, engine);
+        if with_mode != text {
+            write_replacing(path, &with_mode)?;
         }
         return Ok(Secrets {
-            admin_email: read_value(&with_tenant, "AUTH_BOOTSTRAP_EMAIL").unwrap_or_default(),
+            admin_email: read_value(&with_mode, "AUTH_BOOTSTRAP_EMAIL").unwrap_or_default(),
             admin_password: None,
         });
     }
@@ -248,6 +288,10 @@ pub fn write_env(path: &Path) -> Result<Secrets, std::io::Error> {
     // leaves the key empty, and a stack with more than one tenant
     // refuses every job with no user until it is set (REL-10 D1).
     let text = with_the_catalog_tenant(&text);
+
+    // `BI-44`: the mode and the single engine go into the file the API
+    // reads at start-up, after the template's keys are filled.
+    let text = with_install_mode(&text, mode, engine);
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -340,6 +384,68 @@ fn with_the_catalog_tenant(text: &str) -> String {
             out
         }
     }
+}
+
+/// The `.env` with the installer's mode and exactly one engine URL (`BI-44`).
+///
+/// A `full` install gets no new line at all: its existing `COMPOSE_PROFILES`
+/// decide which optional services run, and `--engine` is refused there. In
+/// `bi-only`, the API's mutual-exclusion rule is written as data: a Trino
+/// install names `TRINO_URL` and has no `ClickHouse` URL; a `ClickHouse`
+/// install has no `TRINO_URL`. An operator's own commented-out line is left
+/// as it is.
+fn with_install_mode(text: &str, mode: InstallModeArg, engine: QueryEngineArg) -> String {
+    if mode == InstallModeArg::Full {
+        return text.to_string();
+    }
+    let mut out = crate::env::with_variable(text, INSTALL_MODE_VARIABLE, mode.as_str());
+    out = crate::env::with_variable(&out, QUERY_ENGINE_VARIABLE, engine.as_str());
+    match engine {
+        QueryEngineArg::Trino => {
+            out = crate::env::with_variable(&out, TRINO_URL_VARIABLE, TRINO_URL_VALUE);
+            for name in OTHER_ENGINE_URL_VARIABLES {
+                out = comment_out_variable(&out, name);
+            }
+        }
+        QueryEngineArg::ClickHouse => {
+            out = comment_out_variable(&out, TRINO_URL_VARIABLE);
+        }
+    }
+    out
+}
+
+/// Comment out every ACTIVE line naming `name`, and leave a commented
+/// placeholder when the key was absent, so a reader sees the exclusion
+/// where the other engine's URL would have been. Idempotent: a line the
+/// tool (or the operator) already commented out stays a single line.
+fn comment_out_variable(text: &str, name: &str) -> String {
+    let mut found = false;
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let declaration = trimmed.strip_prefix('#').unwrap_or(trimmed).trim();
+        if crate::env::name_of(declaration) == Some(name) {
+            found = true;
+            if trimmed.starts_with('#') {
+                lines.push(line.to_string());
+            } else {
+                lines.push(format!("# {line}"));
+            }
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    let mut out = lines.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    if !found {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        let _ = writeln!(out, "# {name}=");
+    }
+    out
 }
 
 /// Replace the empty assignment of a key with a value.
@@ -1203,5 +1309,112 @@ mod tests {
             error.to_string().contains(".env"),
             "the error says what failed: {error}"
         );
+    }
+
+    #[test]
+    fn a_full_install_adds_no_mode_line_to_its_env() {
+        // The full `.env` stays byte-for-byte what the earlier writer made.
+        let text = "POSTGRES_PASSWORD=x\nCOMPOSE_PROFILES=dagster\n";
+        assert_eq!(
+            with_install_mode(text, InstallModeArg::Full, QueryEngineArg::ClickHouse),
+            text
+        );
+    }
+
+    #[test]
+    fn a_bi_only_trino_env_names_one_engine_and_no_clickhouse_url() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+        write_env_with_mode(&path, InstallModeArg::BiOnly, QueryEngineArg::Trino)
+            .expect("the .env is written");
+
+        let text = std::fs::read_to_string(&path).expect("the .env is readable");
+        assert_eq!(
+            read_value(&text, INSTALL_MODE_VARIABLE).as_deref(),
+            Some("bi-only")
+        );
+        assert_eq!(
+            read_value(&text, QUERY_ENGINE_VARIABLE).as_deref(),
+            Some("trino")
+        );
+        assert_eq!(
+            read_value(&text, TRINO_URL_VARIABLE).as_deref(),
+            Some(TRINO_URL_VALUE)
+        );
+        for name in OTHER_ENGINE_URL_VARIABLES {
+            assert_eq!(
+                read_value(&text, name),
+                None,
+                "{name} would start a second engine"
+            );
+            assert!(
+                text.contains(&format!("# {name}=")),
+                "{name} is not visibly excluded: {text}"
+            );
+        }
+        let mode = std::fs::metadata(&path)
+            .expect("the .env has metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the .env is mode {mode:o}");
+    }
+
+    #[test]
+    fn a_bi_only_clickhouse_env_names_one_engine_and_no_trino_url() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+        write_env_with_mode(&path, InstallModeArg::BiOnly, QueryEngineArg::ClickHouse)
+            .expect("the .env is written");
+
+        let text = std::fs::read_to_string(&path).expect("the .env is readable");
+        assert_eq!(
+            read_value(&text, INSTALL_MODE_VARIABLE).as_deref(),
+            Some("bi-only")
+        );
+        assert_eq!(
+            read_value(&text, QUERY_ENGINE_VARIABLE).as_deref(),
+            Some("clickhouse")
+        );
+        assert_eq!(read_value(&text, TRINO_URL_VARIABLE), None);
+        assert!(text.contains("# TRINO_URL="));
+    }
+
+    #[test]
+    fn an_existing_trino_url_is_commented_out_for_a_clickhouse_install() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+        std::fs::write(
+            &path,
+            "POSTGRES_PASSWORD=operators-own-value\nTRINO_URL=http://old-trino:8080\n",
+        )
+        .expect("the old .env is written");
+
+        write_env_with_mode(&path, InstallModeArg::BiOnly, QueryEngineArg::ClickHouse)
+            .expect("the mode is written");
+
+        let text = std::fs::read_to_string(&path).expect("the .env is readable");
+        assert_eq!(read_value(&text, TRINO_URL_VARIABLE), None);
+        assert_eq!(
+            text.matches("TRINO_URL=http://old-trino:8080").count(),
+            1,
+            "the operator's line was not kept as a comment"
+        );
+        assert!(text.contains("# TRINO_URL=http://old-trino:8080"));
+        assert!(text.contains("POSTGRES_PASSWORD=operators-own-value"));
+    }
+
+    #[test]
+    fn a_second_bi_only_write_changes_nothing() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+        write_env_with_mode(&path, InstallModeArg::BiOnly, QueryEngineArg::Trino)
+            .expect("the first write works");
+        let before = std::fs::read_to_string(&path).expect("the .env is readable");
+        write_env_with_mode(&path, InstallModeArg::BiOnly, QueryEngineArg::Trino)
+            .expect("the second write works");
+        let after = std::fs::read_to_string(&path).expect("the .env is readable");
+        assert_eq!(after, before, "the second write duplicated a line");
     }
 }

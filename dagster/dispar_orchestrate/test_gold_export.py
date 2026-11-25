@@ -1003,5 +1003,117 @@ class GoldTrimSharedCleanupTests(unittest.TestCase):
         )
 
 
+class GoldZoneSchedulingTests(unittest.TestCase):
+    """DATA-65: Silver and Gold publications of the same bare mart name
+    are two schedules, two step keys, two API calls and two histories."""
+
+    def _publications_response(self, publications: list[dict]) -> mock.Mock:
+        response = mock.Mock(spec=requests.Response)
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"publications": publications}
+        return response
+
+    def test_both_zones_of_the_same_bare_mart_are_kept(self) -> None:
+        response = self._publications_response(
+            [{"mart": "orders", "zone": "silver"}, {"mart": "orders", "zone": "gold"}]
+        )
+        with mock.patch.object(gold_export.requests, "get", return_value=response):
+            marts = gold_export._enabled_publication_marts(_cfg())
+        self.assertEqual(list(marts), ["orders", "orders"])
+        self.assertEqual(
+            [(t.mart, t.zone) for t in marts.targets],
+            [("orders", gold_export.ZONE_SILVER), ("orders", gold_export.ZONE_GOLD)],
+        )
+
+    def test_a_pre_data65_publication_defaults_to_gold(self) -> None:
+        response = self._publications_response([{"mart": "orders"}])
+        with mock.patch.object(gold_export.requests, "get", return_value=response):
+            marts = gold_export._enabled_publication_marts(_cfg())
+        self.assertEqual([t.zone for t in marts.targets], [gold_export.ZONE_GOLD])
+
+    def test_an_unknown_publication_zone_is_a_non_retryable_failure(self) -> None:
+        response = self._publications_response(
+            [{"mart": "orders", "zone": "bronze"}]
+        )
+        with mock.patch.object(gold_export.requests, "get", return_value=response):
+            with self.assertRaises(gold_export.Failure) as raised:
+                gold_export._enabled_publication_marts(_cfg())
+        self.assertFalse(raised.exception.allow_retries)
+
+    def test_silver_export_posts_the_zone_param_and_gold_does_not(self) -> None:
+        response = mock.Mock(spec=requests.Response)
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"rowsExported": 1}
+        with mock.patch.object(gold_export.requests, "post", return_value=response) as post:
+            gold_export.export_one_mart(_cfg(), "orders", "silver")
+        self.assertEqual(
+            post.call_args.kwargs["params"], {"ifChanged": "true", "zone": "silver"}
+        )
+        with mock.patch.object(gold_export.requests, "post", return_value=response) as post:
+            gold_export.export_one_mart(_cfg(), "orders")
+        self.assertEqual(post.call_args.kwargs["params"], {"ifChanged": "true"})
+
+    def test_silver_and_gold_publications_get_distinct_mapped_steps(self) -> None:
+        from dispar_orchestrate import gold_export
+
+        cfg = mock.Mock(marts=[], ch=None)
+        publications = gold_export.PublicationMarts(
+            ["orders", "orders"],
+            [
+                gold_export.MartExportTarget("orders", "silver"),
+                gold_export.MartExportTarget("orders", "gold"),
+            ],
+        )
+        exported: list[tuple[str, str]] = []
+
+        def fake_export(_cfg, mart, zone=gold_export.DEFAULT_ZONE):
+            exported.append((mart, zone))
+            return {"rowsExported": 2}
+
+        with mock.patch.object(gold_export.GoldExportConfig, "from_env", return_value=cfg), \
+                mock.patch.object(gold_export, "_enabled_publication_marts", return_value=publications), \
+                mock.patch.object(gold_export, "export_one_mart", side_effect=fake_export), \
+                mock.patch.object(gold_export, "record_maintenance_run") as mocked_record:
+            result = gold_export_job.execute_in_process(raise_on_error=False)
+
+        self.assertTrue(result.success)
+        step_keys = {e.step_key for e in result.all_events if e.event_type_value == "STEP_SUCCESS"}
+        self.assertIn("export_gold_mart[orders]", step_keys)
+        self.assertIn("export_gold_mart[silver__orders]", step_keys)
+        self.assertEqual(
+            sorted(exported), [("orders", "gold"), ("orders", "silver")]
+        )
+        tables = [c.kwargs.get("table_name") for c in mocked_record.call_args_list]
+        self.assertIn("gold.orders", tables)
+        self.assertIn("silver.orders", tables)
+
+    def test_a_silver_trim_targets_the_silver_namespace(self) -> None:
+        from unittest.mock import MagicMock
+
+        cfg = _cfg()
+        mock_table = MagicMock()
+        mock_table.scan.return_value.to_arrow.return_value = None
+        mock_table.scan.return_value.to_arrow.side_effect = None
+        mock_catalog = MagicMock()
+        mock_catalog.load_table.return_value = mock_table
+
+        # A zero-row table short-circuits the trim after the catalog load,
+        # so no PyIceberg mutation is needed to prove the namespace choice.
+        import pyarrow as pa
+
+        mock_table.scan.return_value.to_arrow.side_effect = None
+        mock_table.scan.return_value.to_arrow.return_value = pa.Table.from_arrays(
+            [pa.array([], type=pa.timestamp("us"))], names=["_exported_at"]
+        )
+        with mock.patch.object(gold_export, "load_gold_catalog", return_value=mock_catalog), \
+                mock.patch.object(gold_export, "record_gold_trim_run") as mocked_record:
+            result = gold_export.run_trim_for_mart(cfg, "orders", zone="silver")
+
+        self.assertEqual(result["status"], "nothing_to_trim")
+        mock_catalog.load_table.assert_called_once_with("silver.orders")
+        self.assertEqual(mocked_record.call_args.kwargs["zone"], "silver")
+        self.assertEqual(mocked_record.call_args.kwargs["mart"], "orders")
+
+
 if __name__ == "__main__":
     unittest.main()

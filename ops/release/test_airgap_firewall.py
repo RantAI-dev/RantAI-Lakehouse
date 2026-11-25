@@ -182,8 +182,9 @@ class AirgapFirewallTest(unittest.TestCase):
             commands.index(lo_rule),
             min(commands.index(line) for line in rejects),
         )
-        # No chain/rule in the FORWARD path: container egress (with its
-        # `apk add` init containers) is REL-16's work, not ours.
+        # No chain/rule in the FORWARD path: this script owns host OUTPUT.
+        # REL-16 cut container egress on DOCKER-USER in the release workflow,
+        # after replacing the `apk add` init containers; that is not ours.
         for line in commands:
             self.assertNotIn("DOCKER-USER", line)
             self.assertNotIn("-A FORWARD", line)

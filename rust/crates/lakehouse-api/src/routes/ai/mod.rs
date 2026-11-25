@@ -41,7 +41,7 @@ use axum::extract::{Extension, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
-use lakehouse_clickhouse::{ChClient, QueryOptions};
+use lakehouse_clickhouse::{ChClient, ChTableEnsured, QueryOptions};
 use lakehouse_core::ApiError;
 use lakehouse_llm::{
     ChatOptions, HiddenSpans, LlmMessage, LlmMessageRole, StreamPiece, ToolCall, ToolCallFunction,
@@ -115,6 +115,11 @@ pub async fn build_status(
 // ── POST /api/ai/chat ───────────────────────────────────────────────────
 
 const MAX_ITER: u32 = 8;
+
+/// The note the answer carries when the loop used all of its tool-calling
+/// rounds. Also the signal that the final answer followed the tool-call limit,
+/// so a chart claim in it can be checked against what the trace really did.
+const TOOL_LIMIT_NOTE: &str = "tool-call limit reached";
 
 /// How many times the same call with the same arguments may fail before the
 /// chat loop stops calling tools (plan 111, the parking lot's item 6).
@@ -619,6 +624,13 @@ async fn system_prompt(
     sql_help: bool,
 ) -> String {
     let latest_user = user_messages.last().copied().unwrap_or_default();
+    // `BI-44` slice 3: a `bi-only` install has no lakehouse DATA MAP, and
+    // the map builder below reads `ClickHouse` and Lakekeeper, which that
+    // deployment never started. `full` mode never enters this helper, so
+    // its prompt stays byte for byte what `AI-32` pinned.
+    if state.config.is_bi_only() {
+        return bi_only_system_prompt(state, is_build, asking, sql_help, context, latest_user);
+    }
     let withheld = withheld_by_policy(state).await;
     let terms = users_terms(state, principal).await;
     // The DATA MAP describes the shared, one-per-deployment catalog and
@@ -661,17 +673,16 @@ async fn system_prompt(
             // which roles may read what hides every table (fail closed) —
             // the map still renders, with none of its tables in it.
             let access = match principal {
+                // SEC-68: a role-less service identity is not a wildcard
+                // admin. `for_principal` answers zero tables for it, keeps a
+                // genuine `*:*` admin at `All`, and degrades to `All` only
+                // for a non-empty role set with no Postgres pool.
                 Some(principal) => {
-                    crate::table_access::for_roles(state.pg.as_deref(), &principal.role_names)
+                    crate::table_access::for_principal(state.pg.as_deref(), principal)
                         .await
-                        .unwrap_or_else(|_| {
-                            crate::table_access::TableAccess::Listed(
-                                std::collections::HashSet::new(),
-                                std::collections::HashSet::new(),
-                            )
-                        })
+                        .unwrap_or_else(|_| crate::table_access::TableAccess::none())
                 }
-                None => crate::table_access::TableAccess::All,
+                None => crate::table_access::TableAccess::none(),
             };
             // `SEC-20`, plan 97: the closing line of the map names registry
             // datasets, which another tenant's upload is one of. The reach is
@@ -726,6 +737,41 @@ async fn system_prompt(
     } + &words
         + &ctx_line
         + &prompt::closing(latest_user, state.config.ai_default_reply_language))
+}
+
+/// The `bi-only` prompt: the measured base and the same switch-controlled
+/// rules, plus [`prompt::bi_only_engine_rules`] and an honest "no DATA MAP"
+/// line instead of the lakehouse catalog (which this install does not have).
+/// The reply-language line stays last, as in `full` mode.
+fn bi_only_system_prompt(
+    state: &AppState,
+    is_build: bool,
+    asking: bool,
+    sql_help: bool,
+    context: &str,
+    latest_user: &str,
+) -> String {
+    let base = if is_build {
+        format!("{}{}", prompt::SYSTEM_BASE, prompt::SYSTEM_BUILD_SUFFIX)
+    } else {
+        format!("{}{}", prompt::SYSTEM_BASE, prompt::SYSTEM_ASK_SUFFIX)
+    };
+    let mut rules = String::new();
+    if state.config.ai_ask_back && asking {
+        rules.push_str(prompt::ASK_BACK_RULES);
+    }
+    if state.config.ai_sql_help && sql_help {
+        rules.push_str(prompt::SQL_HELP_RULES);
+    }
+    if state.config.ai_semantic_layer {
+        rules.push_str(prompt::DISTINCT_COUNT_RULES);
+    }
+    format!(
+        "{base}{rules}{}\n\nDATA MAP: unavailable in a bi-only installation. Call list_datasets and describe_dataset to explore the external tables.{}{}",
+        prompt::bi_only_engine_rules(state.config.query_engine),
+        page_context_line(context),
+        prompt::closing(latest_user, state.config.ai_default_reply_language)
+    )
 }
 
 /// Plan 17: an Explain turn offers no tool. The console's Explain sends the
@@ -1608,7 +1654,8 @@ async fn run_chat(
     // The iteration budget is exhausted, or the same call failed too many
     // times — ask once more for a final answer, tool-free.
     report(progress, json!({ "type": "status", "phase": "thinking" }));
-    let stop_note = stop_note.unwrap_or("tool-call limit reached");
+    let stop_note = stop_note.unwrap_or(TOOL_LIMIT_NOTE);
+    let hit_tool_limit = stop_note == TOOL_LIMIT_NOTE;
     let reason = if stop_note == REPEATED_CALL_NOTE {
         REPEATED_CALL_REASON
     } else {
@@ -1666,6 +1713,20 @@ async fn run_chat(
         };
         return Ok(chat_response_body(
             &reply,
+            &tool_trace,
+            build_run_id.as_deref(),
+            chart_created,
+            Some(stop_note),
+        ));
+    }
+    // AI-36 F1: a model that spent every round on chart writes that did not
+    // take effect may still claim it made a chart. The trace, not the model's
+    // wording, decides: no successful or drafted `create_chart`/`update_chart`
+    // means no chart exists, so the claim is replaced by a fixed sentence. The
+    // limit note stays, and a turn that drafted or saved a chart is untouched.
+    if hit_tool_limit && chart_write_attempted_without_effect(&tool_trace) {
+        return Ok(chat_response_body(
+            &chart_not_saved_reply(&tool_trace),
             &tool_trace,
             build_run_id.as_deref(),
             chart_created,
@@ -1776,10 +1837,10 @@ async fn before_turn_end<T>(
     tokio::time::timeout(remaining, round).await.ok()
 }
 
-/// The reply of a turn that stopped for time (`AI-34`): one sentence that
-/// says so, and names the tools that ran before the stop. Fixed text, and it
-/// claims nothing about what the results show.
-fn timed_out_reply(tool_trace: &[Value]) -> String {
+/// The tools a turn ran, each backticked, in the order they were first seen.
+/// Shared by the time-out reply and the chart-not-saved reply so both name
+/// the same trace the same way.
+fn ran_tool_names(tool_trace: &[Value]) -> String {
     let mut ran: Vec<&str> = Vec::new();
     for step in tool_trace {
         if let Some(tool) = step["tool"].as_str()
@@ -1788,13 +1849,51 @@ fn timed_out_reply(tool_trace: &[Value]) -> String {
             ran.push(tool);
         }
     }
-    if ran.is_empty() {
+    ran.iter()
+        .map(|tool| format!("`{tool}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The reply of a turn that stopped for time (`AI-34`): one sentence that
+/// says so, and names the tools that ran before the stop. Fixed text, and it
+/// claims nothing about what the results show.
+fn timed_out_reply(tool_trace: &[Value]) -> String {
+    let names = ran_tool_names(tool_trace);
+    if names.is_empty() {
         return "The question took too long to answer in the time allowed, and no tool ran before the time ran out.".to_owned();
     }
-    let names: Vec<String> = ran.iter().map(|tool| format!("`{tool}`")).collect();
     format!(
-        "The question took too long to answer in the time allowed, so it stops after these tools ran: {}.",
-        names.join(", ")
+        "The question took too long to answer in the time allowed, so it stops after these tools ran: {names}."
+    )
+}
+
+/// Whether a chart write was attempted in the turn but none took effect. A
+/// call took effect when it succeeded (`ok`) or it is a `needs_confirmation`
+/// draft the console shows — the same draft test `take_next_step` reads.
+fn chart_write_attempted_without_effect(tool_trace: &[Value]) -> bool {
+    let mut attempted = false;
+    for step in tool_trace {
+        if !matches!(step["tool"].as_str(), Some("create_chart" | "update_chart")) {
+            continue;
+        }
+        attempted = true;
+        if step["ok"].as_bool() == Some(true)
+            || step["result"]["needs_confirmation"].as_bool() == Some(true)
+        {
+            return false;
+        }
+    }
+    attempted
+}
+
+/// The reply when a chart write was attempted but none took effect before the
+/// tool-call limit stopped the turn. Fixed text, never a claim the trace does
+/// not back. The caller has seen a chart tool in the trace, so a name is here.
+fn chart_not_saved_reply(tool_trace: &[Value]) -> String {
+    format!(
+        "No chart was made because the request used up its tool calls before the chart could be saved, after these tools ran: {}.",
+        ran_tool_names(tool_trace)
     )
 }
 
@@ -2402,14 +2501,14 @@ const CHAT_SESSION_MIGRATIONS: [&str; 2] = [
 /// Longest title derived from a conversation's first message.
 const TITLE_MAX_CHARS: usize = 80;
 
-static CHAT_SESSION_TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+static CHAT_SESSION_TABLE_ENSURED: ChTableEnsured = ChTableEnsured::new();
 
 /// Create the `console` database and `chat_session` table if they don't
-/// already exist, and add later columns (idempotent, once per process —
-/// mirroring [`lakehouse_bi::store::ensure_bi_table`]'s pattern).
+/// already exist, and add later columns (idempotent, once per `ClickHouse`
+/// URL — same shared guard as the other `console.*` tables).
 async fn ensure_chat_session_table(ch: &ChClient) -> Result<(), lakehouse_clickhouse::ChError> {
     CHAT_SESSION_TABLE_ENSURED
-        .get_or_try_init(|| async {
+        .ensure(ch, || async {
             ch.exec("CREATE DATABASE IF NOT EXISTS console", None)
                 .await?;
             ch.exec(CREATE_CHAT_SESSION_TABLE, None).await?;
@@ -2419,7 +2518,6 @@ async fn ensure_chat_session_table(ch: &ChClient) -> Result<(), lakehouse_clickh
             Ok(())
         })
         .await
-        .map(drop)
 }
 
 /// A SQL fragment together with the values it binds.
@@ -3177,6 +3275,110 @@ mod tests {
         assert_eq!(
             (prompt::SYSTEM_BASE.len(), fnv1a(prompt::SYSTEM_BASE)),
             (BASE_LEN_BEFORE_ASK_BACK, BASE_FNV_BEFORE_ASK_BACK)
+        );
+    }
+
+    /// `BI-44` slice 3 (`AI-32`): the separate in-place branch must not move a
+    /// byte of the measured `full` prompt. The same fixed input is asked of
+    /// all three states; only the `bi-only` ones gain the engine rules.
+    #[tokio::test]
+    async fn a_bi_only_prompt_names_only_the_active_engine_and_full_stays_pinned() {
+        let headers = axum::http::HeaderMap::new();
+        let full = state_with_ask_back_and_layer("false", "false");
+        let full_prompt = system_prompt(
+            &full,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(
+            full_prompt,
+            format!(
+                "{}{}{PROMPT_TAIL_BEFORE_ASK_BACK}",
+                prompt::SYSTEM_BASE,
+                prompt::SYSTEM_ASK_SUFFIX
+            )
+        );
+
+        let common = [
+            ("DATABASE_URL", "not a postgres url"),
+            ("AI_ASK_BACK", "false"),
+            ("AI_SEMANTIC_LAYER", "false"),
+            ("CH_URL", ""),
+        ];
+        let trino_env = [
+            &common[..],
+            &[
+                ("LAKEHOUSE_INSTALL_MODE", "bi-only"),
+                ("LAKEHOUSE_QUERY_ENGINE", "trino"),
+                ("TRINO_URL", "http://127.0.0.1:1"),
+            ][..],
+        ]
+        .concat();
+        let trino = state_with_env(&trino_env);
+        let trino_prompt = system_prompt(
+            &trino,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            false,
+            false,
+        )
+        .await;
+        assert!(
+            trino_prompt.contains("BI-ONLY ENGINE RULES"),
+            "{trino_prompt}"
+        );
+        assert!(
+            trino_prompt.contains("This installation runs Trino SQL only."),
+            "{trino_prompt}"
+        );
+        assert!(
+            !trino_prompt.contains("This installation runs ClickHouse SQL"),
+            "the inactive engine is named only as not installed: {trino_prompt}"
+        );
+        assert!(
+            trino_prompt
+                .find("BI-ONLY ENGINE RULES")
+                .unwrap_or_default()
+                < trino_prompt.find("LANGUAGE:").unwrap_or_default(),
+            "the reply-language line stays last"
+        );
+
+        let ch_env = [
+            &common[..],
+            &[
+                ("LAKEHOUSE_INSTALL_MODE", "bi-only"),
+                ("LAKEHOUSE_QUERY_ENGINE", "clickhouse"),
+            ][..],
+        ]
+        .concat();
+        let clickhouse = state_with_env(&ch_env);
+        let ch_prompt = system_prompt(
+            &clickhouse,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            false,
+            false,
+        )
+        .await;
+        assert!(
+            ch_prompt.contains("This installation runs ClickHouse SQL only."),
+            "{ch_prompt}"
+        );
+        assert!(
+            !ch_prompt.contains("This installation runs Trino SQL"),
+            "{ch_prompt}"
         );
     }
 
@@ -4175,6 +4377,27 @@ mod tests {
         ];
         let reply = unfinished_reply(&trace, BUDGET_REASON);
         assert!(reply.contains("`create_chart`: no reason given"), "{reply}");
+    }
+
+    /// A chart write is unbacked only when `create_chart` or `update_chart`
+    /// was tried and no call of either succeeded or returned a draft. Other
+    /// tools, a saved chart and a draft all leave the model's text alone.
+    #[test]
+    fn an_unbacked_chart_write_ignores_other_tools_and_both_kinds_of_effect() {
+        let refused = vec![
+            json!({ "tool": "list_boards", "ok": true, "result": {} }),
+            json!({ "tool": "update_chart", "ok": false, "result": { "error": "no" } }),
+        ];
+        assert!(chart_write_attempted_without_effect(&refused));
+        let drafted = vec![
+            json!({ "tool": "create_chart", "ok": true, "result": { "needs_confirmation": true } }),
+        ];
+        assert!(!chart_write_attempted_without_effect(&drafted));
+        let saved = vec![json!({ "tool": "update_chart", "ok": true, "result": { "ok": true } })];
+        assert!(!chart_write_attempted_without_effect(&saved));
+        let no_write =
+            vec![json!({ "tool": "list_boards", "ok": false, "result": { "error": "no" } })];
+        assert!(!chart_write_attempted_without_effect(&no_write));
     }
 
     // AI-34: a turn that runs long on a slow model answers from what it

@@ -247,6 +247,9 @@ async fn seed_pipeline_reading(
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: vec![pipelines::PipelineInput {
                 name: "source".to_owned(),
                 zone: reads.0.to_owned(),
@@ -941,6 +944,9 @@ async fn a_join_of_two_governed_inputs_comes_back_with_both_rewritten() {
     let created = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: vec![
                 pipelines::PipelineInput {
                     name: "left_t".to_owned(),
@@ -1248,6 +1254,9 @@ async fn a_join_of_two_governed_inputs_through_a_join_step_comes_back_with_both_
     let created = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: vec![
                 pipelines::PipelineInput {
                     name: "left_t".to_owned(),

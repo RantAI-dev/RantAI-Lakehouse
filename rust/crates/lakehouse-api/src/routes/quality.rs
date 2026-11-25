@@ -52,7 +52,7 @@ use axum::Extension;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use lakehouse_auth::Principal;
-use lakehouse_clickhouse::{ChClient, ChError};
+use lakehouse_clickhouse::{ChClient, ChError, ChTableEnsured};
 use lakehouse_core::ApiError;
 use lakehouse_core::ident::{Ident, SqlLiteral};
 use lakehouse_store::governance::QualityRule;
@@ -708,11 +708,11 @@ fn verdict(check: &Check, row: &Map<String, Value>) -> Verdict {
 
 // ── console.quality_run ────────────────────────────────────────────────
 
-static TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+static TABLE_ENSURED: ChTableEnsured = ChTableEnsured::new();
 
 async fn ensure_table(ch: &ChClient) -> Result<(), ChError> {
     TABLE_ENSURED
-        .get_or_try_init(|| async {
+        .ensure(ch, || async {
             ch.exec("CREATE DATABASE IF NOT EXISTS console", None)
                 .await?;
             ch.exec(
@@ -737,7 +737,6 @@ async fn ensure_table(ch: &ChClient) -> Result<(), ChError> {
             .await
         })
         .await
-        .map(drop)
 }
 
 async fn record_run(

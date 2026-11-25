@@ -32,6 +32,18 @@ fn body(args: &Map<String, Value>) -> Bytes {
     Bytes::from(serde_json::to_vec(&Value::Object(route_args(args))).unwrap_or_default())
 }
 
+/// The one sentence both parameter tools answer when a call that needs a
+/// default leaves it out. The tool refuses before the route: `ParamDef.default`
+/// is `#[serde(default)]`, so the route would otherwise save a null default,
+/// and the BI validator's own sentence is not the same for every parameter
+/// type.
+const PARAM_DEFAULT_REQUIRED: &str = "A default is required: send `default` with the parameter so it has a value when nobody chooses one.";
+
+/// Whether a tool call left `default` out or sent it as null.
+fn missing_default(args: &Map<String, Value>) -> bool {
+    args.get("default").is_none_or(Value::is_null)
+}
+
 /// The formula functions the assistant reads: one entry per category, in
 /// the order the catalog has them, each function one line of its signature
 /// and its help.
@@ -249,6 +261,9 @@ pub(super) async fn run(
         "delete_hierarchy" => delete_hierarchy(state, args).await,
         "list_parameters" => api_result_to_value(params::list(State(state.clone())).await).await,
         "create_parameter" => {
+            if missing_default(args) {
+                return json!({ "error": PARAM_DEFAULT_REQUIRED });
+            }
             let who = principal.cloned().map(Extension);
             with_param_id(
                 api_result_to_value(params::create(State(state.clone()), who, body(args)).await)
@@ -256,6 +271,13 @@ pub(super) async fn run(
             )
         }
         "update_parameter" => {
+            // The tool reads no stored parameter, so the call's own keys are
+            // the signal of a change: `type` or `values` means the default has
+            // to be sent again. A relabel-only call is left to the route as it
+            // was. Both arms refuse with the same sentence.
+            if (args.contains_key("type") || args.contains_key("values")) && missing_default(args) {
+                return json!({ "error": PARAM_DEFAULT_REQUIRED });
+            }
             let who = principal.cloned().map(Extension);
             api_result_to_value(params::update(State(state.clone()), who, body(args)).await).await
         }
@@ -378,5 +400,153 @@ mod function_list_tests {
                 .count();
             assert_eq!(hits, 1, "{} is listed {hits} times", f.name);
         }
+    }
+}
+
+#[cfg(test)]
+mod parameter_default_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "the mock server and config setup use fixed test values"
+    )]
+
+    use std::collections::HashMap;
+
+    use serde_json::{Map, Value, json};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::run;
+    use crate::config::Config;
+    use crate::state::AppState;
+
+    /// The one sentence both parameter tools answer when a call that needs a
+    /// default leaves it out.
+    const REQUIRED: &str = "A default is required: send `default` with the parameter so it has a value when nobody chooses one.";
+
+    /// A stand-in `ClickHouse`: every write is recorded and every read finds
+    /// no existing parameter, enough for a valid definition to be saved.
+    async fn state_on(server: &MockServer) -> AppState {
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": [], "rows": 0 })),
+            )
+            .mount(server)
+            .await;
+        let env = HashMap::from([("CH_URL".to_owned(), server.uri())]);
+        AppState::new(Config::from_map(&env).expect("a valid test config"))
+    }
+
+    fn param_args(fields: &[(&str, Value)]) -> Map<String, Value> {
+        fields
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), value.clone()))
+            .collect()
+    }
+
+    /// Every statement `ClickHouse` received, as text.
+    async fn statements(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .expect("recording is on")
+            .iter()
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn create_parameter_without_default_is_refused_and_saves_nothing() {
+        let ch = MockServer::start().await;
+        let state = state_on(&ch).await;
+        let args = param_args(&[
+            ("name", json!("region")),
+            ("type", json!("text")),
+            ("label", json!("Region")),
+        ]);
+
+        let result = run(&state, None, "create_parameter", &args).await;
+
+        assert_eq!(result["error"], json!(REQUIRED), "{result}");
+        assert!(
+            !statements(&ch).await.iter().any(|s| s.contains("INSERT")),
+            "a refused call wrote nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_parameter_with_a_null_default_is_refused_with_the_same_sentence() {
+        let ch = MockServer::start().await;
+        let state = state_on(&ch).await;
+        let args = param_args(&[
+            ("name", json!("region")),
+            ("type", json!("text")),
+            ("default", Value::Null),
+        ]);
+
+        let result = run(&state, None, "create_parameter", &args).await;
+
+        assert_eq!(result["error"], json!(REQUIRED), "{result}");
+    }
+
+    #[tokio::test]
+    async fn create_parameter_with_a_default_still_saves_the_definition() {
+        let ch = MockServer::start().await;
+        let state = state_on(&ch).await;
+        let args = param_args(&[
+            ("name", json!("region")),
+            ("type", json!("text")),
+            ("label", json!("Region")),
+            ("default", json!("West")),
+        ]);
+
+        let result = run(&state, None, "create_parameter", &args).await;
+
+        assert_eq!(result["ok"], json!(true), "{result}");
+        assert_eq!(result["param"]["default"], json!("West"), "{result}");
+        assert!(
+            statements(&ch)
+                .await
+                .iter()
+                .any(|s| s.contains("INSERT INTO console.bi_param")),
+            "a valid definition was saved"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_parameter_with_new_values_but_no_default_is_refused() {
+        let ch = MockServer::start().await;
+        let state = state_on(&ch).await;
+        let args = param_args(&[
+            ("id", json!("p_1")),
+            ("name", json!("region")),
+            ("type", json!("list")),
+            ("values", json!([{ "value": "West" }, { "value": "East" }])),
+        ]);
+
+        let result = run(&state, None, "update_parameter", &args).await;
+
+        assert_eq!(result["error"], json!(REQUIRED), "{result}");
+        assert!(
+            !statements(&ch).await.iter().any(|s| s.contains("INSERT")),
+            "a refused call wrote nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_parameter_that_changes_the_type_without_a_default_is_refused() {
+        let ch = MockServer::start().await;
+        let state = state_on(&ch).await;
+        let args = param_args(&[
+            ("id", json!("p_1")),
+            ("name", json!("region")),
+            ("type", json!("number")),
+        ]);
+
+        let result = run(&state, None, "update_parameter", &args).await;
+
+        assert_eq!(result["error"], json!(REQUIRED), "{result}");
     }
 }
