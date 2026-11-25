@@ -342,7 +342,8 @@
       },
       {
         "title": "Configure it",
-        "note": "Writes `.env` with generated secrets. Set `AUTH_BOOTSTRAP_EMAIL` and `AUTH_BOOTSTRAP_PASSWORD` there for your first account."
+        "note": "Writes `.env` with generated secrets. Set `AUTH_BOOTSTRAP_EMAIL` and `AUTH_BOOTSTRAP_PASSWORD` there for your first account.",
+        "notePhone": "Writes `.env` with secrets. Set the first admin's email and password there."
       },
       {
         "title": "Start it",

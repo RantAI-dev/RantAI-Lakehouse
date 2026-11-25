@@ -342,7 +342,8 @@
       },
       {
         "title": "Atur konfigurasinya",
-        "note": "Menulis `.env` berisi secret yang dibuat otomatis. Isi `AUTH_BOOTSTRAP_EMAIL` dan `AUTH_BOOTSTRAP_PASSWORD` di sana untuk akun pertama Anda."
+        "note": "Menulis `.env` berisi secret yang dibuat otomatis. Isi `AUTH_BOOTSTRAP_EMAIL` dan `AUTH_BOOTSTRAP_PASSWORD` di sana untuk akun pertama Anda.",
+        "notePhone": "Membuat `.env` berisi secret. Isi email dan password admin pertama di sana."
       },
       {
         "title": "Jalankan",

@@ -82,7 +82,19 @@ export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarte
                 </ul>
               </div>
               <p className="mt-2.5 text-[14px] leading-6 text-pretty text-[#E8F4FF]/65">
-                <Inline text={step.note} />
+                {/* WEB-5 M8 (phone pass): a step with a phone note shows it below 1024 px (two lines, not four). */}
+                {"notePhone" in step && step.notePhone ? (
+                  <>
+                    <span className="max-lg:hidden">
+                      <Inline text={step.note} />
+                    </span>
+                    <span className="lg:hidden">
+                      <Inline text={step.notePhone} />
+                    </span>
+                  </>
+                ) : (
+                  <Inline text={step.note} />
+                )}
               </p>
             </Reveal>
           ))}

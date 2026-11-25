@@ -3382,8 +3382,8 @@ html[data-tod="day"] footer .lk-wm [class*="text-[#E8F4FF]/[0.12]"] {
 /* WEB-5 T3b: sections far below the fold are not styled or laid out until they near the screen
    (`content-visibility: auto`). The intrinsic heights are the measured content heights of each
    section (without its padding), so the page is as tall as before at 390, 768 and 1190 px wide, in
-   both languages (WEB-5 M3 phone pass: governance re-measured at 390 px after its bento became a
-   swipe row). `auto` keeps the real height once the section has been seen; the pinned and
+   both languages (WEB-5 phone pass: governance re-measured at 390 px after its bento became a
+   swipe row, M3, and get-started after its step 2 got a phone note, M8). `auto` keeps the real height once the section has been seen; the pinned and
    sticky sections (depths, dashboards, open) and the vh-sized ones (assistant, final) are left out. */
 [data-home] #governance,
 [data-home] #get-started,
@@ -3392,9 +3392,9 @@ html[data-tod="day"] footer .lk-wm [class*="text-[#E8F4FF]/[0.12]"] {
 }
 [data-home] #governance { contain-intrinsic-block-size: auto 1237.02px; }
 :lang(id) [data-home] #governance { contain-intrinsic-block-size: auto 1257.27px; }
-[data-home] #get-started { contain-intrinsic-block-size: auto 836.56px; }
+[data-home] #get-started { contain-intrinsic-block-size: auto 788.56px; }
 [data-home] #faq { contain-intrinsic-block-size: auto 635px; }
-:lang(id) [data-home] #get-started { contain-intrinsic-block-size: auto 801.63px; }
+:lang(id) [data-home] #get-started { contain-intrinsic-block-size: auto 753.63px; }
 :lang(id) [data-home] #faq { contain-intrinsic-block-size: auto 688.88px; }
 @media (min-width: 768px) {
   [data-home] #governance,
