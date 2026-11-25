@@ -98,8 +98,7 @@ export function RoleAccessRulesSection({ roleName }: { roleName: string }) {
         // cannot name this role in a matchable form. Saying so stops it
         // reading as a rule that went missing.
         <p className="text-xs text-muted-foreground">
-          A rule written as plain text is not listed: the engine skips it, so it names no
-          role.{" "}
+          Rules written as plain text are not listed.{" "}
           <Link
             href="/governance/policies"
             className="text-primary underline-offset-2 hover:underline"

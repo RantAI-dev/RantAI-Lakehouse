@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { HelpHint } from "@/components/patterns/help-hint"
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
@@ -26,6 +27,7 @@ import {
   isHexColor,
 } from "@/lib/formatting-settings"
 import { listTimeZones } from "@/lib/time-zones"
+import { TimeZoneSelect } from "@/components/patterns/time-zone-select"
 import { withNotify } from "@/lib/notify"
 import { identityService, settingsService, type ReportingSettingsInput } from "@/services"
 
@@ -51,8 +53,8 @@ export function ReportingSettingsForm({
   canWrite: boolean
   /**
    * BI-9 review fix R6: where the zone names come from. Tests pass a short
-   * list, because several hundred `<option>`s are slow to render under load;
-   * the page always uses the browser's full list.
+   * list, because several hundred items are slow to render under load; the
+   * page always uses the browser's full list.
    */
   zoneList?: (saved?: string) => string[]
 }) {
@@ -101,7 +103,6 @@ export function ReportingSettingsForm({
     }
   }, [loaded])
 
-  const zones = React.useMemo(() => zoneList(loaded?.timeZone), [zoneList, loaded?.timeZone])
   const paletteInvalid = palette.length > 0 && palette.length < COMPANY_PALETTE_MIN
   const changed =
     loaded !== null &&
@@ -198,23 +199,13 @@ export function ReportingSettingsForm({
         <div className="flex max-w-sm flex-col gap-4">
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="report-time-zone">Report time zone</Label>
-            {/* A native datalist: typing filters the 400-odd names, with no
-                popup to manage. The server still checks the name. */}
-            <Input
+            <TimeZoneSelect
               id="report-time-zone"
-              aria-label="Report time zone"
-              list="report-time-zones"
               value={zone}
-              onChange={(e) => setZone(e.target.value)}
-              placeholder="Search a time zone"
+              onValueChange={setZone}
               disabled={!canWrite}
-              autoComplete="off"
+              zones={zoneList}
             />
-            <datalist id="report-time-zones">
-              {zones.map((name) => (
-                <option key={name} value={name} />
-              ))}
-            </datalist>
           </div>
           <div className="flex flex-col gap-1.5">
             <Label>First day of the week</Label>
@@ -236,18 +227,15 @@ export function ReportingSettingsForm({
               </SelectContent>
             </Select>
           </div>
-          <section className="flex flex-col gap-1.5" aria-labelledby="settings-numbers">
-            <h2 id="settings-numbers" className="text-sm font-medium">
-              Numbers
-            </h2>
-            <Label htmlFor="number-locale">Number locale</Label>
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="number-locale">Number format</Label>
             <Select
               value={locale}
               items={NUMBER_LOCALES}
               onValueChange={(v) => setLocale(v ?? locale)}
               disabled={!canWrite}
             >
-              <SelectTrigger id="number-locale" className="w-full" aria-label="Number locale">
+              <SelectTrigger id="number-locale" className="w-full" aria-label="Number format">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -258,20 +246,17 @@ export function ReportingSettingsForm({
                 ))}
               </SelectContent>
             </Select>
+            {/* PR UX-7 review SHOULD-FIX 1: the one help popover, `HelpHint`, ends the one-line help. */}
             <p className="text-xs text-muted-foreground">
-              One setting for the whole deployment. Charts keep their separators until you
-              choose.
+              Separators in every chart. <HelpHint>A chart that set its own separators keeps them.</HelpHint>
             </p>
-          </section>
+          </div>
           <section className="flex flex-col gap-1.5" aria-labelledby="settings-palette">
             <h2 id="settings-palette" className="text-sm font-medium">
               Company palette
             </h2>
             {unsaved.palette ? <UnsavedNote /> : null}
-            <p className="text-xs text-muted-foreground">
-              {COMPANY_PALETTE_MIN} to {COMPANY_PALETTE_MAX} colours. With a palette set, new
-              charts use it.
-            </p>
+            <p className="text-xs text-muted-foreground">{COMPANY_PALETTE_MIN}–{COMPANY_PALETTE_MAX} colours. New charts use them.</p>
             <ul className="flex flex-wrap gap-2" aria-label="Company palette colours">
               {palette.map((colour) => (
                 <li key={colour} className="flex items-center gap-1">
@@ -322,9 +307,7 @@ export function ReportingSettingsForm({
             <h2 id="settings-fonts" className="text-sm font-medium">
               Fonts
             </h2>
-            <p className="text-xs text-muted-foreground">
-              The fonts a dashboard may use. All of them ship with the console.
-            </p>
+            <p className="text-xs text-muted-foreground">Fonts a dashboard may use.</p>
             {Object.entries(SHIPPED_FONTS).map(([id, label]) => (
               <div key={id} className="flex items-center gap-2">
                 <Checkbox
@@ -343,9 +326,7 @@ export function ReportingSettingsForm({
             </h2>
             {unsaved.sites ? <UnsavedNote /> : null}
             <p className="text-xs text-muted-foreground">
-              Image and web-page cards may only show addresses on these sites, written
-              https://host or https://host:port, no wildcards. At most {MAX_CONTENT_SITES}.
-              With none listed, no such card can be saved.
+              Sites image and web-page cards may show. <HelpHint>{`Written https://host or https://host:port, no wildcards. At most ${MAX_CONTENT_SITES}. With none listed, no image or web-page card can be saved.`}</HelpHint>
             </p>
             <ul className="flex flex-col gap-1" aria-label="Allowed content sites">
               {sites.map((s) => (
@@ -386,14 +367,12 @@ export function ReportingSettingsForm({
           {canReadDomains ? (
             <section className="flex flex-col gap-1.5" aria-labelledby="settings-report-domains">
               <h2 id="settings-report-domains" className="text-sm font-medium">
-                Reports: outside email domains
+                Outside email domains
               </h2>
               {unsaved.domains ? <UnsavedNote /> : null}
               <p className="text-xs text-muted-foreground">
-                A scheduled report may be sent to an address outside the company only if its
-                domain is listed here, written example.com, no wildcards. At most{" "}
-                {MAX_REPORT_DOMAINS}. With none listed, no report leaves the company.
-              </p>
+              Outside domains a scheduled report may reach. <HelpHint>{`Written example.com, no wildcards. At most ${MAX_REPORT_DOMAINS}. With none listed, no report leaves the company.`}</HelpHint>
+            </p>
               <ul className="flex flex-col gap-1" aria-label="Report domains">
                 {domains.map((d) => (
                   <li key={d} className="flex items-center gap-2 text-sm">
@@ -437,13 +416,8 @@ export function ReportingSettingsForm({
                 Block downloads for these roles
               </h2>
               <p className="text-xs text-muted-foreground">
-                A checked role cannot use the console&apos;s export actions: PDF, Excel, CSV,
-                image and dashboard-file downloads, a Query Studio result download, and
-                &quot;Copy as TSV&quot;. It does not stop a person from selecting and copying
-                what is on the screen. A person who also holds an unchecked role still can, and
-                Platform Admin is never blocked. With none checked, everyone who can see a
-                dashboard or run a query can export it.
-              </p>
+              Checked roles cannot export or download. <HelpHint>Covers PDF, Excel, CSV, image and dashboard-file downloads, Query Studio result downloads and Copy as TSV. It cannot stop copying from the screen. A person who also holds an unchecked role still can, and Platform Admin is never blocked.</HelpHint>
+            </p>
               {roleNames.map((name) => (
                 <div key={name} className="flex items-center gap-2">
                   <Checkbox
@@ -462,9 +436,7 @@ export function ReportingSettingsForm({
               Public links
             </h2>
             <p className="text-xs text-muted-foreground">
-              When this is off, every public link stops working at once and no new one can
-              be made. Nothing is deleted: switching it on again brings back the links
-              that have not expired.
+              Off stops every public link at once. <HelpHint>Nothing is deleted: turning it on again brings back the links that have not expired.</HelpHint>
             </p>
             <div className="flex items-center gap-2">
               <Checkbox

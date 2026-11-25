@@ -8,6 +8,7 @@ import { FormPage } from "@/components/patterns/form-page"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SelectField } from "@/components/patterns/select-field"
+import { SuggestInput } from "@/components/patterns/suggest-input"
 import { SqlColumnChips, SqlRowsTable } from "@/components/patterns/sql-rows-table"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -1015,20 +1016,16 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                   </div>
                   <div className="space-y-1.5">
                     <Label htmlFor="pipeline-incremental-column">Cursor column</Label>
-                    <Input
+                    {/* PR #635 review: semantic conflict with BLD-12 (#715) — suggest via SuggestInput, not a datalist. */}
+                    <SuggestInput
                       id="pipeline-incremental-column"
-                      list="pipeline-cursor-suggestions"
                       value={incrementalColumn}
-                      onChange={(e) => setIncrementalColumn(e.target.value)}
+                      onValueChange={setIncrementalColumn}
+                      suggestions={cursorSuggestions.map((name) => ({ value: name }))}
                       placeholder="e.g. updated_at"
                       aria-invalid={cursorMissing}
                       aria-describedby={cursorMissing ? "pipeline-cursor-error" : undefined}
                     />
-                    <datalist id="pipeline-cursor-suggestions">
-                      {cursorSuggestions.map((name) => (
-                        <option key={name} value={name} />
-                      ))}
-                    </datalist>
                     {cursorMissing ? (
                       <p id="pipeline-cursor-error" role="alert" className="text-xs text-destructive">
                         A cursor column is required for an incremental pipeline.
