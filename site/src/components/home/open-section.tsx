@@ -44,7 +44,7 @@ export function OpenSection({ copy, cta, contactHref }: { copy: HomeCopy["open"]
         <CodePanel
           copy={copy.code}
           action={
-            <CtaLink href={LINKS.source} variant="ghost" size="sm" target="_blank" className="bg-[var(--lk-n-surface)]">
+            <CtaLink href={LINKS.source} variant="ghost" size="sm" target="_blank" className="bg-[var(--lk-n-surface)] max-lg:h-10">
               {cta.source}
               <ArrowUpRight aria-hidden="true" className="size-4 transition-transform duration-200 ease-out group-hover:translate-x-0.5 group-hover:-translate-y-0.5 motion-reduce:transition-none" />
             </CtaLink>

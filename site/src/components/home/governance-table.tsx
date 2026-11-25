@@ -300,7 +300,7 @@ function RoleToggle({ copy, role, onChange }: { copy: GovernanceCopy; role: Role
             tabIndex={role === r ? 0 : -1}
             onClick={() => onChange(r)}
             className={cn(
-              "relative z-10 rounded-full px-4 py-1.5 text-[13px] font-medium transition-colors duration-200 ease-out active:scale-95 motion-reduce:transition-none",
+              "relative z-10 rounded-full px-4 py-1.5 text-[13px] font-medium max-lg:min-h-10 transition-colors duration-200 ease-out active:scale-95 motion-reduce:transition-none",
               role === r ? "text-white" : "text-white/70 hover:text-[#E8F4FF]",
             )}
           >

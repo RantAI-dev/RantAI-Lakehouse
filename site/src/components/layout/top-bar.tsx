@@ -189,7 +189,7 @@ export function TopBar({
         <div className="flex min-w-0 items-center gap-10">
           <a
             href={anchor("#hero")}
-            className="flex shrink-0 items-center gap-2.5 rounded-lg text-[#E8F4FF] transition-opacity hover:opacity-75"
+            className="flex shrink-0 items-center gap-2.5 rounded-lg text-[#E8F4FF] transition-opacity hover:opacity-75 max-lg:min-h-10"
           >
             {/* O2: the official mark at its own ratio, sized by height (rantai-page: size-7). */}
             <MascotMark className="h-7 w-auto max-[339px]:h-6" />
