@@ -1,42 +1,31 @@
-# Publish the landing page to GitHub Pages (WEB-1): https://lakehouse.rantai.dev
+# Publish the Lakehouse site to GitHub Pages (WEB-5 D22): https://lakehouse.rantai.dev
 #
-# The page is the same `LandingPage` component the console serves at
-# `/landing`, exported statically by `ops/landing-pages` (a minimal Next
-# project) because the console's own config is `output: "standalone"` with a
-# `force-dynamic` root layout (`SEC-47`). See `ops/landing-pages/README.md`.
+# The site is `site/`, its own package and a static Next export (`output:
+# "export"`, WEB-5 D1). It replaced the console's `/landing` page, which this
+# workflow used to export from `ops/landing-pages`; that route and its export
+# are gone, so this workflow builds `site/` instead.
+#
+# GitHub Pages serves files and cannot set response headers, so the site's
+# Content-Security-Policy ships as a <meta> tag written at build time
+# (`site/scripts/csp-meta.ts`, D22). `CNAME` and `.nojekyll` are Pages
+# details, not the site's, so this workflow writes them into `site/out` and
+# `site/public/` stays host-agnostic (D1).
 #
 # It is its own workflow, not a job in ci.yml: it deploys rather than gates,
 # it needs the `pages: write`/`id-token: write` permissions ci.yml's read-only
 # token deliberately does not have, and it must run on a push to `main` that
-# touches only the page's inputs.
+# touches only the site. ci.yml's `site` job is the gate; this one publishes.
 name: Deploy Landing Page
 
 on:
   push:
     branches: [main]
-    # Everything the export reads. A landing edit, an icon, the design system
-    # tokens or fonts, the build runner, or the dependency tree must publish;
-    # an unrelated console change must not.
+    # The site is self-contained (own package.json and bun.lock, nothing
+    # imported from the console), so only its folder and this file publish.
     paths:
-      - "src/app/landing/**"
-      - "src/features/landing/**"
-      - "src/app/globals.css"
-      - "src/app/fonts/**"
-      # The two console modules the landing components import (`cn`, and the
-      # reduced-motion hook the landing re-exports).
-      - "src/lib/utils.ts"
-      - "src/hooks/use-reduced-motion.ts"
-      - "design-system/globals.css"
-      - "design-system/tokens/**"
-      - "design-system/fonts/**"
-      - "public/**"
-      - "ops/landing-pages/**"
-      - "scripts/build-landing-pages.ts"
-      - "package.json"
-      - "bun.lock"
-      - "tsconfig.json"
+      - "site/**"
       - ".github/workflows/deploy-landing.yml"
-  # On demand, so the page can be republished without a code change (for
+  # On demand, so the site can be republished without a code change (for
   # example after the custom domain or the Pages environment is changed).
   workflow_dispatch:
 
@@ -58,6 +47,9 @@ jobs:
     name: Build the static export
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: site
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -70,28 +62,43 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      # The published site has no console of its own; the CTA points at the
-      # demo one. `src/features/landing/landing-copy.ts` reads this at build
-      # time and falls back to `/login` when it is unset.
-      - name: Build the landing page
-        run: NEXT_PUBLIC_CONSOLE_URL=https://lakehouse-demo.rantai.dev/login bun run build:landing
+      # The build needs the production origin for the canonical, hreflang and
+      # sitemap URLs and refuses `http://` (D2); ci.yml builds the same site
+      # against the reserved `example.invalid` instead.
+      - name: Build the site
+        env:
+          NEXT_PUBLIC_SITE_URL: https://lakehouse.rantai.dev
+        run: bun run build
 
       # A missing `.nojekyll` breaks `_next/` and a missing `CNAME` drops the
-      # custom domain; fail here instead of publishing a broken site.
+      # custom domain; both are written here, after the build, because the
+      # export is rebuilt from scratch every time.
+      - name: Add the Pages files
+        run: |
+          set -euo pipefail
+          echo "lakehouse.rantai.dev" > out/CNAME
+          touch out/.nojekyll
+
+      # Fail here instead of publishing a broken site: both locales, the
+      # contact page and the 404 exist as plain files, and the English hero
+      # headline is in the root page.
       - name: Verify the export
         run: |
           set -euo pipefail
-          test -f out-landing/index.html
-          test -f out-landing/CNAME
-          test "$(cat out-landing/CNAME)" = "lakehouse.rantai.dev"
-          test -f out-landing/.nojekyll
-          test -d out-landing/_next
-          grep -q "Your data has a home now" out-landing/index.html
+          test -f out/index.html
+          test -f out/id/index.html
+          test -f out/contact/index.html
+          test -f out/404.html
+          test -f out/CNAME
+          test "$(cat out/CNAME)" = "lakehouse.rantai.dev"
+          test -f out/.nojekyll
+          test -d out/_next
+          grep -q "Your data has a home now" out/index.html
 
       - name: Upload the Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: out-landing
+          path: site/out
 
   deploy:
     name: Deploy to GitHub Pages
