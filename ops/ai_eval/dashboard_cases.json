@@ -1096,6 +1096,9 @@
     "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_wisman", "kind": "bar", "dimension": "jumlah", "bin.mode": "width", "bin.width": 500}},
     "facts": [
       {"label": "default cap", "kind": "text", "values": ["at most 20"], "aliases": {"at most 20": ["20 values", "20 bins", "20 groups", "up to 20", "default cap", "default limit", "20 by default", "limit of 20", "limit 20", "set a limit"]}}
+    ],
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "bar", "def.dimension": "jumlah", "def.bin.mode": "width", "def.bin.width": 500}, "count": 1}
     ]
   }
 ]
