@@ -6625,13 +6625,15 @@
                     "heading",
                     "paragraph",
                     "list",
+                    "quote",
+                    "divider",
                     "link",
                     "chart"
                   ]
                 },
                 "text": {
                   "type": "string",
-                  "description": "heading, paragraph or link words; plain text, never HTML or Markdown"
+                  "description": "words; except in a link, **bold**, *italic* and [words](address). Never HTML"
                 },
                 "level": {
                   "type": "integer",
@@ -6660,6 +6662,14 @@
                 "chart": {
                   "type": "string",
                   "description": "a chart block's chart id, from list_charts"
+                },
+                "width": {
+                  "type": "string",
+                  "enum": [
+                    "text",
+                    "wide"
+                  ],
+                  "description": "text (default) or wide"
                 }
               },
               "required": [
@@ -6706,13 +6716,15 @@
                     "heading",
                     "paragraph",
                     "list",
+                    "quote",
+                    "divider",
                     "link",
                     "chart"
                   ]
                 },
                 "text": {
                   "type": "string",
-                  "description": "heading, paragraph or link words; plain text, never HTML or Markdown"
+                  "description": "words; except in a link, **bold**, *italic* and [words](address). Never HTML"
                 },
                 "level": {
                   "type": "integer",
@@ -6741,6 +6753,14 @@
                 "chart": {
                   "type": "string",
                   "description": "a chart block's chart id, from list_charts"
+                },
+                "width": {
+                  "type": "string",
+                  "enum": [
+                    "text",
+                    "wide"
+                  ],
+                  "description": "text (default) or wide"
                 }
               },
               "required": [
@@ -6760,13 +6780,15 @@
                     "heading",
                     "paragraph",
                     "list",
+                    "quote",
+                    "divider",
                     "link",
                     "chart"
                   ]
                 },
                 "text": {
                   "type": "string",
-                  "description": "heading, paragraph or link words; plain text, never HTML or Markdown"
+                  "description": "words; except in a link, **bold**, *italic* and [words](address). Never HTML"
                 },
                 "level": {
                   "type": "integer",
@@ -6795,6 +6817,14 @@
                 "chart": {
                   "type": "string",
                   "description": "a chart block's chart id, from list_charts"
+                },
+                "width": {
+                  "type": "string",
+                  "enum": [
+                    "text",
+                    "wide"
+                  ],
+                  "description": "text (default) or wide"
                 }
               },
               "required": [

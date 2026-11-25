@@ -42,6 +42,11 @@ interface DataTableAdvancedToolbarProps<
   trailing?: React.ReactNode;
   /** Names the CSV download under Settings; omit to leave the table unexportable. */
   exportName?: string;
+  /**
+   * `false` leaves the Settings gear out of row 1, for a page that draws the
+   * same menu as its own ⋯ in the page frame (`UX-8`: the Catalog). Default on.
+   */
+  settingsMenu?: boolean;
 }
 
 export function DataTableAdvancedToolbar<TData>({
@@ -58,6 +63,7 @@ export function DataTableAdvancedToolbar<TData>({
   propertyBarOpenKeys,
   trailing,
   exportName,
+  settingsMenu = true,
   children,
   className,
   ...props
@@ -123,16 +129,20 @@ export function DataTableAdvancedToolbar<TData>({
                 <DataTableResetFilters />
               )}
             </div>
-            <div className="flex items-center gap-2">
-              <DataTableSettingsMenu
-                table={table}
-                onRefresh={onRefresh}
-                isRefreshing={isRefreshing}
-                columnControls={columnControls}
-                exportName={exportName}
-              />
-              {trailing}
-            </div>
+            {settingsMenu || trailing ? (
+              <div className="flex items-center gap-2">
+                {settingsMenu ? (
+                  <DataTableSettingsMenu
+                    table={table}
+                    onRefresh={onRefresh}
+                    isRefreshing={isRefreshing}
+                    columnControls={columnControls}
+                    exportName={exportName}
+                  />
+                ) : null}
+                {trailing}
+              </div>
+            ) : null}
           </div>
           {!hidePropertyBar && propertyBarOpen ? (
             <DataTablePropertyBar
