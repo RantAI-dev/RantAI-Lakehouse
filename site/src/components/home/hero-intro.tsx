@@ -11,8 +11,13 @@ import * as React from "react";
  *    to right, the lead, the buttons and the reassurance line; the top bar
  *    and the depth gauge come in last.
  *
- * Two paths, chosen before the first paint by a tiny inline script that
- * only puts classes on <html>:
+ * Two paths, chosen by a tiny inline script that only puts classes on <html>.
+ * WEB-5 T3: the page starts on the 3D hold, and the WebGL test runs one task
+ * after the first paint (creating a context on a cold browser can take
+ * seconds, and it used to sit in front of the first paint and the LCP). If
+ * the answer is no, the 3D hold is dropped and the DOM beats start at once;
+ * the hold and the DOM beats look the same for those first frames (black, the
+ * headline masked):
  * - DOM (`lk-intro`): no fast WebGL here. The beats are CSS keyframes on
  *   hooks the hero already has (`data-intro-backdrop`, `data-hero-creature`,
  *   `data-intro-copy`, hero-motion.tsx), over the DOM night lake and the
@@ -44,7 +49,7 @@ import * as React from "react";
 
 /**
  * The same test as `hasFastWebGL` (effects/scene/webgl-support.ts), inline so
- * the choice is made before the first paint; the answer is kept on
+ * the choice is made without waiting for hydration; the answer is kept on
  * `window.__lkFastGL` so the page does not probe twice. Under `next dev`
  * with the test-only override, the server writes `true` instead (this file
  * is a server component, so the flag's name never reaches the browser).
@@ -71,10 +76,11 @@ function skipNow(){end(true);}
 for(var i=0;i<ev.length;i++)addEventListener(ev[i],skipNow,{capture:true,passive:true});
 if(lite){d.classList.add("lk-intro-lite");timer=setTimeout(function(){end(false);},800);return;}
 function go(){if(went||done)return;went=true;clearTimeout(timer);d.classList.add("lk-intro-go");timer=setTimeout(function(){end(false);},2600);}
-var gl=window.__lkFastGL=${forceGL ? "true" : PROBE};
-if(gl){d.classList.add("lk-intro","lk-intro-3d");window.__lkIntroGo=go;
-timer=setTimeout(function(){d.classList.remove("lk-intro-3d");go();},1500);}
-else{d.classList.add("lk-intro");go();}
+window.__lkIntroGo=go;
+d.classList.add("lk-intro","lk-intro-3d");
+timer=setTimeout(function(){d.classList.remove("lk-intro-3d");go();},1500);
+function probe(){if(done||went)return;var gl=window.__lkFastGL=${forceGL ? "true" : PROBE};if(!gl){d.classList.remove("lk-intro-3d");go();}}
+requestAnimationFrame(function(){setTimeout(probe,0);});
 }catch(e){}})();`;
 
 const CSS = `

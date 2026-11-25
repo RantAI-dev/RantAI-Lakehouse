@@ -61,7 +61,12 @@ function subscribeWebgl(onChange: () => void): () => void {
     // probed already and holds the page until the scene's first frame), the
     // answer is given at hydration and the scene's chunk is requested at
     // once, so the hold stays short. Everywhere else, after the first paint.
-    if (document.documentElement.classList.contains("lk-intro-3d")) {
+    // The probe runs just after the first paint (so it never delays it); if hydration
+    // beat it, the page takes the ordinary path below.
+    if (
+      document.documentElement.classList.contains("lk-intro-3d") &&
+      (window as unknown as { __lkFastGL?: unknown }).__lkFastGL === true
+    ) {
       void import("./scene/lake-scene");
       queueMicrotask(answer);
     } else {
