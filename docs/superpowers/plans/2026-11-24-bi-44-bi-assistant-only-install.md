@@ -258,3 +258,119 @@ Every command was run from `/tmp/wt-bi44-s1`; Rust used
    image variables as the root file, and the README tells the operator to
    build those images with the root Compose file first. This also keeps
    warehouse-only context paths out of the deployment templates.
+
+---
+
+## Slice 2 Handoff
+
+Developer: implementation sub-agent, 2026-11-24. Branch
+`feat/bi-44-in-place-external-catalog`, stacked on
+`origin/feat/bi-44-in-place-mode-foundation` at `6f890525c` (slice 1's
+handoff commit). Worktree `/tmp/wt-bi44-s2`. No PR opened or merged; the
+developer pushes the branch and hands off.
+
+### Commits (plan order)
+
+- `1f4c0949e` T1 `BI-44 slice 2: source matrix, in-place introspection and catalog gate`
+- `77657b3f8` T2 `BI-44 slice 2: govern 3-part external catalog tables`
+- `f4901f1d3` T3 `BI-44 slice 2: in-place integration tests and classified catalog errors`
+- `ee9975012` T3 follow-up `BI-44 slice 2: format and satisfy clippy -D warnings`
+- this commit: the handoff.
+
+### What was built
+
+- **T1** New `rust/crates/lakehouse-api/src/in_place.rs` (wired into
+  `lib.rs`): the one source-coverage matrix with normalized aliases and an
+  honest `supported: false` reason for every unsupported source
+  (`ClickHouse`: `postgresql`/`mysql`/`clickhouse`; `Trino`: the nine
+  federated sources); bounded, identifier-escaped `SHOW CATALOGS` /
+  `SHOW SCHEMAS` / `SHOW TABLES` / `DESCRIBE` introspection on `Trino`
+  and `system.tables` / `system.columns` introspection on `ClickHouse`,
+  with built-in catalogs and schemas filtered and no upstream text in an
+  error. `GET /api/settings/deployment` gains `supportedInPlaceSources`
+  **only in `bi-only`** (the `full` body keeps exactly three keys, so the
+  existing byte-shaped test is untouched). `routes/catalog.rs::list`
+  returns an early `bi-only` answer from the active engine's own catalog,
+  with `zone: "external"` and `null` for every unmeasured metric — no
+  Lakekeeper or `ClickHouse` registry dial. `routes/connectors.rs`
+  refuses a source the installed engine cannot read in place with a 400
+  naming the engine and the reason, before any SSRF check, credential or
+  row exists.
+- **T2** `sql_rewrite.rs` keeps the historical `"schema.table"` key and
+  adds a catalog-scoped full key, so a 2-part policy still governs a
+  3-part query while a 3-part policy binds only to its own catalog. Both
+  matching obligations are merged (all masks, row filters AND-ed, fail
+  closed on conflicting real columns), the derived table's `FROM` keeps
+  the full quoted 3-part identifier in the active engine's dialect, and
+  unparseable SQL still returns `Err`. `policy_engine.rs` resolves the
+  governed table's real columns through in-place introspection in
+  `bi-only` instead of dialing an uninstalled engine.
+- **T3** New integration module
+  `tests/bi_only_in_place_catalog.rs`, registered in `tests/it.rs` as
+  `OPS-32` requires: a `bi-only+trino` catalog list served only by
+  wiremock `Trino` (asserting the exact `SHOW` statements and that no
+  undialable registry could have answered), a `bi-only+trino` query where
+  the mask and row filter reach `Trino` through substitution with the
+  full quoted table, and an honest 400 for `oracle` in
+  `bi-only+clickhouse`.
+- **T3 follow-up** Rustfmt and the three clippy `-D warnings` findings
+  (identical match arms, a needlessly owned wiremock body, `assert!` on
+  `is_empty()`).
+
+### Verification (foreground, on the final code commit `ee9975012`)
+
+Every command ran from `/tmp/wt-bi44-s2` with
+`CARGO_INCREMENTAL=0` and
+`CARGO_TARGET_DIR=/home/shiro/rantai/RantAI-Lakehouse/rust/target`.
+
+| Command | Result |
+| --- | --- |
+| `cd rust && cargo fmt --check -p lakehouse-api` | clean (`FMT_CHECK_CLEAN`) |
+| `cargo clippy --manifest-path rust/Cargo.toml -p lakehouse-api --all-targets -- -D warnings` | finished with no warnings |
+| `cargo test --manifest-path rust/Cargo.toml -p lakehouse-api --lib` | **3975 passed**, 0 failed, 19 ignored |
+| `cargo test --manifest-path rust/Cargo.toml -p lakehouse-api --test it -- bi_only_in_place_catalog bi_only_query_mode deployment_settings_route route_auth sec11_guard` | **123 passed**, 0 failed, 1763 filtered out |
+| `bash scripts/ci/check_test_modules.sh` | every test file compiled into a test binary |
+| `git diff --check` | clean |
+
+The brief's literal `cargo fmt --manifest-path rust/Cargo.toml --check`
+fails with `Failed to find targets` because that manifest is the
+workspace root and has no targets of its own; the scoped `cd rust &&
+cargo fmt --check -p lakehouse-api` is the equivalent check this crate's
+slice 1 handoff used (and it is clean).
+
+### Skipped / not verified
+
+- **Not run:** the full workspace verification block (`cargo clippy
+  --workspace`, `cargo test --workspace`, `bun run typecheck/lint/test`,
+  Dagster pytest, `docker compose --profile '*' config --quiet`). This
+  slice changes only `lakehouse-api` Rust and one plan document; the
+  reviewer runs the full block before merge (`AGENTS.md`, "Keep build
+  time down").
+- **No migrations added** — `0154`–`0157` remain reserved by the merge
+  queue. `policy.rs`, `audit_coverage.rs`, `routes/agents.rs`,
+  `routes/gold.rs` and the root `docker-compose.yml` were not touched.
+- **Not run:** a live `docker compose up` of either standalone file. A
+  `bi-only` in-place install against a real source belongs to slice 4's
+  E2E gate; the proof here is the wiremock integration tests.
+
+### Design notes for the reviewer
+
+1. `canonicalize` still drops a leading catalog, so every existing
+   two-part policy and every existing byte-shaped `ClickHouse` rewrite
+   is unchanged. The new full key is ADDITIVE: the rewrite looks up both
+   and merges only when both match; a three-part policy can never match
+   `crm_pg.public.customers`. `enforce` also keeps the two obligations
+   under their separate keys so `substitute_governed_tables` is the one
+   place that merges them and fails closed on a conflict.
+2. Quoting of the derived table's `FROM` changes only for three-part
+   names; one- and two-part names keep `name.to_string()` byte for byte.
+   On `Trino` the full name becomes `"erp_pg"."public"."customers"`, on
+   `ClickHouse` `` `erp_pg`.`public`.`customers` ``.
+3. Introspection uses a fixed internal `X-Trino-User`, never a caller
+   value, and bounds every `SHOW` loop by the requested table cap. The
+   in-place column resolver in `bi-only+trino` needs a 3-part authored
+   key (a 2-part one names no catalog and fails closed), which is why
+   the integration test authors the policy on `erp_pg.public.customers`.
+4. `supportedInPlaceSources` is omitted in `full` mode on purpose: the
+   existing deployment test asserts exactly three top-level keys, and a
+   full stack does not read any source in place.
