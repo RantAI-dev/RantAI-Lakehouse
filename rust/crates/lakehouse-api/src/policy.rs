@@ -868,6 +868,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // the tile, narrowed by the roles an administrator switched off from
     // downloading (checked in the handler, D7); every download is audited.
     ("GET",    "/api/dashboard/chart-export", Policy::RequiresAuth),
+    // BI-72 (D3): whether a web-page card's site refuses to be framed. Answers
+    // only for an address on the content sites; `dashboard:read`.
+    ("GET",    "/api/dashboard/frame-check",  Policy::RequiresPermission("dashboard:read")),
     // BI-1 (D5): a dashboard as a PDF. `dashboard:read`, narrowed by the roles
     // switched off from downloading (D7), audited before the file is sent.
     ("GET",    "/api/dashboard/export/pdf",   Policy::RequiresAuth),

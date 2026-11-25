@@ -8,6 +8,8 @@ import { cn } from "@/lib/utils";
 import { decimalsFor } from "@/lib/chart-axis";
 import type { StyleFields } from "@/lib/chart-style";
 import { formatValue } from "@/lib/value-format";
+import { compactKpiText } from "@/lib/kpi-fit";
+import { KpiValue, OverflowText } from "./fit-text";
 import { conditionalCss } from "./table-cell";
 import { useReporting } from "./reporting-context";
 import type { Rows } from "./tile-dialogs";
@@ -34,8 +36,14 @@ export function KpiCard({ def, cell, caption }: { readonly def: TableDefFields &
   const label = (bucket: unknown) => (grain && bucket !== undefined ? bucketLabel(grain, bucket) : "");
   const Arrow = r.delta === null || r.delta === 0 ? Minus : r.delta > 0 ? ArrowUp : ArrowDown;
   return (
-    <div className="grid h-full place-content-center px-2 text-center">
-      <p className="text-4xl font-semibold tabular-nums text-foreground" style={paint}>{r.value === null ? "—" : formatValue(r.value, def.format, numberLocale, dec)}</p>
+    // Owner QA 2026-11-15: one column as wide as the tile (`minmax(0,1fr)`), so every line is held to
+    // the tile's width: the number fits it (`KpiValue`), the caption stops at two lines.
+    <div className="grid h-full grid-cols-[minmax(0,1fr)] content-center px-2 text-center">
+      <KpiValue
+        className="text-4xl font-semibold tabular-nums text-foreground" style={paint}
+        full={r.value === null ? "—" : formatValue(r.value, def.format, numberLocale, dec)}
+        compact={r.value === null ? null : compactKpiText(r.value, def.format, numberLocale, dec)}
+      />
       {(r.mode === "previous" || r.mode === "last_year") && r.value !== null ? (
         <p className="mt-0.5 text-xs text-muted-foreground">{label(r.valueBucket)}</p>
       ) : null}
@@ -68,7 +76,7 @@ export function KpiCard({ def, cell, caption }: { readonly def: TableDefFields &
           <polyline points={sparklinePoints(r.series, 120, 28)} fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" />
         </svg>
       ) : null}
-      {caption ? <p className="mt-1 text-xs text-muted-foreground">{caption}</p> : null}
+      {caption ? <OverflowText as="p" lines={2} text={caption} className="mt-1 text-xs text-muted-foreground" /> : null}
     </div>
   );
 }

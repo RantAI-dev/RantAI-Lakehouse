@@ -2,7 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { Sparkles } from "lucide-react"
+import { Bot } from "lucide-react"
 
 export type StartProps = {
   icon: React.ComponentType<{ className?: string }>
@@ -37,7 +37,7 @@ export function StartButton({ icon: Icon, title, description, href, onAi }: Star
           title="Let AI do it"
           className="inline-flex items-center border-l border-border px-3 text-[var(--brand-1)] transition-colors hover:bg-[color-mix(in_oklch,var(--brand-1),transparent_88%)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
         >
-          <Sparkles className="size-4" />
+          <Bot className="size-4" aria-hidden />
         </button>
       ) : null}
     </div>
