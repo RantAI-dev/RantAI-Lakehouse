@@ -131,10 +131,10 @@ function TraceEdges({ w, gap, path, className }: Readonly<{ w: number; gap: numb
  * from its row in one table to its row in the next, with the same light along it. The same props,
  * so the live version's loop, pointer and tap work unchanged.
  */
-const V_PAD = 6;
-const V_HEAD = 22;
-const V_ROW = 20;
-const V_GAP = 12;
+const V_PAD = 5;
+const V_HEAD = 20;
+const V_ROW = 17;
+const V_GAP = 8;
 const V_GUTTER = 18;
 const V_TABLE = V_PAD * 2 + V_HEAD + V_ROW * 4;
 const vRowY = (t: number, r: number) => t * (V_TABLE + V_GAP) + V_PAD + V_HEAD + V_ROW * r + V_ROW / 2;

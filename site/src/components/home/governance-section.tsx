@@ -28,7 +28,7 @@ export function GovernanceSection({ copy }: { copy: HomeCopy["governance"] }) {
     <section
       id="governance"
       // WEB-5 audit #19: less padding below, so the gap to "Yours to keep" is not a band of empty water.
-      className="lk-fallback-bg relative scroll-mt-16 bg-[var(--lk-n-bg)] pt-28 pb-16 md:pt-36 md:pb-20"
+      className="lk-fallback-bg relative scroll-mt-16 bg-[var(--lk-n-bg)] pt-28 pb-16 max-md:pt-20 max-md:pb-12 md:pt-36 md:pb-20"
     >
       <Container>
         <DisplayHeading>
@@ -38,7 +38,7 @@ export function GovernanceSection({ copy }: { copy: HomeCopy["governance"] }) {
           <LeadText className="mt-5 max-w-[40rem]">{copy.sub}</LeadText>
         </Reveal>
 
-        <Reveal className="mt-10" y={40}>
+        <Reveal className="mt-10 max-md:mt-7" y={40}>
           <GovernanceTable copy={copy} />
         </Reveal>
 

@@ -27,14 +27,11 @@ type Bento = HomeCopy["governance"]["bento"];
  * and space. No lift, no tilt.
  */
 const tile =
-  "lk-mb-tile relative flex flex-col overflow-hidden rounded-3xl bg-[var(--lk-n-surface)] p-6 outline-none focus-visible:ring-2 focus-visible:ring-[#44A6FA]/70 md:px-8 md:py-6";
-
-/** WEB-5 M3: a tile in the phone's swipe row: most of the screen wide, snapping to the left edge. */
-const swipe = "max-md:w-[80vw] max-md:max-w-[22rem] max-md:shrink-0 max-md:snap-start";
+  "lk-mb-tile relative flex flex-col overflow-hidden rounded-3xl bg-[var(--lk-n-surface)] p-6 outline-none focus-visible:ring-2 focus-visible:ring-[#44A6FA]/70 max-md:p-4 md:px-8 md:py-6";
 
 function Words({ title, line }: { title: string; line: string }) {
   return (
-    <div className="mt-auto pt-5 md:pt-4">
+    <div className="mt-auto pt-5 max-md:pt-3 md:pt-4">
       <h3 className="text-[16px] leading-6 font-medium text-balance text-[#E8F4FF]">{title}</h3>
       <p className="mt-0.5 text-[13.5px] leading-[1.5] text-pretty text-white/55">{line}</p>
     </div>
@@ -43,45 +40,34 @@ function Words({ title, line }: { title: string; line: string }) {
 
 export function GovernanceBento({ copy }: { copy: Bento }) {
   return (
-    <div className="lk-mb relative mt-4">
+    <div className="lk-mb relative mt-4 max-md:mt-3">
       {/* O37: the spotlight over the whole grid, moved by the deferred controller. */}
       <span aria-hidden="true" className="lk-mb-spot pointer-events-none absolute -inset-10 z-10" />
       <BentoFxHost />
-    <ul className="grid gap-4 md:grid-cols-6">
+    {/* Owner QA 2026-11-25 ("gausah di scroll scrolll ke kanan atau kiri"): below 768 px the tiles
+        stack, each as tall as its own content, with tighter padding and gaps (the M3 swipe row is
+        gone; the lineage keeps its vertical drawing). */}
+    <ul className="grid gap-4 max-md:gap-2.5 md:grid-cols-6">
       <LiveTile label={copy.lineage.title} className={`${tile} md:col-span-4`}>
         <ColumnLineage />
         <Words title={copy.lineage.title} line={copy.lineage.line} />
       </LiveTile>
-      {/* WEB-5 M3 (phone pass): below 768 px the four small tiles are one row the visitor swipes,
-          a tile at a time with the next one peeking in, edges that fade only where a tile is
-          hidden, and dots that follow the row (all CSS, ".lk-gv-swipe" in app/globals.css). From
-          768 px this item and its list are `display: contents`, so the four tiles sit in the
-          bento grid exactly as before. */}
-      <li className="lk-gv-swipe-wrap min-w-0 md:contents">
-        <ul className="lk-gv-swipe -mx-4 flex snap-x snap-mandatory scroll-px-4 gap-3 overflow-x-auto px-4 py-1 [scrollbar-width:none] md:contents [&::-webkit-scrollbar]:hidden">
-          <LiveTile label={copy.proof.title} className={`${tile} ${swipe} md:col-span-2`}>
-            <Proof badge={copy.proof.badge} />
-            <Words title={copy.proof.title} line={copy.proof.line} />
-          </LiveTile>
-          <LiveTile label={copy.audit.title} className={`${tile} ${swipe} md:col-span-2`}>
-            <Audit text={copy.audit} />
-            <Words title={copy.audit.title} line={copy.audit.line} />
-          </LiveTile>
-          <LiveTile label={copy.catalog.title} className={`${tile} ${swipe} md:col-span-2`}>
-            <Catalog text={copy.catalog} />
-            <Words title={copy.catalog.title} line={copy.catalog.line} />
-          </LiveTile>
-          <LiveTile label={copy.access.title} className={`${tile} ${swipe} md:col-span-2`}>
-            <Access text={copy.access} />
-            <Words title={copy.access.title} line={copy.access.line} />
-          </LiveTile>
-        </ul>
-        <ol aria-hidden="true" className="lk-dash-dots lk-gv-dots mt-4 flex justify-center gap-1.5 md:hidden">
-          {[0, 1, 2, 3].map((i) => (
-            <li key={i} style={{ "--i": i } as React.CSSProperties} />
-          ))}
-        </ol>
-      </li>
+      <LiveTile label={copy.proof.title} className={`${tile} md:col-span-2`}>
+        <Proof badge={copy.proof.badge} />
+        <Words title={copy.proof.title} line={copy.proof.line} />
+      </LiveTile>
+      <LiveTile label={copy.audit.title} className={`${tile} md:col-span-2`}>
+        <Audit text={copy.audit} />
+        <Words title={copy.audit.title} line={copy.audit.line} />
+      </LiveTile>
+      <LiveTile label={copy.catalog.title} className={`${tile} md:col-span-2`}>
+        <Catalog text={copy.catalog} />
+        <Words title={copy.catalog.title} line={copy.catalog.line} />
+      </LiveTile>
+      <LiveTile label={copy.access.title} className={`${tile} md:col-span-2`}>
+        <Access text={copy.access} />
+        <Words title={copy.access.title} line={copy.access.line} />
+      </LiveTile>
     </ul>
     </div>
   );
@@ -114,7 +100,8 @@ function Audit({ text }: { text: Bento["audit"] }) {
       {text.rows.map((r, i) => (
         <li
           key={r}
-          className="lk-gv-row flex items-center gap-2 rounded-xl bg-[var(--lk-n-raised)] px-3 py-1.5 text-[12.5px] text-white/85"
+          // Owner QA 2026-11-25: a phone shows the last two entries (the second and the one that waits).
+          className={`lk-gv-row flex items-center gap-2 rounded-xl bg-[var(--lk-n-raised)] px-3 py-1.5 text-[12.5px] text-white/85 ${i === 0 ? "max-md:hidden" : ""}`}
           style={{ animationDelay: `${0.15 + i * 0.25}s` }}
         >
           <span className="size-1.5 shrink-0 rounded-full bg-[#44A6FA]" />
