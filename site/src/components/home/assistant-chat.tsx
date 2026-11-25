@@ -146,7 +146,7 @@ function Panel({ copy }: { copy: AssistantCopy }) {
         <div className="lk-ast-composer rounded-xl px-4 pt-3 pb-2.5">
           {/* One line: while a question types, the line keeps its end in view, like a real input. */}
           <p className="relative flex h-5 justify-end overflow-hidden text-[14px] leading-5 text-[#E8F4FF]">
-            <span className="lk-ast-placeholder absolute inset-0 truncate text-[#E8F4FF]/45">{copy.placeholder}</span>
+            <span className="lk-ast-placeholder absolute inset-0 truncate text-[#E8F4FF]/50">{copy.placeholder}</span>
             <span className="mr-auto shrink-0 whitespace-pre">
               <span data-typed />
               <span className="lk-ast-caret ml-px inline-block h-[1.05em] w-px translate-y-[3px] bg-[#8FCBFF]" />

@@ -89,7 +89,7 @@ export function CodePanel({ copy, action }: { copy: OpenCopy["code"]; action?: R
             </span>
           ) : (
             <span key={i} className="relative flex">
-              <span className="w-11 shrink-0 pr-3 text-right text-[#E8F4FF]/30 tabular-nums select-none">{row.n}</span>
+              <span data-n={row.n} className="lk-open-ln w-11 shrink-0 pr-3 text-right text-[#E8F4FF]/30 tabular-nums select-none" />
               <code className="!text-[12px] !leading-[19px] whitespace-pre text-[#E8F4FF]/80">{tokens(row.text)}</code>
             </span>
           ),
@@ -152,7 +152,7 @@ export function ConsoleHome({ windowTitle }: { windowTitle: string }) {
                 <span className="absolute inset-y-0 left-1.5 flex items-center gap-2 whitespace-nowrap">
                   <span>
                     <span data-typed className="text-[#E8F4FF]" />
-                    <span data-ghost className="text-[#E8F4FF]/45">{CONSOLE_PROMPTS.ask}</span>
+                    <span data-ghost className="text-[#E8F4FF]/50">{CONSOLE_PROMPTS.ask}</span>
                   </span>
                   <span className="lk-con-tab rounded bg-[#E8F4FF]/[0.08] px-1.5 text-[10px] leading-4 text-[#E8F4FF]/55 max-sm:hidden">Tab</span>
                 </span>

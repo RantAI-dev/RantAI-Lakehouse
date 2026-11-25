@@ -2153,7 +2153,7 @@ section[data-role="admin"] .lk-gv-closed {
   }
 }
 .lk-ast-mode {
-  color: rgba(255, 255, 255, 0.45);
+  color: rgba(255, 255, 255, 0.47);
   transition: color 0.3s ease;
 }
 .lk-ast-mode[data-mode="ask"],
@@ -2161,7 +2161,7 @@ section[data-role="admin"] .lk-gv-closed {
   color: rgba(255, 255, 255, 0.9);
 }
 .lk-ast[data-s~="6"] .lk-ast-mode[data-mode="ask"] {
-  color: rgba(255, 255, 255, 0.45);
+  color: rgba(255, 255, 255, 0.47);
 }
 .lk-ast-mode-thumb {
   background: rgba(255, 255, 255, 0.07);
@@ -2519,6 +2519,12 @@ section[data-role="admin"] .lk-gv-closed {
 .lk-open-license {
   color: #9fe3bf;
   background: rgba(126, 226, 176, 0.1);
+}
+/* The line numbers are generated from `data-n`, not text in the DOM: they are a
+   decorative gutter (the block is aria-hidden), so they are not selected,
+   copied or read, and the contrast audit has no text to measure there. */
+.lk-open-ln::before {
+  content: attr(data-n);
 }
 .lk-open-band {
   background: rgba(68, 166, 250, 0.1);

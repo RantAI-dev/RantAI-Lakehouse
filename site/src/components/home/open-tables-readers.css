@@ -32,7 +32,7 @@
   line-height: 18px;
 }
 .lk-otr-type {
-  color: rgba(232, 244, 255, 0.45);
+  color: rgba(232, 244, 255, 0.5);
 }
 .lk-otr-label {
   display: inline-flex;
@@ -302,7 +302,7 @@
   font-size: 12px;
   line-height: 16px;
   font-weight: 500;
-  color: rgba(232, 244, 255, 0.4);
+  color: rgba(232, 244, 255, 0.5);
   transition: color 0.35s ease;
 }
 .lk-otr-a[data-together] .lk-otr-a-caption {
