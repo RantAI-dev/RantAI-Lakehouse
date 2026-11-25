@@ -37,19 +37,18 @@ use common::{
     TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
 };
 
-/// ONE `ClickHouse` per test binary, shared by every test — mirroring
-/// `gold_export_history::TABLE_ENSURED`'s process-wide "the table has
-/// been ensured" cache, which assumes a single `ClickHouse` per process.
-/// Per-test containers would race that cache (whoever runs the ensure
-/// first pins it to THEIR container; another test's first
-/// `console.gold_export_run` read then hits a server without the table
-/// and 500s). Tests stay isolated the other way: each has its own
-/// Postgres database, and every test uses its own mart names.
+/// ONE `ClickHouse` per test binary, shared by every test: these tests
+/// seed and read `serving.*` marts, and one container per binary is far
+/// cheaper than one per test. Table DDL no longer depends on this: the
+/// `ensure_*_table` guards are keyed by `ClickHouse` URL
+/// (`lakehouse_clickhouse::ChTableEnsured`), so a `wiremock` stand-in that
+/// answered a DDL earlier in this process can no longer vouch for this
+/// container (the `Coverage & SBOM` `gold_publication::*` failure of runs
+/// 45545437095 and 45531180507). Tests stay isolated the other way: each
+/// has its own Postgres database, and every test uses its own mart names.
 ///
 /// `pub(crate)`: `gold_latest_copy`'s tests share this same container for
-/// the same reason — its `LATEST_COPY_TABLE_ENSURED` `OnceCell` is just as
-/// process-wide, so a second container would let whichever module ran
-/// first pin the other's DDL to the wrong server.
+/// the same reason.
 static CLICKHOUSE: tokio::sync::OnceCell<lakehouse_test_support::clickhouse::Started> =
     tokio::sync::OnceCell::const_new();
 

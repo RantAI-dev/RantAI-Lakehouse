@@ -191,6 +191,59 @@ export const NAV_GROUPS: NavGroup[] = [
 /** Flat list of every sidebar nav item, used for active-state and command search. */
 export const ALL_NAV_ITEMS: NavItem[] = NAV_GROUPS.flatMap((g) => g.items)
 
+/**
+ * Pages that move data INTO the warehouse (`BI-44`). A `bi-only`
+ * installation has no Dagster, object store, upload or Gold export service;
+ * a link to one of these pages would open a dead end. The extra names are
+ * pages other sections link to (`/lakehouse/tables`, `/gold-exports`): a
+ * child route is hidden with its parent. Home, History, Dashboards,
+ * Catalog, Query Studio, Sources, Governance and Settings stay visible:
+ * they read the customer's tables in place through the installed engine.
+ */
+export const BI_ONLY_HIDDEN_HREFS: ReadonlySet<string> = new Set([
+  "/pipelines",
+  "/storage",
+  "/lakehouse",
+  "/uploads",
+  "/gold",
+  "/gold-exports",
+])
+
+/**
+ * Whether a nav href belongs to a warehouse-only page in a `bi-only`
+ * installation. Child routes count as part of their parent, but a prefix
+ * must end at a path boundary so `/pipelines-extra` is not swallowed.
+ */
+export function isHiddenInBiOnly(href: string): boolean {
+  for (const hidden of BI_ONLY_HIDDEN_HREFS) {
+    if (href === hidden || href.startsWith(`${hidden}/`)) return true
+  }
+  return false
+}
+
+/**
+ * The sidebar sections a `bi-only` installation can actually open.
+ *
+ * Pure by design: the caller owns the deployment answer, so this never
+ * fetches anything and can be tested on its own. With `full`, an absent or
+ * a loading `installMode`, the SAME array is returned untouched — no
+ * refetch, no flash of a shorter menu, no guess from a health probe. Only
+ * an affirmative `"bi-only"` hides anything; empty groups drop out so the
+ * sidebar does not draw an empty section header.
+ */
+export function filterNavSectionsForInstallMode(
+  sections: NavGroup[],
+  installMode?: string
+): NavGroup[] {
+  if (installMode !== "bi-only") return sections
+  return sections
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((item) => !isHiddenInBiOnly(item.href)),
+    }))
+    .filter((group) => group.items.length > 0)
+}
+
 /** The group (section) that contains the active page — for bottom-nav & sub-navigation. */
 export function activeNavGroup(pathname: string): NavGroup | undefined {
   const href = activeNavHref(pathname)

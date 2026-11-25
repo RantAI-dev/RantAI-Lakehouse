@@ -9,6 +9,7 @@ import { TableProviders } from "@/components/app-shell/table-providers";
 import { AuthProvider } from "@/features/auth/auth-provider";
 import { ReactGrabDev } from "@/components/app-shell/react-grab-dev";
 import { NONCE_HEADER } from "@/lib/csp";
+import { EMBED_TRANSPARENT_CLASS, EMBED_TRANSPARENT_HEADER } from "@/lib/embed-look";
 import {
   readWorkspaceBranding,
   workspaceIconLinks,
@@ -73,12 +74,16 @@ export default async function RootLayout({
   // first paint) and only a nonce passed here lets the browser run it. Without
   // it the page paints light and only switches after hydration.
   const nonce = (await headers()).get(NONCE_HEADER) ?? undefined;
+  // `PR #648 review 1`: the proxy marks a transparent embed on the request, so
+  // `html` (and `body`, in `globals.css`) is cleared in this server render
+  // rather than after hydration, and the frame is transparent from first paint.
+  const embedTransparent = (await headers()).get(EMBED_TRANSPARENT_HEADER) === "1";
   const iconLinks = workspaceIconLinks(await readWorkspaceBranding());
   return (
     <html
       lang="en"
       suppressHydrationWarning
-      className={`${geist.variable} ${geistMono.variable} ${dashboardFontVariables} font-sans antialiased`}
+      className={`${geist.variable} ${geistMono.variable} ${dashboardFontVariables} font-sans antialiased${embedTransparent ? ` ${EMBED_TRANSPARENT_CLASS}` : ""}`}
     >
       <head>
         <meta name="theme-color" content="#050A30" />

@@ -45,6 +45,7 @@ mod maintenance_policy;
 mod migrations_upgrade;
 mod outside_reads;
 mod overview;
+mod pipeline_chain;
 mod pipeline_last_run;
 mod pipelines;
 mod public_links;

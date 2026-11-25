@@ -6,6 +6,7 @@ import type {
   PipelineSource,
   PipelineRunStep,
   PipelineRunLogsPage,
+  TriggerPipelineOptions,
 } from "@/services/contracts/pipelines"
 
 describe("WS4 pipelines contracts", () => {
@@ -33,6 +34,9 @@ describe("WS4 pipelines contracts", () => {
         sourceZone: "silver",
         sourceTable: "raw",
         incrementalColumn: null,
+        incrementalStrategy: "append",
+        partitionGranularity: "day",
+        lookbackHours: 0,
         transforms: ["dedupe(id)"],
         fbicEnabled: false,
         targetZone: "serving",
@@ -108,6 +112,37 @@ describe("WS4 pipelines contracts", () => {
       cursor: "opaque-cursor-1",
     }
     expect(fixture.cursor).toBe("opaque-cursor-1")
+  })
+
+  it("BLD-12 carries the materialization config on the pipeline, its definition and its trigger options", () => {
+    const detail: PipelineDetail = {
+      id: "pl-bld12",
+      name: "incremental orders",
+      kind: "incremental",
+      status: "ready",
+      owner: "system",
+      source: "silver.orders",
+      target: "serving.orders_daily",
+      schedule: "manual",
+      lastRunAt: null,
+      slaOk: null,
+      freshnessLagSeconds: null,
+      engine: "authored",
+      description: null,
+      graph: null,
+      config: [],
+      definition: null,
+      runs: [],
+      incrementalColumn: "event_time",
+      incrementalStrategy: "partition_replace",
+      partitionGranularity: "month",
+      lookbackHours: 24,
+    }
+    expect(detail.incrementalStrategy).toBe("partition_replace")
+    expect(detail.partitionGranularity).toBe("month")
+    expect(detail.lookbackHours).toBe(24)
+    const options: TriggerPipelineOptions = { fullRefresh: true }
+    expect(options.fullRefresh).toBe(true)
   })
 
   it("Pipeline carries optional targetLag and lag (BLD-2 D8)", () => {

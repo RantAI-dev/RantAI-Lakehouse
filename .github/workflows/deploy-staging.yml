@@ -591,7 +591,15 @@ jobs:
       - name: Prune the build cache back to its budget
         run: |
           docker builder prune --all --max-used-space 8GB --reserved-space 4GB --force
-          docker system df
+          # The `df` line is informational only. On run 45550813927 the
+          # prune succeeded (freed 1.912 GB) and then `docker system df`
+          # exited 1 with `failed to retrieve container list: rw layer
+          # snapshot not found for container ...`, which failed the step
+          # and aborted the deploy before `Health-check lakehouse-api`
+          # could run. A diagnostic must never decide whether the deploy
+          # goes on: a missing containerd snapshot on the staging host is
+          # worth a warning, not a rollback of an otherwise good build.
+          docker system df || echo "::warning::docker system df failed (non-fatal; check for orphaned containerd snapshots on the staging host)"
 
       - name: Health-check lakehouse-api
         run: |

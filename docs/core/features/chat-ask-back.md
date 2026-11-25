@@ -47,6 +47,7 @@ Yes. The assistant asks by itself when a word is unclear. The user answers by cl
 ## Limits to tell a customer
 
 - The chat asks once. If its previous message was a question, it takes the most likely reading and says which.
+- After a person answers the chat's question, the reply opens by naming the reading it used. It is the model's reply, so it holds in most replies, not all.
 - A turn in which the chat asks holds the question and its options only; the chat does not ask after it has already run a query in that turn, and only `run_sql`, `query_metric` and `run_saved_query` count — looking up which metrics or tables exist does not. The chat may ask right after a call was refused, for example which number column to bin, because the refusal says the call cannot be built as asked. After a refused late ask the chat answers with the reading it used, without an apology and without a question in text.
 - Options are two to four, each at most 80 characters.
 - A saved word is stored per user. Another user is asked again.
@@ -86,7 +87,7 @@ The data map change of `AI_RELEVANT_TABLES` has one row above (row 12). The prom
 
 **Accepted by:** __________ **Date:** ______ **Build:** ______
 
-Exceptions, each with an owner and a date:
+Exceptions, each with an owner and a date: Rows 9, 10, 12 accepted on unit tests (`config.rs` `parse_switch` / `ConfigError::UnsupportedAiAskBack`, and the prompt data-map tests), owner 2026-11-22.
 
 ## After acceptance
 
