@@ -231,12 +231,7 @@
     "bento": {
       "lineage": {
         "title": "Lineage per kolom",
-        "line": "Lihat asal setiap kolom, dari mentah sampai terkurasi.",
-        "nodes": [
-          "orders.amount",
-          "clean.amount",
-          "revenue_by_city"
-        ]
+        "line": "Lihat asal setiap kolom, dari mentah sampai terkurasi."
       },
       "proof": {
         "title": "Masking teruji",
@@ -300,15 +295,9 @@
       "table": "orders",
       "format": "Apache Iceberg",
       "builtIn": "bawaan",
-      "engine": "Query engine Anda",
-      "notebook": "Notebook Anda",
       "sr": "Sebuah tabel Apache Iceberg di tengah, dibaca oleh ClickHouse yang dijalankan Lakehouse, dan oleh engine atau notebook lain yang membaca Iceberg.",
-      "anyEngine": "Engine apa pun yang membaca Iceberg",
       "storage": "Object storage Anda",
-      "snapshots": "Snapshot",
-      "rows": "{n} baris",
-      "current": "terkini",
-      "dbTitle": "File yang sama, tanpa salinan"
+      "sameAnswer": "Tabel sama, jawaban sama"
     },
     "hosting": {
       "label": "Tempat berjalan",

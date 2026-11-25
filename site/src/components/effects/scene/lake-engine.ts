@@ -69,10 +69,10 @@ export type EngineOptions = {
 export type LakeEngine = {
   dispose: () => void;
   /**
-   * Day look (the lab's `/lab/hero/` only; the home page never calls it, so
+   * Day look (not called by the home page, so
    * the lake stays the night scene). 0 is night, exactly as built; 1 is a
    * calm day: a pale sky, a soft sun for the moon, brighter water. Any value
-   * between blends the two, so the lab can ease from one to the other.
+   * between blends the two, so a caller can ease from one to the other.
    */
   setTimeOfDay: (day: number) => void;
   /**
@@ -82,7 +82,7 @@ export type LakeEngine = {
    */
   setDay: (target: number, ms: number) => void;
   /**
-   * Lab framing (`/lab/hero/` only). `box`: put the creature where the page's
+   * Hero framing (unused by the home page). `box`: put the creature where the page's
    * `[data-hero-box]` element is (its top is the dome's top, its bottom the
    * waterline), easing there when the page moves it. `sun`: put the sun (or
    * the moon) at `x` of the width and `above` of the height above the horizon;
@@ -334,7 +334,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     }
   };
 
-  // Lab state (`/lab/hero/`): all inert unless `setLab` is called.
+  // Lab state: all inert unless `setLab` is called.
   const lab: { on: boolean; box: boolean; sun: { x: number; above: number } | null } = {
     on: false,
     box: false,

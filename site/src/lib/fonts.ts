@@ -7,8 +7,7 @@
  * - Geist (body, UI and the uppercase labels): the console's file from
  *   `design-system/fonts/`, same variable, `swap`, preloaded.
  * - Inter Tight (the big display lines): bold, tight-tracked, upright.
- *   The owner chose it from the hero lab (`/lab/hero/`) for the whole site.
- *   Instrument Serif, the earlier display face, is now loaded by the lab only.
+ *   The owner chose it for the whole site.
  *
  * No Geist Mono: WEB-5 review fix R7 (owner) keeps monospace for code only,
  * and the one code identifier uses the system's monospace stack

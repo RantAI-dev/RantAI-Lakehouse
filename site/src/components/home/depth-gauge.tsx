@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { JOURNEY } from "@/lib/home-content";
-import { formatDepth, gaugeDepthAt, gaugeFraction, SLAB_DEPTHS, type Anchor, type DepthsRange } from "@/lib/depth-journey";
+import { gaugeDepthAt, gaugeFraction, SLAB_DEPTHS, type Anchor, type DepthsRange } from "@/lib/depth-journey";
 import { measureJourney } from "@/lib/measure-journey";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 
@@ -16,31 +16,27 @@ const TICKS = [...new Set([0, ...JOURNEY.map((c) => c.depth), ...SLAB_DEPTHS])].
  * final call comes on screen and fades out over the next 60 % of a screen,
  * as the final's night sea scrolls in.
  * - Wide screens (1360 px and up): a thin scale on the left edge, 0 m at the top and the deepest
- *   point at the bottom, with a tick for each chapter, a marker and the
- *   reading in metres. Inside the depths section it hides, because that
- *   section's own gauge stands in the same place with the slabs' labels,
- *   and the readings are the same.
+ *   point at the bottom, with a tick for each chapter and a marker. Inside
+ *   the depths section it hides, because that section's own gauge stands in
+ *   the same place with the slabs' labels.
  * - Narrower screens, phones included: a hairline under the top bar whose
- *   fill is the depth, with the reading at its right end. It does not crowd
- *   a 360 px bar, which is already full with the wordmark, the language
- *   switch and the button.
+ *   fill is the depth. It does not crowd a 360 px bar, which is already
+ *   full with the wordmark, the language switch and the button.
  * - WEB-5 review fix R8 (BLOCKER): the scale used to start at `md` (768 px)
- *   and covered the sections' text up to about 1280 px. Its reading ends at
- *   x 92 px, and the 1120 px column's text starts at x 97 at 1280 and x 137
- *   at 1360 (measured), so the scale starts at 1360 px. There its reading
- *   clears the text by 44 px, at least 37 px even for "−100 m"; the review
- *   asks for 24.
+ *   and covered the sections' text up to about 1280 px; the 1120 px
+ *   column's text starts at x 97 at 1280 and x 137 at 1360 (measured), so
+ *   the scale starts at 1360 px. (It used to carry a reading in metres; the
+ *   owner asked for it to go on 2026-11-24, so the scale is now only the
+ *   line, the ticks and the marker.)
  *
- * The values are written through refs from a passive, rAF-throttled scroll
- * listener (no React state per scroll event, D5). Under reduced motion the
- * reading steps from chapter to chapter. It is decorative (`aria-hidden`):
- * the chapters it marks are the section headings. Without JavaScript it is
- * hidden (app/globals.css).
+ * The values are written through a CSS variable from a passive,
+ * rAF-throttled scroll listener (no React state per scroll event, D5).
+ * Under reduced motion the marker steps from chapter to chapter. It is
+ * decorative (`aria-hidden`): the chapters it marks are the section
+ * headings. Without JavaScript it is hidden (app/globals.css).
  */
-export function DepthGauge({ surfaceLabel }: { surfaceLabel: string }) {
+export function DepthGauge() {
   const rootRef = React.useRef<HTMLDivElement>(null);
-  const readingRef = React.useRef<HTMLSpanElement>(null);
-  const phoneReadingRef = React.useRef<HTMLSpanElement>(null);
   const reduced = useReducedMotionSafe();
 
   React.useEffect(() => {
@@ -67,20 +63,17 @@ export function DepthGauge({ surfaceLabel }: { surfaceLabel: string }) {
       const depth = gaugeDepthAt(y, anchors, depths, reduced);
       const inDepths = depths !== null && y >= depths.top - window.innerHeight * 0.25 && y <= depths.top + depths.span;
       const f = gaugeFraction(depth);
-      const text = formatDepth(depth);
-      // O42: the reading has reached the bottom as the final call comes on
+      // O42: the marker has reached the bottom as the final call comes on
       // screen; it fades out while the night sea scrolls in (no climb to 0 m).
       const vh = window.innerHeight;
       const fade = Math.min(1, Math.max(0, (y - (finalTop - vh)) / (0.6 * vh)));
       const opacity = (1 - fade).toFixed(2);
-      const key = `${f.toFixed(3)}|${text}|${inDepths}|${opacity}`;
+      const key = `${f.toFixed(3)}|${inDepths}|${opacity}`;
       if (key === last) return;
       last = key;
       root.style.opacity = opacity;
       root.style.setProperty("--lk-gauge-f", f.toFixed(4));
       root.toggleAttribute("data-in-depths", inDepths);
-      if (readingRef.current) readingRef.current.textContent = text;
-      if (phoneReadingRef.current) phoneReadingRef.current.textContent = text;
     };
     const onScroll = () => {
       if (!frame) frame = requestAnimationFrame(paint);
@@ -111,28 +104,14 @@ export function DepthGauge({ surfaceLabel }: { surfaceLabel: string }) {
             style={{ top: `${gaugeFraction(d) * 100}%` }}
           />
         ))}
-        <span className="absolute -top-6 left-0 text-[10px] font-medium tracking-[0.18em] text-[#E8F4FF]/55 uppercase">
-          {surfaceLabel}
-        </span>
         <span className="lk-gauge-marker absolute left-[3px] flex -translate-y-1/2 items-center gap-2.5">
           <span className="block size-[9px] rounded-full bg-[#44A6FA] shadow-[0_0_12px_3px_rgba(68,166,250,0.6)]" />
-          <span ref={readingRef} className="text-[11px] font-medium tracking-[0.12em] whitespace-nowrap text-[#E8F4FF]/85 tabular-nums">
-            0 m
-          </span>
         </span>
       </div>
-      {/* Below 1360 px: a hairline under the top bar, with the reading at its end. */}
+      {/* Below 1360 px: a hairline under the top bar. */}
       <div className="lk-gauge-line fixed inset-x-0 top-16 z-40 h-4 min-[1360px]:hidden">
         <span className="absolute inset-x-0 top-0 h-px bg-[#E8F4FF]/10" />
         <span className="lk-gauge-fill absolute top-0 left-0 h-px w-full origin-left bg-[#44A6FA]/80" />
-        {/* WEB-5 audit #8: no reading on phones (it sat on the copy and the cards); from 768 px it sits
-            on its own dark chip, so it never merges with a card corner passing under it. */}
-        <span
-          ref={phoneReadingRef}
-          className="absolute top-1.5 right-4 hidden rounded-full bg-[#020514]/85 px-2 py-0.5 text-[10px] font-medium tracking-[0.12em] text-[#E8F4FF]/75 tabular-nums backdrop-blur-sm md:inline"
-        >
-          0 m
-        </span>
       </div>
     </div>
   );

@@ -216,7 +216,7 @@ html[data-scene] .lk-fallback-bg {
    writes --lk-gauge-f, the depth as a fraction of the deepest point. The
    desktop marker moves down the scale and the phone hairline fills with it.
    The desktop scale hides inside the depths section, whose own gauge
-   stands there. Without JavaScript there is no reading, so no gauge. */
+   stands there. Without JavaScript the marker never moves, so no gauge. */
 .lk-gauge {
   --lk-gauge-f: 0;
 }
@@ -894,16 +894,6 @@ html.motion-ready .lk-tile:not([data-shown]) :is(.lk-gv-node, .lk-gv-row, .lk-gv
     transform: translateY(8px);
   }
 }
-/* Lineage: a pulse travels each edge. */
-.lk-gv-pulse {
-  stroke-dasharray: 0.12 0.88;
-  stroke-dashoffset: 1;
-  opacity: 0;
-}
-.lk-tile[data-shown] .lk-gv-pulse {
-  opacity: 1;
-  animation: lk-flow 2.2s ease-in-out 1s infinite;
-}
 /* Proof: the address masks and unmasks; the check stays. */
 .lk-gv-mask {
   opacity: 0;
@@ -1021,7 +1011,33 @@ section[data-role="admin"] .lk-gv-closed {
   transform: translateY(-3px);
 }
 /* Paused off screen, like the dashboards' tiles. */
-.lk-tile:not([data-live]) :is(.lk-gv-pulse, .lk-gv-plain, .lk-gv-mask, .lk-gv-wait, .lk-gv-ok, .lk-gv-caret) {
+.lk-tile:not([data-live]) :is(.lk-gv-plain, .lk-gv-mask, .lk-gv-wait, .lk-gv-ok, .lk-gv-caret) {
+  animation-play-state: paused;
+}
+
+/* ---- Column lineage (`components/home/lineage-trace.tsx`) ---------------
+   A bead of light along the traced path, Bronze → Silver, then Silver →
+   Gold (the second edge waits 1.1 s). In at the start, out at the end, then
+   it waits; it rests just off either end (0.2 / -1.02), so its round caps
+   never leave a dot. Reduced motion: the block at the end of this file stops
+   every animation in a tile, and the bead rests out of sight. ------------ */
+.lk-lt-pulse {
+  stroke-dasharray: 0.18 1.4;
+  stroke-dashoffset: 0.2;
+}
+.lk-tile[data-shown] .lk-lt-pulse {
+  animation: lk-lt-run 2.2s cubic-bezier(0.45, 0, 0.55, 1) backwards infinite;
+}
+@keyframes lk-lt-run {
+  0% {
+    stroke-dashoffset: 0.2;
+  }
+  50%,
+  100% {
+    stroke-dashoffset: -1.02;
+  }
+}
+.lk-tile:not([data-live]) .lk-lt-pulse {
   animation-play-state: paused;
 }
 
@@ -1209,9 +1225,6 @@ section[data-role="admin"] .lk-gv-closed {
   html.motion-ready .lk-tile:not([data-shown]) :is(.lk-gv-node, .lk-gv-row, .lk-gv-result, .lk-gv-badge) {
     opacity: 1;
   }
-  .lk-gv-pulse {
-    opacity: 0;
-  }
   /* O18: tooltips and highlights still appear, at once. */
   .lk-hov-show,
   .lk-hov-grow,
@@ -1282,11 +1295,10 @@ section[data-role="admin"] .lk-gv-closed {
   position: relative;
   overflow: hidden;
   border-radius: var(--radius-3xl);
-  /* Borderless (owner): one flat surface a step lighter than the water, the depth's colour as a
-     top edge, and a soft shadow so it still stands off the 3D sea. */
+  /* Borderless (owner): one flat surface a step lighter than the water and a soft shadow so it
+     still stands off the 3D sea. No coloured top edge (owner, 2026-11-24). */
   background: var(--lk-n-surface);
   box-shadow:
-    inset 0 1px 0 0 color-mix(in srgb, var(--lk-depth-accent) 55%, transparent),
     0 28px 60px -28px rgba(0, 0, 0, 0.7);
   color: #e8f4ff;
   font-size: 12px;
@@ -1354,8 +1366,8 @@ section[data-role="admin"] .lk-gv-closed {
 }
 .lk-depth-grid-gold {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 52px minmax(0, 1.3fr);
-  column-gap: 14px;
+  grid-template-columns: minmax(0, 1fr) 44px minmax(0, 1.5fr);
+  column-gap: 24px;
   align-items: center;
   padding: 0 14px;
 }
@@ -2744,9 +2756,7 @@ section[data-role="admin"] .lk-gv-closed {
   padding-bottom: calc(var(--lk-depths-card-lift) + var(--lk-depths-slab-edge));
 }
 .lk-depth-on-slab .lk-depth-card {
-  box-shadow:
-    inset 0 1px 0 0 color-mix(in srgb, var(--lk-depth-accent) 55%, transparent),
-    0 18px 22px -14px rgba(0, 0, 0, 0.75);
+  box-shadow: 0 18px 22px -14px rgba(0, 0, 0, 0.75);
 }
 .lk-depth-slab {
   position: absolute;
@@ -2789,184 +2799,6 @@ section[data-role="admin"] .lk-gv-closed {
 .lk-ast-log {
   -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 40px);
   mask-image: linear-gradient(180deg, transparent 0, #000 40px);
-}
-
-/* ---- Open tables, the anatomy (home/tables-anatomy.tsx) ------------------------------------ */
-.lk-tb {
-  --lk-ease: cubic-bezier(0.16, 1, 0.3, 1);
-  background: var(--lk-n-surface);
-}
-.lk-tb-label {
-  font-size: 11px;
-  line-height: 16px;
-  font-weight: 500;
-  letter-spacing: 0.04em;
-  color: rgba(232, 244, 255, 0.5);
-}
-.lk-tb-engine,
-.lk-tb-table,
-.lk-tb-file {
-  position: relative;
-  background: var(--lk-n-raised);
-  border-radius: 12px;
-}
-.lk-tb-engine {
-  padding: 8px 10px 9px;
-  transition: box-shadow 0.2s ease, transform 0.2s var(--lk-ease);
-}
-.lk-tb-table {
-  padding: 12px 14px;
-}
-.lk-tb-file {
-  padding: 6px 10px;
-  border-radius: 8px;
-  color: rgba(232, 244, 255, 0.8);
-  transition: box-shadow 0.2s ease, color 0.2s ease;
-}
-/* A wire from each engine down to the table, and from the table down to the files. */
-.lk-tb-stem {
-  position: absolute;
-  left: 50%;
-  top: 100%;
-  width: 1px;
-  height: 14px;
-  background: rgba(143, 203, 255, 0.28);
-  transition: background-color 0.2s ease;
-}
-.lk-tb-table::after {
-  content: "";
-  position: absolute;
-  left: 50%;
-  top: 100%;
-  width: 1px;
-  height: 14px;
-  background: rgba(143, 203, 255, 0.28);
-  transition: background-color 0.2s ease;
-}
-/* The snapshot timeline: a hairline with a dot per snapshot; the tip names its row count. */
-.lk-tb-snaps {
-  display: flex;
-  align-items: center;
-  gap: 18px;
-}
-.lk-tb-snap {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 11px;
-  line-height: 16px;
-  color: rgba(232, 244, 255, 0.7);
-}
-.lk-tb-snap + .lk-tb-snap::before {
-  content: "";
-  position: absolute;
-  right: calc(100% + 2px);
-  width: 14px;
-  height: 1px;
-  background: rgba(143, 203, 255, 0.3);
-}
-.lk-tb-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: rgba(143, 203, 255, 0.4);
-  transition: transform 0.2s var(--lk-ease), background-color 0.2s ease;
-}
-.lk-tb-snap[data-current] .lk-tb-dot {
-  background: #8fcbff;
-}
-.lk-tb-snap:hover .lk-tb-dot {
-  transform: scale(1.4);
-  background: #8fcbff;
-}
-.lk-tb-snaptip {
-  position: absolute;
-  left: 50%;
-  bottom: calc(100% + 6px);
-  translate: -50% 0;
-  padding: 2px 8px;
-  border-radius: 8px;
-  background: var(--lk-n-bg);
-  color: #e8f4ff;
-  font-size: 11px;
-  line-height: 16px;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.18s ease;
-}
-.lk-tb-snap:hover .lk-tb-snaptip {
-  opacity: 1;
-}
-/* The engine's mark: lake blue at rest, its brand colour when lit. */
-.lk-tb-mark {
-  color: #8fcbff;
-  transition: color 0.2s ease;
-}
-.lk-tb-engine:hover .lk-tb-mark,
-.lk-tb-engine:focus-within .lk-tb-mark {
-  color: var(--brand);
-}
-/* An engine lit: its own stem, the table's wire and every file light up (the same files, no copy). */
-.lk-tb-engine:hover {
-  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.5);
-  transform: translateY(-2px);
-}
-.lk-tb-engine:hover .lk-tb-stem {
-  background: #8fcbff;
-}
-.lk-tb:has(.lk-tb-engine:hover) .lk-tb-table::after {
-  background: #8fcbff;
-}
-.lk-tb:has(.lk-tb-engine:hover) .lk-tb-file {
-  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.45);
-  color: #e8f4ff;
-}
-/* Entering: the tiers draw in top-down, then a pulse climbs each stem from the files. */
-.lk-show-visual[data-on] .lk-tb-tier {
-  animation: lk-tb-in 0.55s var(--lk-ease) backwards;
-  animation-delay: var(--d, 0s);
-}
-.lk-show-visual[data-on] .lk-tb-file {
-  animation: lk-tb-in 0.45s var(--lk-ease) backwards;
-  animation-delay: calc(0.5s + var(--i) * 0.08s);
-}
-.lk-tb-stem::after {
-  content: "";
-  position: absolute;
-  left: -1px;
-  top: 0;
-  width: 3px;
-  height: 3px;
-  border-radius: 999px;
-  background: #8fcbff;
-  opacity: 0;
-}
-.lk-show-visual[data-on] .lk-tb-stem::after {
-  animation: lk-tb-pulse 3.2s ease-in-out infinite;
-  animation-delay: calc(1.2s + var(--i) * 0.45s);
-}
-@keyframes lk-tb-in {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-}
-@keyframes lk-tb-pulse {
-  0%,
-  100% {
-    opacity: 0;
-    transform: translateY(12px);
-  }
-  15% {
-    opacity: 1;
-  }
-  45% {
-    opacity: 0;
-    transform: translateY(0);
-  }
 }
 
 /* ---- Your servers or ours, the real stack (home/hosting-stack.tsx) --------------------------- */
@@ -3095,12 +2927,8 @@ section[data-role="admin"] .lk-gv-closed {
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .lk-tb *,
   .lk-hs * {
     animation: none !important;
-  }
-  .lk-tb-stem::after {
-    display: none;
   }
   .lk-hs-thumb,
   .lk-hs-box,
@@ -3109,8 +2937,7 @@ section[data-role="admin"] .lk-gv-closed {
   .lk-hs-sources,
   .lk-hs-term,
   .lk-hs-talk,
-  .lk-hs-card,
-  .lk-tb-engine {
+  .lk-hs-card {
     transition: none !important;
   }
 }

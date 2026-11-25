@@ -2,6 +2,7 @@ import * as React from "react";
 import { BadgeCheck, Check, Folder, LayoutDashboard, Lock, LockOpen, Search } from "lucide-react";
 import type { HomeCopy } from "@/lib/copy";
 import { BentoFxHost } from "./bento-fx-host";
+import { ColumnLineage } from "./lineage-trace";
 import { LiveTile } from "./live-tile";
 
 /**
@@ -45,7 +46,7 @@ export function GovernanceBento({ copy }: { copy: Bento }) {
       <BentoFxHost />
     <ul className="grid gap-4 md:grid-cols-6">
       <LiveTile label={copy.lineage.title} className={`${tile} md:col-span-4`}>
-        <Lineage nodes={copy.lineage.nodes} />
+        <ColumnLineage />
         <Words title={copy.lineage.title} line={copy.lineage.line} />
       </LiveTile>
       <LiveTile label={copy.proof.title} className={`${tile} md:col-span-2`}>
@@ -66,32 +67,6 @@ export function GovernanceBento({ copy }: { copy: Bento }) {
       </LiveTile>
     </ul>
     </div>
-  );
-}
-
-/** Raw → clean → curated, one column's path, with a pulse travelling along the edges. */
-function Lineage({ nodes }: { nodes: string[] }) {
-  const colours = ["#C8834A", "#B9C6D3", "#F2C14E"];
-  const xs = [16, 222, 428];
-  return (
-    <svg viewBox="0 24 600 72" className="my-2 h-auto w-full overflow-visible" aria-hidden="true">
-      {[0, 1].map((i) => (
-        <g key={i}>
-          <path className="lk-gv-edge lk-draw" style={{ animationDelay: `${0.3 + i * 0.3}s` }} pathLength={1} d={`M${xs[i] + 156} 60 C${xs[i] + 180} 60 ${xs[i + 1] - 24} 60 ${xs[i + 1]} 60`} fill="none" stroke="#E8F4FF" strokeOpacity="0.25" strokeWidth="2" />
-          <path className="lk-gv-pulse" style={{ animationDelay: `${i * 1.1}s` }} pathLength={1} d={`M${xs[i] + 156} 60 C${xs[i] + 180} 60 ${xs[i + 1] - 24} 60 ${xs[i + 1]} 60`} fill="none" stroke="#44A6FA" strokeWidth="3" strokeLinecap="round" />
-        </g>
-      ))}
-      {nodes.map((n, i) => (
-        <g key={n} className="lk-gv-node" style={{ animationDelay: `${i * 0.3}s` }}>
-          <rect x={xs[i]} y="36" width="156" height="48" rx="14" fill="#112238" />
-          <circle cx={xs[i] + 18} cy="60" r="4" fill={colours[i]} />
-          {/* A column name is code: monospace (DESIGN.md §4). */}
-          <text x={xs[i] + 30} y="64.5" fill="#E8F4FF" fontSize="13" fontFamily="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
-            {n}
-          </text>
-        </g>
-      ))}
-    </svg>
   );
 }
 

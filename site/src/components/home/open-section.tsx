@@ -7,7 +7,7 @@ import { SplitWords } from "@/components/shared/reveal";
 import { CodePanel, ConsoleHome } from "./open-visuals";
 import { ConsolePlay } from "./console-play";
 import { HostingStack } from "./hosting-stack";
-import { TablesAnatomy } from "./tables-anatomy";
+import { OneTableManyReaders } from "./open-tables-readers";
 import { OpenShowcase } from "./open-showcase";
 
 /**
@@ -52,7 +52,7 @@ export function OpenSection({ copy, cta, contactHref }: { copy: HomeCopy["open"]
         />
       ),
     },
-    { title: tables.title, body: tables.body, visual: <TablesAnatomy copy={copy.tables} /> },
+    { title: tables.title, body: tables.body, visual: <OneTableManyReaders copy={copy.tables} /> },
     { title: servers.title, body: servers.body, visual: <HostingStack copy={copy.hosting} contactHref={contactHref} /> },
     {
       title: copy.console.label,

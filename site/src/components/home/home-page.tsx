@@ -56,7 +56,7 @@ export async function HomePage({ locale }: Readonly<{ locale: Locale }>) {
         {/* WEB-5 D14 S2: the water the second half of the page sits in. First, so every section paints over it. */}
         <DepthBackdrop />
         {/* WEB-5 D14 S3: the depth, the whole way down and back up. */}
-        <DepthGauge surfaceLabel={common.gauge.surface} />
+        <DepthGauge />
         <TopBar locale={locale} nav={common.nav} cta={common.cta} language={common.language} />
         <main id="main" tabIndex={-1}>
           <SceneZone>

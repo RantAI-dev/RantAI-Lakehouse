@@ -216,15 +216,16 @@ export function DepthDataCard({
               <div key={g.city} className="lk-depth-group lk-depth-grid-gold" style={{ "--slot": i } as React.CSSProperties}>
                 <span className="font-medium text-[#E8F4FF]">{g.city}</span>
                 <span className="text-right text-[#E8F4FF]/70 tabular-nums">{g.orders}</span>
-                <span className="flex min-w-0 flex-col items-end gap-1">
-                  <span className="font-medium text-[#E8F4FF] tabular-nums" data-count={g.revenue}>
-                    {fmt.format(g.revenue)}
-                  </span>
-                  <span className="lk-depth-track relative h-[5px] w-full overflow-hidden rounded-full">
+                {/* One line: the bar fills from the left, the figure sits at the right end, both centred on the row. */}
+                <span className="flex min-w-0 items-center gap-2.5">
+                  <span className="lk-depth-track relative h-[5px] min-w-0 flex-1 overflow-hidden rounded-full">
                     <span
                       className="lk-depth-bar absolute inset-y-0 left-0 rounded-full"
                       style={{ width: `${Math.round((g.revenue / GOLD_MAX) * 100)}%`, "--i": i } as React.CSSProperties}
                     />
+                  </span>
+                  <span className="w-[52px] shrink-0 text-right font-medium text-[#E8F4FF] tabular-nums" data-count={g.revenue}>
+                    {fmt.format(g.revenue)}
                   </span>
                 </span>
               </div>
