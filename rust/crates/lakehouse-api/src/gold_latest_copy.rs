@@ -40,7 +40,7 @@
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ident::SqlLiteral;
 use lakehouse_dagster::DgClient;
-use lakehouse_iceberg::gold;
+use lakehouse_iceberg::gold::{self, PublishZone};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
@@ -61,6 +61,8 @@ const OP_NAME: &str = "refresh_gold_latest_copy";
 /// publish's ONE `_exported_at` stamp in microseconds, and the row
 /// count the op must read back exactly.
 pub struct LatestCopyRequest<'a> {
+    /// DATA-65: the publication zone the copy belongs to.
+    pub zone: PublishZone,
     /// The mart name as the route received it.
     pub mart: &'a str,
     /// The published table's sanitized name (`GoldExportResult.table`).
@@ -77,13 +79,20 @@ pub struct LatestCopyRequest<'a> {
 /// disagree about the suffix.
 #[must_use]
 pub fn run_config(req: &LatestCopyRequest<'_>) -> Value {
-    json!({"ops": {OP_NAME: {"config": {
+    let mut config = json!({
         "mart": req.mart,
         "table": req.table,
         "latest_table": gold::latest_table_name(req.table),
         "copy_exported_at_micros": req.copy_exported_at_micros,
         "rows": req.rows,
-    }}}})
+    });
+    // Gold keeps the exact five-key config the op had before DATA-65, so
+    // every existing launch/test is byte-identical. Silver adds one extra
+    // key naming the namespace the Python op must read/write.
+    if req.zone == PublishZone::Silver {
+        config["zone"] = json!(req.zone.namespace_name());
+    }
+    json!({"ops": {OP_NAME: {"config": config}}})
 }
 
 /// Cached "has `console.gold_latest_copy_run` been created this process"
@@ -124,6 +133,13 @@ async fn ensure_gold_latest_copy_run_table_uncached(ch: &ChClient) -> Result<(),
             started_at DateTime64(3),\n\
             finished_at DateTime64(3)\n\
           ) ENGINE = MergeTree ORDER BY (mart, started_at)",
+        None,
+    )
+    .await?;
+    // DATA-65: Silver and Gold copies of the same bare mart name keep
+    // independent histories. Existing rows were all Gold.
+    ch.exec(
+        "ALTER TABLE console.gold_latest_copy_run ADD COLUMN IF NOT EXISTS zone String DEFAULT 'gold'",
         None,
     )
     .await?;
@@ -253,26 +269,48 @@ pub fn micros_to_rfc3339(us: i64) -> Option<String> {
         })
 }
 
+#[allow(
+    dead_code,
+    reason = "the Gold-only SQL form is kept for the pre-DATA-65 callers and pinned by tests; \
+              production callers now go through the zone-aware form"
+)]
 fn latest_holds_sql(mart: &str) -> String {
+    latest_holds_sql_for_zone(mart, "gold")
+}
+
+/// DATA-65: zone-aware newest successful copy.
+fn latest_holds_sql_for_zone(mart: &str, zone: &str) -> String {
     format!(
         "SELECT toString(toUnixTimestamp64Micro(copy_exported_at)) AS copy_micros, \
                 rows, \
                 toString(toUnixTimestamp64Milli(finished_at)) AS finished_ms \
          FROM console.gold_latest_copy_run \
-         WHERE mart = {mart} AND status = 'success' \
+         WHERE mart = {mart} AND zone = {zone} AND status = 'success' \
          ORDER BY started_at DESC LIMIT 1 FORMAT JSON",
         mart = SqlLiteral::from(mart),
+        zone = SqlLiteral::from(zone),
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "the Gold-only SQL form is kept for the pre-DATA-65 callers and pinned by tests; \
+              production callers now go through the zone-aware form"
+)]
 fn latest_run_sql(mart: &str) -> String {
+    latest_run_sql_for_zone(mart, "gold")
+}
+
+/// DATA-65: zone-aware newest run of any status.
+fn latest_run_sql_for_zone(mart: &str, zone: &str) -> String {
     format!(
         "SELECT status, reason, cleanup, \
                 toString(toUnixTimestamp64Milli(finished_at)) AS finished_ms \
          FROM console.gold_latest_copy_run \
-         WHERE mart = {mart} \
+         WHERE mart = {mart} AND zone = {zone} \
          ORDER BY started_at DESC LIMIT 1 FORMAT JSON",
         mart = SqlLiteral::from(mart),
+        zone = SqlLiteral::from(zone),
     )
 }
 
@@ -333,10 +371,27 @@ pub async fn latest_copy_state(
     ch: &ChClient,
     mart: &str,
 ) -> Result<(Option<LatestCopyHolds>, Option<LatestCopyRun>), ChError> {
+    latest_copy_state_for_zone(ch, mart, PublishZone::Gold).await
+}
+
+/// DATA-65: the latest-copy state of one `(zone, mart)` publication.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the record table cannot be ensured or either
+/// query fails.
+pub async fn latest_copy_state_for_zone(
+    ch: &ChClient,
+    mart: &str,
+    zone: PublishZone,
+) -> Result<(Option<LatestCopyHolds>, Option<LatestCopyRun>), ChError> {
     ensure_gold_latest_copy_run_table(ch).await?;
-    let holds = ch.rows(&latest_holds_sql(mart), None).await?;
+    let zone = zone.namespace_name();
+    let holds = ch
+        .rows(&latest_holds_sql_for_zone(mart, zone), None)
+        .await?;
     let holds = holds.first().map(row_to_holds);
-    let runs = ch.rows(&latest_run_sql(mart), None).await?;
+    let runs = ch.rows(&latest_run_sql_for_zone(mart, zone), None).await?;
     let last = runs.first().map(row_to_run);
     Ok((holds, last))
 }
@@ -353,6 +408,7 @@ mod tests {
 
     fn request(table: &str) -> LatestCopyRequest<'_> {
         LatestCopyRequest {
+            zone: PublishZone::Gold,
             mart: "gold_export_smoke",
             table,
             copy_exported_at_micros: 1_795_168_800_123_456,
@@ -384,6 +440,41 @@ mod tests {
             json!(1_795_168_800_123_456_i64)
         );
         assert_eq!(op["rows"], json!(123));
+    }
+
+    /// DATA-65: a Silver launch carries the extra `zone` key in its run
+    /// config, and the latest-copy state read filters on that zone, so a
+    /// `silver.orders` copy never shows up under `gold.orders`.
+    #[test]
+    fn silver_launches_carry_the_zone_and_filter_history_by_it() {
+        let mut req = request("orders");
+        req.zone = PublishZone::Silver;
+        let config = run_config(&req);
+        let op = &config["ops"][OP_NAME]["config"];
+        assert_eq!(op["zone"], "silver");
+        assert_eq!(op.as_object().unwrap().len(), 6);
+
+        holds_and_run_sql_are_zone_scoped("silver");
+    }
+
+    fn holds_and_run_sql_are_zone_scoped(zone: &str) {
+        for sql in [
+            latest_holds_sql_for_zone("orders", zone),
+            latest_run_sql_for_zone("orders", zone),
+        ] {
+            assert!(sql.contains("mart = 'orders'"), "{sql}");
+            assert!(sql.contains(&format!("zone = '{zone}'")), "{sql}");
+        }
+    }
+
+    #[test]
+    fn gold_launches_keep_the_five_key_config_and_gold_history() {
+        let config = run_config(&request("orders"));
+        assert_eq!(
+            config["ops"][OP_NAME]["config"].as_object().unwrap().len(),
+            5
+        );
+        holds_and_run_sql_are_zone_scoped("gold");
     }
 
     #[test]

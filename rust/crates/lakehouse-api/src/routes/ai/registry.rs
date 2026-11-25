@@ -1608,17 +1608,19 @@ fn kill_query_schema() -> Value {
 
 fn export_gold_mart_schema() -> Value {
     json!({ "type": "function", "function": { "name": "export_gold_mart",
-        "description": "Export one Gold mart (serving.<mart>) to its Iceberg Gold table through Lakekeeper. Append-only: running it again adds the rows again with a new _exported_at; it does not replace them.",
+        "description": "Export one Silver (silver.<mart>) or Gold (serving.<mart>) mart to its Iceberg table through Lakekeeper. Append-only: running it again adds the rows again with a new _exported_at; it does not replace them.",
         "parameters": { "type": "object", "properties": {
-            "mart": { "type": "string", "description": "Gold mart name, e.g. mart_sales" } },
+            "mart": { "type": "string", "description": "Mart name, e.g. mart_sales" },
+            "zone": { "type": "string", "enum": ["silver", "gold"], "description": "Publication zone (default gold): silver reads silver.<mart> and writes silver.<mart>." } },
             "required": ["mart"] } } })
 }
 
 fn get_gold_export_schema() -> Value {
     json!({ "type": "function", "function": { "name": "get_gold_export",
-        "description": "Read a Gold Iceberg table back (by mart) through Lakekeeper: its row count and format version, independent of ClickHouse.",
+        "description": "Read a Silver or Gold Iceberg table back (by mart and zone) through Lakekeeper: its row count and format version, independent of ClickHouse.",
         "parameters": { "type": "object", "properties": {
-            "mart": { "type": "string", "description": "Gold mart name, e.g. mart_sales" } },
+            "mart": { "type": "string", "description": "Mart name, e.g. mart_sales" },
+            "zone": { "type": "string", "enum": ["silver", "gold"], "description": "Publication zone (default gold)." } },
             "required": ["mart"] } } })
 }
 

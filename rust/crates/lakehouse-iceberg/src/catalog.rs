@@ -274,15 +274,20 @@ impl IcebergClient {
         Ok(BronzeTable { table })
     }
 
-    /// Ensures the flat `gold` namespace (ADR 0010) exists, creating it if
-    /// not. Idempotent, same shape as [`Self::ensure_bronze_namespace`].
+    /// Ensures the flat namespace for `zone` exists, creating it if not.
+    /// Idempotent, same shape as [`Self::ensure_bronze_namespace`].
     ///
     /// # Errors
     ///
     /// Returns [`IcebergError::Catalog`] for any failure other than the
     /// namespace already existing.
-    pub async fn ensure_gold_namespace(&self) -> Result<NamespaceIdent, IcebergError> {
-        let namespace = gold::gold_namespace().map_err(|e| IcebergError::Bronze(e.to_string()))?;
+    pub async fn ensure_published_namespace(
+        &self,
+        zone: gold::PublishZone,
+    ) -> Result<NamespaceIdent, IcebergError> {
+        let namespace = zone
+            .namespace()
+            .map_err(|e| IcebergError::Bronze(e.to_string()))?;
         if self.catalog.namespace_exists(&namespace).await? {
             return Ok(namespace);
         }
@@ -306,26 +311,40 @@ impl IcebergClient {
         }
     }
 
-    /// Creates a Gold export table named `mart_name` (sanitized per
-    /// `gold::sanitize_mart_name`) in the `gold` namespace (ADR 0010), with
+    /// Ensures the flat `gold` namespace (ADR 0010) exists. Thin wrapper
+    /// over [`Self::ensure_published_namespace`] kept for 100% backward
+    /// compatibility (DATA-65).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::ensure_published_namespace`].
+    pub async fn ensure_gold_namespace(&self) -> Result<NamespaceIdent, IcebergError> {
+        self.ensure_published_namespace(gold::PublishZone::Gold)
+            .await
+    }
+
+    /// Creates a published export table named `table_name` (sanitized per
+    /// `gold::sanitize_mart_name`) in `zone`'s namespace, with
     /// `domain_fields` plus the standard `_exported_at` column, partitioned
-    /// by `day(_exported_at)`, **always at Iceberg format-version 2**.
-    /// Fails if the table already exists — use [`Self::load_gold_table`]
-    /// for idempotent create-or-load.
+    /// by `day(_exported_at)`, **always at Iceberg format-version 2**. DATA-65:
+    /// the mechanics are identical for Silver and Gold; only the namespace
+    /// differs. Fails if the table already exists — use
+    /// [`Self::load_published_table`] for idempotent create-or-load.
     ///
     /// # Errors
     ///
     /// Returns [`IcebergError::Bronze`] if the name/schema/partition spec
     /// cannot be constructed, or [`IcebergError::Catalog`] if the catalog
     /// call fails (including `TableAlreadyExists`).
-    pub async fn create_gold_table(
+    pub async fn create_published_table(
         &self,
-        mart_name: &str,
+        zone: gold::PublishZone,
+        table_name: &str,
         domain_fields: Vec<NestedField>,
     ) -> Result<GoldTable, IcebergError> {
-        let namespace = self.ensure_gold_namespace().await?;
-        let sanitized =
-            gold::sanitize_mart_name(mart_name).map_err(|e| IcebergError::Bronze(e.to_string()))?;
+        let namespace = self.ensure_published_namespace(zone).await?;
+        let sanitized = gold::sanitize_mart_name(table_name)
+            .map_err(|e| IcebergError::Bronze(e.to_string()))?;
         let schema =
             gold::gold_schema(domain_fields).map_err(|e| IcebergError::Bronze(e.to_string()))?;
         let partition_spec = gold::export_day_partition_spec(&schema)
@@ -342,23 +361,57 @@ impl IcebergClient {
         Ok(GoldTable { table })
     }
 
-    /// Loads an existing Gold export table by mart name.
+    /// Creates a Gold export table — thin wrapper over
+    /// [`Self::create_published_table`] with [`gold::PublishZone::Gold`],
+    /// kept for backward compatibility (DATA-65).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::create_published_table`].
+    pub async fn create_gold_table(
+        &self,
+        table_name: &str,
+        domain_fields: Vec<NestedField>,
+    ) -> Result<GoldTable, IcebergError> {
+        self.create_published_table(gold::PublishZone::Gold, table_name, domain_fields)
+            .await
+    }
+
+    /// Loads an existing published table by name from `zone`'s namespace.
     ///
     /// # Errors
     ///
     /// Returns [`IcebergError::Catalog`] if the table does not exist or the
     /// catalog call fails.
-    pub async fn load_gold_table(&self, mart_name: &str) -> Result<GoldTable, IcebergError> {
-        let namespace = gold::gold_namespace().map_err(|e| IcebergError::Bronze(e.to_string()))?;
-        let sanitized =
-            gold::sanitize_mart_name(mart_name).map_err(|e| IcebergError::Bronze(e.to_string()))?;
+    pub async fn load_published_table(
+        &self,
+        zone: gold::PublishZone,
+        table_name: &str,
+    ) -> Result<GoldTable, IcebergError> {
+        let namespace = zone
+            .namespace()
+            .map_err(|e| IcebergError::Bronze(e.to_string()))?;
+        let sanitized = gold::sanitize_mart_name(table_name)
+            .map_err(|e| IcebergError::Bronze(e.to_string()))?;
         let ident = TableIdent::new(namespace, sanitized);
         let table = self.catalog.load_table(&ident).await?;
         Ok(GoldTable { table })
     }
 
-    /// Loads an existing Gold export table by mart name, or `None` when the
-    /// catalog says the table does not exist (`DATA-49`, QA `LH-DATA-1-01`).
+    /// Loads an existing Gold export table — thin wrapper over
+    /// [`Self::load_published_table`] with [`gold::PublishZone::Gold`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::load_published_table`].
+    pub async fn load_gold_table(&self, table_name: &str) -> Result<GoldTable, IcebergError> {
+        self.load_published_table(gold::PublishZone::Gold, table_name)
+            .await
+    }
+
+    /// Loads an existing published table by name from `zone`'s namespace,
+    /// or `None` when the catalog says the table does not exist (`DATA-49`,
+    /// QA `LH-DATA-1-01`).
     ///
     /// The kind is read off the raw [`iceberg::Error`] before
     /// [`IcebergError`]'s conversion keeps only its `Display`; the REST client
@@ -370,14 +423,17 @@ impl IcebergClient {
     ///
     /// Returns [`IcebergError::Catalog`] if the catalog call fails for any
     /// reason other than "table not found", and [`IcebergError::Bronze`] if
-    /// the mart name or namespace cannot be built.
-    pub async fn load_gold_table_if_exists(
+    /// the table name or namespace cannot be built.
+    pub async fn load_published_table_if_exists(
         &self,
-        mart_name: &str,
+        zone: gold::PublishZone,
+        table_name: &str,
     ) -> Result<Option<GoldTable>, IcebergError> {
-        let namespace = gold::gold_namespace().map_err(|e| IcebergError::Bronze(e.to_string()))?;
-        let sanitized =
-            gold::sanitize_mart_name(mart_name).map_err(|e| IcebergError::Bronze(e.to_string()))?;
+        let namespace = zone
+            .namespace()
+            .map_err(|e| IcebergError::Bronze(e.to_string()))?;
+        let sanitized = gold::sanitize_mart_name(table_name)
+            .map_err(|e| IcebergError::Bronze(e.to_string()))?;
         let ident = TableIdent::new(namespace, sanitized);
         match self.catalog.load_table(&ident).await {
             Ok(table) => Ok(Some(GoldTable { table })),
@@ -386,23 +442,59 @@ impl IcebergClient {
         }
     }
 
-    /// Creates the Gold table if it does not already exist, or loads it if
-    /// it does. Every export run after the first hits the `load` branch —
-    /// the schema/partition spec passed here only matters for the table's
-    /// first creation.
+    /// Loads an existing Gold export table, or `None` when not published.
+    /// Thin wrapper over [`Self::load_published_table_if_exists`] with
+    /// [`gold::PublishZone::Gold`] (DATA-65).
     ///
     /// # Errors
     ///
-    /// See [`Self::create_gold_table`] and [`Self::load_gold_table`].
-    pub async fn create_or_load_gold_table(
+    /// See [`Self::load_published_table_if_exists`].
+    pub async fn load_gold_table_if_exists(
         &self,
-        mart_name: &str,
+        table_name: &str,
+    ) -> Result<Option<GoldTable>, IcebergError> {
+        self.load_published_table_if_exists(gold::PublishZone::Gold, table_name)
+            .await
+    }
+
+    /// Creates the published table if it does not already exist, or loads
+    /// it if it does. Every export run after the first hits the `load`
+    /// branch — the schema/partition spec passed here only matters for the
+    /// table's first creation.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::create_published_table`] and
+    /// [`Self::load_published_table`].
+    pub async fn create_or_load_published_table(
+        &self,
+        zone: gold::PublishZone,
+        table_name: &str,
         domain_fields: Vec<NestedField>,
     ) -> Result<GoldTable, IcebergError> {
-        match self.load_gold_table(mart_name).await {
+        match self.load_published_table(zone, table_name).await {
             Ok(table) => Ok(table),
-            Err(_) => self.create_gold_table(mart_name, domain_fields).await,
+            Err(_) => {
+                self.create_published_table(zone, table_name, domain_fields)
+                    .await
+            }
         }
+    }
+
+    /// Creates-or-loads a Gold export table — thin wrapper over
+    /// [`Self::create_or_load_published_table`] with
+    /// [`gold::PublishZone::Gold`] (DATA-65).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::create_or_load_published_table`].
+    pub async fn create_or_load_gold_table(
+        &self,
+        table_name: &str,
+        domain_fields: Vec<NestedField>,
+    ) -> Result<GoldTable, IcebergError> {
+        self.create_or_load_published_table(gold::PublishZone::Gold, table_name, domain_fields)
+            .await
     }
 
     /// Borrows the underlying [`Catalog`] — needed because

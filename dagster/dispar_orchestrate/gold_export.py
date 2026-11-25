@@ -134,6 +134,15 @@ def _required_env(name: str) -> str:
 INVALID_KEEP_COPIES_REASON = "invalid GOLD_KEEP_COPIES"
 INVALID_ORPHAN_MIN_AGE_REASON = "invalid GOLD_ORPHAN_MIN_AGE_SECONDS"
 
+# DATA-65: the two publication zones. A Gold target keeps the bare mart
+# name as its Dagster step key (so every pre-DATA-65 step key, test and
+# run-history reference is unchanged); a Silver target is prefixed so
+# `silver.orders` and `serving.orders` cannot collide in one mapped job.
+ZONE_SILVER = "silver"
+ZONE_GOLD = "gold"
+DEFAULT_ZONE = ZONE_GOLD
+SILVER_STEP_PREFIX = "silver__"
+
 
 class InvalidKeepCopiesError(ValueError):
     """Raised when GOLD_KEEP_COPIES cannot be parsed as an integer >= 1."""
@@ -288,16 +297,26 @@ def _headers(cfg: GoldExportConfig) -> dict[str, str]:
     }
 
 
-def export_one_mart(cfg: GoldExportConfig, mart: str) -> dict[str, Any]:
+def export_one_mart(
+    cfg: GoldExportConfig, mart: str, zone: str = DEFAULT_ZONE
+) -> dict[str, Any]:
     """`ifChanged=true` (gold-publish-per-mart plan T4): the API skips
     the export — 200 `{skipped: true, reason: ...}`, nothing written,
     no history row — when the mart's `max(modification_time)` last moved
     strictly before its last successful export (equal timestamps export,
     PR slice B review B1). The manual console trigger sends no such
-    parameter; only the schedule measures before it writes."""
+    parameter; only the schedule measures before it writes.
+
+    DATA-65: a Silver export adds `zone=silver` to the query. Gold sends
+    exactly the old `{ifChanged: true}` params, so no existing URL test or
+    deployment changes.
+    """
+    params = {"ifChanged": "true"}
+    if zone != DEFAULT_ZONE:
+        params["zone"] = zone
     resp = requests.post(
         f"{cfg.api_url}/api/gold/export/{mart}",
-        params={"ifChanged": "true"},
+        params=params,
         headers=_headers(cfg),
         timeout=60,
     )
@@ -324,6 +343,7 @@ def _enabled_publication_marts(cfg: GoldExportConfig) -> list[str]:
             allow_retries=False,
         )
     marts: list[str] = []
+    targets: list[MartExportTarget] = []
     for publication in publications:
         mart = publication.get("mart") if isinstance(publication, dict) else None
         if not isinstance(mart, str) or not mart:
@@ -332,8 +352,19 @@ def _enabled_publication_marts(cfg: GoldExportConfig) -> list[str]:
                 f"publication without a mart name: {publication!r}",
                 allow_retries=False,
             )
+        # DATA-65: a pre-DATA-65 API has no `zone` on an item; it was all
+        # Gold. An unknown zone is a protocol error, not a silently
+        # defaulted Gold publish into the wrong namespace.
+        zone = publication.get("zone", DEFAULT_ZONE) if isinstance(publication, dict) else DEFAULT_ZONE
+        if zone not in (ZONE_SILVER, ZONE_GOLD):
+            raise Failure(
+                f"GET {cfg.api_url}/api/gold/publications returned an "
+                f"unknown zone {zone!r} for mart {mart!r}",
+                allow_retries=False,
+            )
         marts.append(mart)
-    return marts
+        targets.append(MartExportTarget(mart, zone))
+    return PublicationMarts(marts, targets)
 
 
 # Dagster's `DynamicOutput.mapping_key` must match `^[A-Za-z0-9_]+$`
@@ -359,6 +390,75 @@ def _sanitize_mapping_key(name: str) -> str:
     graph itself would refuse to build -- caught here at the fan-out
     op, not at graph-build time, with both names in the message."""
     return _SANITIZE_NON_ASCII.sub("_", name)
+
+
+@dataclass(frozen=True)
+class MartExportTarget:
+    """One scheduled export: a mart name plus the zone it publishes to.
+
+    DATA-65: the zone decides both the ClickHouse source schema the API
+    reads and the Iceberg namespace the table lands in. A `str` is accepted
+    everywhere (and means Gold) so every pre-DATA-65 caller, test and
+    in-process run config keeps working unchanged.
+    """
+
+    mart: str
+    zone: str = DEFAULT_ZONE
+
+    @classmethod
+    def from_input(cls, value: Any) -> "MartExportTarget":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            return cls(value)
+        if isinstance(value, dict):
+            mart = value.get("mart")
+            zone = value.get("zone", DEFAULT_ZONE)
+            if isinstance(mart, str) and isinstance(zone, str):
+                return cls(mart, zone)
+        raise Failure(
+            f"not a Gold export target: {value!r}", allow_retries=False
+        )
+
+    @property
+    def iceberg_table(self) -> str:
+        """The catalog's two-part name of this publication's table."""
+        return f"{self.zone}.{self.mart}"
+
+    @property
+    def mapping_key(self) -> str:
+        """A `DynamicOutput` key unique across both zones and valid for
+        Dagster's `^[A-Za-z0-9_]+$` rule. Gold keeps the bare sanitized
+        name; Silver is prefixed (DATA-65)."""
+        key = _sanitize_mapping_key(self.mart)
+        return f"{SILVER_STEP_PREFIX}{key}" if self.zone == ZONE_SILVER else key
+
+
+class PublicationMarts(list[str]):
+    """The mart names returned by `_enabled_publication_marts`, plus the
+    `(zone, mart)` targets they came from.
+
+    A plain `list[str]` subclass so callers that only need names (including
+    the latest-copy op and the existing tests) see exactly the same value
+    they did before DATA-65. `list_gold_marts` reads the extra `targets`
+    to schedule each publication with its own zone — a Silver and a Gold
+    publication can share a bare mart name and are TWO entries here.
+    """
+
+    def __init__(
+        self, marts: list[str], targets: list[MartExportTarget] | None = None
+    ) -> None:
+        super().__init__(marts)
+        self.targets = targets or [MartExportTarget(mart) for mart in marts]
+
+    def zone_of(self, mart: str) -> str:
+        # The latest-copy op asks "is this mart published in my zone?"
+        # after it has learned the zone; a plain list (pre-DATA-65) means
+        # Gold, the only zone that existed then.
+        for target in self.targets:
+            if target.mart == mart:
+                return target.zone
+        return DEFAULT_ZONE
 
 
 # The op itself only calls the API per mart; the API reads the ClickHouse
@@ -397,24 +497,31 @@ def list_gold_marts(context) -> Any:
     context.log.info(
         f"enabled publications: {enabled}; GOLD_EXPORT_MARTS override: {cfg.marts}"
     )
-    seen_names: set[str] = set()
+    publication_targets = (
+        enabled.targets if isinstance(enabled, PublicationMarts) else None
+    )
+    if publication_targets is None:
+        publication_targets = [MartExportTarget(mart) for mart in enabled]
+    seen_names: set[tuple[str, str]] = set()
     seen_keys: dict[str, str] = {}
-    sources = [("publication setting", m) for m in enabled]
-    sources += [("GOLD_EXPORT_MARTS", m) for m in cfg.marts]
-    for source, mart in sources:
-        if mart in seen_names:
+    sources = [("publication setting", target) for target in publication_targets]
+    # The env override is an operator escape hatch for Gold marts; it has
+    # no zone syntax, exactly as before DATA-65.
+    sources += [("GOLD_EXPORT_MARTS", MartExportTarget(mart)) for mart in cfg.marts]
+    for source, target in sources:
+        if (target.zone, target.mart) in seen_names:
             continue
-        key = _sanitize_mapping_key(mart)
+        key = target.mapping_key
         if key in seen_keys:
             raise Failure(
                 f"two Gold marts map to the same Dagster step key {key!r}: "
-                f"{seen_keys[key]!r} and {mart!r} ({source}) -- "
+                f"{seen_keys[key]!r} and {target.iceberg_table!r} ({source}) -- "
                 "rename one so each mart maps to a unique step",
                 allow_retries=False,
             )
-        seen_names.add(mart)
-        seen_keys[key] = mart
-        yield DynamicOutput(mart, mapping_key=key)
+        seen_names.add((target.zone, target.mart))
+        seen_keys[key] = target.iceberg_table
+        yield DynamicOutput(target, mapping_key=key)
 
 
 @op(
@@ -428,7 +535,7 @@ def list_gold_marts(context) -> Any:
         ],
     ),
 )
-def export_gold_mart(context, mart: str) -> dict[str, Any]:
+def export_gold_mart(context, mart: Any) -> dict[str, Any]:
     """Run `POST /api/gold/export/{mart}` for ONE mart and record the
     outcome via `record_maintenance_run` (the same `bronze_meta.*`
     registry `maintenance.py` writes to -- `GET /api/governance/
@@ -448,9 +555,14 @@ def export_gold_mart(context, mart: str) -> dict[str, Any]:
     partition between "retryable transient" and "non-retryable
     config/auth" honest: only the latter wraps in
     `Failure(allow_retries=False)`, and they don't originate here."""
+    target = MartExportTarget.from_input(mart)
+    mart = target.mart
+    zone = target.zone
     cfg = GoldExportConfig.from_env()
     try:
-        body = export_one_mart(cfg, mart)
+        # A Gold export keeps the exact two-argument call its tests and
+        # callers have always made; only Silver adds the zone argument.
+        body = export_one_mart(cfg, mart) if zone == DEFAULT_ZONE else export_one_mart(cfg, mart, zone)
     except requests.HTTPError as exc:
         # PR slice C review C-B1: HTTP 409 — the API's single-flight lock
         # (an export of this mart is already running) — is a skip, not a
@@ -459,7 +571,7 @@ def export_gold_mart(context, mart: str) -> dict[str, Any]:
         if exc.response is not None and exc.response.status_code == 409:
             context.log.info(f"skipped {mart!r}: already running (HTTP 409)")
             record_maintenance_run(
-                table_name=f"gold.{mart}",
+                table_name=target.iceberg_table,
                 dry_run_metrics={},
                 applied_metrics={},
                 skipped_verbs=["already_running"],
@@ -477,7 +589,7 @@ def export_gold_mart(context, mart: str) -> dict[str, Any]:
         # the policy's retries have all come up empty.
         context.log.error(f"export of {mart!r} failed: {exc}")
         record_maintenance_run(
-            table_name=f"gold.{mart}",
+            table_name=target.iceberg_table,
             dry_run_metrics={},
             applied_metrics={},
             skipped_verbs=[f"export_failed: {exc}"],
@@ -494,7 +606,7 @@ def export_gold_mart(context, mart: str) -> dict[str, Any]:
     if body.get("skipped") is True:
         context.log.info(f"skipped {mart!r}: {body.get('reason')}")
         record_maintenance_run(
-            table_name=f"gold.{mart}",
+            table_name=target.iceberg_table,
             dry_run_metrics={},
             applied_metrics={},
             skipped_verbs=["unchanged"],
@@ -511,7 +623,7 @@ def export_gold_mart(context, mart: str) -> dict[str, Any]:
     # `GET /api/governance/maintenance` without corrupting a column
     # whose meaning `maintenance.py`'s own readers rely on.
     record_maintenance_run(
-        table_name=f"gold.{mart}",
+        table_name=target.iceberg_table,
         dry_run_metrics={},
         applied_metrics={},
         skipped_verbs=[f"rows_exported={body.get('rowsExported')}"],
@@ -523,7 +635,7 @@ def export_gold_mart(context, mart: str) -> dict[str, Any]:
     # nothing rather than a guessed number.
     rows = body.get("rowsExported")
     if isinstance(rows, int) and not isinstance(rows, bool):
-        context.log_event(AssetMaterialization(asset_key=f"gold.{mart}", metadata={"rows": rows}))
+        context.log_event(AssetMaterialization(asset_key=target.iceberg_table, metadata={"rows": rows}))
     return body
 
 
@@ -575,12 +687,19 @@ def ensure_gold_trim_run_table(target: ClickHouseTarget) -> None:
         target,
         "ALTER TABLE console.gold_trim_run ADD COLUMN IF NOT EXISTS files_removed Nullable(UInt32)",
     )
+    # DATA-65: Silver and Gold trims of the same bare mart name are
+    # independent histories. Existing rows were all Gold.
+    _ch_exec(
+        target,
+        "ALTER TABLE console.gold_trim_run ADD COLUMN IF NOT EXISTS zone String DEFAULT 'gold'",
+    )
 
 
 def record_gold_trim_run(
     target: ClickHouseTarget | None,
     *,
     mart: str,
+    zone: str = DEFAULT_ZONE,
     status: str,
     copies_kept: int | None = None,
     oldest_kept_exported_at: Any = None,
@@ -600,10 +719,10 @@ def record_gold_trim_run(
     finished_at = finished_at or datetime.datetime.now(datetime.timezone.utc)
     sql = (
         f"INSERT INTO console.gold_trim_run ("
-        f"id, mart, status, copies_kept, oldest_kept_exported_at, "
+        f"id, mart, zone, status, copies_kept, oldest_kept_exported_at, "
         f"copies_removed, snapshots_expired, files_removed, reason, "
         f"started_at, finished_at) VALUES ("
-        f"{_sql_str(run_id)}, {_sql_str(mart)}, {_sql_str(status)}, "
+        f"{_sql_str(run_id)}, {_sql_str(mart)}, {_sql_str(zone)}, {_sql_str(status)}, "
         f"{_sql_num(copies_kept)}, {_sql_dt64(oldest_kept_exported_at)}, "
         f"{_sql_num(copies_removed)}, {_sql_num(snapshots_expired)}, "
         f"{_sql_num(files_removed)}, {_sql_str(reason)}, "
@@ -689,10 +808,16 @@ def remove_gold_orphan_files(cfg: GoldExportConfig, table_name: str, older_than_
 
 
 def run_trim_for_mart(
-    cfg: GoldExportConfig, mart: str, context: Any = None
+    cfg: GoldExportConfig,
+    mart: str,
+    context: Any = None,
+    zone: str = DEFAULT_ZONE,
 ) -> dict[str, Any]:
-    """Execute trim logic for a single Gold mart (DATA-2 D1, D3, D5, A1)."""
+    """Execute trim logic for a single published mart (DATA-2 D1, D3, D5,
+    A1). DATA-65: `zone` decides which Iceberg namespace is trimmed and
+    which history row is written; Gold is the default."""
     started_at = datetime.datetime.now(datetime.timezone.utc)
+    table_name = f"{zone}.{mart}"
     log = context.log if context else None
 
     # The pause (REL-2 S4 decision D16): the trim expires snapshots and
@@ -714,6 +839,7 @@ def run_trim_for_mart(
             record_gold_trim_run(
                 cfg.ch,
                 mart=mart,
+                zone=zone,
                 status="skipped",
                 reason=reason,
                 started_at=started_at,
@@ -735,6 +861,7 @@ def run_trim_for_mart(
             record_gold_trim_run(
                 cfg.ch,
                 mart=mart,
+                zone=zone,
                 status="failed",
                 reason=INVALID_KEEP_COPIES_REASON,
                 started_at=started_at,
@@ -759,6 +886,7 @@ def run_trim_for_mart(
             record_gold_trim_run(
                 cfg.ch,
                 mart=mart,
+                zone=zone,
                 status="failed",
                 reason=INVALID_ORPHAN_MIN_AGE_REASON,
                 started_at=started_at,
@@ -772,16 +900,17 @@ def run_trim_for_mart(
     # 2. Connect to catalog and load table
     try:
         catalog = load_gold_catalog(cfg)
-        table = catalog.load_table(f"gold.{mart}")
+        table = catalog.load_table(table_name)
     except Exception as exc:
         finished_at = datetime.datetime.now(datetime.timezone.utc)
         if log:
-            log.error(f"failed to load table gold.{mart}: {exc}")
+            log.error(f"failed to load table {table_name}: {exc}")
         fixed_reason = "catalog_unavailable"
         try:
             record_gold_trim_run(
                 cfg.ch,
                 mart=mart,
+                zone=zone,
                 status="failed",
                 reason=fixed_reason,
                 started_at=started_at,
@@ -798,12 +927,13 @@ def run_trim_for_mart(
     except Exception as exc:
         finished_at = datetime.datetime.now(datetime.timezone.utc)
         if log:
-            log.error(f"failed to scan table gold.{mart}: {exc}")
+            log.error(f"failed to scan table {table_name}: {exc}")
         fixed_reason = "table_scan_failed"
         try:
             record_gold_trim_run(
                 cfg.ch,
                 mart=mart,
+                zone=zone,
                 status="failed",
                 reason=fixed_reason,
                 started_at=started_at,
@@ -817,10 +947,11 @@ def run_trim_for_mart(
     if len(df) == 0:
         finished_at = datetime.datetime.now(datetime.timezone.utc)
         if log:
-            log.info(f"gold.{mart} has 0 rows; nothing to trim")
+            log.info(f"{table_name} has 0 rows; nothing to trim")
         record_gold_trim_run(
             cfg.ch,
             mart=mart,
+            zone=zone,
             status="nothing_to_trim",
             copies_kept=0,
             copies_removed=0,
@@ -841,12 +972,13 @@ def run_trim_for_mart(
         oldest_kept = distinct_exported_at[-1]
         if log:
             log.info(
-                f"gold.{mart} has {distinct_count} copies (<= keep_copies {keep_copies}); "
+                f"{table_name} has {distinct_count} copies (<= keep_copies {keep_copies}); "
                 "nothing to trim"
             )
         record_gold_trim_run(
             cfg.ch,
             mart=mart,
+            zone=zone,
             status="nothing_to_trim",
             copies_kept=distinct_count,
             oldest_kept_exported_at=oldest_kept,
@@ -864,7 +996,7 @@ def run_trim_for_mart(
     copies_to_remove = distinct_count - keep_copies
     if log:
         log.info(
-            f"trimming gold.{mart}: {distinct_count} copies, keeping {keep_copies}, "
+            f"trimming {table_name}: {distinct_count} copies, keeping {keep_copies}, "
             f"removing {copies_to_remove} (cutoff {cutoff_time})"
         )
 
@@ -876,7 +1008,7 @@ def run_trim_for_mart(
     except Exception as exc:
         finished_at = datetime.datetime.now(datetime.timezone.utc)
         if log:
-            log.error(f"failed to delete rows from gold.{mart}: {exc}")
+            log.error(f"failed to delete rows from {table_name}: {exc}")
         from pyiceberg.exceptions import CommitFailedException
 
         fixed_reason = (
@@ -888,6 +1020,7 @@ def run_trim_for_mart(
             record_gold_trim_run(
                 cfg.ch,
                 mart=mart,
+                zone=zone,
                 status="failed",
                 reason=fixed_reason,
                 started_at=started_at,
@@ -905,12 +1038,13 @@ def run_trim_for_mart(
     except Exception as exc:
         finished_at = datetime.datetime.now(datetime.timezone.utc)
         if log:
-            log.error(f"failed to expire snapshots for gold.{mart}: {exc}")
+            log.error(f"failed to expire snapshots for {table_name}: {exc}")
         fixed_reason = "expire_snapshots_failed"
         try:
             record_gold_trim_run(
                 cfg.ch,
                 mart=mart,
+                zone=zone,
                 status="failed",
                 reason=fixed_reason,
                 started_at=started_at,
@@ -925,16 +1059,17 @@ def run_trim_for_mart(
     # DATA-6 D11 reasoning as the snapshot expiry above)
     files_removed = 0
     try:
-        files_removed = remove_gold_orphan_files(cfg, f"gold.{mart}", orphan_min_age_seconds)
+        files_removed = remove_gold_orphan_files(cfg, table_name, orphan_min_age_seconds)
     except Exception as exc:
         finished_at = datetime.datetime.now(datetime.timezone.utc)
         if log:
-            log.error(f"failed to remove orphan files for gold.{mart}: {exc}")
+            log.error(f"failed to remove orphan files for {table_name}: {exc}")
         fixed_reason = "orphan_cleanup_failed"
         try:
             record_gold_trim_run(
                 cfg.ch,
                 mart=mart,
+                zone=zone,
                 status="failed",
                 reason=fixed_reason,
                 started_at=started_at,
@@ -951,6 +1086,7 @@ def run_trim_for_mart(
         record_gold_trim_run(
             cfg.ch,
             mart=mart,
+            zone=zone,
             status="success",
             copies_kept=keep_copies,
             oldest_kept_exported_at=cutoff_time,
@@ -986,20 +1122,26 @@ def run_trim_for_mart(
     ),
 )
 def trim_gold_mart(
-    context, mart: str, export_result: dict[str, Any]
+    context, mart: Any, export_result: dict[str, Any]
 ) -> dict[str, Any]:
     """Trim old copies from `gold.{mart}` after a successful export (DATA-2 D1).
     A skipped or failed export does not trim.
     Always returns `export_result` untouched so the export summary is preserved.
     """
+    target = MartExportTarget.from_input(mart)
+    mart = target.mart
     if export_result.get("skipped") is True:
         context.log.info(f"export of {mart!r} was skipped; skipping trim")
         return export_result
 
     cfg = GoldExportConfig.from_env()
     try:
-        trim_res = run_trim_for_mart(cfg, mart, context=context)
-        context.log.info(f"trim result for {mart!r}: {trim_res}")
+        trim_res = (
+            run_trim_for_mart(cfg, mart, context=context)
+            if target.zone == DEFAULT_ZONE
+            else run_trim_for_mart(cfg, mart, context=context, zone=target.zone)
+        )
+        context.log.info(f"trim result for {target.iceberg_table!r}: {trim_res}")
     except Exception as exc:
         context.log.error(f"unexpected exception trimming {mart!r}: {exc}")
 

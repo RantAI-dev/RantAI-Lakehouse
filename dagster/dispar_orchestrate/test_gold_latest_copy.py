@@ -30,7 +30,7 @@ import pytest
 import pyarrow as pa
 from dagster import Failure, build_op_context
 
-from dispar_orchestrate import gold_latest_copy
+from dispar_orchestrate import gold_export, gold_latest_copy
 from dispar_orchestrate.gold_export import GoldExportConfig
 from dispar_orchestrate.ingest_factory import SERIAL_TAG
 
@@ -568,6 +568,39 @@ class LatestCopyRefreshTests(unittest.TestCase):
         self.assertNotIn("secret-value-xyz", recorded_insert)
         self.assertNotIn("S3 PUT failed", recorded_insert)
 
+    def test_a_silver_request_reads_and_records_the_silver_zone(self) -> None:
+        """DATA-65: the op's namespace comes from the request's zone, and
+        a Gold request is refused when only Silver is published."""
+        from dataclasses import replace
+
+        publications = gold_export.PublicationMarts(
+            [MART], [gold_export.MartExportTarget(MART, gold_export.ZONE_SILVER)]
+        )
+        catalog = MagicMock()
+        catalog.load_table.side_effect = RuntimeError("catalog stopped here")
+        recorded: list[dict] = []
+        with patch(
+            "dispar_orchestrate.gold_latest_copy._enabled_publication_marts",
+            return_value=publications,
+        ), patch(
+            "dispar_orchestrate.gold_latest_copy.load_gold_catalog", return_value=catalog
+        ), patch(
+            "dispar_orchestrate.gold_latest_copy.record_gold_latest_copy_run",
+            side_effect=lambda target, **kw: recorded.append(kw),
+        ):
+            silver_req = replace(_req(), zone=gold_export.ZONE_SILVER)
+            result = gold_latest_copy.refresh_latest_copy(_cfg(ch=object()), silver_req)
+            self.assertEqual(result["reason"], gold_latest_copy.REASON_CATALOG_UNAVAILABLE)
+            catalog.load_table.assert_called_once_with(f"{gold_export.ZONE_SILVER}.{TABLE}")
+            self.assertEqual(recorded[0]["zone"], gold_export.ZONE_SILVER)
+
+            catalog.reset_mock()
+            gold_rejection = gold_latest_copy.refresh_latest_copy(
+                _cfg(marts=[], ch=object()), _req()
+            )
+            self.assertEqual(gold_rejection["reason"], gold_latest_copy.REASON_PUBLISHING_OFF)
+            catalog.load_table.assert_not_called()
+
     def test_publishing_switched_off_skips_and_writes_nothing(self) -> None:
         main = _MainTable(_MAIN_SCHEMA, copy_frame=_arrow_frame(COPY_MICROS, 5))
         catalog = _Catalog(main, None)
@@ -722,6 +755,22 @@ class LatestCopyRequestTests(unittest.TestCase):
         self.assertEqual(req.mart, MART)
         self.assertEqual(req.latest_table, LATEST_TABLE)
         self.assertEqual(req.rows, 5)
+
+    def test_a_missing_zone_defaults_to_gold_and_silver_is_accepted(self) -> None:
+        """DATA-65: the Rust API's five-key Gold config still parses; a
+        Silver launch adds `zone: silver` and is honoured."""
+        req = gold_latest_copy.LatestCopyRequest.from_op_config(self._valid())
+        self.assertEqual(req.zone, gold_export.ZONE_GOLD)
+        config = self._valid()
+        config["zone"] = gold_export.ZONE_SILVER
+        silver = gold_latest_copy.LatestCopyRequest.from_op_config(config)
+        self.assertEqual(silver.zone, gold_export.ZONE_SILVER)
+
+    def test_an_unknown_zone_is_refused(self) -> None:
+        config = self._valid()
+        config["zone"] = "bronze"
+        with pytest.raises(gold_latest_copy.InvalidLatestCopyRequest):
+            gold_latest_copy.LatestCopyRequest.from_op_config(config)
 
     def test_a_missing_field_is_refused(self) -> None:
         for key in ("mart", "table", "latest_table", "copy_exported_at_micros", "rows"):
