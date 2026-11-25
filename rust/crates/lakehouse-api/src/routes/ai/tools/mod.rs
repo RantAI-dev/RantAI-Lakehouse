@@ -620,15 +620,33 @@ fn arg_filter_modes(
     )
 }
 
+/// The builder's default chart cap, as the tools report it (`AI-36` F5).
+/// The turn reply and the marker in a tool result must read the same number,
+/// so neither carries a copy of it.
+pub(super) fn default_chart_limit() -> u32 {
+    dashboards::DEFAULT_CHART_LIMIT
+}
+
+/// The one sentence a capped chart adds to the turn reply (F5). It names the
+/// default from [`default_chart_limit`], never a copy.
+pub(super) fn default_cap_sentence() -> String {
+    format!(
+        "This chart shows at most {} values by default; set a `limit` to show more.",
+        default_chart_limit()
+    )
+}
+
 /// Checks a chart call before the gate offers it as a draft, and
 /// adds what the draft holds to it. `draft` is the gate's `needs_confirmation`
 /// answer; a call that is not a chart call is returned as it came. A chart
 /// call that builds comes back as the draft with a `definition` key, the
 /// digest of what the save would store (for an update the stored chart merged
-/// with the call): the card reads `args`, so the key changes nothing the
-/// person sees. The error otherwise, so a draft that the save would refuse (a
-/// mart or column that does not exist, a dashboard the caller may not edit, a
-/// SQL source they cannot see) is refused rather than offered. Writes nothing.
+/// with the call), and a `defaultCap` key when the chart relies on the
+/// builder's default cap: the card reads `args`, so the keys change nothing
+/// the person sees. The error otherwise, so a draft that the save would
+/// refuse (a mart or column that does not exist, a dashboard the caller may
+/// not edit, a SQL source they cannot see) is refused rather than offered.
+/// Writes nothing.
 ///
 /// The draft runs the save's checks, from the same code and in the save's
 /// order: [`require_chart_call_allowed`] here, then the preparation the save
@@ -664,9 +682,12 @@ pub(crate) async fn check_draft(
         return Err(json!({ "error": "The reporting settings could not be read." }));
     };
     let id = (name == "update_chart").then(|| arg_str(args, "id"));
-    let definition =
+    let chart =
         dashboards::check_chart_draft(&state.clickhouse, &scope.viewer, args, id, &time).await?;
-    draft["definition"] = Value::String(definition);
+    draft["definition"] = Value::String(chart.definition);
+    if let Some(cap) = chart.default_cap {
+        draft["defaultCap"] = json!(cap);
+    }
     Ok(draft)
 }
 
