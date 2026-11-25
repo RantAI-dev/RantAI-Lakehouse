@@ -379,6 +379,24 @@ describe("the Dashboards page's chart outlines (BI-59, P3)", () => {
   })
 })
 
+describe("the report editor's chart list (BI-62, D5)", () => {
+  it("reads the specs list once and keeps each chart's title, kind and dashboard", async () => {
+    const calls = stubFetch(() =>
+      json({
+        charts: [
+          { id: "u1", board: "b_1", kind: "bar", title: "Visits" },
+          { id: "u2", kind: "kpi" },
+        ],
+      }),
+    )
+    expect(await clickhouseDashboardService.listCharts()).toEqual([
+      { id: "u1", title: "Visits", kind: "bar", board: "b_1" },
+      { id: "u2", title: "u2", kind: "kpi", board: "default" },
+    ])
+    expect(calls.map((c) => c.url)).toEqual(["/api/dashboard/specs"])
+  })
+})
+
 describe("clickhouseDashboardService.filterValues", () => {
   it("asks /api/dashboard/values by board, narrowed by the other filters and the search, and stringifies the values (BI-29)", async () => {
     const calls = stubFetch(() => json({ values: ["Bali", 7], truncated: true }))

@@ -569,7 +569,7 @@ MODE: BUILD. Besides answering, you can operate the lakehouse:
 - Iceberg tables: list_iceberg_tables, describe_iceberg_table, get_table_maintenance, set_table_maintenance. Storage: get_capacity. Saved queries: save_query, list_saved_queries, run_saved_query. Gold export: export_gold_mart appends a mart to its Iceberg table; get_gold_export reads it back.
 - Governance: draft_policy, draft_classification_rule and draft_quality_rule always save a draft; activating it stays a human action in the console.
 - Embedding: get_embed_snippet describes the address template and the locked filters; enable_embed and set_embed_filter_modes wait for human approval; withdraw_embed_tokens needs a confirm in this chat. You never sign a token and never show one: the customer's own server signs it, so never write a token or a signing command in your answer.
-- Reports and templates: a report is a written page with live charts between the text. create_report takes a title, an optional folderId and blocks in reading order (heading, paragraph, list, link, chart with a chart id from list_charts). Text is plain words, never HTML or Markdown. A report holds at most 30 charts. list_reports, update_report (`blocks` replaces every block, `append` adds blocks, `chart` adds one chart at the end) and delete_report needs approval. list_templates shows templates; create_dashboard_from_template starts a new, independent dashboard from one. Say the report or dashboard's link is below; do not write the address yourself.
+- Reports and templates: create_report takes title, optional folderId and blocks in order: heading, paragraph, list, quote {text}, divider {}, chart {id from list_charts, width: text or wide}. Marks: **bold**, *italic* and [words](address), a link inside a sentence; \\ escapes a mark; never HTML. A report holds at most 30 charts. list_reports, update_report (`blocks` replaces all, `append` adds blocks, `chart` adds one chart at the end) and delete_report needs approval. list_templates shows templates; create_dashboard_from_template starts an independent dashboard from one. Say its link is below; never write the address.
 - These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_tab, delete_board, delete_calculated_field, delete_metric, run_bronze_maintenance, kill_query, enable_embed, set_embed_filter_modes, delete_report, delete_template. Call the tool; the server then creates the approval. Only when a tool result says needs_approval, tell the user the request is waiting in Approvals (/agents/approvals). Never say a request is waiting if you did not call the tool, or if its result did not say needs_approval.
 - needs_confirmation and needs_approval are different. needs_confirmation: the user confirms in this chat, with the Confirm button under your reply; never mention Approvals for it. needs_approval: a human must approve it in Approvals (/agents/approvals).
 - When a tool result says needs_confirmation, call no other tool that needs the drafted object: reply with ONE short sentence that names the draft (a chart, a board, a tab or a calculated field). The sentence must stay true after the person confirms: say what the draft makes (for example \"A bar chart of visitors by month.\") and never that it is waiting, that it needs confirming or where to confirm it. Write a last line `NEXT: <the remaining steps, in one sentence>` only when the request needs another object after the draft, or another change to the drafted object (its cache rule, its format, its tab); never for confirming, saving or publishing the draft itself, and never when the draft is the whole request. Do not repeat the arguments and do not ask the user to type a confirmation. A user message that starts with `Confirmed and saved:` lists the objects that now exist: never draft them again; do only the step after `Continue:`; when nothing is left, answer in one sentence and call no tool.
@@ -1335,6 +1335,22 @@ mod tests {
         for tool in ["list_templates", "create_dashboard_from_template"] {
             assert!(tools.contains(tool), "{tool}");
         }
+    }
+
+    /// `BI-62` (decision D9, assistant parity): the report hint names the
+    /// editor's blocks, the chart width and the inline marks, and no longer
+    /// tells the model that text is never Markdown.
+    #[test]
+    fn the_report_hint_names_the_editors_blocks_and_marks() {
+        for clause in [
+            "quote {text}",
+            "divider {}",
+            "width: text or wide",
+            "**bold**, *italic* and [words](address)",
+        ] {
+            assert!(SYSTEM_BUILD_SUFFIX.contains(clause), "{clause}");
+        }
+        assert!(!SYSTEM_BUILD_SUFFIX.contains("never HTML or Markdown"));
     }
 
     #[test]

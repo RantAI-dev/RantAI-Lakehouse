@@ -2095,19 +2095,25 @@ fn get_embed_snippet_schema() -> Value {
 }
 
 /// The blocks of a report (`BI-18` part D, `lakehouse_bi::reports::Block`),
-/// shared by [`create_report_schema`] and [`update_report_schema`].
+/// shared by [`create_report_schema`] and [`update_report_schema`]. `BI-62`
+/// (decision D9, assistant parity): the quote and divider blocks, a chart's
+/// width and the inline marks of `lakehouse_bi::reports` (bold, italic and a
+/// link inside a sentence), so the assistant writes what the editor shows.
+/// The `link` kind stays so an old report the assistant rewrites keeps its
+/// link blocks.
 fn report_blocks_schema(description: &str) -> Value {
     json!({
         "type": "array",
         "description": description,
         "items": { "type": "object", "properties": {
-            "type": { "type": "string", "enum": ["heading", "paragraph", "list", "link", "chart"] },
-            "text": { "type": "string", "description": "heading, paragraph or link words; plain text, never HTML or Markdown" },
+            "type": { "type": "string", "enum": ["heading", "paragraph", "list", "quote", "divider", "link", "chart"] },
+            "text": { "type": "string", "description": "words; except in a link, **bold**, *italic* and [words](address). Never HTML" },
             "level": { "type": "integer", "enum": [1, 2, 3], "description": "heading size, 1 the largest; 2 when left out" },
             "items": { "type": "array", "items": { "type": "string" }, "description": "a list's items" },
             "ordered": { "type": "boolean", "description": "a numbered list when true" },
             "url": { "type": "string", "description": "a link's address: https://, http://, mailto: or a console path such as /dashboards/<id>" },
-            "chart": { "type": "string", "description": "a chart block's chart id, from list_charts" } },
+            "chart": { "type": "string", "description": "a chart block's chart id, from list_charts" },
+            "width": { "type": "string", "enum": ["text", "wide"], "description": "text (default) or wide" } },
             "required": ["type"] }
     })
 }
