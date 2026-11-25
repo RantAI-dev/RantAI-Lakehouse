@@ -80,7 +80,9 @@ describe("QueryTransparencyPanel sources", () => {
 // the engine that answered, and a Trino statement says there is no estimate
 // instead of showing a ClickHouse answer about Trino SQL.
 describe("QueryTransparencyPanel engine", () => {
-  it("says a Trino query has no pre-run estimate, names Trino, and shows no source and no error", () => {
+  // UX-9: the engine is named once, in the status bar under the editor
+  // (`studio-status-bar.test.tsx`); the Plan tab does not repeat it.
+  it("says a Trino query has no pre-run estimate, and shows no source, no error and no engine", () => {
     panel({
       ...BASE,
       supported: false,
@@ -97,17 +99,18 @@ describe("QueryTransparencyPanel engine", () => {
 
     expect(screen.getByText("No pre-run estimate")).toBeTruthy()
     expect(screen.getByText("A Trino query has no pre-run estimate.")).toBeTruthy()
-    expect(screen.getByText("Trino")).toBeTruthy()
+    expect(screen.queryByText("Trino")).toBeNull()
     // Nothing was read, so no table is named and no failure is reported.
     expect(screen.queryByText("Sources")).toBeNull()
     expect(screen.queryByText("This query cannot be planned")).toBeNull()
   })
 
-  it("names ClickHouse as the engine of an estimate", () => {
+  it("shows a ClickHouse estimate's details without repeating the engine or the scan", () => {
     panel({ ...BASE, supported: true, queryEngine: "clickhouse" })
 
     expect(screen.queryByText("No pre-run estimate")).toBeNull()
-    expect(screen.getByText("ClickHouse")).toBeTruthy()
+    expect(screen.queryByText("ClickHouse")).toBeNull()
+    expect(screen.queryByText("Est. scan")).toBeNull()
     expect(screen.getByText("Hot analytics")).toBeTruthy()
   })
 

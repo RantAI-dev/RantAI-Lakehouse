@@ -68,7 +68,7 @@ export function filterRows(
  * number is one too, because the engine sends every cell as text and a
  * column of numbers only reads as numbers once they are parsed.
  */
-function asNumber(value: QueryCell): number | null {
+export function asNumber(value: QueryCell): number | null {
   if (typeof value === "number") return Number.isFinite(value) ? value : null
   if (value === null || typeof value === "boolean") return null
   return PLAIN_NUMBER.test(value) ? Number(value) : null
@@ -83,12 +83,55 @@ function asNumber(value: QueryCell): number | null {
  * engine sends every cell as text, so without it no column would ever count
  * as numeric and the statistics would always be text order.
  */
-function isNumericColumn(values: readonly QueryCell[]): boolean {
+export function isNumericColumn(values: readonly QueryCell[]): boolean {
   if (values.some((value) => typeof value === "number")) return true
   const readable = values
     .filter((value) => value !== null && cellText(value) !== "")
     .map((value) => asNumber(value))
   return readable.length > 0 && readable.every((value) => value !== null)
+}
+
+/**
+ * A decimal written the one way a number is written: no leading zero, no
+ * exponent, no sign but a minus. Only such text is given thousands
+ * separators in the grid; "007" or "1e5" keeps its own spelling, because
+ * reformatting it would show a value the engine did not send.
+ */
+const CANONICAL_DECIMAL = /^(-?)(0|[1-9]\d*)(?:\.(\d+))?$/
+
+/**
+ * `UX-9` browser review: the text of a numeric cell the engine sent as text
+ * (ClickHouse quotes 64-bit integers, so a `sum()` arrives as "3010348"),
+ * with the thousands separators of `locale`. The integer part goes through
+ * `BigInt`, so a UInt64 past `Number.MAX_SAFE_INTEGER` keeps every digit,
+ * and the fraction is kept as sent; only the separators change. Text that is
+ * not a canonical decimal comes back unchanged.
+ */
+export function formatDecimalText(text: string, locale: string): string {
+  const match = CANONICAL_DECIMAL.exec(text)
+  if (!match) return text
+  const [, sign, whole, fraction] = match
+  const grouped = BigInt(whole!).toLocaleString(locale)
+  if (fraction === undefined) return `${sign}${grouped}`
+  const decimal =
+    new Intl.NumberFormat(locale).formatToParts(1.5).find((part) => part.type === "decimal")
+      ?.value ?? "."
+  return `${sign}${grouped}${decimal}${fraction}`
+}
+
+/**
+ * Orders two cells of a numeric column by value: numbers and numeric text
+ * alike, nulls and text that is no number last. Text is compared as
+ * `Number`, which orders integers past 2^53 to within their last digits;
+ * the cell itself still shows every digit.
+ */
+export function compareNumericCells(a: QueryCell, b: QueryCell): number {
+  const x = asNumber(a)
+  const y = asNumber(b)
+  if (x === null && y === null) return 0
+  if (x === null) return 1
+  if (y === null) return -1
+  return x - y
 }
 
 /** The statistics of one column of the rows the grid shows. */

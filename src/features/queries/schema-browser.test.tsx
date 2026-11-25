@@ -13,6 +13,7 @@ import { ServiceError } from "@/services/errors"
 import type { LakehouseTableDetail } from "@/services/contracts/lakehouse"
 import { SchemaBrowser } from "./schema-browser"
 import { SqlPanel } from "./sql-panel"
+import { RunButton } from "./studio-toolbar"
 import { queryDraftKey } from "@/lib/query-draft"
 import { useQueryStudio } from "./use-query-studio"
 
@@ -83,20 +84,19 @@ const ICEBERG_TABLE = {
   compactionAvailable: false,
 } as unknown as LakehouseTableDetail
 
-/** The page's two halves that matter here: the editor with its toolbar, and the browser. */
+/** The page's two halves that matter here: the editor with its Run button, and the browser. */
 function Harness() {
   const studio = useQueryStudio(queryDraftKey("u1", null))
   return (
     <>
-      <SqlPanel studio={studio} onSave={() => {}} />
-      <SchemaBrowser studio={studio} onClose={() => {}} />
+      <RunButton studio={studio} />
+      <SqlPanel studio={studio} />
+      <SchemaBrowser studio={studio} />
     </>
   )
 }
 
 function stubServices(options: { assets?: "ok" | "forbidden" } = {}) {
-  spyOn(queryService, "listSaved").mockResolvedValue([])
-  spyOn(queryService, "listHistory").mockResolvedValue([])
   spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
   if (options.assets === "forbidden") {
     spyOn(assetService, "listAssets").mockRejectedValue(
@@ -201,7 +201,12 @@ describe("SchemaBrowser", () => {
     const view = editorView(container)
     setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
 
-    fireEvent.click(await screen.findByRole("button", { name: "Insert serving.mart_wisman" }))
+    const row = await screen.findByRole("button", { name: "Insert serving.mart_wisman" })
+    // UX-9 browser review: the row shows the name alone; the full name and
+    // the address it inserts are its tooltip, in every layer alike.
+    expect(row.textContent).not.toContain("serving.mart_wisman")
+    expect(row.getAttribute("title") ?? "").toContain("serving.mart_wisman")
+    fireEvent.click(row)
 
     expect(view.state.doc.toString()).toBe("SELECT * FROM serving.mart_wisman")
     // The statement now names the table, so its columns are fetched; let
@@ -220,7 +225,7 @@ describe("SchemaBrowser", () => {
     fireEvent.click(row)
 
     expect(view.state.doc.toString()).toBe("SELECT * FROM ")
-    expect(row.getAttribute("title")).toBe(BRONZE_NEEDS_TRINO)
+    expect(row.getAttribute("title") ?? "").toContain(BRONZE_NEEDS_TRINO)
   })
 
   it("keeps saying so on a ClickHouse tab once the detail has loaded, and offers no ClickHouse name", async () => {
@@ -236,7 +241,7 @@ describe("SchemaBrowser", () => {
     expect(await screen.findByText("oid")).toBeTruthy()
     const row = screen.getByRole("button", { name: "Demo Orders" })
     fireEvent.click(row)
-    expect(row.getAttribute("title")).toBe(BRONZE_NEEDS_TRINO)
+    expect(row.getAttribute("title") ?? "").toContain(BRONZE_NEEDS_TRINO)
     expect(screen.queryByRole("button", { name: /^Insert (iceberg|icecat_api)/ })).toBeNull()
     expect(view.state.doc.toString()).toBe("SELECT * FROM ")
   })
@@ -292,7 +297,7 @@ describe("SchemaBrowser", () => {
 
     await waitFor(() => {
       const row = screen.getByRole("button", { name: "Demo Orders" })
-      expect(row.getAttribute("title")).toBe(NO_READABLE_TABLE)
+      expect(row.getAttribute("title") ?? "").toContain(NO_READABLE_TABLE)
     })
     expect(screen.queryByRole("button", { name: /^Insert iceberg/ }) === null).toBe(true)
     expect(view.state.doc.toString()).toBe("SELECT * FROM ")
@@ -316,7 +321,7 @@ describe("SchemaBrowser", () => {
     expect(await screen.findByText(TABLE_PROOF_FAILED)).toBeTruthy()
     expect(screen.queryByText(NO_READABLE_TABLE)).toBeNull()
     const row = screen.getByRole("button", { name: "Demo Orders" })
-    expect(row.getAttribute("title")).toBe(TABLE_PROOF_FAILED)
+    expect(row.getAttribute("title") ?? "").toContain(TABLE_PROOF_FAILED)
     const retry = screen.getByRole("button", {
       name: "Retry reading the table of Demo Orders",
     })
@@ -495,7 +500,7 @@ describe("SchemaBrowser", () => {
     setBuffer(view, "SELECT 1", "SELECT 1".length)
     expect(view.state.doc.toString()).toBe("SELECT 1")
     await waitFor(() => {
-      const run = screen.getByRole("button", { name: "Run query" }) as HTMLButtonElement
+      const run = screen.getByRole("button", { name: "Run" }) as HTMLButtonElement
       expect(run.disabled).toBe(false)
     })
   })
@@ -509,7 +514,7 @@ describe("SchemaBrowser search", () => {
     render(<Harness />)
     await screen.findByText("Silver")
 
-    fireEvent.change(screen.getByRole("textbox", { name: "Search tables" }), {
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search tables" }), {
       target: { value: "ord" },
     })
 
@@ -522,7 +527,7 @@ describe("SchemaBrowser search", () => {
     render(<Harness />)
     await screen.findByText("Silver")
 
-    fireEvent.change(screen.getByRole("textbox", { name: "Search tables" }), {
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search tables" }), {
       target: { value: "zzzz" },
     })
 
@@ -534,7 +539,7 @@ describe("SchemaBrowser search", () => {
     stubServices()
     render(<Harness />)
     await screen.findByText("Silver")
-    const search = screen.getByRole("textbox", { name: "Search tables" })
+    const search = screen.getByRole("searchbox", { name: "Search tables" })
 
     fireEvent.change(search, { target: { value: "ord" } })
     fireEvent.change(search, { target: { value: "" } })

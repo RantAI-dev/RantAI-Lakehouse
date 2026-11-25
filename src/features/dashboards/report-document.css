@@ -174,7 +174,31 @@
   mask-image: linear-gradient(to bottom, transparent, black 12px, black calc(100% - 12px), transparent);
 }
 
+/* The assistant's draft (BI-62 PR B, D8): its text reads like the page, with no space above its first block. */
+.rd-draft-text > .rd-doc > :first-child { margin-top: 0; }
+/* While the answer streams, a caret after the last words. */
+.rd-draft-text[data-writing] > .rd-doc > :is(p, h2, h3, h4):last-child::after,
+.rd-draft-text[data-writing] > .rd-doc > :is(ul, ol):last-child > li:last-child::after,
+.rd-draft-text[data-writing] > .rd-doc > blockquote:last-child > :last-child::after {
+  content: "";
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.125em;
+  border-radius: 1px;
+  background: var(--primary);
+}
+
 @media (prefers-reduced-motion: no-preference) {
+  /* A draft rises into place (220 ms); with reduced motion it is simply there. */
+  .rd-rise { animation: rd-rise 220ms cubic-bezier(0.23, 1, 0.32, 1) both; }
+  /* The writing caret blinks gently; with reduced motion it stays still. */
+  .rd-draft-text[data-writing] > .rd-doc > :is(p, h2, h3, h4):last-child::after,
+  .rd-draft-text[data-writing] > .rd-doc > :is(ul, ol):last-child > li:last-child::after,
+  .rd-draft-text[data-writing] > .rd-doc > blockquote:last-child > :last-child::after {
+    animation: rd-blink 1s steps(2, start) infinite;
+  }
   /* Menus grow from where they were opened (150 ms). */
   .rd-pop { animation: rd-pop 150ms cubic-bezier(0.23, 1, 0.32, 1) both; }
   /* The handle appears softly beside the row. */
@@ -183,3 +207,5 @@
 
 @keyframes rd-pop { from { opacity: 0; transform: scale(0.97); } to { opacity: 1; transform: scale(1); } }
 @keyframes rd-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes rd-rise { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@keyframes rd-blink { to { visibility: hidden; } }

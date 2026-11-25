@@ -22,6 +22,7 @@ import { SqlEditor } from "@/components/sql-editor"
 import type { CompletionTable } from "@/lib/sql-completion"
 import {
   createSqlCompletionSource,
+  renderKindLabel,
   sqlCompletionExtension,
 } from "./sql-completion-source"
 
@@ -187,5 +188,18 @@ describe("the list of the editor the console shows", () => {
     const labels = await shownLabels(view)
 
     expect(labels.slice().sort()).toEqual(["day", "region"])
+  })
+})
+
+// UX-9 browser review: CodeMirror's emoji icons drew as empty boxes, so the
+// list says what each option is in a word instead.
+describe("renderKindLabel", () => {
+  it("names a column, a table, a parameter and a keyword, and nothing for a message", () => {
+    expect(renderKindLabel({ type: "property" })?.textContent).toBe("column")
+    expect(renderKindLabel({ type: "class" })?.textContent).toBe("table")
+    expect(renderKindLabel({ type: "variable" })?.textContent).toBe("parameter")
+    expect(renderKindLabel({ type: "keyword" })?.textContent).toBe("keyword")
+    expect(renderKindLabel({ type: "text" })).toBeNull()
+    expect(renderKindLabel({})).toBeNull()
   })
 })

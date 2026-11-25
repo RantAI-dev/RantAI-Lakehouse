@@ -12,11 +12,16 @@
  * - The "/" menu runs on `@tiptap/suggestion`; the menu itself is React
  *   (`report-editor-menus.tsx`), fed through a small store.
  * - A chart dragged from the Charts tab lands between blocks (`createShelfDrop`).
+ * - The assistant's draft (`BI-62` PR B, D8) is a block of its own that is
+ *   never part of the report: `insertDraft`, `removeDraft` and `acceptDraft`
+ *   put it in and take it out without leaving a trace in the document.
  *
  * Every package is MIT, pinned at 3.34.0. No Tiptap Pro and no drag-handle
  * extension (it pulls collaboration packages): the handles are ours.
  */
 import { Extension, Node, mergeAttributes, textblockTypeInputRule, type AnyExtension, type Editor, type JSONContent, type Range } from "@tiptap/core"
+import { closeHistory } from "@tiptap/pm/history"
+import type { Node as PmNode } from "@tiptap/pm/model"
 import { NodeSelection, Plugin, PluginKey, TextSelection } from "@tiptap/pm/state"
 import type { EditorView } from "@tiptap/pm/view"
 import Suggestion, { type SuggestionKeyDownProps, type SuggestionProps } from "@tiptap/suggestion"
@@ -25,7 +30,8 @@ import { Typography } from "@tiptap/extension-typography"
 import { Focus, Placeholder } from "@tiptap/extensions"
 
 import { safeReportUrl } from "@/lib/report-blocks"
-import { matchSlashItems, type SlashEntry } from "@/lib/report-doc"
+import { DRAFT_NODE, blocksToDoc, matchSlashItems, type SlashEntry } from "@/lib/report-doc"
+import type { ReportBlock } from "@/services/contracts/dashboard-reports"
 
 /* ------------------------------------------------------------------ */
 /* Document, title and headings                                        */
@@ -216,6 +222,8 @@ export function insertBlock(editor: Editor, node: JSONContent, at?: number) {
 
 export type SlashItem = SlashEntry & {
   disabled?: boolean
+  /** Why a disabled item cannot be picked now, in one line (its tooltip). */
+  reason?: string
   run: (editor: Editor, range: Range) => void
 }
 
@@ -350,6 +358,141 @@ export function createShelfDrop(onDrop: (chartId: string, pos: number) => void) 
 }
 
 /* ------------------------------------------------------------------ */
+/* The assistant's draft (BI-62 PR B, D8)                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The draft node's schema alone (the page adds its React view; tests use
+ * this). It holds only which draft (`draft`, the key of its answer in the
+ * page's draft store), the chart it describes, and whether it took the place
+ * of an empty line (`replaced`), so taking it out can put that line back.
+ * The answer itself never enters the document: streaming text is not a
+ * transaction, and `docToBlocks` skips the node, so autosave never sees a
+ * draft (D8: drafts never save until accepted).
+ */
+export const DRAFT_NODE_SPEC = {
+  name: DRAFT_NODE,
+  group: "block",
+  atom: true,
+  selectable: false,
+  draggable: false,
+  addAttributes() {
+    return {
+      draft: { default: null, rendered: false },
+      chart: { default: null, rendered: false },
+      replaced: { default: false, rendered: false },
+    }
+  },
+  // Never read back from HTML: a pasted copy of a draft is not a draft (its answer lives in the page).
+  parseHTML: () => [],
+  renderHTML: () => ["div", { "data-ai-draft": "" }] as const,
+}
+
+export const PlainDraftNode = Node.create(DRAFT_NODE_SPEC)
+
+/** Where the draft `id` is in the document, if it still is. */
+export function findDraft(doc: PmNode, id: string): { pos: number; node: PmNode } | null {
+  let pos = 0
+  for (let i = 0; i < doc.childCount; i++) {
+    const node = doc.child(i)
+    if (node.type.name === DRAFT_NODE && node.attrs.draft === id) return { pos, node }
+    pos += node.nodeSize
+  }
+  return null
+}
+
+/** The drafts the document holds, by id. */
+export function draftIds(doc: PmNode): Set<string> {
+  const ids = new Set<string>()
+  doc.forEach((node) => {
+    if (node.type.name === DRAFT_NODE && typeof node.attrs.draft === "string") ids.add(node.attrs.draft)
+  })
+  return ids
+}
+
+/**
+ * Put a draft where `insertBlock` would put a block: at `at`, in an empty
+ * line's place (remembered, so Discard puts the line back), or under the
+ * block holding the cursor. Outside the undo history: a draft is not an edit
+ * of the report, so Undo never steps through it.
+ */
+export function insertDraft(editor: Editor, attrs: { draft: string; chart?: string | null }, at?: number): void {
+  const { state } = editor
+  const titleEnd = state.doc.child(0).nodeSize
+  let from: number
+  let to: number
+  let replaced = false
+  if (typeof at === "number") {
+    from = to = Math.max(at, titleEnd)
+  } else {
+    const { selection } = state
+    const { $from } = selection
+    if ($from.depth === 0) {
+      from = to = Math.max(selection instanceof NodeSelection ? selection.to : $from.pos, titleEnd)
+    } else {
+      const top = $from.node(1)
+      if (top.type.name === "paragraph" && top.content.size === 0) {
+        from = $from.before(1)
+        to = $from.after(1)
+        replaced = true
+      } else {
+        from = to = Math.max($from.after(1), titleEnd)
+      }
+    }
+  }
+  const node = state.schema.nodes[DRAFT_NODE].create({ draft: attrs.draft, chart: attrs.chart ?? null, replaced })
+  const tr = state.tr.replaceWith(from, to, node)
+  tr.setMeta("addToHistory", false)
+  editor.view.dispatch(tr)
+}
+
+/**
+ * Take the draft out, putting back the empty line it took the place of, so
+ * the document is as it was before the draft (Discard). Outside the undo
+ * history. Answers whether an empty line now stands where the draft was, or
+ * null when the draft is gone already.
+ */
+export function removeDraft(editor: Editor, id: string): { pos: number; line: boolean } | null {
+  const { state } = editor
+  const found = findDraft(state.doc, id)
+  if (!found) return null
+  const { pos, node } = found
+  // The schema is `title block+`: the page keeps a line to write on.
+  const line = node.attrs.replaced === true || state.doc.childCount <= 2
+  const tr = line
+    ? state.tr.replaceWith(pos, pos + node.nodeSize, state.schema.nodes.paragraph.create())
+    : state.tr.delete(pos, pos + node.nodeSize)
+  tr.setMeta("addToHistory", false)
+  editor.view.dispatch(tr)
+  return { pos, line }
+}
+
+/**
+ * Accept: the draft becomes `blocks` where it stood. The draft is first
+ * taken out as Discard would (outside history), then the blocks go in as one
+ * history step of their own, so a single Undo takes the accepted text out
+ * and leaves the page as it was before the draft. Answers false when the
+ * draft is gone.
+ */
+export function acceptDraft(editor: Editor, id: string, blocks: readonly ReportBlock[]): boolean {
+  const removed = removeDraft(editor, id)
+  if (!removed) return false
+  if (blocks.length === 0) return true
+  const content = (blocksToDoc("", blocks).content ?? []).slice(1) as JSONContent[]
+  const { pos, line } = removed
+  editor
+    .chain()
+    .command(({ tr }) => {
+      closeHistory(tr)
+      return true
+    })
+    .insertContentAt(line ? { from: pos, to: pos + 2 } : pos, content)
+    .scrollIntoView()
+    .run()
+  return true
+}
+
+/* ------------------------------------------------------------------ */
 /* The whole set                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -373,16 +516,19 @@ export const CHART_NODE_SPEC = {
 export const PlainChartNode = Node.create(CHART_NODE_SPEC)
 
 /**
- * The editor's extensions. `chartNode` is the chart node with its React view
- * on the page; `slash` and `onShelfDrop` are left out where nothing reads them.
+ * The editor's extensions. `chartNode` and `draftNode` are the chart and
+ * draft nodes with their React views on the page; `slash` and `onShelfDrop`
+ * are left out where nothing reads them.
  */
 export function reportExtensions({
   chartNode = PlainChartNode,
+  draftNode = PlainDraftNode,
   slash,
   onShelfDrop,
   onLinkKey,
 }: {
   chartNode?: AnyExtension
+  draftNode?: AnyExtension
   slash?: { store: SlashStore; items: () => SlashItem[] }
   onShelfDrop?: (chartId: string, pos: number) => void
   /** ⌘K with words selected: the selection toolbar opens its link field. */
@@ -436,6 +582,7 @@ export function reportExtensions({
     ClickBack,
     LinkKey,
     chartNode,
+    draftNode,
     ...(slash ? [createSlashCommand(slash.store, slash.items)] : []),
     ...(onShelfDrop ? [createShelfDrop(onShelfDrop)] : []),
   ]

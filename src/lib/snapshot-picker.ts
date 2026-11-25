@@ -48,23 +48,7 @@ export function pinSnapshot(
     return `${body}\nSETTINGS ${setting}`
   }
   const head = sql.slice(0, clause)
-  const tail = sql.slice(clause + "SETTINGS".length)
-  // Comments carry no meaning in the list, and one left in place could
-  // swallow the setting appended after it.
-  const noise = blank(tail, true)
-  const items: string[] = []
-  let depth = 0
-  let from = 0
-  const commentless = blank(tail, false)
-  for (let i = 0; i <= noise.length; i++) {
-    const ch = noise[i]
-    if (ch === "(") depth++
-    else if (ch === ")") depth--
-    else if (i === noise.length || (ch === "," && depth === 0)) {
-      items.push(commentless.slice(from, i).replace(/[\s;]+$/, "").trim())
-      from = i + 1
-    }
-  }
+  const items = settingsItems(sql.slice(clause + "SETTINGS".length))
   const kept = items.filter((it) => it !== "" && !/^iceberg_snapshot_id\s*=/i.test(it))
   return `${head}SETTINGS ${[...kept, setting].join(", ")}`
 }
@@ -113,6 +97,95 @@ function pinSnapshotOnTrino(
     return `${sql.slice(0, end)} FOR VERSION AS OF ${snapshotId}${rest}`
   }
   return null
+}
+
+/**
+ * `UX-9`: the versions a statement is pinned to, as `pinSnapshot` writes
+ * them — the ClickHouse `iceberg_snapshot_id` setting in the last top-level
+ * `SETTINGS`, and every Trino `FOR VERSION AS OF <id>` outside comments and
+ * literals. Query Studio reads the pin from the SQL itself, so a pin that
+ * came in a link (the asset page's "Query this version") shows the same chip
+ * as one picked in the studio. Ids stay strings (see `pinSnapshot`).
+ */
+export function pinnedSnapshots(sql: string): string[] {
+  const ids: string[] = []
+  const clickhouse = clickhousePin(sql)
+  if (clickhouse !== null) ids.push(clickhouse.id)
+  for (const range of trinoPins(sql)) ids.push(range.id)
+  return [...new Set(ids)]
+}
+
+/**
+ * `UX-9`: the statement with every version pin `pinnedSnapshots` finds taken
+ * out, so the query reads the tables as they are now. A `SETTINGS` clause
+ * that held only the pin goes with it; other settings stay, in their order.
+ * A statement with no pin comes back unchanged.
+ */
+export function unpinSnapshots(sql: string): string {
+  let out = sql
+  // Trino's pins first, from the end, so the earlier offsets stay right.
+  for (const range of trinoPins(out).reverse()) {
+    out = out.slice(0, range.from) + out.slice(range.to)
+  }
+  const clickhouse = clickhousePin(out)
+  if (clickhouse === null) return out
+  const head = out.slice(0, clickhouse.clause)
+  return clickhouse.kept.length === 0
+    ? head.replace(/\s+$/, "")
+    : `${head}SETTINGS ${clickhouse.kept.join(", ")}`
+}
+
+/** The ClickHouse pin of the last top-level `SETTINGS`, with the other settings it sits among. */
+function clickhousePin(sql: string): { id: string; clause: number; kept: string[] } | null {
+  const clause = lastTopLevelSettings(sql)
+  if (clause === null) return null
+  const items = settingsItems(sql.slice(clause + "SETTINGS".length))
+  let id: string | null = null
+  const kept: string[] = []
+  for (const item of items) {
+    const pin = /^iceberg_snapshot_id\s*=\s*(\d+)$/i.exec(item)
+    if (pin) id = pin[1]!
+    else if (item !== "") kept.push(item)
+  }
+  return id === null ? null : { id, clause, kept }
+}
+
+/**
+ * The comma-separated items of a `SETTINGS` list (the text after the
+ * keyword), split at top-level commas, each trimmed and with its comments
+ * dropped: a comment carries no meaning in the list, and one left in place
+ * could swallow a setting appended after it.
+ */
+function settingsItems(tail: string): string[] {
+  const noise = blank(tail, true)
+  const commentless = blank(tail, false)
+  const items: string[] = []
+  let depth = 0
+  let from = 0
+  for (let i = 0; i <= noise.length; i++) {
+    const ch = noise[i]
+    if (ch === "(") depth++
+    else if (ch === ")") depth--
+    else if (i === noise.length || (ch === "," && depth === 0)) {
+      items.push(commentless.slice(from, i).replace(/[\s;]+$/, "").trim())
+      from = i + 1
+    }
+  }
+  return items
+}
+
+/** Every Trino `FOR VERSION AS OF <id>` outside comments and literals, with the range it covers. */
+function trinoPins(sql: string): { id: string; from: number; to: number }[] {
+  // The blanked copy keeps its offsets, so a match in it is a match in the
+  // statement, and one inside a comment or a literal cannot match at all.
+  const noise = blank(sql, true)
+  const pattern = /\s+FOR\s+VERSION\s+AS\s+OF\s+(\d+)/gi
+  const out: { id: string; from: number; to: number }[] = []
+  let match: RegExpExecArray | null
+  while ((match = pattern.exec(noise)) !== null) {
+    out.push({ id: match[1]!, from: match.index, to: match.index + match[0].length })
+  }
+  return out
 }
 
 /**
