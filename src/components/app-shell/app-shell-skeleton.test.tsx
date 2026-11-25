@@ -10,6 +10,7 @@ import { SidebarProvider } from "@/components/ui/sidebar"
 import { DashboardHeader } from "@/features/dashboards/dashboard-header"
 import { DashboardTilesSkeleton } from "@/features/dashboards/dashboard-skeleton"
 import { SOFT_TILE_FRAME } from "@/features/dashboards/tile-card"
+import { HOME_BACKGROUND_SCRIPT } from "@/lib/home-background"
 import { PRODUCT_NAME } from "@/lib/product-branding"
 import { AppShellSkeleton } from "./app-shell-skeleton"
 
@@ -78,6 +79,23 @@ describe("AppShellSkeleton", () => {
     expect(document.querySelectorAll("[data-slot='tile-placeholder']").length).toBe(4)
   })
 
+  it("draws Home's own placeholder on / (WEB-17 T5): the band's base, the composer, no generic rows", () => {
+    shell("/")
+    expect(screen.getByRole("status", { name: "Loading Home" })).toBeTruthy()
+    expect(screen.queryByRole("status", { name: "Loading" })).toBeNull()
+    // The band in its solid base colour, no drawing yet; transparent by CSS when this browser
+    // chose Off, but still there, so the hero keeps its place (owner QA 2026-11-14).
+    const band = document.querySelector("[data-slot='lake-band']")
+    expect(band).not.toBeNull()
+    expect(band?.className).toContain("in-data-[home-bg=off]:opacity-0")
+    expect(band?.className).not.toContain("hidden")
+    expect(document.querySelector("canvas[data-slot='lake-scene']")).toBeNull()
+    // The composer's own component, inert so nothing typed before the page mounts is lost.
+    const box = screen.getByLabelText("Message AI Copilot", { selector: "textarea" })
+    expect(box.closest("[inert]")).not.toBeNull()
+    expect(screen.getByText(/Answers only, changes nothing/)).toBeTruthy()
+  })
+
   it("draws the generic placeholder elsewhere", () => {
     shell("/catalog")
     expect(screen.getByRole("status", { name: "Loading" })).toBeTruthy()
@@ -129,5 +147,23 @@ describe("the dashboard's loading placeholders", () => {
     expect(document.querySelector("[data-slot='facts-placeholder']")).toBeNull()
     expect(screen.getByText("Ana")).toBeTruthy()
     expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy()
+  })
+})
+
+describe("the Background mark before first paint (WEB-17 T5)", () => {
+  afterEach(() => {
+    window.localStorage.clear()
+    document.documentElement.removeAttribute("data-home-bg")
+  })
+
+  it("marks <html> only when this browser chose Off, and never throws", () => {
+    window.localStorage.setItem("home-background", "off")
+    new Function(HOME_BACKGROUND_SCRIPT)()
+    expect(document.documentElement.getAttribute("data-home-bg")).toBe("off")
+
+    document.documentElement.removeAttribute("data-home-bg")
+    window.localStorage.setItem("home-background", "ascii")
+    new Function(HOME_BACKGROUND_SCRIPT)()
+    expect(document.documentElement.hasAttribute("data-home-bg")).toBe(false)
   })
 })

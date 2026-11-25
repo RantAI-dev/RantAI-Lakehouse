@@ -784,6 +784,113 @@ describe("useQueryStudio statements", () => {
     expect(result.current.running).toBe(false)
   })
 
+  it("asks the server to cancel a Trino run too, and aborts the request only after the answer (BI-63)", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    let signal: AbortSignal | undefined
+    const run = spyOn(queryService, "run").mockImplementation(((
+      _sql: string,
+      _options: unknown,
+      sig?: AbortSignal
+    ) => {
+      signal = sig
+      return new Promise(() => {})
+    }) as never)
+    let answer: () => void = () => {}
+    const cancel = spyOn(queryService, "cancel").mockImplementation(
+      () => new Promise((resolve) => { answer = () => resolve({ stopped: 0 }) })
+    )
+    const { result } = mountWith("SELECT 1")
+    expect(result.current.engine).toBe("trino")
+
+    await act(async () => {
+      void result.current.runQuery()
+    })
+    await waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+    const runId = (run.mock.calls[0]?.[1] as { runId: string }).runId
+
+    await act(async () => {
+      result.current.stopRun()
+    })
+
+    // Cancel went first and the request is still open; "Stopped" is already on screen.
+    expect(cancel).toHaveBeenCalledTimes(1)
+    expect(cancel.mock.calls[0]?.[0]).toBe(runId)
+    expect(signal?.aborted).toBe(false)
+    expect(result.current.running).toBe(false)
+
+    await act(async () => {
+      answer()
+    })
+    await waitFor(() => expect(signal?.aborted).toBe(true))
+  })
+
+  // PR #649 review 1: Stop aborts only after the cancel's answer (up to 2 s),
+  // so a stopped batch's cleanup can resume after the person pressed Run
+  // again and a newer batch owns the tab. The old batch must leave the new
+  // one's rows, its "running" state (the Stop button) and its reload alone.
+  it("a stopped batch's late cleanup leaves alone the newer batch that replaced it", async () => {
+    // The real fetch rejects when its request is aborted, so the stopped
+    // batch's loop resumes in its catch; the promise settles otherwise only
+    // when the test says so, which ends the newer batch.
+    const inFlight: { signal?: AbortSignal; resolve: (value: unknown) => void }[] = []
+    const run = spyOn(queryService, "run").mockImplementation(((
+      _sql: string,
+      _options: unknown,
+      sig?: AbortSignal
+    ) => {
+      return new Promise((resolve, reject) => {
+        inFlight.push({ signal: sig, resolve })
+        sig?.addEventListener("abort", () => reject(new Error("aborted")))
+      })
+    }) as never)
+    let answer: () => void = () => {}
+    const cancel = spyOn(queryService, "cancel").mockImplementation(
+      () => new Promise((resolve) => { answer = () => resolve({ stopped: 0 }) })
+    )
+    const { result } = mountWith("SELECT 1")
+
+    // The first batch is in flight when Stop is pressed.
+    await act(async () => {
+      void result.current.runSelectionOrAll()
+    })
+    await waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+    await act(async () => {
+      result.current.stopRun()
+    })
+    expect(result.current.running).toBe(false)
+
+    // Run pressed again before the cancel answered: a newer batch owns the
+    // tab, and its statement is in flight.
+    await act(async () => {
+      void result.current.runSelectionOrAll()
+    })
+    await waitFor(() => expect(run).toHaveBeenCalledTimes(2))
+    expect(result.current.running).toBe(true)
+
+    // The cancel answers; the old request aborts and the stopped batch's
+    // cleanup resumes — after the newer batch has replaced it.
+    await act(async () => {
+      answer()
+    })
+    await waitFor(() => expect(inFlight[0]?.signal?.aborted).toBe(true))
+
+    // The newer batch still owns the page: its row was not overwritten with
+    // "not run", and running is still true, so the Stop button is still
+    // there to stop it.
+    expect(result.current.running).toBe(true)
+    const rows = result.current.runs[result.current.activeTabId] ?? []
+    expect(rows.map((entry) => entry.status)).toEqual(["running"])
+
+    // And it ends on its own terms, not on the old batch's cleanup.
+    await act(async () => {
+      inFlight[1]?.resolve(RESULT)
+    })
+    await waitFor(() => expect(result.current.running).toBe(false))
+    const done = result.current.runs[result.current.activeTabId] ?? []
+    expect(done.map((entry) => entry.status)).toEqual(["done"])
+    expect(cancel).toHaveBeenCalledTimes(1)
+  })
+
   it("runs only the selection when there is one", async () => {
     const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
     const sql = "SELECT 1; SELECT 2; SELECT 3"

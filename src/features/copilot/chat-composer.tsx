@@ -6,6 +6,7 @@ import { ArrowUp, SlidersHorizontal, Square } from "lucide-react";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Popover, PopoverContent, PopoverDescription, PopoverHeader, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
+import { useSlidingIndicator } from "@/hooks/use-sliding-indicator";
 import { cn } from "@/lib/utils";
 import type { Mode } from "./use-copilot";
 import { capsForMode } from "./capabilities";
@@ -29,7 +30,7 @@ export function ToolsMenu({
           type="button"
           title="Choose what AI Copilot can use"
           className={cn(
-            "flex items-center gap-1.5 rounded-lg px-2 py-1 text-xs transition-colors hover:text-foreground data-[state=open]:bg-muted data-[state=open]:text-foreground",
+            "flex items-center gap-1.5 rounded-lg px-2 py-1 text-xs transition-[background-color,color,scale] duration-150 ease-ui hover:text-foreground active:scale-[0.97] data-[state=open]:bg-muted data-[state=open]:text-foreground",
             limited ? "text-amber-700 dark:text-amber-400" : "text-muted-foreground",
           )}
         >
@@ -77,8 +78,13 @@ export function ToolsMenu({
  * drive the same `useCopilot` mode.
  */
 export function ModeToggle({ mode, setMode }: { mode: Mode; setMode: (m: Mode) => void }) {
+  // Micro-interaction audit 2026-11-14 (emil): the raised fill is one pill that slides between Ask and
+  // Build, so the switch reads as a switch; each side gives a little under the press.
+  const { listRef, indicatorRef } = useSlidingIndicator<HTMLDivElement>(mode, { box: true });
   return (
-    <div className="inline-flex rounded-lg bg-muted/60 p-0.5" role="group" aria-label="AI Copilot mode">
+    <div ref={listRef} className="relative isolate inline-flex rounded-lg bg-muted/60 p-0.5" role="group" aria-label="AI Copilot mode">
+      <span ref={indicatorRef} aria-hidden data-slot="mode-pill"
+        className="pointer-events-none absolute top-0 left-0 -z-10 rounded-md bg-background shadow-xs data-ready:transition-[transform,width,height] data-ready:duration-[220ms] data-ready:ease-move" />
       {(["ask", "build"] as Mode[]).map((m) => (
         <button
           key={m}
@@ -86,11 +92,13 @@ export function ModeToggle({ mode, setMode }: { mode: Mode; setMode: (m: Mode) =
           aria-pressed={mode === m}
           title={m === "ask" ? "Ask: answers questions, changes nothing" : "Build: can create and change things, asking you first"}
           onClick={() => setMode(m)}
+          data-indicator-item
+          data-indicator-active={mode === m || undefined}
           className={cn(
-            "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
+            "rounded-md px-2.5 py-1 text-xs font-medium transition-[color,scale] duration-200 ease-ui active:scale-[0.97]",
             // Neutral, not `text-primary`: primary is too dark to read on the
             // dark theme, where the selected mode all but disappeared.
-            mode === m ? "bg-background text-foreground shadow-xs" : "text-muted-foreground hover:text-foreground",
+            mode === m ? "text-foreground" : "text-muted-foreground hover:text-foreground",
           )}
         >
           {m === "ask" ? "Ask" : "Build"}
@@ -100,15 +108,22 @@ export function ModeToggle({ mode, setMode }: { mode: Mode; setMode: (m: Mode) =
   );
 }
 
+/** What a page can do to the composer from outside: put text in it (`WEB-17` "Ask why"). */
+export type ChatComposerHandle = {
+  /** Replace the text, focus the box with the caret at the end; nothing is sent. */
+  fill: (text: string) => void;
+};
+
 /**
  * The chat composer — input + Ask/Build toggle + Tools menu + send. A "bar"
  * style like Google Cloud Assist / RantAI-Agents. Used by the global chat
  * dock and /copilot.
  */
 export function ChatComposer({
-  mode, setMode, onSend, onStop, busy, placeholder, autoFocus, rows = 2,
-  enabledCaps, toggleCap, onFocus, glass, compact, solid, examples, value, onValueChange,
+  ref, mode, setMode, onSend, onStop, busy, placeholder, autoFocus, rows = 2,
+  enabledCaps, toggleCap, onFocus, glass, compact, solid, examples, footer, value, onValueChange,
 }: {
+  ref?: React.Ref<ChatComposerHandle>;
   mode: Mode;
   setMode: (m: Mode) => void;
   onSend: (text: string) => void;
@@ -139,6 +154,11 @@ export function ChatComposer({
    */
   examples?: string[];
   /**
+   * One line under the toolbar, inside the box, edge to edge: Home's
+   * context strip (what Ask can read, what Build may change). Full style only.
+   */
+  footer?: React.ReactNode;
+  /**
    * The draft, when the caller owns it. The floating dock swaps the
    * collapsed pill and the open composer (two mounts of this component), and
    * a draft kept here would be lost at every open and close.
@@ -149,7 +169,33 @@ export function ChatComposer({
   const [ownInput, setOwnInput] = React.useState("");
   const input = value ?? ownInput;
   const setInput = onValueChange ?? setOwnInput;
+  const area = React.useRef<HTMLTextAreaElement>(null);
+  // Micro-interaction audit 2026-11-14 (emil; WEB-17 "Ask why"): text put in from elsewhere arrives with
+  // a short cue, the box's edge lighting up and easing back, so the eye goes to it before Enter.
+  const [filled, setFilled] = React.useState(0);
+  React.useEffect(() => {
+    if (!filled) return;
+    const t = window.setTimeout(() => setFilled(0), 650);
+    return () => window.clearTimeout(t);
+  }, [filled]);
   const reduce = useReducedMotion() ?? false;
+  React.useImperativeHandle(ref, () => ({
+    fill: (text: string) => {
+      setInput(text);
+      setFilled((n) => n + 1);
+      const el = area.current;
+      if (!el) return;
+      // Micro-interaction audit 2026-11-14: a box scrolled out of sight is brought back with a glide
+      // (at once under reduced motion) instead of the jump `focus()` makes on its own.
+      el.focus({ preventScroll: true });
+      const box = el.getBoundingClientRect();
+      if (box.top < 0 || box.bottom > window.innerHeight) {
+        el.scrollIntoView?.({ block: "center", behavior: reduce ? "auto" : "smooth" });
+      }
+      // After React has put the text in, so the caret lands after it.
+      requestAnimationFrame(() => el.setSelectionRange(text.length, text.length));
+    },
+  }), [reduce, setInput]);
   const [exampleIndex, setExampleIndex] = React.useState(0);
   const cycling = Boolean(examples?.length) && !input;
   React.useEffect(() => {
@@ -242,9 +288,9 @@ export function ChatComposer({
               <motion.span
                 key={example}
                 initial={reduce ? false : { opacity: 0, y: 6 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={reduce ? undefined : { opacity: 0, y: -6 }}
-                transition={{ duration: 0.25 }}
+                // Micro-interaction audit 2026-11-14: the console's ease-out, and the old example leaves faster than the new one comes.
+                animate={{ opacity: 1, y: 0, transition: { duration: 0.25, ease: [0.23, 1, 0.32, 1] } }}
+                exit={reduce ? undefined : { opacity: 0, y: -6, transition: { duration: 0.15, ease: [0.23, 1, 0.32, 1] } }}
                 className="min-w-0 truncate"
               >
                 {example}
@@ -268,7 +314,7 @@ export function ChatComposer({
             aria-label="Stop"
             title="Stop"
             className={cn(
-              "grid size-8 place-items-center rounded-lg bg-foreground text-background transition-colors hover:bg-foreground/85",
+              "grid size-8 place-items-center rounded-lg bg-foreground text-background transition-[background-color,scale] duration-150 ease-ui hover:bg-foreground/85 active:scale-95",
               "ml-auto",
             )}
           >
@@ -281,7 +327,7 @@ export function ChatComposer({
             disabled={busy || !input.trim()}
             aria-label="Send"
             className={cn(
-              "grid size-8 place-items-center rounded-lg transition-colors",
+              "grid size-8 place-items-center rounded-lg transition-[background-color,color,scale] duration-150 ease-ui enabled:active:scale-95",
               "ml-auto",
               busy || !input.trim() ? "bg-muted text-muted-foreground" : "bg-primary text-primary-foreground hover:bg-primary/85",
             )}
@@ -290,14 +336,16 @@ export function ChatComposer({
           </button>
         )}
       </div>
+      {footer ? <div className="-mx-1.5 -mb-1.5 mt-1.5 overflow-hidden rounded-b-[15px]">{footer}</div> : null}
     </>
   );
 
   return (
     // Owner QA 2026-11-15: `transition-all` also tweened size and radius
     // whenever the box changed shape; only the focus colours fade now.
-    <div data-slot="chat-composer" className={cn(
-      "rounded-2xl border p-1.5 transition-[background-color,border-color,box-shadow] duration-150 ease-ui",
+    <div data-slot="chat-composer" data-filled={filled ? "" : undefined} className={cn(
+      "rounded-2xl border p-1.5 transition-[border-color,background-color,box-shadow] duration-200 ease-ui",
+      "data-filled:border-primary/50 data-filled:ring-3 data-filled:ring-primary/15",
       solid
         ? "border-border bg-background shadow-xs focus-within:border-foreground/25"
         : glass ? `${glassCls} focus-within:bg-background/60` : `${glassCls} focus-within:border-foreground/20 focus-within:bg-muted/40 focus-within:shadow-md`,

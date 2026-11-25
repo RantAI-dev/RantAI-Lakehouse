@@ -460,6 +460,7 @@ estimate (S, M, L), which the base has no field for.
 | ID | Kind | Item | Module | Priority | Status | PR | Source |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `WEB-10` | Task | A popup opened inside a dashboard fixed to the light theme takes the console's dark colours: the list of a dropdown, a menu and a popover are drawn in a portal on `<body>`, outside the dashboard's `.theme-light` subtree (`BI-17` D6). Readable, but dark on a light dashboard; since `WEB-9` this includes the embed filter bar's list, which used to be the browser's light one. Make a popup follow the theme of the surface that opened it | Platform | P3 | Done | #688 | `WEB-9` S3 review, D6 finding; `superpowers/plans/2026-11-12-web-9-one-dropdown.md` |
+| `WEB-17` | Feature | Home revamp, the owner's mockup B (2026-11-14): the AI Copilot composer over our own dithered lake scene, then a compact bento with real data only (a live dashboard, recent AI chats, pipelines with "Ask why", needs attention). A Background choice in Customize: Dither, ASCII or Off. Activity heatmap, month totals and "Gold rows this month" are left out until an API gives them | Platform | P1 | In Progress |  | `specs/web-17.md`; `features/console-home.md`; `superpowers/plans/2026-11-14-web-17-home-revamp.md` |
 | `WEB-18` | Feature | AI chat history moves into the sidebar (owner, 2026-11-14): the History page and its sidebar entry go away; on a conversation the app sidebar becomes the chat list ("Back to menu", New chat, Search, AI settings, chats by day) and slides back to the main menu. Chats are reached from Home and the conversation page | Platform | P1 | In Progress |  | `superpowers/plans/2026-11-14-web-18-chat-sidebar.md` |
 | `OPS-18` | Task | `security.yml` downloads the `gitleaks` and `cargo-deny` binaries without a retry, so a GitHub release-download outage (2026-11-08, 16:02 to 17:35 WIB) failed three jobs without scanning anything. Add a retry | Operations | P3 | Done | #691 | PR #423 |
 | `DATA-45` | Task | Iceberg tables with no catalog entry (for example some Gold export tables) are no longer listed anywhere since `WEB-3` slice 2 removed the Table Maintenance list; their pages work by address only | Data | P3 | Done | #701 | #374 handoff |
@@ -678,6 +679,7 @@ set by the product owner and are left empty until they are.
 | `BI-55` | 2026-11-13 | | |
 | `DATA-56` | 2026-11-12 | 2026-11-12 (#492) | |
 | `RPT-2` | 2026-11-12 | 2026-11-12 (#492) | |
+| `RPT-3` | Task | What a report's recipient sees: the scheduled-report email signs off as "Rantai Lake, scheduled report" (the old name; owner decision 2026-11-18 is "RantAI Lakehouse"), and every PDF prints a dark band around the white page (the page margins take the dark root background) | Dashboards | P2 | Building | | owner 2026-11-21 (RPT-1 check on the QA stack); `superpowers/plans/2026-11-21-rpt-3-report-email-polish.md` |
 | `REL-25` | 2026-11-12 | 2026-11-12 (#492) | |
 | `ADM-15` | 2026-11-12 | 2026-11-12 (#492) | |
 | `DATA-53` | 2026-11-12 | 2026-11-12 (#489) | |

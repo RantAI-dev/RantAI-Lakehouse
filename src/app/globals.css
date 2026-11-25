@@ -308,7 +308,13 @@ html.embed-transparent body {
    bersih. Dipicu tombol Export → PDF (window.print()). */
 @media print {
   [data-print-hide] { display: none !important; }
-  body { background: #fff !important; }
+  /* RPT-3 (PR #641 review SHOULD-FIX 1): the @page margin is not painted with
+     the root's background but with the canvas colour of the colour scheme. The
+     console's <html> carries the `dark` class (color-scheme: dark), whose
+     canvas is #121212, so a PDF had a dark band around the white page. The root
+     is light and white in the print medium only. */
+  html { color-scheme: light !important; }
+  html, body { background: #fff !important; }
   @page { margin: 10mm; }
 
   .dash-canvas {
