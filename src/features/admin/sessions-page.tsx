@@ -56,8 +56,9 @@ export function SessionsPanel() {
         </span>
       ),
     },
-    // QA LH-SEC-5-01 (ADM-14 D9/D10): the browser the session came from, and
-    // "Not recorded" for the address the API cannot know.
+    // ADM-14 D10 (QA LH-SEC-5-01): "Not recorded" for the address the API
+    // has no trusted source for. `SEC-82` may change this; the page must not
+    // show a wrong address in the meantime.
     { key: "ip", header: "IP", render: (r) => r.createdIp ?? "Not recorded" },
     {
       key: "ua",
