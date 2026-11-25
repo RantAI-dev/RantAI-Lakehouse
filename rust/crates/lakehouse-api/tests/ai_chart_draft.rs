@@ -628,6 +628,30 @@ async fn a_last_answer_that_is_not_empty_is_left_as_the_model_wrote_it() {
     assert_eq!(body["answer"], "Only a draft.", "{body}");
 }
 
+/// AI-36 F1: every round calls `create_chart` with a mart that does not
+/// exist, so nothing was drafted or saved, and the final model answer claims
+/// a chart was made. The claim is not backed by the trace: the reply is the
+/// fixed sentence, and the note stays the tool-call limit note.
+#[tokio::test]
+async fn a_claim_of_a_chart_that_no_tool_saved_is_replaced_by_the_fixed_sentence() {
+    let llm = mock_model(spent_rounds(
+        &chart_args(MART, COLUMN),
+        Some("I created the chart you asked for."),
+    ))
+    .await;
+    let ch = mock_clickhouse(false).await;
+
+    let (status, body) = chat(&llm, &ch, "Buat grafik penjualan per wilayah.").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["answer"],
+        "No chart was made because the request used up its tool calls before the chart could be saved, after these tools ran: `create_chart`.",
+        "{body}"
+    );
+    assert_eq!(body["note"], "tool-call limit reached", "{body}");
+}
+
 /// The chart the update tests name, and the board it is filed on.
 const STORED_CHART: &str = "c_stored";
 const STORED_BOARD: &str = "b_stored";

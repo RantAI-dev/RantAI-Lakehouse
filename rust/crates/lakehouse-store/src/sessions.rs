@@ -21,10 +21,10 @@
 //! admin permission"), so a hash in the wire shape would be a path to
 //! session takeover.
 //!
-//! `created_ip` is always `null`: the API sits behind the console's own
-//! server, so it has no trusted source for the client's address, and
-//! recording the peer or a forwarded header would show a wrong address as a
-//! fact (`ADM-14` decision D10). `user_agent` is the browser as it named
+//! `created_ip` is always `null`: the API has no trusted source for the
+//! client's address, so a session records nothing rather than a wrong
+//! address (`ADM-14` decision D10; `SEC-82` may change this).
+//! `user_agent` is the browser as it named
 //! itself at sign-in (`routes::auth::login` and `routes::auth::oidc_callback`
 //! pass it to `session::create_session`), and `null` for a session older than
 //! that change — an honest absence either way rather than a fabricated
@@ -66,8 +66,9 @@ pub struct SessionRow {
     /// add noise).
     pub expires_at: String,
     /// `session.created_ip` — always `null`: the API has no trusted source
-    /// for the client's address, so nothing is recorded rather than a wrong
-    /// address (`ADM-14` decision D10; see the module doc comment).
+    /// for the client's address (`ADM-14` decision D10; `SEC-82` may change
+    /// this), so a session records nothing rather than a wrong address. See
+    /// the module doc comment.
     pub created_ip: Option<String>,
     /// `session.user_agent` — the browser as it named itself at sign-in
     /// (`ADM-14` decision D9), `null` for a session older than that change.

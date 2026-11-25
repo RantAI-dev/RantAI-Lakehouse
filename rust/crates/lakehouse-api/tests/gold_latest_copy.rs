@@ -1,10 +1,10 @@
 //! `DATA-6` T2: the API's launch half, against a `wiremock` Dagster and
-//! the REAL shared `ClickHouse` container (`gold_publication`'s — its
-//! `OnceCell` cache for `console.gold_latest_copy_run` is process-wide, so
-//! a second container would let whichever module ran first pin the
-//! other's DDL to the wrong server). The plan's fallback for a
-//! `wiremock`-unfriendly `CH_URL` is used for exactly that reason; the
-//! rows are counted where they were written.
+//! the REAL shared `ClickHouse` container (`gold_publication`'s — one
+//! container per test binary keeps the Gold tests cheap; the
+//! `ensure_*_table` guards are keyed by `ClickHouse` URL, so the DDL is
+//! still correct against whichever engine a test uses). The plan's
+//! fallback for a `wiremock`-unfriendly `CH_URL` is used for exactly that
+//! reason; the rows are counted where they were written.
 //!
 //! The op itself (`refresh_gold_latest_copy`) is exercised by the
 //! Python side (`test_gold_latest_copy.py`) and by the
@@ -40,6 +40,7 @@ async fn state_with(dagster_url: String) -> AppState {
 
 fn request(mart: &str) -> LatestCopyRequest<'_> {
     LatestCopyRequest {
+        zone: lakehouse_iceberg::gold::PublishZone::Gold,
         mart,
         table: "gold_export_smoke",
         copy_exported_at_micros: COPY_MICROS,

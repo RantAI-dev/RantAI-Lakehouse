@@ -19,6 +19,9 @@ use time::OffsetDateTime;
 
 fn input() -> CreatePipelineInput {
     CreatePipelineInput {
+        incremental_strategy: "append".to_owned(),
+        partition_granularity: "day".to_owned(),
+        lookback_hours: 0,
         inputs: Vec::new(),
         steps: Vec::new(),
         name: "orders_hourly_rollup".to_owned(),

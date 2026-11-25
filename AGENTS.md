@@ -212,10 +212,11 @@ for it on every step.
   just before the handoff, and once more by the reviewer before merge. CI
   runs it again on the PR. That is three full runs per PR, not one per
   commit.
-- **CI's `test` job is `cargo nextest run --workspace`, in three partitions**
-  (`REL-20`): the single `cargo test --workspace` became three parallel
-  nextest partitions plus `cargo test --doc`. Local developers may keep
-  `cargo test`; only the CI command changed.
+- **CI's `test` job is `cargo nextest run --workspace`, in six partitions**
+  (`REL-20`; six since `OPS-CI-FAST`, measured on PR #724: three partitions
+  took 1,704s / 1,382s / 1,674s each): the single `cargo test --workspace`
+  became six parallel nextest partitions plus `cargo test --doc`. Local
+  developers may keep `cargo test`; only the CI command changed.
 - **Integration tests are one binary per crate** (`OPS-32`): `lakehouse-api`,
   `lakehouse-store` and `lakehouse-auth` build `tests/it.rs`, which declares
   every test file as a module. Run one file with

@@ -1231,6 +1231,11 @@ fn deployment_features(
 /// without reading the deployment's environment; they are facts about the
 /// deployment, not a claim that any service is healthy.
 ///
+/// In `bi-only` mode the answer also carries `supportedInPlaceSources`, the
+/// source matrix of the one installed engine. It is omitted in `full` mode,
+/// where the three-field body is byte-compatible with the console's older
+/// readers and no source is read in place.
+///
 /// It reports configuration, never health: a feature is "on" when its
 /// settings are in place. Backups are not in the list — the API cannot see
 /// the backup container's settings (feature page, Limits).
@@ -1251,11 +1256,23 @@ pub async fn get_deployment(State(state): State<AppState>) -> ApiResult<ApiJson<
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
     let single_sign_on = crate::runtime_settings::oidc(&state).await.is_some();
-    Ok(ApiJson(json!({
+    let mut body = json!({
         "features": deployment_features(&state, &email, &assistant, &sso, single_sign_on),
         "installMode": state.config.install_mode.name(),
         "queryEngine": state.config.default_query_engine_name(),
-    })))
+    });
+    // `BI-44` slice 2: the source matrix is a fact about a `bi-only`
+    // installation, so it is reported from the same single source of truth
+    // the connector gate uses. In `full` mode the body keeps the three keys
+    // the console has always read — an additive field here would break the
+    // byte-shaped deployment test, and a full stack does not read sources
+    // in place.
+    if state.config.is_bi_only() {
+        let supported: Vec<&str> =
+            crate::in_place::supported_source_types(state.config.query_engine).to_vec();
+        body["supportedInPlaceSources"] = json!(supported);
+    }
+    Ok(ApiJson(body))
 }
 
 /// `PUT /api/settings/email` — save the mail server, the account, the
