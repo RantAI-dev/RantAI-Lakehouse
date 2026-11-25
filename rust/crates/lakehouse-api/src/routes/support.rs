@@ -334,6 +334,100 @@ pub(crate) async fn describe_columns(
         .collect())
 }
 
+/// The fixed words for a dashboard SQL-source preview on the one engine a
+/// `bi-only` install started. Trino's own text goes to the log under a
+/// reference id only (SEC-11); a caller never sees it in a response.
+pub(crate) const PREVIEW_TRINO: upstream_error::Context = upstream_error::Context::new(
+    "dashboard SQL source preview",
+    "The SQL source failed to run.",
+    "The query engine is unavailable.",
+);
+
+/// Classifies a `Trino` failure of an in-place preview. A query the engine
+/// refused is the caller's failed request (422); transport, timeout and row
+/// cap failures mean the engine could not serve it (503).
+fn classify_trino_preview_error(err: &lakehouse_trino::TrinoError) -> lakehouse_core::ApiError {
+    use upstream_error::{Class, FailedAs};
+
+    let class = match err {
+        lakehouse_trino::TrinoError::Query(_)
+        | lakehouse_trino::TrinoError::HttpStatus(_)
+        | lakehouse_trino::TrinoError::TooManyRows { .. } => Class::Failed,
+        lakehouse_trino::TrinoError::Transport(_) | lakehouse_trino::TrinoError::Timeout => {
+            Class::Unavailable
+        }
+    };
+    upstream_error::report(&PREVIEW_TRINO, class, &err.to_string())
+        .into_api_error(FailedAs::Unprocessable)
+}
+
+/// The `Trino` user a preview runs as: the same `console-<id>` form Query
+/// Studio uses, so the engine's audit log names the real caller.
+fn trino_preview_user(principal: &lakehouse_auth::Principal) -> String {
+    format!("console-{}", principal.id.uuid())
+}
+
+/// Probe the columns of a governed SQL source on `Trino` without reading
+/// rows. `DESCRIBE` has no subquery form in `Trino`, so a zero-row execution
+/// of the rewritten statement supplies the engine's own column names and
+/// types — the same source [`describe_columns`] reads from `ClickHouse`'s
+/// `DESCRIBE`. No other engine is dialed.
+///
+/// # Errors
+///
+/// A classified 422/503 when `Trino` refuses or cannot be reached, or 422
+/// when the statement returns no columns (nothing a dashboard could draw).
+pub(crate) async fn describe_trino_preview_columns(
+    state: &crate::state::AppState,
+    principal: &lakehouse_auth::Principal,
+    rewritten: &str,
+) -> Result<Vec<lakehouse_bi::sources::SourceColumn>, lakehouse_core::ApiError> {
+    let sql = format!("SELECT * FROM (\n{rewritten}\n) AS src LIMIT 0");
+    let result = state
+        .trino
+        .run_statement(&sql, &trino_preview_user(principal))
+        .await
+        .map_err(|err| classify_trino_preview_error(&err))?;
+    let columns: Vec<lakehouse_bi::sources::SourceColumn> = result
+        .columns
+        .iter()
+        .map(|c| lakehouse_bi::sources::SourceColumn {
+            name: c.name.clone(),
+            ty: c.type_signature.clone(),
+        })
+        .collect();
+    if columns.is_empty() {
+        return Err(lakehouse_core::ApiError::Unprocessable(
+            "the SQL source returns no columns.".to_owned(),
+        ));
+    }
+    Ok(columns)
+}
+
+/// Run one already-rewritten preview statement on the active `Trino`
+/// installation, returning the `{columns, rows}` shape the dashboard builder
+/// reads. The client bounds the rows; the wrapper around this call adds the
+/// preview's own `LIMIT`. Upstream text is classified before it reaches a
+/// response (`SEC-11`).
+///
+/// # Errors
+///
+/// A classified 422/503 when `Trino` refuses the statement or cannot be
+/// reached.
+pub(crate) async fn run_trino_preview(
+    state: &crate::state::AppState,
+    principal: &lakehouse_auth::Principal,
+    sql: &str,
+) -> Result<Value, lakehouse_core::ApiError> {
+    let result = state
+        .trino
+        .run_statement(sql, &trino_preview_user(principal))
+        .await
+        .map_err(|err| classify_trino_preview_error(&err))?;
+    let (columns, rows) = crate::routes::query::trino_result_to_rows(&result);
+    Ok(json!({ "columns": columns, "rows": rows }))
+}
+
 /// [`crate::policy_engine::enforcement_error_message`], with the sentence
 /// above for a refused `dictGet*` call in a statement that does a `RegionOf`
 /// lookup (it names a `console.geo_dict_` dictionary); every other refusal
