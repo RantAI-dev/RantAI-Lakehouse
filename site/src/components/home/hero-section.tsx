@@ -62,7 +62,12 @@ export function HeroSection({
             <DisplayHeading as="h1" size="xl" className="lk-ii mt-5 short:mt-3 short:text-[2.75rem]">
               {copy.headline}
             </DisplayHeading>
-            <LeadText className="lk-ii mx-auto mt-6 max-w-[34rem] short:mt-4 short:text-[15px] short:leading-[1.5] md:mx-0">{copy.sub}</LeadText>
+            {/* WEB-5 M7 (phone pass): below 1024 px the phone copy, which keeps the Indonesian to two
+                lines at 390 px (the English is the same text in both). */}
+            <LeadText className="lk-ii mx-auto mt-6 max-w-[34rem] short:mt-4 short:text-[15px] short:leading-[1.5] md:mx-0">
+              <span className="max-lg:hidden">{copy.sub}</span>
+              <span className="lg:hidden">{copy.subPhone}</span>
+            </LeadText>
             <div className="lk-ii mt-9 short:mt-6 flex flex-wrap items-center justify-center gap-3 md:justify-start">
               {/* WEB-5 D20: the install path is on the page now; it links on to the README. */}
               <CtaLink href="#get-started">{cta.install}</CtaLink>
