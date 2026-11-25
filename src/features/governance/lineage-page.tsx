@@ -1,5 +1,6 @@
 "use client"
 
+import { SuggestInput } from "@/components/patterns/suggest-input"
 import * as React from "react"
 import { PageHeader } from "@/components/patterns/page-header"
 import { DataTable } from "@/components/data-table/data-table"
@@ -8,7 +9,6 @@ import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { FlowCanvas } from "@/components/patterns/flow-canvas"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
-import { Input } from "@/components/ui/input"
 import { useSearchParams } from "next/navigation"
 import { useDataTable } from "@/hooks/use-data-table"
 import { useService } from "@/hooks/use-service"
@@ -95,19 +95,14 @@ export function LineagePage() {
         title="Lineage"
         description="What feeds a dataset or table and what it feeds: connector ingest, catalog registry, authored pipelines, views and Gold exports. Every connection comes from a platform record."
       />
-      <Input
+      <SuggestInput
         value={focus}
-        onChange={(e) => setFocus(e.target.value)}
+        onValueChange={setFocus}
         className="max-w-sm"
         aria-label="Dataset or table"
         placeholder="Dataset slug or table, e.g. serving.<table>"
-        list="lineage-focus-options"
+        suggestions={assets.status === "success" ? assets.data.map((a) => ({ value: a.id, label: a.name })) : []}
       />
-      <datalist id="lineage-focus-options">
-        {assets.status === "success"
-          ? assets.data.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)
-          : null}
-      </datalist>
       {state.status === "success" && state.data.supported && state.data.nodes.length === 0 ? (
         <EmptyState title="No lineage to show" description={state.data.note} />
       ) : null}
