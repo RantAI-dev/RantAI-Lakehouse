@@ -1999,3 +1999,12 @@ While WEB-5 was in review, `main` published the old in-console landing page to G
    - `ops/landing-pages` notes that are now history.
 
 Then push, wait for CI to go green, and mark #379 ready. The team merges.
+
+### §11 review (planner, 2026-11-25)
+
+- T1 (`1f73419db`) and T2 (`3025a6409`): accepted. CI found two gaps the local run could not: the OPS-25 gate-groups lint (`4feeb8e23`, `site` is a non-gate job and `site/*` selects no gate) and the dependency review on `site/` Next 16.4.3 (`c6f2fff84`, now 16.4.6). Both are fixed, and CI is green at `5002cd324`.
+- T3 (`ce10be3d6`, `809796fae`): accepted. `/id/` reaches 92. **Miss:** `/` stays at 86 against the target of 90, recorded in RESULT with its numbers. Every remaining lever changes what the visitor sees, so it is the owner's call.
+- T4 (`2b52c39c8`, `518da111e`, `903ae2fa9`): accepted. The code-gutter line numbers became CSS generated content rather than brighter text.
+  - **Why accepted:** they are decorative (`aria-hidden`, not selectable), which is WCAG 1.4.3's "incidental" exemption, and generated line numbers are a common code-viewer pattern.
+  - **What it means for the score:** accessibility 100 for that node comes from the exemption, not from raised contrast. RESULT says so.
+  - The caption nudges are a visible change and wait for the owner's QA before push.
