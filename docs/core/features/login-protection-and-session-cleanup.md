@@ -63,7 +63,7 @@ No. Sign-in protection is not something a user asks for; it is always on.
 | 2 | How long the lock lasts | 5 minutes | |
 | 3 | How long dead sessions and revoked tokens are kept before deletion | 30 days | |
 | 4 | Whether an operator can switch the protection off | No. The numbers can be changed; it cannot be disabled | |
-| 5 | How many failed sign-ins one source may make, and within what time (plan `adm-130` decision 2). 50, not 5, because one office behind one NAT shares one address | 50 in 15 minutes. Above that every sign-in from that source is refused with a 429 and a `Retry-After` until the window ends, and the check runs before the password is checked. The per-account lock (5 in 15 minutes) is unchanged and still guards each account. A successful sign-in does not reset the count. The 429 runs only behind a declared edge proxy that OVERWRITES `X-Forwarded-For`; with the default empty list the 429 is off, but the count and audit compaction still run | Owner, 2026-11-20 |
+| 5 | How many failed sign-ins one source may make, and within what time (plan `adm-130` decision 2). 50, not 5, because one office behind one NAT shares one address | 50 in 15 minutes. Above that every sign-in from that source is refused with a 429 and a `Retry-After` until the window ends, and the check runs before the password is checked. The per-account lock (5 in 15 minutes) is unchanged and still guards each account. A successful sign-in does not reset the count. The 429 runs only behind a declared edge proxy that OVERWRITES `X-Forwarded-For`; with the default empty list the 429 is off, but the count and audit compaction still run | Owner, 2026-11-20; revised by the owner 2026-11-24 (decision B) |
 | 6 | What the audit trail writes for a source's failed sign-ins (plan `adm-130` decision 3) | The first failed sign-in of a source and window writes the `auth.login` refused row; the later ones only count, and one summary row with the count is written when the window closes. The per-account `auth.login_locked` row is unchanged: one per lock | Owner, 2026-11-20 |
 | 7 | How the gate's refusals are recorded (plan `adm-130` decision 4) | Per principal, route pattern and window: the first 403 writes the row, the later ones count, and one summary row names the route and the count. A 401 writes nothing. There is no 429 for a gate refusal | Owner, 2026-11-20 |
 | 8 | What the rows carry about the source (plan `adm-130` decision 5) | The source address, in `args.source`. Never the identifier, never the password, never a hash of either | Owner, 2026-11-20 |
@@ -84,6 +84,10 @@ an operator can change.
 - Through the console with the default empty `TRUSTED_PROXIES` every caller
   shares one source, so there is no per-source 429, while the audit
   compaction still applies.
+- Without a trusted edge, `args.source` is the console proxy's address. It
+  does not identify the caller, and the counts cover the whole deployment.
+  Per-caller attribution exists only behind an edge that overwrites
+  `X-Forwarded-For` and is declared in `TRUSTED_PROXIES`.
 
 ## Acceptance checklist
 

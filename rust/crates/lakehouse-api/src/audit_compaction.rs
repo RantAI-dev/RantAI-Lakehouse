@@ -37,6 +37,14 @@
 //! for it. A window whose summary could not be written keeps its counter
 //! row, and the next sweep tries again.
 //!
+//! Only one API instance may sweep at a time: two instances (a replica, or
+//! the old and the new one during a rolling deploy) sweeping together
+//! would race to write the same summary twice before the delete. [`sweep`]
+//! takes an advisory transaction lock for its whole run; an instance that
+//! cannot take it writes nothing and lets the owner summarise the windows.
+//! The lock only serializes sweeps: the audit writes and the counter
+//! queries keep their own path, outside the lock's transaction.
+//!
 //! # What a row may hold
 //!
 //! The summary row of a sign-in names the source the failures came from
@@ -224,13 +232,34 @@ pub async fn mark_first_row_written(
 ///
 /// # Errors
 ///
-/// Returns the storage error when the counters cannot be read or the
-/// summarised rows cannot be deleted. A summary row that cannot be
-/// written is logged and its window keeps its counter row.
+/// Returns the storage error when the sweep lock cannot be acquired, the
+/// counters cannot be read, or the summarised rows cannot be deleted. A
+/// summary row that cannot be written is logged and its window keeps its
+/// counter row.
 pub async fn sweep(state: &AppState) -> Result<SweepCounts, StoreError> {
     let Some(pool) = state.pg.as_deref() else {
         return Ok(SweepCounts::default());
     };
+    // Only one instance may sweep at a time: two instances racing here
+    // would write the same summary twice before the delete. The lock is
+    // transaction-scoped and this transaction stays open for the whole
+    // sweep, so the lock is released only when the sweep commits (or an
+    // early `?` error drops the transaction and rolls it back). The audit
+    // writes and counter queries below use `pool` directly, NOT this
+    // transaction: the lock serializes sweeps without wrapping their
+    // writes.
+    let mut guard_tx = pool.begin().await?;
+    let acquired: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind("audit_compaction.sweep")
+            .fetch_one(&mut *guard_tx)
+            .await?;
+    if !acquired {
+        // Another instance owns the sweep; it will summarise these
+        // windows. Roll back to release the lock and write nothing.
+        guard_tx.rollback().await?;
+        return Ok(SweepCounts::default());
+    }
     let mut counts = SweepCounts::default();
 
     for window in lakehouse_auth::source_throttle::closed_windows(pool).await? {
@@ -276,6 +305,7 @@ pub async fn sweep(state: &AppState) -> Result<SweepCounts, StoreError> {
         counts.deleted += 1;
     }
 
+    guard_tx.commit().await?;
     Ok(counts)
 }
 

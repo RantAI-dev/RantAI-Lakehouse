@@ -457,6 +457,8 @@ pub async fn login(
 async fn complete_sign_in(
     state: &AppState,
     pool: &PgPool,
+    // Kept in the signature: callers pass it positionally; the address is
+    // deliberately not recorded (`ADM-14` D10; `SEC-82`).
     _source: &ClientSource,
     headers: &HeaderMap,
     principal: Principal,
@@ -1434,6 +1436,8 @@ impl ExchangeFailure {
 )]
 pub async fn oidc_callback(
     State(state): State<AppState>,
+    // Kept in the signature: callers pass it positionally; the address is
+    // deliberately not recorded (`ADM-14` D10; `SEC-82`).
     _source: ClientSource,
     Query(query): Query<OidcCallbackQuery>,
     headers: HeaderMap,

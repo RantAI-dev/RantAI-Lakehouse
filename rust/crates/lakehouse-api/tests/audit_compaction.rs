@@ -652,6 +652,238 @@ async fn a_closed_window_gets_one_summary_row_with_the_count() {
     );
 }
 
+/// A closed window whose counter says its first row was NEVER written
+/// counts every failure in the summary, not one fewer
+/// (`SEC-75` decision 3; gov-dev review item A1).
+///
+/// The flag is set directly after the failures: the first row really was
+/// written, but a counter that never got marked (a crash between the write
+/// and the mark) must not make the summary under-count. The false branch of
+/// `summarised_count` is what this scenario pins down.
+#[tokio::test]
+async fn a_window_without_a_first_row_counts_every_failure() {
+    let (TestApp { router, pool }, state) =
+        spin_up_with_state(&env_trusting_the_loopback(), |_| {}).await;
+    let addr = serve(router).await;
+    let client = reqwest::Client::new();
+
+    fail_sign_ins(&pool, &client, addr, SOURCE, "spray", 3).await;
+
+    // Stand in for a first row that never got marked on the counter, then
+    // close the window the sweep reads.
+    sqlx::query("UPDATE login_source_throttle SET first_row_written = FALSE WHERE source = $1")
+        .bind(SOURCE)
+        .execute(&pool)
+        .await
+        .expect("clear the first-row flag");
+    close_the_window_of_a_source(&pool, SOURCE).await;
+
+    let counts = lakehouse_api::audit_compaction::sweep(&state)
+        .await
+        .expect("the sweep runs");
+    assert_eq!(counts.summaries, 1, "one summary: {counts:?}");
+
+    let rows = audit_rows(&pool, "auth.login").await;
+    // The summary reports the first row AND the later two: all three
+    // failures, not the two that came after a first row.
+    let summary = summary_of(
+        &rows,
+        "3 more failed sign-ins from this source in 15 minutes.",
+    );
+    assert_eq!(
+        summary["args"]["count"], 3,
+        "every failure is counted when no first row was written"
+    );
+}
+
+/// A window whose summary write fails keeps its counter, and the NEXT sweep
+/// writes the summary (`SEC-75` decision 3; gov-dev review item A2).
+///
+/// The audit insert is made to fail with a temporary trigger that refuses
+/// summary rows, and the trigger is dropped before the second sweep. The
+/// `continue` after a failed `record_best_effort_checked` is what keeps the
+/// counter for the retry: without it the counter is deleted and the retry
+/// has nothing to summarise.
+#[tokio::test]
+async fn a_failed_summary_write_keeps_the_counter_for_the_next_sweep() {
+    let (TestApp { router, pool }, state) =
+        spin_up_with_state(&env_trusting_the_loopback(), |_| {}).await;
+    let addr = serve(router).await;
+    let client = reqwest::Client::new();
+
+    fail_sign_ins(&pool, &client, addr, SOURCE, "spray", 3).await;
+    // Make "full count" literal: this window owes the summary all three
+    // failures, so the retried summary must report three, not two.
+    sqlx::query("UPDATE login_source_throttle SET first_row_written = FALSE WHERE source = $1")
+        .bind(SOURCE)
+        .execute(&pool)
+        .await
+        .expect("clear the first-row flag");
+    close_the_window_of_a_source(&pool, SOURCE).await;
+
+    // A nonce keeps the trigger's name unique even if the suite runs in
+    // parallel against the same test Postgres (one database per test).
+    let nonce = uuid::Uuid::new_v4().simple();
+    let fun_name = format!("fail_summary_writes_{nonce}");
+    let trigger_name = format!("summary_unwritable_{nonce}");
+
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        r"CREATE OR REPLACE FUNCTION {fun_name}() RETURNS trigger
+           AS 'BEGIN RAISE EXCEPTION ''injected summary write failure''; END;'
+           LANGUAGE plpgsql"
+    )))
+    .execute(&pool)
+    .await
+    .expect("create the failing trigger function");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TRIGGER IF EXISTS {trigger_name} ON audit_event"
+    )))
+    .execute(&pool)
+    .await
+    .expect("clear any stale trigger");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        r"CREATE TRIGGER {trigger_name}
+           BEFORE INSERT ON audit_event
+           FOR EACH ROW WHEN (NEW.detail LIKE '%more failed sign-ins%')
+           EXECUTE FUNCTION {fun_name}()"
+    )))
+    .execute(&pool)
+    .await
+    .expect("arm the failing trigger");
+
+    // Assert under a panic catch so the DROP runs on every path.
+    let result = std::panic::AssertUnwindSafe(async {
+        let counts = lakehouse_api::audit_compaction::sweep(&state)
+            .await
+            .expect("the sweep runs");
+        assert_eq!(
+            counts.summaries, 0,
+            "a failed summary is not counted as written: {counts:?}"
+        );
+        let rows = audit_rows(&pool, "auth.login").await;
+        assert_eq!(rows.len(), 1, "no summary was written: {rows:#?}");
+        assert_eq!(
+            counter_rows_of_a_source(&pool, SOURCE).await,
+            1,
+            "the counter row stays for the next sweep"
+        );
+    })
+    .catch_unwind()
+    .await;
+
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TRIGGER IF EXISTS {trigger_name} ON audit_event"
+    )))
+    .execute(&pool)
+    .await
+    .expect("disarm the failing trigger");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP FUNCTION IF EXISTS {fun_name}()"
+    )))
+    .execute(&pool)
+    .await
+    .expect("drop the failing trigger function");
+
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+
+    // The write works again: the next sweep writes exactly one summary of
+    // the whole window and deletes the counter row.
+    let counts = lakehouse_api::audit_compaction::sweep(&state)
+        .await
+        .expect("the sweep runs");
+    assert_eq!(counts.summaries, 1, "the retried summary lands: {counts:?}");
+
+    let rows = audit_rows(&pool, "auth.login").await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "one refused row and one summary after the retry: {rows:#?}"
+    );
+    let summary = summary_of(
+        &rows,
+        "3 more failed sign-ins from this source in 15 minutes.",
+    );
+    assert_eq!(
+        summary["args"]["count"], 3,
+        "the retry reports the full count"
+    );
+    assert_eq!(
+        counter_rows_of_a_source(&pool, SOURCE).await,
+        0,
+        "the summarised counter row is deleted"
+    );
+}
+
+/// A sweep cannot run while another API process holds the sweep lock
+/// (gov-dev review item B). The holder is a separate transaction on another
+/// connection from the pool: it stands in for a replica or the old process
+/// during a rolling deploy that is already sweeping the same database.
+#[tokio::test]
+async fn a_sweep_cannot_run_while_another_process_holds_the_lock() {
+    let (TestApp { router, pool }, state) =
+        spin_up_with_state(&env_trusting_the_loopback(), |_| {}).await;
+    let addr = serve(router).await;
+    let client = reqwest::Client::new();
+
+    fail_sign_ins(&pool, &client, addr, SOURCE, "spray", 3).await;
+    close_the_window_of_a_source(&pool, SOURCE).await;
+
+    let mut holder = pool.begin().await.expect("a holder transaction");
+    let held: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind("audit_compaction.sweep")
+            .fetch_one(&mut *holder)
+            .await
+            .expect("take the sweep lock");
+    assert!(held, "the other process holds the sweep lock");
+
+    // The locked sweep is a no-op: another process owns the window.
+    let counts = lakehouse_api::audit_compaction::sweep(&state)
+        .await
+        .expect("the sweep runs");
+    assert_eq!(
+        counts,
+        lakehouse_api::audit_compaction::SweepCounts::default(),
+        "the sweep that cannot take the lock does nothing: {counts:?}"
+    );
+    let rows = audit_rows(&pool, "auth.login").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "no summary while the lock is held: {rows:#?}"
+    );
+    assert_eq!(
+        counter_rows_of_a_source(&pool, SOURCE).await,
+        1,
+        "no counter row is deleted while the lock is held"
+    );
+
+    holder.rollback().await.expect("release the sweep lock");
+
+    // Once the lock is free, one sweep writes the summary and deletes the
+    // counter row.
+    let counts = lakehouse_api::audit_compaction::sweep(&state)
+        .await
+        .expect("the sweep runs");
+    assert_eq!(
+        counts.summaries, 1,
+        "the second sweep writes the summary: {counts:?}"
+    );
+    let rows = audit_rows(&pool, "auth.login").await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "one refused row and one summary after the lock is released: {rows:#?}"
+    );
+    assert_eq!(
+        counter_rows_of_a_source(&pool, SOURCE).await,
+        0,
+        "the counter row is deleted by the sweep that owns the lock"
+    );
+}
+
 /// A window with nothing after its first row writes NO summary: there is
 /// nothing to summarise (`SEC-75` decision 3).
 #[tokio::test]
