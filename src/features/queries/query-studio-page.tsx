@@ -17,6 +17,8 @@ import { IcebergTimeTravelControls } from "./time-travel-controls"
 import { QueryTransparencyPanel } from "./query-transparency-panel"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useCopilot } from "@/features/copilot/use-copilot"
+import { useDeploymentSettings } from "@/hooks/use-deployment-settings"
+import { availableQueryEngines } from "@/lib/query-engines"
 import { summarizeQuery } from "@/lib/page-context-summary"
 import { queryDraftKey } from "@/lib/query-draft"
 import { SchemaBrowser } from "./schema-browser"
@@ -47,10 +49,26 @@ export function QueryStudioPage() {
 function QueryStudioWorkspace({ draftKey }: { draftKey: string | null }) {
   // All the state lives in the hook; this file is the layout.
   const studio = useQueryStudio(draftKey)
+  const { engine: studioEngine, setEngine } = studio
   const router = useRouter()
   const [schemaOpen, setSchemaOpen] = React.useState(false)
   const { hasPermission } = useAuth()
   const canAuthorSources = hasPermission("dashboard:sql")
+  // `BI-44`: the deployment route is admin-gated, so this asks only for a
+  // holder of `settings:write`. Everyone else keeps the two-engine
+  // selector; the API still refuses the inactive engine at run time.
+  const deployment = useDeploymentSettings(hasPermission("settings:write"))
+  const availableEngines = React.useMemo(
+    () => availableQueryEngines(deployment?.installMode, deployment?.queryEngine),
+    [deployment?.installMode, deployment?.queryEngine]
+  )
+  React.useEffect(() => {
+    // A `?engine=` link or an old draft can name an engine this install
+    // does not run. With one installed engine, keep the tab on it instead
+    // of offering a query the API must refuse with a 400.
+    if (availableEngines.length !== 1 || studioEngine === availableEngines[0]) return
+    setEngine(availableEngines[0])
+  }, [availableEngines, studioEngine, setEngine])
 
   /**
    * `WEB-7` D5: saving is its own page now, so the statement it would save
@@ -163,6 +181,7 @@ function QueryStudioWorkspace({ draftKey }: { draftKey: string | null }) {
                     onSaveAsSource={canAuthorSources ? openSaveSourcePage : undefined}
                     onToggleSchema={() => setSchemaOpen((open) => !open)}
                     schemaOpen={schemaOpen}
+                    availableEngines={availableEngines}
                   />
                 </div>
                 {schemaOpen ? (
