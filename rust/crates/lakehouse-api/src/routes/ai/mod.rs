@@ -1897,6 +1897,29 @@ fn chart_not_saved_reply(tool_trace: &[Value]) -> String {
     )
 }
 
+/// AI-36 F5: the reply says the builder's default cap when a chart write took
+/// effect and its result carries the marker. The trace decides, not the
+/// model's wording: no phrase check and no repeat suppression. One sentence
+/// per turn, even when several charts were capped.
+fn append_default_cap_note(answer: &str, tool_trace: &[Value]) -> String {
+    let cap = u64::from(tools::default_chart_limit());
+    let capped = tool_trace.iter().any(|step| {
+        matches!(step["tool"].as_str(), Some("create_chart" | "update_chart"))
+            && (step["ok"].as_bool() == Some(true)
+                || step["result"]["needs_confirmation"].as_bool() == Some(true))
+            && step["result"]["defaultCap"].as_u64() == Some(cap)
+    });
+    if !capped {
+        return answer.to_owned();
+    }
+    let sentence = tools::default_cap_sentence();
+    // An empty or blank answer gets the sentence alone, with no leading space.
+    if answer.trim().is_empty() {
+        return sentence;
+    }
+    format!("{answer} {sentence}")
+}
+
 /// The response body of a turn that stopped for time (`AI-34`).
 fn timed_out_body(tool_trace: &[Value], build_run_id: Option<&str>, chart_created: bool) -> Value {
     chat_response_body(
@@ -2276,6 +2299,9 @@ fn chat_response_body(
     note: Option<&str>,
 ) -> Value {
     let (answer, next_step) = take_next_step(answer, tool_trace);
+    // F5: the note follows the cleaned answer, so a pending `NEXT:` line stays
+    // in `nextStep` and the cap is the last thing the person reads.
+    let answer = append_default_cap_note(&answer, tool_trace);
     let mut body = Map::new();
     body.insert("answer".to_owned(), json!(answer));
     body.insert("toolTrace".to_owned(), json!(tool_trace));
@@ -4764,6 +4790,94 @@ mod tests {
         assert_eq!(obj.get("buildRunId").unwrap(), "r_1");
         assert_eq!(obj.get("chartCreated").unwrap(), true);
         assert_eq!(obj.get("note").unwrap(), "tool-call limit reached");
+    }
+
+    /// AI-36 F5: a chart tool that took effect and reports the builder's
+    /// default cap makes the reply say the cap once, even though the model's
+    /// answer does not. The cap comes from the trace, not the model's wording.
+    #[test]
+    fn a_capped_chart_draft_makes_the_reply_end_with_the_fixed_cap_sentence() {
+        let trace = vec![json!({
+            "tool": "create_chart", "ok": true,
+            "result": { "needs_confirmation": true, "defaultCap": 20 },
+        })];
+        let body = chat_response_body("Visitors by bin.", &trace, None, false, None);
+        let sentence = "This chart shows at most 20 values by default; set a `limit` to show more.";
+        let answer = body["answer"].as_str().unwrap_or_default();
+        assert!(answer.ends_with(sentence), "{body}");
+        assert_eq!(answer.matches(sentence).count(), 1, "{body}");
+    }
+
+    /// AI-36 F5: a chart with a `limit`, a failed call that happens to carry
+    /// the marker, and a turn with no chart write all leave the answer alone.
+    #[test]
+    fn a_limit_a_failed_call_and_no_chart_add_no_cap_sentence() {
+        let sentence = "This chart shows at most 20 values by default; set a `limit` to show more.";
+        let traces: Vec<Vec<Value>> = vec![
+            vec![
+                json!({ "tool": "create_chart", "ok": true, "result": { "created": true, "limit": 10 } }),
+            ],
+            vec![
+                json!({ "tool": "update_chart", "ok": false, "result": { "error": "no", "defaultCap": 20 } }),
+            ],
+            vec![json!({ "tool": "list_boards", "ok": true, "result": { "defaultCap": 20 } })],
+            vec![],
+        ];
+        for trace in traces {
+            let body = chat_response_body("Visitors by bin.", &trace, None, false, None);
+            let answer = body["answer"].as_str().unwrap_or_default();
+            assert!(!answer.contains(sentence), "{body}");
+        }
+    }
+
+    /// AI-36 F5: several capped charts in one turn still give one sentence.
+    #[test]
+    fn two_capped_charts_in_one_turn_add_the_cap_sentence_once() {
+        let trace = vec![
+            json!({ "tool": "create_chart", "ok": true, "result": { "needs_confirmation": true, "defaultCap": 20 } }),
+            json!({ "tool": "update_chart", "ok": true, "result": { "updated": true, "defaultCap": 20 } }),
+        ];
+        let body = chat_response_body("Two charts.", &trace, None, false, None);
+        let sentence = "This chart shows at most 20 values by default; set a `limit` to show more.";
+        let answer = body["answer"].as_str().unwrap_or_default();
+        assert_eq!(answer.matches(sentence).count(), 1, "{body}");
+    }
+
+    /// AI-36 F5: the sentence is added to the cleaned answer, so a pending
+    /// `NEXT:` line stays in `nextStep` instead of being buried under the note.
+    #[test]
+    fn the_cap_sentence_follows_the_answer_after_the_next_step_is_split() {
+        let trace = vec![json!({
+            "tool": "create_chart", "ok": true,
+            "result": { "needs_confirmation": true, "defaultCap": 20 },
+        })];
+        let body = chat_response_body("Drafted.\nNEXT: Save it.", &trace, None, false, None);
+        assert_eq!(body["nextStep"], json!("Save it."), "{body}");
+        assert_eq!(
+            body["answer"],
+            json!(
+                "Drafted. This chart shows at most 20 values by default; set a `limit` to show more."
+            ),
+            "{body}"
+        );
+    }
+
+    /// AI-36 F5 (review round 2, NIT as a real bug): a capped turn whose answer
+    /// is empty or only spaces gets the sentence alone, with no leading space.
+    #[test]
+    fn a_capped_turn_with_an_empty_answer_gets_the_cap_sentence_with_no_leading_space() {
+        let trace = vec![json!({
+            "tool": "create_chart", "ok": true,
+            "result": { "needs_confirmation": true, "defaultCap": 20 },
+        })];
+        let sentence = "This chart shows at most 20 values by default; set a `limit` to show more.";
+        for answer in ["", "   ", "\n"] {
+            assert_eq!(
+                append_default_cap_note(answer, &trace),
+                sentence,
+                "answer {answer:?}"
+            );
+        }
     }
 
     #[test]

@@ -68,6 +68,7 @@ once a first release is tagged.
 - A binned chart drafted with no `limit` now says in its result that it shows at most 20 values by default and that a `limit` shows more, so the assistant can warn the person instead of showing a cut without saying so (`AI-36`).
 - A policy the assistant drafts now has conditions the engine can enforce, or the assistant says it enforces nothing (`AI-27`).
 - After a person answers the chat's question, the reply now opens by naming the reading it used (`AI-17`).
+- A binned chart with no limit now always says it shows at most 20 values, and a grain change updates the subtitle's words too (`AI-36`).
 
 ### Security
 
