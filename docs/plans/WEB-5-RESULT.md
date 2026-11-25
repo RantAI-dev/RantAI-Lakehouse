@@ -690,3 +690,41 @@ Accessibility, SEO and best practices: 100 in all twelve runs; CLS 0. A first ro
 - The 3D dive band after the hero (needs a GPU), out of scope.
 - At 360 px the Indonesian footer link "Semua mengalir masuk" wraps to two lines (42 px tap).
 - In the M3 swipe row every tile is as tall as the tallest (the audit log), so the masking tile has space between its picture and its title.
+
+### Owner QA round, 2026-11-25 (seven items, phone only)
+
+The owner checked the phone pass in Chrome's phone emulation (iPhone 12 Pro, 390x844, real GPU, day). Seven findings; each is phone only (below 1024 px, or 768 px where noted) and has its own commit.
+
+| # | Finding | Cause and change | Commit |
+| --- | --- | --- | --- |
+| 1 | "dia kek ga masuk ke dalam air": the 3D dive stayed at the surface behind the sources | **Root cause, older than the phone pass** (engine and timeline unchanged since `d0e0e47e2`): on a narrow screen the engine pulls the camera back from what it looks at (`distScaleHero`, 1.84 at 390x844) along the line of sight; once the camera tips down under the water that line points steeply down, so the pull lifted the camera out of the water (y +2.06 at 1.95 vh where the path says -0.80, +0.08 at 3.4 vh, under again only at 3.8 vh). Desktop's scale is 1, so it dived. Fix: the pull-back eases out over the waterline stretch (`heroPull`, 0.95 to 1.75 vh); under the water a phone follows the desktop's path. Three new timeline tests | `31e118d7a` |
+| 2 | Too many source chips | Eight best-known sources and a "+11 more" line; the rest stay for screen readers. Static wrap chosen over the drifting marquee (calmer, and the owner ruled out sideways movement) | `9e2614968` |
+| 3 | Depths cards too data-heavy | Three rows (misspelt city, the x2 duplicate, the empty amount) and three columns (Order, City, Amount); headers say "3 of 5 rows" / "2 of 4 rows"; Gold built from all five rows, so nothing contradicts; Gold keeps the lag only; card and slab centred as one block (below 768 px) | `0b2f2340c` |
+| 4 | Masking table scrolled sideways, two header rows | Two columns (name over e-mail, amount), switch alone in the header (below 768 px); masking and decode unchanged | `3b64ce0e1` |
+| 5 | "gausah di scroll scrolll ke kanan atau kiri" | M3's swipe row removed; tiles stack, compact, each its own height; vertical lineage kept. Then nothing else scrolls sideways: commands wrap at spaces and after `/`, the reduced-motion dashboards stack | `5d830cec4`, `0596718b1` |
+| 6 | "Yours to keep" all at once | The desktop showcase's markers and observer drive a phone sequence: one sticky stage, one promise and picture at a time, 45svh of scroll each, dots; only the shown picture counts for the loops; every picture fits at 390x844, 360x740, 375x667 | `b46551ccc`, `11cb51b34` |
+| 7 | Four text blocks in the hero | Eyebrow hidden; reassurance one line ("Free · Open source · Runs on your servers") | `c8bc75382` |
+| — | Lighthouse after the round: 85-88 | The phone sequence had copied the showcase's `.lk-show-visual:not([data-on]) *` rule; its universal selector added about 250 ms of style recalculation at load (4x CPU). Removed on phones | `535d5364f` |
+
+Measured after the round (export on :3402, `d0e0e47e2` on :3401):
+
+- **Dive** (forced-WebGL dev build, 390x844, day, engine state per frame): camera y +0.14 at 0.95 vh, -0.25 at 1.75, -0.80 at 1.95, -1.99 at 2.5, -3.69 at 3.4 vh. Strips before (top) and after: `web-5-screens/r-phone-dive-before-after.jpg`.
+- **Phone audit**, 390 and 360, EN and ID: 0 elements wider than the viewport, **0 sideways-scrollable boxes**, 0 visible text under 12 px, 0 taps under 40 px, 0 headings or descriptions over 2 lines. Page height 16,727 / 16,807 / 15,578 / 15,590 (en-390 / id-390 / en-360 / id-360). Longest empty band: the "Yours to keep" stage as it releases after its last picture (359-379 px at 390, 328 at 360); the before build had 330-358 px bands too.
+- **Governance** is 1,746 px at 390x844 (about 2.1 screens); content 1,618 px (1,628 before the pass, 1,246 with the swipe row).
+- **Hero** (R12 probe, export, scene "none"): gap from the creature to the headline 32 px at 360x640, 48 at 375x667, 118 at 360x740, 108 at 390x844, EN and ID; buttons on the first screen. Largest paint is the H1 by day and night at 390 and 360, EN and ID (4x CPU).
+- **contain-intrinsic-block-size**, re-measured: governance EN 1618.02 (1638.27 under 390 px, 1684.66 under 375), ID 1638.27; get-started EN 848.56, ID 813.63 (848.56 under 390); 768 px: governance 899.23, get-started 511 (the first pass had missed the tablet values). "Install it" lands `#get-started` at 64 px at 390, 375, 360, 768 and 1190 px, EN and ID.
+- **Desktop**, before against after, every 600 px, reduced motion: 1190x800 EN 18 of 19 shots 0 px, ID 19 of 19; 1440x900 EN 20 of 20, ID 19 of 20. The two shots that differ are in the footer's 12 %-opacity wordmark, 151 and 17 pixels by at most 4 of 255 (the known dither); page heights equal.
+- **Lighthouse** mobile, night (`TZ=Asia/Jakarta`, 00:2x), three runs interleaved:
+
+| Page | Build | Performance (runs) | Median | LCP | TBT median |
+| --- | --- | --- | --- | --- | --- |
+| `/` | before | 91 / 91 / 93 | 91 | 1.66 s | 321 ms |
+| `/` | after | 91 / 90 / 93 | **91** | 1.66 s | 336 ms |
+| `/id/` | before | 94 / 91 / 92 | 92 | 1.66 s | 336 ms |
+| `/id/` | after | 92 / 94 / 93 | **93** | 1.66 s | 291 ms |
+
+  Accessibility, SEO and best practices 100 in all twelve runs; CLS 0.
+- `bun run size`: 195.0 KB on `/` and `/id/` (budget 200). CSP: 0 violations, 0 page errors (`/`, `/id/`, `/contact/`, `/id/contact/`, 390 and 1440). `bun run test` 98 of 98, `typecheck` and `lint` pass.
+- Pictures: `web-5-screens/r-phone-hero-sources-governance.jpg`, `r-phone-depths.jpg`, `r-phone-open-sequence.jpg`.
+
+Not verified: the 3D path after the fix on a real GPU (the strips are software-rendered under `next dev`); Safari's toolbar heights (`svh`) for the pinned stages; the iPhone QA.
