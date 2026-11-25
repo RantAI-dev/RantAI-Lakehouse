@@ -438,7 +438,7 @@ fn get_build_status_schema() -> Value {
 
 fn describe_mart_schema() -> Value {
     json!({ "type": "function", "function": { "name": "describe_mart",
-        "description": "Gold marts (serving.*) that can be charted. With no argument: every mart with its row count. With `mart`: its columns split into dimensions (categories, time) and measures (numbers). Each column also has a kind (number, date, datetime, text); a date or datetime dimension can take a grain. Call this before create_chart.",
+        "description": "Gold marts (serving.*) that can be charted. With no argument: every mart with its row count. With `mart`: its columns split into dimensions (categories, time) and measures (numbers). Each column also has a kind (number, date, datetime, text); a date or datetime dimension can take a grain.",
         "parameters": { "type": "object", "properties": {
             "mart": { "type": "string", "description": "mart name, e.g. mart_sales" } } } } })
 }
@@ -448,14 +448,14 @@ fn describe_mart_schema() -> Value {
 fn reference_lines_schema() -> Value {
     json!({ "type": "array", "maxItems": 5, "items": { "type": "object", "properties": {
         "kind": { "type": "string", "enum": ["value", "average", "median", "min", "max", "trend", "band", "forecast"],
-            "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`; forecast: the series continued `horizon` periods ahead with a 95 % band (bar, line, area, stacked, combo with the date dimension grouped by minute to year, no breakdown, at most one per chart)" },
+            "description": "value (default): a line at `value`; average, median, min, max and trend are computed from the rows shown; band runs from `value` to `to`; forecast continues `horizon` periods with a 95 % band (a date dimension, no breakdown, one per chart)" },
         "horizon": { "type": "integer", "minimum": 1, "maximum": 60, "description": "forecast only, required: how many periods ahead" },
         "value": { "oneOf": [ { "type": "number" }, param_ref_schema() ], "description": "where on the value axis: a number, or {param: <a number parameter>}. Required for kind value and band; leave out for a computed line" },
         "to": { "oneOf": [ { "type": "number" }, param_ref_schema() ], "description": "band only: the other edge" },
         "label": { "type": "string", "description": "at most 60 characters" },
         "color": { "type": "string", "description": "#rrggbb" },
         "measure": { "type": "string", "description": "a computed line: which value of the chart it describes (a result name); default the first" } } },
-        "description": "up to 5 marks on the value axis (bar, hbar, line, area, stacked, combo), for example a target at 1,000, the average, a trend or a band. Use a parameter for a line the viewer can move. A computed line describes the rows on screen" })
+        "description": "up to 5 marks on the value axis (bar, hbar, line, area, stacked, combo), for example a target at 1,000, the average, a trend or a band. A parameter moves a line the viewer can change." })
 }
 
 /// The `BI-17` part A formatting fields of `create_chart`, `update_chart` and
@@ -492,7 +492,7 @@ fn style_properties() -> Value {
     let mut later_value_format = value_format.clone();
     strip_descriptions(&mut later_value_format);
     json!({
-        "format": { "oneOf": [value_format, { "type": "null" }], "description": "how every number of the chart is written (the number format). null removes it. Changing it with format_chart keeps everything else of the chart" },
+        "format": { "oneOf": [value_format, { "type": "null" }], "description": "how every number is written; null removes it." },
         "valueFormats": { "type": ["object", "null"], "additionalProperties": later_value_format, "description": "a number format per value, keyed by the value's result name; replaces `format` for that value" },
         "dateFormat": { "type": ["object", "null"], "properties": {
             "style": { "type": "string", "enum": ["auto", "short", "medium", "long", "iso", "monthYear"] },
@@ -563,12 +563,12 @@ fn format_chart_schema() -> Value {
     if let Value::Object(schema) = &mut add_lines
         && let Some(Value::String(description)) = schema.get_mut("description")
     {
-        "lines to add to the chart's own, which stay (at most 5 in all). Use this to add a line; referenceLines replaces every line the chart has."
+        "lines added to the chart's own, which stay (at most 5 in all); referenceLines replaces every line the chart has."
             .clone_into(description);
     }
     properties.insert(super::tools::ADD_REFERENCE_LINES.to_owned(), add_lines);
     json!({ "type": "function", "function": { "name": "format_chart",
-        "description": "Change only how a saved chart looks: number and date formats (rupiah, percent, compact, decimals), colours (a palette, a colour per series, colour by value), axes, data labels, reference lines (a target at 1,000, an average, a trend, a band), notes, tooltip fields and, for a table or KPI, conditional colours. Send ONLY the fields that change: a field you give replaces that field, null removes it, and everything you leave out stays as it is (the data, the title, the filters and the other formatting). list_charts gives the ids. To change what the chart shows, use update_chart.",
+        "description": "Change only how a saved chart looks: formats (rupiah, percent, compact, decimals), colours, axes, data labels, reference lines, notes, tooltip fields and, for a table or KPI, conditional colours. Send ONLY the fields that change: a field you give replaces that field, null removes it, and everything you leave out stays. list_charts gives the ids. To change what the chart shows, use update_chart.",
         "parameters": { "type": "object", "properties": properties, "required": ["chart"] } } })
 }
 
@@ -584,7 +584,7 @@ fn set_dashboard_theme_schema() -> Value {
 
 fn set_cache_rule_schema() -> Value {
     json!({ "type": "function", "function": { "name": "set_cache_rule",
-        "description": "Set how long a dashboard's or a chart's results may be remembered instead of computed again (\"Make this chart always fresh\"). For \"this chart\", \"the chart\" or \"it\" about one chart, give its chart id; give a board (list_boards) only when the person means the whole dashboard, and never set the dashboard's rule for a request about one chart. When the page lists more than one chart and the person did not name one, call ask_user with the charts' titles as the options first; with exactly one chart on the page, use it. Give a board or a chart, one of the two. rule: default follows the level above (a chart follows its dashboard, a dashboard follows the install's setting in Admin > Settings), fresh computes every time, minutes remembers for `minutes` (1 to 1440). The narrowest rule set wins. Not for the built-in dashboard; set it on one of its charts or duplicate it first. The install's own rule is set by an administrator in Admin > Settings, not here. A result is also recomputed whenever the data under it changes, whatever the rule.",
+        "description": "Set how long a dashboard's or a chart's results may be remembered instead of computed again (\"Make this chart always fresh\"). For \"this chart\", \"the chart\" or \"it\" about one chart, give its chart id; give a board (list_boards) only when the person means the whole dashboard, and never set the dashboard's rule for a request about one chart. When the page lists more than one chart and the person did not name one, call ask_user with the charts' titles as the options first; with exactly one chart on the page, use it. Give a board or a chart, one of the two. rule: default follows the level above, fresh computes every time, minutes remembers for `minutes` (1 to 1440). The narrowest rule wins. Not for the built-in dashboard; duplicate it first. The install's own rule is set in Admin > Settings.",
         "parameters": { "type": "object", "properties": {
             "board": { "type": "string", "description": "the dashboard id (list_boards)" },
             "chart": { "type": "string", "description": "the chart id (list_charts)" },
@@ -743,7 +743,7 @@ fn create_chart_schema() -> Value {
             // 2026-11-08).
             "subtitle": { "type": ["string", "null"] },
             "mart": { "type": "string" }, "kind": { "type": "string", "enum": chart_kind_enum() },
-            "sqlSource": { "type": "string", "description": "SQL source id (s_…) from list_sql_sources, instead of mart for a chart that combines several marts; set mart OR sqlSource, not both" },
+            "sqlSource": { "type": "string", "description": "SQL source id (s_…), instead of mart for a chart that combines several marts; set mart OR sqlSource, not both" },
             "text": { "type": "string" }, "caption": { "type": "string" },
             "target": { "type": "number" }, "dimension": { "type": "string" },
             "measures": measures_schema(),
@@ -851,7 +851,7 @@ fn suggest_dashboard_schema() -> Value {
 
 fn list_maps_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_maps",
-        "description": "List the maps a geomap, pointmap or geoheat chart can be drawn on: the ones that ship with the console and the ones an administrator uploaded, with the id to put in `map` and a label. Call it before setting `map`.",
+        "description": "List the maps a geomap, pointmap or geoheat chart can be drawn on: the ones that ship with the console and the ones an administrator uploaded, with the id to put in `map` and a label.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
@@ -863,7 +863,7 @@ fn list_charts_schema() -> Value {
 
 fn suggest_join_schema() -> Value {
     json!({ "type": "function", "function": { "name": "suggest_join",
-        "description": "Candidate column pairs for joining two Gold marts in a chart (`joins` of create_chart), best first. `suggested` marks the pairs to use; `coversRightKey` false means a row of the first mart may match several rows of the second, so sums of the second mart's columns multiply. Reads column metadata only.",
+        "description": "Candidate column pairs for joining two Gold marts in a chart (`joins` of create_chart), best first. `suggested` marks the pairs to use; `coversRightKey` false means a row of the first mart may match several rows of the second, so sums of the second mart's columns multiply.",
         "parameters": { "type": "object", "properties": {
             "left": { "type": "string", "description": "the chart's mart, e.g. mart_visits" },
             "right": { "type": "string", "description": "the mart to join to it" } },
@@ -872,7 +872,7 @@ fn suggest_join_schema() -> Value {
 
 fn list_sql_sources_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_sql_sources",
-        "description": "List the dashboard SQL sources (saved SQL, usually combining several Gold marts) with their dimensions and measures. Use the id as sqlSource in create_chart. Users create SQL sources in Query Studio, not in chat.",
+        "description": "List the dashboard SQL sources (saved SQL, usually combining several Gold marts) with their dimensions and measures. Users create SQL sources in Query Studio, not in chat.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
@@ -900,7 +900,7 @@ fn delete_chart_schema() -> Value {
 
 fn create_tab_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_tab",
-        "description": "Add a tab to a dashboard (board). On a dashboard with no tabs the first tab holds every chart already on it, so to separate some charts create a second tab as well and then move_charts_to_tab. The built-in dashboard has no tabs.",
+        "description": "Add a tab to a dashboard (board). The built-in dashboard has no tabs.",
         "parameters": { "type": "object", "properties": {
             "board": { "type": "string", "description": "dashboard id from list_boards" },
             "title": { "type": "string", "description": "1 to 60 characters" } },
@@ -954,19 +954,19 @@ fn delete_tab_schema() -> Value {
 fn calc_source_properties() -> Value {
     json!({
         "mart": { "type": "string", "description": "Gold mart name (from describe_mart)" },
-        "sqlSource": { "type": "string", "description": "SQL source id (s_…) from list_sql_sources, instead of mart" }
+        "sqlSource": { "type": "string", "description": "SQL source id (s_…), instead of mart" }
     })
 }
 
 fn list_formula_functions_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_formula_functions",
-        "description": "The formula language of calculated fields and every function it has (its signature and one line of help, by category). Call it before writing a formula. You write formulas, never SQL.",
+        "description": "The formula language of calculated fields and every function it has (its signature and one line of help, by category). You write formulas, never SQL.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
 fn list_metrics_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_metrics",
-        "description": "The saved metrics (name, label, description, the table or SQL source they are computed from, their date column). A metric is one agreed definition of a number such as revenue. Call it BEFORE writing a query or a chart for a number the user names: if one matches, use it and name it in your answer; if none matches, say so before you write SQL.",
+        "description": "The saved metrics (name, label, description, the table or SQL source they are computed from, their date column). A metric is one agreed definition of a number such as revenue.",
         "parameters": { "type": "object", "properties": calc_source_properties() } } })
 }
 
@@ -980,7 +980,7 @@ fn describe_metric_schema() -> Value {
 
 fn query_metric_schema() -> Value {
     json!({ "type": "function", "function": { "name": "query_metric",
-        "description": "The value of a metric, read as the person you are helping (their access, masks and row filters apply). With no other argument it is one number. groupBy splits it by one column; grain (day, week, month, quarter, year) splits it by that period of the metric's date column; filters narrow it further. Say which metric you used.",
+        "description": "The value of a metric, read as the person you are helping (their access, masks and row filters apply). With no other argument it is one number. groupBy splits it by one column; grain (day, week, month, quarter, year) splits it by that period of the metric's date column; filters narrow it further.",
         "parameters": { "type": "object", "properties": {
             "name": { "type": "string", "description": "the metric's name from list_metrics" },
             "groupBy": { "type": "string", "description": "a column of the metric's table; with grain, a date column" },
@@ -1030,16 +1030,16 @@ fn delete_metric_schema() -> Value {
 
 fn list_calculated_fields_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_calculated_fields",
-        "description": "The calculated fields of one mart or SQL source (name, formula, whether it is one value per row or an aggregate, and its type). A chart uses one by naming it in dimension, breakdown or measures like a column.",
+        "description": "The calculated fields of one mart or SQL source (name, formula, whether it is one value per row or an aggregate, and its type).",
         "parameters": { "type": "object", "properties": calc_source_properties() } } })
 }
 
 fn validate_formula_schema() -> Value {
     let mut properties = calc_source_properties();
-    properties["formula"] = json!({ "type": "string", "description": "the formula to check, in the formula language (see list_formula_functions)" });
+    properties["formula"] = json!({ "type": "string", "description": "the formula to check" });
     properties["name"] = json!({ "type": "string", "description": "the field's name, if it already has one (so a field that uses itself is caught)" });
     json!({ "type": "function", "function": { "name": "validate_formula",
-        "description": "Check a formula against a mart or SQL source without saving anything: returns ok with its level and type, or the message and the character position of the first mistake. Use it to fix a formula before create_calculated_field.",
+        "description": "Check a formula against a mart or SQL source without saving anything: returns ok with its level and type, or the message and the character position of the first mistake.",
         "parameters": { "type": "object", "properties": properties, "required": ["formula"] } } })
 }
 
@@ -1139,7 +1139,7 @@ fn delete_board_schema() -> Value {
 
 fn arrange_board_schema() -> Value {
     json!({ "type": "function", "function": { "name": "arrange_board",
-        "description": "Place chart tiles on a board's 12-column grid. Send only the tiles that change; the rest keep their boxes. Refuses a chart that is not on the board, a box that does not fit the 12-column grid, and a width or height below 1. The board's saved layout is replaced whole; last write wins.",
+        "description": "Place chart tiles on a board's 12-column grid. Send only the tiles that change. It refuses a chart that is not on the board, a box that does not fit the 12-column grid, and a width or height below 1. The board's saved layout is replaced whole; last write wins.",
         "parameters": { "type": "object", "properties": {
             "board": { "type": "string" },
             "tiles": {
@@ -1174,7 +1174,7 @@ fn move_chart_schema() -> Value {
 /// a year column's value as a date range the column cannot match.
 fn set_board_view_filters_schema() -> Value {
     json!({ "type": "function", "function": { "name": "set_board_view_filters",
-        "description": "Change the filters visible to the person on this page, this time only. Use it for a request to see only some data on this page (\"show only 2026\", \"only Bali\", \"tampilkan hanya …\"), instead of a new chart; a year is an `in` filter with the year on a year column (such as `tahun`), or a between filter on a date column's first and last day of that year when the source has no year column. Nothing is saved; the board's default and every other viewer's view are unchanged. Empty filters clear the view. Available in every chat mode, including Ask.",
+        "description": "Change the filters visible to the person on this page, this time only. Use it for a request to see only some data on this page (\"show only 2026\", \"only Bali\", \"tampilkan hanya …\"), instead of a new chart; a year is an `in` filter with the year on a year column (such as `tahun`), or a between filter on a date column's first and last day of that year when the source has no year column. Empty filters clear the view. Available in every chat mode, including Ask.",
         "parameters": { "type": "object", "properties": {
             "board": { "type": "string" },
             "filters": filters_array_property() },
@@ -1183,7 +1183,7 @@ fn set_board_view_filters_schema() -> Value {
 
 fn save_board_filters_schema() -> Value {
     json!({ "type": "function", "function": { "name": "save_board_filters",
-        "description": "Save a board's default filters, so the next person to open the board sees them. Use only when the person asks to save for everyone. The built-in Main board refuses.",
+        "description": "Save a board's default filters, so the next person to open the board sees them. The built-in Main board refuses.",
         "parameters": { "type": "object", "properties": {
             "board": { "type": "string" },
             "filters": filters_array_property() },
@@ -1220,7 +1220,7 @@ fn create_hierarchy_schema() -> Value {
         json!({ "type": "string", "description": "for example Geography (1 to 64 characters)" });
     properties["levels"] = json!({ "type": "array", "minItems": 2, "maxItems": 6, "items": { "type": "string" }, "description": "2 to 6 columns of the source, outermost first (province, city, place)" });
     json!({ "type": "function", "function": { "name": "create_hierarchy",
-        "description": "Save a hierarchy on a mart or SQL source. A viewer can then drill down a chart whose dimension is one of its levels. Charts do not store it, so it never breaks a chart.",
+        "description": "Save a hierarchy on a mart or SQL source. A viewer can then drill down a chart whose dimension is one of its levels.",
         "parameters": { "type": "object", "properties": properties, "required": ["name", "levels"] } } })
 }
 
@@ -1235,7 +1235,7 @@ fn delete_hierarchy_schema() -> Value {
 
 fn list_parameters_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_parameters",
-        "description": "The parameters of the deployment: named values (a number, text, a date, or a choice from a list) that a viewer changes on a dashboard and that a formula ({name}), a chart's limit, a reference line or a column switch can read. Use before create_chart to reuse one.",
+        "description": "The parameters of the deployment: named values (a number, text, a date, or a choice from a list) that a viewer changes on a dashboard and that a formula ({name}), a chart's limit, a reference line or a column switch can read.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
@@ -1295,6 +1295,27 @@ fn alert_agg_enum() -> Value {
     json!(["sum", "avg", "max", "min", "count"])
 }
 
+/// `BI-65`: when a digest is sent, shared by [`create_alert_rule_schema`] and
+/// [`update_alert_rule_schema`] so the two cannot drift. It is the shape a
+/// report subscription's schedule has (`routes::reports::ScheduleInput`), and
+/// the alerts route refuses anything else with a 400 that says so.
+fn digest_schedule_schema() -> Value {
+    json!({ "type": "object",
+        "description": "for type=digest, required when creating one: kind hourly, daily, weekly or monthly; hour 0 to 23 (not hourly); minute 0 to 59; weekday 1 (Monday) to 7 (Sunday), for weekly; monthDay 1 to 28 or \"last\", for monthly.",
+        "properties": {
+            "kind": { "type": "string", "enum": ["hourly", "daily", "weekly", "monthly"] },
+            "hour": { "type": "integer" },
+            "minute": { "type": "integer" },
+            "weekday": { "type": "integer" },
+            "monthDay": { "type": ["integer", "string"] } },
+        "required": ["kind"] })
+}
+
+fn digest_time_zone_schema() -> Value {
+    json!({ "type": "string",
+        "description": "for type=digest: an IANA time zone, for example Asia/Jakarta; the report's when left out" })
+}
+
 fn list_alert_rules_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_alert_rules",
         "description": "List every alert rule (threshold alerts) and digest (scheduled summaries), with whether each is enabled.",
@@ -1303,7 +1324,7 @@ fn list_alert_rules_schema() -> Value {
 
 fn create_alert_rule_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_alert_rule",
-        "description": "Create an alert or digest rule. Alert (type=alert): mart, measure, agg, op and threshold; it watches that aggregate. Or give metric (a name from list_metrics) with op and threshold, and the alert watches that metric instead (it is read as the person who saves it: their masking and row filters apply, and if they lose access or the alert permission the rule stops and says why). Chart alert (BI-37, also type=alert): give chart (a chart id from list_charts or the page context), the condition above, below or any_rows, and the threshold; with `series` when the chart shows more than one number. With no target a chart alert is sent to your own email address. Without the alert permission only a chart alert to your own email address is allowed. Digest (type=digest): board, the dashboard to summarise. Delivered by webhook (target=URL) or email (target=address).",
+        "description": "Create an alert or digest rule. Alert (type=alert): mart, measure, agg, op and threshold, or metric (a name from list_metrics) with op and threshold; it is read as the person who saves it (their masking and row filters apply; if they lose access or the alert permission, the rule stops and says why). Chart alert (BI-37, type=alert): chart (a chart id from list_charts or the page context), condition above, below or any_rows, and threshold; `series` when the chart shows more than one number. With no target it is sent to your own email. Without the alert permission only a chart alert to your own email is allowed. Digest (type=digest): board, schedule (and timeZone). Delivered by webhook (target=URL) or email (target=address).",
         "parameters": { "type": "object", "properties": {
             "name": { "type": "string" },
             "type": { "type": "string", "enum": ["alert", "digest"] },
@@ -1313,11 +1334,13 @@ fn create_alert_rule_schema() -> Value {
             "agg": { "type": "string", "enum": alert_agg_enum() },
             "op": { "type": "string", "enum": alert_op_enum() },
             "threshold": { "type": "number" },
-            "chart": { "type": "string", "description": "the chart id (list_charts, or the page context), for a chart alert" },
+            "chart": { "type": "string", "description": "the chart id, for a chart alert" },
             "series": { "type": "string", "description": "the result name to watch when the chart shows more than one number" },
             "condition": { "type": "string", "enum": ["above", "below", "any_rows"], "description": "for a chart alert: over the threshold, under it, or 'returns any rows'" },
-            "filters": { "type": "array", "items": { "type": "object" }, "description": "for a chart alert: the filters in force on the page, copied from the page context's raw JSON, so the number is the one on screen; leave out when there are none" },
+            "filters": { "type": "array", "items": { "type": "object" }, "description": "for a chart alert: the page's active filters, copied from the page context's raw JSON; leave out when there are none" },
             "board": { "type": "string", "description": "dashboard board id, for type=digest" },
+            "schedule": digest_schedule_schema(),
+            "timeZone": digest_time_zone_schema(),
             "channel": { "type": "string", "enum": ["webhook", "email"] },
             "target": { "type": "string", "description": "webhook URL or email address to deliver to; leave out for a chart alert to your own email" },
             "enabled": { "type": "boolean" } },
@@ -1342,6 +1365,8 @@ fn update_alert_rule_schema() -> Value {
             "condition": { "type": "string", "enum": ["above", "below", "any_rows"] },
             "filters": { "type": "array", "items": { "type": "object" } },
             "board": { "type": "string" },
+            "schedule": digest_schedule_schema(),
+            "timeZone": digest_time_zone_schema(),
             "channel": { "type": "string", "enum": ["webhook", "email"] },
             "target": { "type": "string" },
             "enabled": { "type": "boolean" } },
@@ -1583,17 +1608,19 @@ fn kill_query_schema() -> Value {
 
 fn export_gold_mart_schema() -> Value {
     json!({ "type": "function", "function": { "name": "export_gold_mart",
-        "description": "Export one Gold mart (serving.<mart>) to its Iceberg Gold table through Lakekeeper. Append-only: running it again adds the rows again with a new _exported_at; it does not replace them.",
+        "description": "Export one Silver (silver.<mart>) or Gold (serving.<mart>) mart to its Iceberg table through Lakekeeper. Append-only: running it again adds the rows again with a new _exported_at; it does not replace them.",
         "parameters": { "type": "object", "properties": {
-            "mart": { "type": "string", "description": "Gold mart name, e.g. mart_sales" } },
+            "mart": { "type": "string", "description": "Mart name, e.g. mart_sales" },
+            "zone": { "type": "string", "enum": ["silver", "gold"], "description": "Publication zone (default gold): silver reads silver.<mart> and writes silver.<mart>." } },
             "required": ["mart"] } } })
 }
 
 fn get_gold_export_schema() -> Value {
     json!({ "type": "function", "function": { "name": "get_gold_export",
-        "description": "Read a Gold Iceberg table back (by mart) through Lakekeeper: its row count and format version, independent of ClickHouse.",
+        "description": "Read a Silver or Gold Iceberg table back (by mart and zone) through Lakekeeper: its row count and format version, independent of ClickHouse.",
         "parameters": { "type": "object", "properties": {
-            "mart": { "type": "string", "description": "Gold mart name, e.g. mart_sales" } },
+            "mart": { "type": "string", "description": "Mart name, e.g. mart_sales" },
+            "zone": { "type": "string", "enum": ["silver", "gold"], "description": "Publication zone (default gold)." } },
             "required": ["mart"] } } })
 }
 
@@ -1628,7 +1655,13 @@ fn draft_policy_schema() -> Value {
             "subjects": { "type": "string", "description": "who or what the policy applies to" },
             "resources": { "type": "string", "description": "which data the policy covers" },
             "effect": { "type": "string", "description": "e.g. \"Permit with obligation\", \"Require approval\"" },
-            "conditions": { "type": "string" },
+            "conditions": { "type": "object", "description": "what it enforces: needs a mask or a rowFilter; without conditions the draft enforces nothing",
+                "properties": {
+                    "roles": { "type": "array", "items": { "type": "string" }, "description": "role names it applies to" },
+                    "table": { "type": "string", "description": "table it governs, e.g. \"serving.mart_x\"" },
+                    "mask": { "type": "array", "items": { "type": "string" }, "description": "columns to mask" },
+                    "rowFilter": { "type": "string", "description": "SQL condition rows must meet" } },
+                "required": ["roles", "table"] },
             "owner": { "type": "string" } },
             "required": ["name", "kind", "subjects", "resources", "effect"] } } })
 }
@@ -1666,7 +1699,7 @@ fn get_ingest_spec_schema() -> Value {
 
 fn set_ingest_spec_schema() -> Value {
     json!({ "type": "function", "function": { "name": "set_ingest_spec",
-        "description": "Set what a connector ingests into Bronze. Call get_ingest_spec and discover_source first. adapter and dial must match the connector's type; each source object names a source table (or endpoint, file) and the Bronze table it lands in. When you send a connector's source objects again (for example to add a table), keep each object's loadMode, primaryKey and excludedColumns exactly as get_ingest_spec returned them: an object sent without a loadMode goes back to replace, and one sent without excludedColumns loads every column again. Example for a Postgres table: adapter \"sql\", ingestMode \"batch\", dial {\"driver\":\"postgres\",\"host\":\"db\",\"port\":5432,\"database\":\"shop\",\"user\":\"reader\"}, sourceObjects [{\"name\":\"public.orders\",\"target\":\"orders\"}], scheduleCron \"0 * * * *\". The server validates the dial and refuses internal addresses. This tool never carries a credential, so it cannot change where a connector points (adapter, host, port, database, endpoint, bucket, base URL or brokers): such a change is refused with a conflict and is made in the console, where the credentials are entered again.",
+        "description": "Set what a connector ingests into Bronze. Call get_ingest_spec and discover_source first. adapter and dial must match the connector's type; each source object names a source table (or endpoint, file) and the Bronze table it lands in. When you send a connector's source objects again (for example to add a table), keep each object's loadMode, primaryKey and excludedColumns exactly as get_ingest_spec returned them: an object sent without a loadMode goes back to replace, and one sent without excludedColumns loads every column again. Example for a Postgres table: adapter \"sql\", ingestMode \"batch\", sourceObjects [{\"name\":\"public.orders\",\"target\":\"orders\"}], scheduleCron \"0 * * * *\". The server validates the dial and refuses internal addresses. This tool never carries a credential, so it cannot change where a connector points (adapter, host, port, database, endpoint, bucket, base URL or brokers): such a change is refused with a conflict and is made in the console, where the credentials are entered again.",
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string", "description": "connector id" },
             "adapter": { "type": "string", "enum": ["sql", "cdc", "files", "rest", "sheets", "mongodb", "kafka", "sftp", "saas"] },
@@ -1681,7 +1714,7 @@ fn set_ingest_spec_schema() -> Value {
                 "primaryKey": { "type": "array", "items": { "type": "string" },
                     "description": "columns that identify one row; needed by replace_dedup, incremental_dedup and history" },
                 "excludedColumns": { "type": "array", "items": { "type": "string" },
-                    "description": "columns of this table left out of the load, by name; only for PostgreSQL, MySQL, MariaDB and SQL Server sources; never a primaryKey or incrementalKey column; keep the list exactly as get_ingest_spec returned it when you send the object again" },
+                    "description": "columns of this table left out of the load, by name; PostgreSQL, MySQL, MariaDB and SQL Server only; never a primaryKey or incrementalKey column; keep it as get_ingest_spec returned it when you send the object again" },
                 "target": { "type": "string", "description": "Bronze table name it lands in" } },
                 "required": ["name", "target"] } },
             "scheduleCron": { "type": "string", "description": "cron schedule for batch ingest, optional" } },
@@ -1731,7 +1764,7 @@ fn create_pipeline_schema() -> Value {
     // to beats a raised `recursion_limit` the whole crate would carry.
     let steps = create_pipeline_steps_parameter();
     json!({ "type": "function", "function": { "name": "create_pipeline",
-        "description": "Author a new pipeline that reads tables and writes a target table. It is saved as a draft; mark_pipeline_ready makes it runnable. Source zones: bronze, silver, gold. Target zones: silver, gold -- a pipeline never writes bronze, which is written by ingestion. A pipeline is 1-5 named inputs and 0-20 named steps. Give the shape one of two ways: (a) inputs and steps, which is the fuller one -- a step is one of: { name, kind: 'sql', sql } with ONE read-only SELECT over the inputs and earlier steps by their names (joins, aggregations, CASE, subqueries and window functions are allowed; a table that is not an input is refused, so list every table you read under inputs), { name, kind: 'transform', reads, transforms } with the five operations below, or a form step: { name, kind: 'join', left, right, joinType, on, columns }, { name, kind: 'aggregate', reads, groupBy, measures, havingMatch, having }, { name, kind: 'filter', reads, match, conditions }; or (b) today's sourceZone, sourceTable and transforms, which is one input and one transform step. Send one form, never both. Prefer a form step (join, aggregate, filter, transform) when it can say what the person asked, because they can then change it in the form; use a SQL step for anything else (a CASE, a calculated column, a window function, a join that is not on equal columns, all and any mixed). A join matches on equal columns only, 1-10 pairs; look its sides' columns up first with describe_mart, describe_dataset or run_sql and list every output column. A measure's name cannot be a column the step reads; a having names a group-by column or a measure; values are text, except a count, sum or average is compared with a number. Transforms use a fixed vocabulary, one per entry: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
+        "description": "Author a new pipeline that reads tables and writes a target table, saved as a draft; mark_pipeline_ready makes it runnable. Source zones: bronze, silver, serving. Target zones: silver, serving. Gold marts live in the ClickHouse serving database -- that is the zone for Gold inputs and outputs, matching the catalog and describe_mart. A pipeline never writes bronze, which ingestion writes. A pipeline is 1-5 named inputs and 0-20 named steps, in one of two shapes: (a) inputs and steps, where a step is { name, kind: 'sql', sql } (one read-only SELECT over the inputs and earlier steps by name; every table you read must be listed under inputs), { name, kind: 'transform', reads, transforms }, or a form step: { name, kind: 'join', left, right, joinType, on, columns }, { name, kind: 'aggregate', reads, groupBy, measures, havingMatch, having }, { name, kind: 'filter', reads, match, conditions }; or (b) sourceZone, sourceTable and transforms, one input and one transform step. Send one shape, never both. Prefer a form step when it says what the person asked, because they can then change it in the form; use a SQL step for a CASE, a calculated column, a window function, a join that is not on equal columns, or mixed all and any. A join matches on equal columns only, 1-10 pairs; look its sides' columns up first with describe_mart, describe_dataset or run_sql and list every output column. A measure's name cannot be a column the step reads; a having names a group-by column or a measure; values are text, except a count, sum or average compared with a number. Transforms: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
         "parameters": { "type": "object", "properties": {
             "name": { "type": "string" },
             "description": { "type": "string" },
@@ -1739,16 +1772,20 @@ fn create_pipeline_schema() -> Value {
                 "description": "the tables the pipeline reads, each with the short name its steps use",
                 "items": { "type": "object", "properties": {
                     "name": { "type": "string", "description": "name steps read it by, letters digits and _ only" },
-                    "zone": { "type": "string", "enum": ["bronze", "silver", "gold"] },
+                    "zone": { "type": "string", "enum": ["bronze", "silver", "serving"] },
                     "table": { "type": "string" } },
                     "required": ["name", "zone", "table"] } },
             "steps": steps,
-            "sourceZone": { "type": "string", "enum": ["bronze", "silver", "gold"] },
+            "sourceZone": { "type": "string", "enum": ["bronze", "silver", "serving"] },
             "sourceTable": { "type": "string" },
-            "targetZone": { "type": "string", "enum": ["silver", "gold"] },
+            "targetZone": { "type": "string", "enum": ["silver", "serving"] },
             "targetTable": { "type": "string" },
             "transforms": { "type": "array", "items": { "type": "string" } },
-            "incrementalColumn": { "type": "string", "description": "optional column for incremental loads" },
+            "kind": { "type": "string", "enum": ["batch", "incremental"], "description": "batch (default) rebuilds the whole target each run; incremental materializes only new or changed rows" },
+            "incrementalColumn": { "type": "string", "description": "required when kind is incremental: the cursor column; letters digits and underscores, not starting with a digit, at most 128 characters" },
+            "incrementalStrategy": { "type": "string", "enum": ["append", "partition_replace"], "description": "incremental only, default append: append adds rows newer than the watermark; partition_replace rewrites entire day or month partitions and tolerates late-arriving data" },
+            "partitionGranularity": { "type": "string", "enum": ["day", "month"], "description": "partition_replace only, default day" },
+            "lookbackHours": { "type": "integer", "minimum": 0, "maximum": 720, "description": "partition_replace only, default 0: hours before the watermark included in the replaced window" },
             "schedule": { "type": "string", "description": "\"manual\" or a cron expression" } },
             "required": ["name", "targetZone", "targetTable"] } } })
 }
@@ -1933,7 +1970,7 @@ fn report_schedule_property() -> Value {
 
 fn create_report_subscription_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_report_subscription",
-        "description": "Send a dashboard by email on a schedule, as a PDF and/or chosen charts' data as Excel or CSV. By default it is sent to the person asking alone, who confirms with the Confirm button. Naming any other recipient (`recipients`) needs a human's approval first, and an outside address works only on a domain an administrator allowed in Admin > Settings. The report is made with the asking person's own permissions, masking and row filters, and every recipient sees the same data.",
+        "description": "Send a dashboard by email on a schedule, as a PDF and/or chosen charts' data as Excel or CSV. It goes to the person asking alone, who confirms with the Confirm button, unless `recipients` names others; naming any other recipient needs a human's approval first, and an outside address works only on a domain an administrator allowed in Admin > Settings. The report uses the asking person's own permissions, masking and row filters, and every recipient sees the same data.",
         "parameters": { "type": "object", "properties": {
             "board": { "type": "string", "description": "the dashboard's id, from list_boards" },
             "schedule": report_schedule_property(),
@@ -3570,6 +3607,37 @@ mod tests {
              (rust/crates/lakehouse-api/tests/fixtures/tool_schemas.json) — \
              regenerate the fixture ONLY for an intentional, reviewed \
              schema change, never to make this test pass during a refactor"
+        );
+    }
+
+    /// BLD-19: the assistant must not be told to write a `gold` database
+    /// that the catalog does not list. Gold lives in `serving`, both as an
+    /// input zone and as a target zone; the description says so explicitly
+    /// so the model can map a request for "Gold" onto the right enum value.
+    #[test]
+    fn create_pipeline_schema_names_serving_as_the_gold_zone() {
+        let schema = (find("create_pipeline").expect("registered tool").schema)();
+        let properties = &schema["function"]["parameters"]["properties"];
+        assert_eq!(
+            properties["targetZone"]["enum"],
+            json!(["silver", "serving"])
+        );
+        assert_eq!(
+            properties["sourceZone"]["enum"],
+            json!(["bronze", "silver", "serving"])
+        );
+        assert_eq!(
+            properties["inputs"]["items"]["properties"]["zone"]["enum"],
+            json!(["bronze", "silver", "serving"])
+        );
+        let description = schema["function"]["description"]
+            .as_str()
+            .expect("a description");
+        assert!(description.contains("Target zones: silver, serving"));
+        assert!(description.contains("Gold marts live in the ClickHouse serving database"));
+        assert!(
+            !description.contains("silver, gold"),
+            "the old zone spelling must not be advertised to the model"
         );
     }
 

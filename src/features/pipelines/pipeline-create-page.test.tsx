@@ -72,6 +72,14 @@ let stepSqlAnswer: { status: number; body: unknown } = {
  */
 let ordersRawSchema: { name: string; type: string }[] | null = null
 
+/**
+ * The catalog's answer for Silver/Gold inputs (`/api/catalog`), and the
+ * schemas keyed by catalog id (`/api/catalog/{id}`). Bronze keeps using the
+ * lakehouse listing, so only these two zones need fixtures here.
+ */
+let catalogAssets: { id: string; name: string; namespace: string }[] = []
+let catalogSchemas: Record<string, { name: string; dataType: string }[]> = {}
+
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -105,6 +113,8 @@ beforeEach(() => {
   }
   stepSqlAnswer = { status: 200, body: { sql: "SELECT * FROM `orders_raw` ORDER BY id LIMIT 1 BY id" } }
   ordersRawSchema = null
+  catalogAssets = []
+  catalogSchemas = {}
   ingestTargets = [
     { name: "public.orders", target: "orders" },
     { name: "public.customers", target: "customers" },
@@ -178,6 +188,17 @@ beforeEach(() => {
     }
     if (url.startsWith("/api/lakehouse/tables")) {
       return jsonResponse({ tables: [table("stock_raw"), table("orders_raw")] })
+    }
+    // Silver and Gold (`serving`) tables and their columns come from the
+    // catalog, not from Lakekeeper's Iceberg namespaces.
+    if (url === "/api/catalog" || url.startsWith("/api/catalog?")) {
+      return jsonResponse({ assets: catalogAssets, namespaces: [] })
+    }
+    if (url.startsWith("/api/catalog/")) {
+      const id = decodeURIComponent(url.split("/api/catalog/")[1] ?? "")
+      const schema = catalogSchemas[id]
+      if (!schema) return jsonResponse({ error: "asset not found" }, 404)
+      return jsonResponse({ id, schema })
     }
     if (url.startsWith("/api/pipelines/preview")) {
       return jsonResponse(previewAnswer.body, previewAnswer.status)
@@ -401,24 +422,120 @@ describe("table suggestions in the pipeline editor", () => {
   })
 })
 
-// WEB-8 D8: zones are the lakehouse's namespaces and columns are the input
-// table's own schema, both read from the page's existing service calls.
-describe("the zone and column pickers in the pipeline editor (WEB-8 D8)", () => {
-  it("offers the namespaces the page loaded as an input's zone", async () => {
+// Zones are the product's medallion layers, not Lakekeeper's namespaces, and
+// an input's columns are its own schema: Iceberg for Bronze, the catalog for
+// Silver and Gold (`serving`).
+describe("the zone and column pickers in the pipeline editor", () => {
+  it("offers Bronze, Silver and Gold (serving) as an input zone, never `default`", async () => {
     renderEditor()
-    await waitFor(() => expect(screen.getByRole("combobox", { name: "Zone" }).textContent).toContain("bronze"))
-    fireEvent.click(screen.getByRole("combobox", { name: "Zone" }))
+    const trigger = await screen.findByRole("combobox", { name: "Zone" })
+    await waitFor(() => expect(trigger.textContent).toContain("Bronze"))
+    fireEvent.click(trigger)
     // `within` the popup: only the open list's own options are read.
-    expect(within(await screen.findByRole("listbox")).getAllByRole("option").map((o) => o.textContent)).toEqual([
-      "bronze",
-      "silver",
-    ])
+    const options = within(await screen.findByRole("listbox")).getAllByRole("option")
+    expect(options.map((o) => o.textContent)).toEqual(["Bronze", "Silver", "Gold"])
+    expect(options.some((o) => /default/i.test(o.textContent ?? ""))).toBe(false)
   })
 
-  it("offers the namespaces as the output zone too", async () => {
+  it("saves the exact stored value behind each input zone label", async () => {
+    renderEditor()
+    await fillNewPipeline()
+    selectRail(/^orders_raw/)
+    chooseLastOption(screen.getByRole("combobox", { name: "Zone" }), "Gold")
+    const body = await saveAndRead("POST")
+    expect(body.inputs).toEqual([{ name: "orders_raw", zone: "serving", table: "orders_raw" }])
+  })
+
+  it("offers only Silver and Gold as the output zone, never Bronze or `default`", async () => {
     renderEditor(existing())
     selectOutput()
-    await waitFor(() => expect(screen.getByRole("combobox", { name: "Output zone" }).textContent).toContain("silver"))
+    const trigger = screen.getByRole("combobox", { name: "Output zone" })
+    await waitFor(() => expect(trigger.textContent).toContain("Silver"))
+    fireEvent.click(trigger)
+    const options = within(await screen.findByRole("listbox")).getAllByRole("option")
+    expect(options.map((o) => o.textContent)).toEqual(["Silver", "Gold"])
+    expect(options.some((o) => /bronze|default/i.test(o.textContent ?? ""))).toBe(false)
+    pickOption(options[1])
+    const body = await saveAndRead("PUT")
+    expect(body.targetZone).toBe("serving")
+  })
+
+  it("loads a Silver input's table suggestions and column schema from the catalog", async () => {
+    catalogAssets = [
+      { id: "silver.orders_clean", name: "orders_clean", namespace: "silver" },
+      { id: "serving.mart_customer", name: "mart_customer", namespace: "serving" },
+    ]
+    catalogSchemas["silver.orders_clean"] = [
+      { name: "id", dataType: "Int64" },
+      { name: "status", dataType: "String" },
+    ]
+    renderEditor()
+    chooseLastOption(screen.getByRole("combobox", { name: "Zone" }), "Silver")
+    const input = screen.getByPlaceholderText("orders_events") as HTMLInputElement
+    // Only the chosen namespace's tables are suggested, from `/api/catalog`.
+    await waitFor(() => expect(input.getAttribute("list")).toBe("input-table-options-input-1"))
+    await waitFor(() =>
+      expect(
+        Array.from(document.querySelectorAll("#input-table-options-input-1 option")).map((o) => o.getAttribute("value"))
+      ).toEqual(["orders_clean"])
+    )
+    expect(sent.some((c) => c.path === "/api/catalog")).toBe(true)
+    fireEvent.change(input, { target: { value: "orders_clean" } })
+    const list = await screen.findByRole("list", { name: "Columns of this table" })
+    expect(within(list).getAllByRole("listitem").map((item) => item.textContent)).toEqual([
+      "id Int64",
+      "status String",
+    ])
+    expect(sent.some((c) => c.path === "/api/catalog/silver.orders_clean")).toBe(true)
+  })
+
+  it("loads a Gold (serving) input's columns from the catalog, for step pickers too", async () => {
+    catalogAssets = [{ id: "serving.mart_customer", name: "mart_customer", namespace: "serving" }]
+    catalogSchemas["serving.mart_customer"] = [{ name: "customer_id", dataType: "UInt64" }]
+    renderEditor()
+    chooseLastOption(screen.getByRole("combobox", { name: "Zone" }), "Gold")
+    fireEvent.change(screen.getByPlaceholderText("orders_events"), { target: { value: "mart_customer" } })
+    const list = await screen.findByRole("list", { name: "Columns of this table" })
+    expect(within(list).getAllByRole("listitem").map((item) => item.textContent)).toEqual(["customer_id UInt64"])
+    // A step reading this input picks from the same catalog columns.
+    fireEvent.click(screen.getByRole("button", { name: "Operations" }))
+    const column = await screen.findByRole("combobox", { name: "Key column" })
+    fireEvent.click(column)
+    expect(within(await screen.findByRole("listbox")).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "customer_id",
+    ])
+    expect(sent.some((c) => c.path === "/api/catalog/serving.mart_customer")).toBe(true)
+  })
+
+  it("keeps a legacy input zone selectable and marked, and saves it unchanged", async () => {
+    renderEditor(withInput({ name: "orders", zone: "gold", table: "mart_x" }))
+    const trigger = screen.getByRole("combobox", { name: "Zone" })
+    await waitFor(() => expect(trigger.textContent).toContain("gold (legacy zone, not offered here)"))
+    fireEvent.click(trigger)
+    expect(within(await screen.findByRole("listbox")).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Bronze",
+      "Silver",
+      "Gold",
+      "gold (legacy zone, not offered here)",
+    ])
+    const body = await saveAndRead("PUT")
+    expect(body.inputs).toEqual([{ name: "orders", zone: "gold", table: "mart_x" }])
+  })
+
+  it("keeps a legacy output zone on edit instead of blanking it", async () => {
+    const base = existing()
+    renderEditor({ ...base, definition: { ...base.definition!, targetZone: "gold" } })
+    selectOutput()
+    const trigger = screen.getByRole("combobox", { name: "Output zone" })
+    await waitFor(() => expect(trigger.textContent).toContain("gold (legacy zone, not offered here)"))
+    fireEvent.click(trigger)
+    expect(within(await screen.findByRole("listbox")).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Silver",
+      "Gold",
+      "gold (legacy zone, not offered here)",
+    ])
+    const body = await saveAndRead("PUT")
+    expect(body.targetZone).toBe("gold")
   })
 
   it("takes the columns, with their types, from the input table's schema once the table exists", async () => {
@@ -1453,5 +1570,80 @@ describe("a form step as SQL (BLD-16, J6)", () => {
       await screen.findByText("steps[0].transforms[0]: this transform is not in the supported grammar")
     ).toBeTruthy()
     expect(document.querySelector(".cm-content")).toBeNull()
+  })
+})
+
+describe("BLD-12 materialization in the pipeline editor", () => {
+  it("offers Full rebuild and Incremental, and reveals the strategy and cursor only for incremental", async () => {
+    renderEditor()
+    await openTab("Schedule and settings")
+    const mode = screen.getByRole("combobox", { name: "Mode" })
+    expect(mode.textContent).toContain("Full rebuild")
+    expect(screen.queryByRole("combobox", { name: "Strategy" })).toBeNull()
+
+    chooseOption(mode, "Incremental")
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Strategy" })).toBeTruthy())
+    expect(screen.getByRole("combobox", { name: "Cursor column" })).toBeTruthy()
+    expect(screen.queryByRole("combobox", { name: "Partition by" })).toBeNull()
+
+    chooseOption(screen.getByRole("combobox", { name: "Strategy" }), "Replace time partitions")
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Partition by" })).toBeTruthy())
+    expect(screen.getByRole("spinbutton", { name: "Lookback window (hours)" })).toBeTruthy()
+  })
+
+  it("blocks an incremental save without a cursor, then sends every field once one is given", async () => {
+    renderEditor()
+    await fillNewPipeline()
+    await openTab("Schedule and settings")
+    chooseOption(screen.getByRole("combobox", { name: "Mode" }), "Incremental")
+
+    const button = saveButton(/create pipeline/i)
+    await waitFor(() => expect(button.disabled).toBe(true))
+    expect(await screen.findByText(/cursor column is required/i)).toBeTruthy()
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Cursor column" }), {
+      target: { value: "event_time" },
+    })
+    chooseOption(screen.getByRole("combobox", { name: "Strategy" }), "Replace time partitions")
+    chooseOption(screen.getByRole("combobox", { name: "Partition by" }), "Month")
+    fireEvent.change(screen.getByRole("spinbutton", { name: "Lookback window (hours)" }), {
+      target: { value: "24" },
+    })
+    await waitFor(() => expect(button.disabled).toBe(false))
+
+    const body = await saveAndRead("POST")
+    expect(body.kind).toBe("incremental")
+    expect(body.incrementalColumn).toBe("event_time")
+    expect(body.incrementalStrategy).toBe("partition_replace")
+    expect(body.partitionGranularity).toBe("month")
+    expect(body.lookbackHours).toBe(24)
+  })
+
+  it("sends the stored materialization fields on an edit and resets them for a full rebuild", async () => {
+    renderEditor(
+      existing({
+        kind: "incremental",
+        definition: {
+          ...existing().definition!,
+          incrementalColumn: "event_time",
+          incrementalStrategy: "partition_replace",
+          partitionGranularity: "month",
+          lookbackHours: 12,
+        },
+      })
+    )
+    await openTab("Schedule and settings")
+    expect((screen.getByRole("combobox", { name: "Cursor column" }) as HTMLInputElement).value).toBe("event_time")
+    expect(screen.getByRole("combobox", { name: "Mode" }).textContent).toContain("Incremental")
+    let body = await saveAndRead("PUT")
+    expect(body.incrementalStrategy).toBe("partition_replace")
+    expect(body.lookbackHours).toBe(12)
+
+    chooseOption(screen.getByRole("combobox", { name: "Mode" }), "Full rebuild")
+    await waitFor(() => expect(screen.queryByRole("combobox", { name: "Cursor column" })).toBeNull())
+    await saveAndRead("PUT")
+    body = sent.filter((c) => c.method === "PUT").at(-1)?.body ?? {}
+    expect(body.kind).toBe("batch")
+    expect(body.incrementalColumn).toBeUndefined()
   })
 })

@@ -42,6 +42,19 @@ fn iso_millis(at: OffsetDateTime) -> String {
     )
 }
 
+/// BLD-12 defaults, the Rust half of migration `0156`'s column defaults. A
+/// stored row written before the migration, or a version snapshot taken before
+/// it, reads as the full-rebuild behaviour it actually had.
+#[must_use]
+fn default_incremental_strategy() -> String {
+    "append".to_owned()
+}
+
+#[must_use]
+fn default_partition_granularity() -> String {
+    "day".to_owned()
+}
+
 /// An authored pipeline. Mirrors `Pipeline` in `contracts/pipelines.ts`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,10 +63,27 @@ pub struct Pipeline {
     pub id: String,
     /// Pipeline name; the table's natural key.
     pub name: String,
-    /// `"batch" | "incremental" | "document" | "vector"`.
+    /// `"batch" | "incremental"` for a pipeline authored today. A row written
+    /// before BLD-12 may still carry `"document"` or `"vector"`; it is read
+    /// verbatim so legacy rows stay visible, but the API refuses those values
+    /// on new creates and updates.
     pub kind: String,
     /// Lifecycle status; `"draft"` for a freshly authored pipeline.
     pub status: String,
+    /// BLD-12: the cursor column an incremental run watermarks on. Absent
+    /// from the wire for a batch pipeline (it is reset to `None` there), so
+    /// the pre-BLD-12 shape is unchanged for every existing row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incremental_column: Option<String>,
+    /// BLD-12: `"append"` or `"partition_replace"` (migration `0156`).
+    /// Always `"append"` for a batch pipeline.
+    pub incremental_strategy: String,
+    /// BLD-12: `"day"` or `"month"` (migration `0156`). Always `"day"` when
+    /// the strategy is not `partition_replace`.
+    pub partition_granularity: String,
+    /// BLD-12: hours of lookback before the replace window's lower bound,
+    /// `0..=720` (migration `0156`). `0` except when explicitly configured.
+    pub lookback_hours: i32,
     /// Who owns this pipeline.
     pub owner: String,
     /// Source location (e.g. `"zone.table"`) — the FIRST input's.
@@ -608,6 +638,17 @@ pub struct AuthoredDefinition {
     pub transforms: Vec<String>,
     /// Whether file-based incremental capture is enabled.
     pub fbic_enabled: bool,
+    /// BLD-12 (migration `0156`): how an incremental run materializes —
+    /// `"append"` (watermark append) or `"partition_replace"` (time-window
+    /// partition replace). Always `"append"` for a batch pipeline.
+    pub incremental_strategy: String,
+    /// BLD-12 (migration `0156`): partition granularity of a
+    /// `partition_replace` target — `"day"` or `"month"`. Always `"day"` for
+    /// an append or batch pipeline.
+    pub partition_granularity: String,
+    /// BLD-12 (migration `0156`): hours of lookback before a partition's
+    /// lower bound, `0..=720`. Always `0` unless `partition_replace` is used.
+    pub lookback_hours: i32,
     /// Target zone.
     pub target_zone: String,
     /// Target table.
@@ -628,6 +669,12 @@ struct PipelineRow {
     name: String,
     kind: String,
     status: String,
+    /// BLD-12 (migration `0156`): the four materialization fields, read on
+    /// every pipeline row so list/detail/report the real configuration.
+    incremental_column: Option<String>,
+    incremental_strategy: String,
+    partition_granularity: String,
+    lookback_hours: i32,
     owner: String,
     source: String,
     target: String,
@@ -672,6 +719,11 @@ struct DefinitionRow {
     source: String,
     target: String,
     incremental_column: Option<String>,
+    /// BLD-12 (migration `0156`), read by `get_definition` so the orchestrator
+    /// gets the materialization config next to the compiled statement.
+    incremental_strategy: String,
+    partition_granularity: String,
+    lookback_hours: i32,
     transforms: serde_json::Value,
     /// BLD-1 part 1 / D1: the stored shape (migration `0140`). Decoded by
     /// [`get_definition`], which falls back to [`legacy_definition`] for a
@@ -690,6 +742,10 @@ impl From<PipelineRow> for Pipeline {
             name: row.name,
             kind: row.kind,
             status: row.status,
+            incremental_column: row.incremental_column,
+            incremental_strategy: row.incremental_strategy.clone(),
+            partition_granularity: row.partition_granularity.clone(),
+            lookback_hours: row.lookback_hours,
             owner: row.owner,
             source: row.source,
             input_tables: row.input_tables,
@@ -732,7 +788,8 @@ impl From<PipelineRow> for Pipeline {
 const PIPELINE_COLUMNS: &str = "id, name, kind, status, owner, source, target, connector_id, \
      source_asset_id, target_asset_id, schedule, last_run_at, next_run_at, \
 freshness_lag_seconds, max_retries, description, depends_on, tenant_id, \
-     target_lag_seconds, target_lag_downstream, input_tables, run_as";
+     target_lag_seconds, target_lag_downstream, input_tables, run_as, \
+     incremental_column, incremental_strategy, partition_granularity, lookback_hours";
 
 /// `RETURNING` clause for the transactional `create_pipeline` /
 /// `update_pipeline` / `delete_pipeline`-read paths. Wider than
@@ -744,7 +801,8 @@ const FULL_PIPELINE_COLUMNS: &str = "id, name, kind, status, owner, source, targ
      source_asset_id, target_asset_id, schedule, last_run_at, next_run_at, \
 freshness_lag_seconds, max_retries, description, depends_on, incremental_column, \
      transforms, inputs, steps, fbic_enabled, tenant_id, target_lag_seconds, \
-     target_lag_downstream, input_tables, run_as";
+     target_lag_downstream, input_tables, run_as, \
+     incremental_strategy, partition_granularity, lookback_hours";
 
 /// The full editable state of a pipeline at one point in time. Persisted
 /// to `pipeline_definition_version.snapshot` (migration `0053`) inside
@@ -779,6 +837,16 @@ pub struct PipelineDefinitionSnapshot {
     pub source_table: String,
     /// `pipeline_definition.incremental_column` (migration `0036`).
     pub incremental_column: Option<String>,
+    /// BLD-12 (migration `0156`): `#[serde(default)]` so a snapshot written
+    /// before the migration still restores to the full-rebuild behaviour.
+    #[serde(default = "default_incremental_strategy")]
+    pub incremental_strategy: String,
+    /// BLD-12 (migration `0156`), same defaulting rule as above.
+    #[serde(default = "default_partition_granularity")]
+    pub partition_granularity: String,
+    /// BLD-12 (migration `0156`), same defaulting rule as above.
+    #[serde(default)]
+    pub lookback_hours: i32,
     /// `pipeline_definition.transforms` decoded from `jsonb`.
     pub transforms: Vec<String>,
     /// `pipeline_definition.fbic_enabled` (migration `0036`).
@@ -965,6 +1033,11 @@ struct FullPipelineRow {
     description: Option<String>,
     depends_on: Vec<String>,
     incremental_column: Option<String>,
+    /// BLD-12 (migration `0156`): the snapshot and the live `Pipeline` both
+    /// carry these, so they are read from the same `RETURNING` row.
+    incremental_strategy: String,
+    partition_granularity: String,
+    lookback_hours: i32,
     transforms: serde_json::Value,
     /// BLD-1 part 1 / D13: the stored shape, read here so the version
     /// snapshot carries it and a restore replays what that version was.
@@ -1000,6 +1073,10 @@ impl From<FullPipelineRow> for Pipeline {
             name: row.name,
             kind: row.kind,
             status: row.status,
+            incremental_column: row.incremental_column,
+            incremental_strategy: row.incremental_strategy.clone(),
+            partition_granularity: row.partition_granularity.clone(),
+            lookback_hours: row.lookback_hours,
             owner: row.owner,
             source: row.source,
             input_tables: row.input_tables,
@@ -1060,6 +1137,9 @@ impl TryFrom<&FullPipelineRow> for PipelineDefinitionSnapshot {
             source_zone,
             source_table,
             incremental_column: row.incremental_column.clone(),
+            incremental_strategy: row.incremental_strategy.clone(),
+            partition_granularity: row.partition_granularity.clone(),
+            lookback_hours: row.lookback_hours,
             transforms,
             fbic_enabled: row.fbic_enabled,
             target_zone,
@@ -1224,7 +1304,8 @@ pub async fn get_definition(
     id: &str,
 ) -> Result<Option<AuthoredDefinition>, StoreError> {
     let row: Option<DefinitionRow> = sqlx::query_as(
-        "SELECT source, target, incremental_column, transforms, inputs, steps, fbic_enabled, \
+        "SELECT source, target, incremental_column, incremental_strategy, \
+         partition_granularity, lookback_hours, transforms, inputs, steps, fbic_enabled, \
          connector_id, max_retries FROM pipeline_definition WHERE id = $1",
     )
     .bind(id)
@@ -1258,6 +1339,9 @@ pub async fn get_definition(
             source_zone,
             source_table,
             incremental_column: row.incremental_column,
+            incremental_strategy: row.incremental_strategy.clone(),
+            partition_granularity: row.partition_granularity.clone(),
+            lookback_hours: row.lookback_hours,
             transforms,
             fbic_enabled: row.fbic_enabled,
             target_zone,
@@ -1278,6 +1362,120 @@ fn split_zone_table(location: &str) -> (String, String) {
         || (String::new(), location.to_owned()),
         |(zone, table)| (zone.to_owned(), table.to_owned()),
     )
+}
+
+// ── BLD-20: one pipeline per output table ────────────────────────────────
+//
+// Two pipelines that name the same output table overwrite each other's data
+// and both claim it. The rule is global (no `tenant_id` filter), matching
+// `pipeline_definition_name_unique`: a physical output table is one resource
+// no matter who authored the writer, and a caller learns only that the key is
+// taken, never whose pipeline holds it. Deletes are hard deletes (there is no
+// soft-delete column), so a deleted pipeline's output table is free as soon
+// as its transaction commits. Nothing here is a migration: the check is a
+// transaction-scoped advisory lock plus a `SELECT`, kept in this store so
+// every save path (create, update, restore, generate, clone-by-create) shares
+// one guard.
+
+/// The canonical `ClickHouse` zone for an output table.
+///
+/// BLD-19 (04e6ff031) makes `gold` an alias of `serving` at the API write
+/// boundary: both spellings name the same physical `serving` database. The
+/// store guard must agree, or a legacy pre-BLD-19 `gold.orders` row and a new
+/// `serving.orders` save could both claim the same `ClickHouse` table (PR #703).
+/// Trimming and case-folding happen here so callers pass the already-canonical
+/// zone to both the advisory-lock key and the SQL predicate.
+#[must_use]
+fn canonical_output_zone(target_zone: &str) -> &str {
+    let zone = target_zone.trim();
+    if zone.eq_ignore_ascii_case("gold") {
+        "serving"
+    } else {
+        zone
+    }
+}
+
+/// The normalized key for an output table: both halves trimmed and
+/// lowercased, and a `gold` zone canonicalized to `serving` (BLD-19), so
+/// `("Silver", " Orders ")` and `("silver", "orders")` are the same physical
+/// table, as are `("gold", "orders")` and `("serving", "orders")`. Used both
+/// as the advisory-lock key and as the name in the 409, so the sentence a
+/// caller sees names exactly what was claimed.
+#[must_use]
+fn normalize_output_table(target_zone: &str, target_table: &str) -> String {
+    format!(
+        "{}.{}",
+        canonical_output_zone(target_zone).to_lowercase(),
+        target_table.trim().to_lowercase()
+    )
+}
+
+/// The refusal for a taken output table: a 409 carrying this crate's own
+/// sentence, never an upstream error's text (AGENTS.md principle 4). Kept as
+/// its own function so create, update and restore say byte-identical words.
+#[must_use]
+fn output_table_conflict(key: &str) -> StoreError {
+    StoreError::FieldConflict(format!(
+        "another pipeline already writes the output table \"{key}\" — pick a different target zone or table"
+    ))
+}
+
+/// Refuse the save when another live pipeline already claims this output
+/// table. MUST be called inside the caller's transaction, before the
+/// `INSERT`/`UPDATE`, so the check and the write are one atomic unit.
+///
+/// Two layers make it race-free without a schema change:
+///
+/// 1. `pg_advisory_xact_lock(hashtextextended($1, 0))` serializes every save
+///    normalizing to the SAME key. The lock is transaction-scoped — released
+///    only at the caller's commit/rollback — so a concurrent save waits here
+///    and then runs its `SELECT` against the first save's committed row (or
+///    sees none if the first rolled back). Without it, two saves could both
+///    see "free" and both commit, reintroducing the overwrite.
+/// 2. The `SELECT` excludes `exclude_id`, so a pipeline updating itself with
+///    its OWN existing `(target_zone, target_table)` never conflicts with
+///    itself. Create passes `None` (every row is "another"); update and
+///    restore pass `Some(id)`.
+///
+/// Stored targets are compared through the same normalization as
+/// [`normalize_output_table`]: `split_part(target, '.', 1)` is the zone and
+/// the remainder after the first `.` is the table (matching
+/// [`split_zone_table`]), both `LOWER(TRIM(...))`d. The stored zone is also
+/// canonicalized (`gold` -> `serving`, BLD-19) in SQL so a legacy `gold.foo`
+/// row collides with a new `serving.foo` save — and the incoming zone is
+/// canonicalized before binding. No tenant filter, per the global scope above.
+async fn assert_output_table_unclaimed(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    exclude_id: Option<&str>,
+    target_zone: &str,
+    target_table: &str,
+) -> Result<(), StoreError> {
+    let key = normalize_output_table(target_zone, target_table);
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&key)
+        .execute(&mut **tx)
+        .await?;
+    let taken: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM pipeline_definition \
+             WHERE ($1::text IS NULL OR id <> $1) \
+               AND CASE LOWER(TRIM(split_part(target, '.', 1))) \
+                       WHEN 'gold' THEN 'serving' \
+                       ELSE LOWER(TRIM(split_part(target, '.', 1))) \
+                   END = LOWER(TRIM($2)) \
+               AND LOWER(TRIM(substring(target FROM position('.' IN target) + 1))) = \
+                   LOWER(TRIM($3)) \
+         )",
+    )
+    .bind(exclude_id)
+    .bind(canonical_output_zone(target_zone))
+    .bind(target_table)
+    .fetch_one(&mut **tx)
+    .await?;
+    if taken {
+        return Err(output_table_conflict(&key));
+    }
+    Ok(())
 }
 
 /// A slug-based id in the same shape `mock/pipelines.ts`'s `slugId` used
@@ -1345,6 +1543,14 @@ pub struct CreatePipelineInput {
     pub source_table: String,
     /// Column an incremental read watermarks on, if any (migration 0036).
     pub incremental_column: Option<String>,
+    /// BLD-12 (migration `0156`): `"append"` or `"partition_replace"`. The
+    /// route defaults it to `"append"` when absent; the store persists what
+    /// it is given, and the column CHECK is the backstop.
+    pub incremental_strategy: String,
+    /// BLD-12 (migration `0156`): `"day"` or `"month"`, default `"day"`.
+    pub partition_granularity: String,
+    /// BLD-12 (migration `0156`): `0..=720`, default `0`.
+    pub lookback_hours: i32,
     /// Grammar-validated transform steps, already checked by
     /// `transform_grammar::parse_transform` at the route layer before this
     /// function is ever called — this store function does not re-validate
@@ -1432,8 +1638,10 @@ const DEFAULT_OWNER: &str = "Current user";
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::Conflict`] (409) if the name is taken, or
-/// [`StoreError::Database`] on any other failure.
+/// Returns [`StoreError::Conflict`] (409) if the name is taken,
+/// [`StoreError::FieldConflict`] (409) if another pipeline already writes
+/// this `(target_zone, target_table)` (BLD-20), or [`StoreError::Database`]
+/// on any other failure.
 pub async fn create_pipeline(
     pool: &PgPool,
     input: &CreatePipelineInput,
@@ -1484,12 +1692,18 @@ pub async fn create_pipeline(
 schedule, description, incremental_column, fbic_enabled, transforms, \
          inputs, steps, input_tables, \
          max_retries, tenant_id, depends_on, connector_id, target_lag_seconds, \
-         target_lag_downstream, run_as) \
+         target_lag_downstream, run_as, \
+         incremental_strategy, partition_granularity, lookback_hours) \
          VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-         $16, $17, $18, $19, $20, $21) \
+         $16, $17, $18, $19, $20, $21, $22, $23, $24) \
          RETURNING {FULL_PIPELINE_COLUMNS}"
     );
     let mut tx = pool.begin().await?;
+    // BLD-20: claim the output table in this same transaction, before the
+    // INSERT. The advisory lock serializes concurrent claims of this key and
+    // the SELECT refuses a second live writer (409 FieldConflict). `None`
+    // excludes no row: every existing pipeline is "another" at create time.
+    assert_output_table_unclaimed(&mut tx, None, &input.target_zone, &input.target_table).await?;
     // safe: only the constant `FULL_PIPELINE_COLUMNS` is formatted in; values are bound.
     let row: FullPipelineRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&id)
@@ -1516,6 +1730,9 @@ schedule, description, incremental_column, fbic_enabled, transforms, \
         // stay a `None` so the row honestly records "no author" and D2 can
         // refuse to run it.
         .bind(input.run_as)
+        .bind(&input.incremental_strategy)
+        .bind(&input.partition_granularity)
+        .bind(input.lookback_hours)
         .fetch_one(&mut *tx)
         .await?;
     let snapshot = PipelineDefinitionSnapshot::try_from(&row)?;
@@ -1559,6 +1776,14 @@ pub struct UpdatePipelineInput {
     pub source_table: String,
     /// Incremental watermark column, if any.
     pub incremental_column: Option<String>,
+    /// BLD-12 (migration `0156`): the strategy this edit writes. Always
+    /// `"append"` for a batch pipeline — the route resets it on a `batch`
+    /// save rather than leaving a stale incremental config behind.
+    pub incremental_strategy: String,
+    /// BLD-12 (migration `0156`): `"day"` or `"month"`, `"day"` for batch.
+    pub partition_granularity: String,
+    /// BLD-12 (migration `0156`): `0..=720`, `0` for batch.
+    pub lookback_hours: i32,
     /// Grammar-validated transform steps; validated at the route layer,
     /// exactly as for [`create_pipeline`].
     ///
@@ -1686,8 +1911,11 @@ impl<'de> serde::Deserialize<'de> for ConnectorChange {
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::Database`] on any failure. `Ok(None)` when no
-/// pipeline with `id` exists.
+/// Returns [`StoreError::FieldConflict`] (409) when the new
+/// `(target_zone, target_table)` is already written by another pipeline
+/// (BLD-20), [`StoreError::Database`] on any other failure. `Ok(None)` when
+/// no pipeline with `id` exists. Keeping this pipeline's OWN output table
+/// never conflicts.
 pub async fn update_pipeline(
     pool: &PgPool,
     id: &str,
@@ -1707,8 +1935,10 @@ pub async fn update_pipeline(
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::Database`] on any failure. `Ok(None)` when no
-/// pipeline with `id` exists.
+/// Returns [`StoreError::FieldConflict`] (409) when the snapshot's
+/// `(target_zone, target_table)` is now written by another pipeline (BLD-20),
+/// [`StoreError::Database`] on any other failure. `Ok(None)` when no pipeline
+/// with `id` exists.
 pub async fn restore_pipeline(
     pool: &PgPool,
     id: &str,
@@ -1763,7 +1993,8 @@ owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
          depends_on = COALESCE($12, depends_on), \
          connector_id = CASE WHEN $13 THEN $14 ELSE connector_id END, \
          inputs = $15, steps = $16, input_tables = $17, \
-         run_as = CASE WHEN $18 THEN $19 ELSE run_as END \
+         run_as = CASE WHEN $18 THEN $19 ELSE run_as END, \
+         incremental_strategy = $20, partition_granularity = $21, lookback_hours = $22 \
          WHERE id = $1 RETURNING {FULL_PIPELINE_COLUMNS}"
     );
     // BLD-9 / decision 7: `connector_id` cannot use the `COALESCE` shape
@@ -1779,6 +2010,13 @@ owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
         ConnectorChange::Set(connector_id) => (true, Some(connector_id.clone())),
     };
     let mut tx = pool.begin().await?;
+    // BLD-20: claim the output table in this same transaction, before the
+    // UPDATE. Excluding `id` lets a pipeline keep its OWN output table on an
+    // unrelated edit (and on a version restore) while still refusing to
+    // steal another pipeline's — including when restore replays a snapshot
+    // that names a table now owned by someone else.
+    assert_output_table_unclaimed(&mut tx, Some(id), &input.target_zone, &input.target_table)
+        .await?;
     // safe: only the constant `FULL_PIPELINE_COLUMNS` is formatted in; values are bound.
     let row: Option<FullPipelineRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
@@ -1811,6 +2049,9 @@ owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
             RunAsChange::Set(user_id) => Some(user_id),
             RunAsChange::Keep | RunAsChange::Clear => None,
         })
+        .bind(&input.incremental_strategy)
+        .bind(&input.partition_granularity)
+        .bind(input.lookback_hours)
         .fetch_optional(&mut *tx)
         .await?;
     let Some(row) = row else {
@@ -1922,8 +2163,19 @@ pub async fn delete_pipeline(
 struct RunnableRow {
     id: String,
     name: String,
+    /// BLD-12: the factory needs the authored kind next to the definition —
+    /// `AuthoredDefinition` holds only inputs/steps/target, so without this
+    /// every run would be treated as a batch full rebuild.
+    kind: String,
     status: String,
     schedule: String,
+    /// BLD-12: mirrored on [`RunnablePipeline`] next to the definition so a
+    /// consumer does not have to reach into `definition` for the materialization
+    /// config.
+    incremental_column: Option<String>,
+    incremental_strategy: String,
+    partition_granularity: String,
+    lookback_hours: i32,
     depends_on: Vec<String>,
     /// BLD-2 (migration `0084`), carried to the factory so it can apply
     /// plan D3 (a target lag replaces the schedule while it is set).
@@ -1942,12 +2194,26 @@ pub struct RunnablePipeline {
     pub id: String,
     /// Display name.
     pub name: String,
+    /// BLD-12: the authored kind (`batch` or `incremental`). The factory reads
+    /// this to decide the materialization strategy.
+    pub kind: String,
     /// `ready` or `paused`: a paused pipeline still has a job (so it can be
     /// run by hand); only its schedule is stopped.
     pub status: String,
     /// Schedule label as authored: a five-field cron, or anything else for
     /// "on demand only".
     pub schedule: String,
+    /// BLD-12: the cursor column, strategy, granularity and lookback of this
+    /// pipeline's materialization. Same values as in `definition`, exposed
+    /// here so the orchestrator can read one place.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incremental_column: Option<String>,
+    /// BLD-12: `"append"` or `"partition_replace"` (migration `0156`).
+    pub incremental_strategy: String,
+    /// BLD-12: `"day"` or `"month"` (migration `0156`).
+    pub partition_granularity: String,
+    /// BLD-12: `0..=720` lookback hours (migration `0156`).
+    pub lookback_hours: i32,
     /// The stored definition the job is built from.
     pub definition: AuthoredDefinition,
     /// Upstream pipeline ids whose SUCCESS runs must precede this one's
@@ -1983,8 +2249,10 @@ pub struct RunnablePipeline {
 /// Returns [`StoreError::Database`] if a query fails.
 pub async fn list_runnable_pipelines(pool: &PgPool) -> Result<Vec<RunnablePipeline>, StoreError> {
     let rows: Vec<RunnableRow> = sqlx::query_as(
-        "SELECT id, name, status, schedule, depends_on, target_lag_seconds, \
-             target_lag_downstream, tenant_id FROM pipeline_definition \
+        "SELECT id, name, kind, status, schedule, incremental_column, \
+             incremental_strategy, partition_granularity, lookback_hours, \
+             depends_on, target_lag_seconds, target_lag_downstream, tenant_id \
+             FROM pipeline_definition \
              WHERE status IN ('ready', 'paused') ORDER BY created_at",
     )
     .fetch_all(pool)
@@ -1996,8 +2264,13 @@ pub async fn list_runnable_pipelines(pool: &PgPool) -> Result<Vec<RunnablePipeli
             out.push(RunnablePipeline {
                 id: row.id,
                 name: row.name,
+                kind: row.kind,
                 status: row.status,
                 schedule: row.schedule,
+                incremental_column: row.incremental_column,
+                incremental_strategy: row.incremental_strategy,
+                partition_granularity: row.partition_granularity,
+                lookback_hours: row.lookback_hours,
                 definition,
                 depends_on: row.depends_on,
                 target_lag: TargetLag::from_columns(
@@ -3124,6 +3397,10 @@ mod tests {
     #[test]
     fn serialized_field_names_match_the_typescript_contract() {
         let pipeline = Pipeline {
+            incremental_column: None,
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             id: "pl-x".to_owned(),
             name: "n".to_owned(),
             kind: "batch".to_owned(),
@@ -3172,6 +3449,11 @@ mod tests {
             "freshnessLagSeconds",
             "dependsOn",
             "maxRetries",
+            // BLD-12: the materialization config is on every pipeline row,
+            // so list/detail and the compile payload share one shape.
+            "incrementalStrategy",
+            "partitionGranularity",
+            "lookbackHours",
             // BLD-2: always present, `null` when the pipeline has no
             // target lag — one shape on every row.
             "targetLag",
@@ -3180,6 +3462,52 @@ mod tests {
         }
         assert!(value.get("connectorId").is_none());
         assert!(value.get("nextRunAt").is_none());
+    }
+
+    /// BLD-12: an incremental pipeline's cursor column is on the wire too
+    /// (it is skipped for a batch row), and every value is the real stored
+    /// one — never a default substituted by the serializer.
+    #[test]
+    fn incremental_pipeline_serializes_its_materialization_config_in_camel_case() {
+        let mut pipeline = Pipeline {
+            id: "pl-x".to_owned(),
+            name: "n".to_owned(),
+            kind: "incremental".to_owned(),
+            status: "ready".to_owned(),
+            incremental_column: Some("event_time".to_owned()),
+            incremental_strategy: "partition_replace".to_owned(),
+            partition_granularity: "month".to_owned(),
+            lookback_hours: 36,
+            owner: "o".to_owned(),
+            source: "s".to_owned(),
+            input_tables: vec!["s".to_owned()],
+            target: "t".to_owned(),
+            connector_id: None,
+            source_asset_id: None,
+            target_asset_id: None,
+            schedule: "manual".to_owned(),
+            last_run_at: None,
+            next_run_at: None,
+            sla_ok: None,
+            freshness_lag_seconds: None,
+            max_retries: 2,
+            description: None,
+            depends_on: Vec::new(),
+            tenant_id: None,
+            target_lag: None,
+            run_as: None,
+        };
+        let value = serde_json::to_value(&pipeline).unwrap();
+        assert_eq!(value["incrementalColumn"], serde_json::json!("event_time"));
+        assert_eq!(
+            value["incrementalStrategy"],
+            serde_json::json!("partition_replace")
+        );
+        assert_eq!(value["partitionGranularity"], serde_json::json!("month"));
+        assert_eq!(value["lookbackHours"], serde_json::json!(36));
+        pipeline.incremental_column = None;
+        let value = serde_json::to_value(&pipeline).unwrap();
+        assert!(value.get("incrementalColumn").is_none());
     }
 
     #[test]
@@ -3192,6 +3520,10 @@ mod tests {
         // behind it (`WS5`), so it stays hardcoded `None` regardless of
         // what the row would say.
         let row = PipelineRow {
+            incremental_column: None,
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             id: "pl-x".to_owned(),
             name: "n".to_owned(),
             kind: "batch".to_owned(),
@@ -3242,6 +3574,10 @@ mod tests {
         // no longer a placeholder to override. `sla_ok` still is.
         let ran_at = OffsetDateTime::from_unix_timestamp(1_735_689_600).unwrap();
         let row = PipelineRow {
+            incremental_column: None,
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             id: "pl-x".to_owned(),
             name: "n".to_owned(),
             kind: "batch".to_owned(),

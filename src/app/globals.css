@@ -64,6 +64,36 @@
 }
 
 /*
+ * BI-64 (`BI-26-AC2`): an embed with `background=transparent` lets the host
+ * page show through. The only opaque paint behind the tiles is `body`'s
+ * `bg-background` from the design system's base layer; `EmbedView` sets this
+ * class on `<html>` while the option is on.
+ *
+ * PR BI-64 review SHOULD-FIX 1: a transparent `body` is not enough. When the
+ * embedded document's used `color-scheme` differs from the host page's, the
+ * browser paints an opaque canvas behind the iframe (CSS Color Adjust, the
+ * iframe backdrop rule), and the console's dark theme sets `color-scheme:
+ * dark` on `<html>`. `normal` leaves the host page's scheme to decide.
+ *
+ * Second pass (BI-64 review SHOULD-FIX 1, second pass): the `ThemeProvider`
+ * (next-themes, from the Rantai Design System, mounted in `src/app/layout.tsx`)
+ * writes `color-scheme` as an inline `style` on `<html>`. An inline style beats
+ * a class rule, so only an `!important` declaration outranks it. The canvas
+ * backdrop follows the root's scheme only, so `body` keeps the theme's scheme
+ * and native scrollbars and form controls stay dark in a dark embed.
+ */
+html.embed-transparent {
+  color-scheme: normal !important;
+}
+html.dark.embed-transparent body {
+  color-scheme: dark;
+}
+html.embed-transparent,
+html.embed-transparent body {
+  background: transparent;
+}
+
+/*
  * DESIGN.md §3: when the system asks for less motion, every movement stops.
  * One rule here instead of a `motion-reduce:` on each element, so a component
  * added later cannot forget it. A near-zero duration (not `none`) keeps

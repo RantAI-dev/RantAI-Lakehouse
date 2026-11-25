@@ -53,12 +53,14 @@ function visit(path: string) {
 }
 
 /** Answers the session and the Copilot sessions list; everything else is an empty success. */
-function stubNetwork(permissions: string[] = []) {
+function stubNetwork(permissions: string[] = [], deployment?: unknown, requested?: string[]) {
   spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
     const path = String(input)
+    requested?.push(path)
     if (path.includes("/api/auth/me")) {
       return json({ id: "u1", name: "Analyst", email: null, roles: ["Analyst"], permissions, tenants: [] })
     }
+    if (path.includes("/api/settings/deployment")) return json(deployment ?? { features: [] })
     if (path.includes("/api/ai/sessions")) return json({ sessions: [] })
     return json({})
   }) as unknown as typeof fetch)
@@ -1007,5 +1009,46 @@ describe("QueryStudioPage one side panel with AI Copilot", () => {
     fireEvent.keyDown(window, { key: "F1" })
 
     expect(await screen.findByRole("option", { name: "Format settings…" })).toBeTruthy()
+  })
+})
+
+describe("QueryStudioPage engine choices (BI-44)", () => {
+  it("offers only the installed engine in a bi-only installation", async () => {
+    stubNetwork(["*:*"], {
+      features: [],
+      installMode: "bi-only",
+      queryEngine: "trino",
+    })
+    seedDraft("SELECT 1")
+    renderPage()
+
+    // The deployment answer is admin-gated. A Trino install moves the tab
+    // off its ClickHouse default, so UX-9's status bar reading Trino proves
+    // the answer landed before the menu is opened. The engine control is a
+    // menu button here, not the old native "Query engine" combobox.
+    const engineButton = await screen.findByRole("button", { name: "Engine: Trino" })
+    fireEvent.click(engineButton)
+    await waitFor(() => expect(screen.getByRole("menuitemradio", { name: /^Trino/ })).toBeTruthy())
+    expect(screen.queryByRole("menuitemradio", { name: /^ClickHouse/ })).toBeNull()
+  })
+
+  it("keeps both engines when the deployment reports full mode", async () => {
+    stubNetwork(["*:*"], { features: [], installMode: "full" })
+    seedDraft("SELECT 1")
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Engine: ClickHouse" }))
+    await waitFor(() => expect(screen.getByRole("menuitemradio", { name: /^Trino/ })).toBeTruthy())
+    expect(screen.getByRole("menuitemradio", { name: /^ClickHouse/ })).toBeTruthy()
+  })
+
+  it("asks no deployment question for a principal who cannot read settings", async () => {
+    const requests: string[] = []
+    stubNetwork(["query:read"], undefined, requests)
+    seedDraft("SELECT 1")
+    renderPage()
+
+    await screen.findByRole("button", { name: "Run" })
+    expect(requests.some((url) => url.includes("/api/settings/deployment"))).toBe(false)
   })
 })

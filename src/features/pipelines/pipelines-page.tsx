@@ -49,6 +49,21 @@ export function PipelinesPage() {
       (signal, id: string) => pipelineService.triggerRun(id, signal)
     )
   )
+  // BLD-18: the row menu offers Pause/Resume for authored pipelines. The
+  // service calls the same routes the detail page uses, which stop/start
+  // the cron schedule, dependency sensor and target-lag freshness sensor.
+  const pauseAction = useServiceAction(
+    withNotify(
+      { success: "Automatic runs paused", error: "Could not pause the pipeline" },
+      (signal, id: string) => pipelineService.pausePipeline(id, signal)
+    )
+  )
+  const resumeAction = useServiceAction(
+    withNotify(
+      { success: "Automatic runs resumed", error: "Could not resume the pipeline" },
+      (signal, id: string) => pipelineService.resumePipeline(id, signal)
+    )
+  )
 
   const columns = React.useMemo(
     () =>
@@ -61,8 +76,14 @@ export function PipelinesPage() {
           const run = await triggerAction.run(p.id)
           if (run) state.reload()
         },
+        onPause: async (p) => {
+          if (await pauseAction.run(p.id)) state.reload()
+        },
+        onResume: async (p) => {
+          if (await resumeAction.run(p.id)) state.reload()
+        },
       }),
-    [router, triggerAction, state]
+    [router, triggerAction, pauseAction, resumeAction, state]
   )
 
   const pipelines = React.useMemo(

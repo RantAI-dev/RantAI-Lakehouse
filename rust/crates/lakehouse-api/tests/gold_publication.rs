@@ -31,59 +31,30 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use lakehouse_clickhouse::ChClient;
 use serde_json::Value;
-use testcontainers::ImageExt;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::clickhouse::ClickHouse;
 use tower::ServiceExt;
 
 use common::{
     TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
 };
 
-/// ONE `ClickHouse` per test binary, shared by every test — mirroring
-/// `gold_export_history::TABLE_ENSURED`'s process-wide "the table has
-/// been ensured" cache, which assumes a single `ClickHouse` per process.
-/// Per-test containers would race that cache (whoever runs the ensure
-/// first pins it to THEIR container; another test's first
-/// `console.gold_export_run` read then hits a server without the table
-/// and 500s). Tests stay isolated the other way: each has its own
-/// Postgres database, and every test uses its own mart names.
+/// ONE `ClickHouse` per test binary, shared by every test: these tests
+/// seed and read `serving.*` marts, and one container per binary is far
+/// cheaper than one per test. Table DDL no longer depends on this: the
+/// `ensure_*_table` guards are keyed by `ClickHouse` URL
+/// (`lakehouse_clickhouse::ChTableEnsured`), so a `wiremock` stand-in that
+/// answered a DDL earlier in this process can no longer vouch for this
+/// container (the `Coverage & SBOM` `gold_publication::*` failure of runs
+/// 45545437095 and 45531180507). Tests stay isolated the other way: each
+/// has its own Postgres database, and every test uses its own mart names.
 ///
 /// `pub(crate)`: `gold_latest_copy`'s tests share this same container for
-/// the same reason — its `LATEST_COPY_TABLE_ENSURED` `OnceCell` is just as
-/// process-wide, so a second container would let whichever module ran
-/// first pin the other's DDL to the wrong server.
-static CLICKHOUSE: tokio::sync::OnceCell<(String, testcontainers::ContainerAsync<ClickHouse>)> =
+/// the same reason.
+static CLICKHOUSE: tokio::sync::OnceCell<lakehouse_test_support::clickhouse::Started> =
     tokio::sync::OnceCell::const_new();
 
-pub(crate) async fn shared_clickhouse()
--> &'static (String, testcontainers::ContainerAsync<ClickHouse>) {
+pub(crate) async fn shared_clickhouse() -> &'static lakehouse_test_support::clickhouse::Started {
     CLICKHOUSE
-        .get_or_init(|| async {
-            // Exactly the compose service's env trio (CH_USER defaults to
-            // "default", CH_PASSWORD to empty,
-            // CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT pinned "1"). ALL THREE
-            // are required: the 26.8 image's entrypoint disables network
-            // access for `default` when CLICKHOUSE_USER is unset — even
-            // with an empty password — and
-            // CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT is what keeps
-            // passwordless `default` reachable (the compose file documents
-            // the same trio as its local-dev default).
-            let container = ClickHouse::default()
-                .with_env_var("CLICKHOUSE_USER", "default")
-                .with_env_var("CLICKHOUSE_PASSWORD", "")
-                .with_env_var("CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT", "1")
-                .with_tag("26.8")
-                .start()
-                .await
-                .expect("start the ClickHouse testcontainer");
-            let host = container.get_host().await.expect("container host");
-            let port = container
-                .get_host_port_ipv4(8123)
-                .await
-                .expect("container HTTP port");
-            (format!("http://{host}:{port}"), container)
-        })
+        .get_or_init(lakehouse_test_support::clickhouse::start)
         .await
 }
 
@@ -241,11 +212,11 @@ async fn put_publication_is_denied_to_a_principal_without_gold_export() {
     assert_eq!(status, StatusCode::FORBIDDEN, "403 from the auth gate");
 }
 
-/// The scheduler's list route has TWO layers: the `RequiresAuth` floor
-/// (covered by `route_auth.rs`) PLUS `check_export_token` in the handler
-/// (the plan's own requirement). A session that clears the floor but
-/// holds neither `gold:export` nor the shared token must not read the
-/// publication list.
+/// The scheduler's list route has TWO layers: the SEC-66 read grant in
+/// `POLICY_TABLE` PLUS `check_export_token` in the handler (the plan's own
+/// requirement). A session holding neither a Gold grant nor the shared
+/// token must not read the publication list — since SEC-66 it is refused
+/// at the gate (403) before the handler's token branch is ever reached.
 #[tokio::test]
 async fn publications_list_still_requires_the_export_permission_beyond_the_auth_floor() {
     let (app, _ch) = spin_up_with_clickhouse().await;
@@ -261,8 +232,11 @@ async fn publications_list_still_requires_the_export_permission_beyond_the_auth_
     )
     .await;
     assert!(
-        status == StatusCode::UNAUTHORIZED || status == StatusCode::SERVICE_UNAVAILABLE,
-        "check_export_token must refuse a session without gold:export, got {status}"
+        status == StatusCode::FORBIDDEN
+            || status == StatusCode::UNAUTHORIZED
+            || status == StatusCode::SERVICE_UNAVAILABLE,
+        "neither the SEC-66 policy gate nor check_export_token may let a session \
+         without a Gold grant or the shared token read the list, got {status}"
     );
 }
 
@@ -393,14 +367,15 @@ async fn enabling_lists_a_mart_and_disabling_removes_it_from_the_list() {
 
 /// A mart that exists but was never switched on reports the OFF default:
 /// `enabled: false, updatedAt: null`, honest nulls for both freshness
-/// facts it cannot have yet, and `canEdit: false` for a session without
-/// `gold:export` (the floor is only `RequiresAuth` here — read-only).
+/// facts it cannot have yet, and `canEdit: false` for a reader who holds
+/// `gold:read` but not `gold:export` (SEC-66 made the detail read-gated,
+/// while the edit button still follows the write permission).
 #[tokio::test]
 async fn detail_defaults_for_a_never_enabled_mart_are_the_off_state() {
     let (app, ch) = spin_up_with_clickhouse().await;
     seed_mart(&ch, "plain_mart").await;
     let sessions = Sessions { app };
-    let cookie = sessions.with("").await;
+    let cookie = sessions.with("gold:read").await;
 
     let (status, body) = send(
         &sessions.app.router,

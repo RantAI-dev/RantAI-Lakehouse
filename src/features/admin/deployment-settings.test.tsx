@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import { CONFIGURATION_DOC, DeploymentSettings } from "./deployment-settings"
 
@@ -81,5 +81,68 @@ describe("DeploymentSettings (ADM-6)", () => {
     render(<DeploymentSettings />)
     await waitFor(() => expect(screen.getByText("Set up")).toBeTruthy())
     expect(screen.getByText("Not set up")).toBeTruthy()
+  })
+})
+
+describe("DeploymentSettings installation summary (BI-44 AC5)", () => {
+  it("shows the full lakehouse and the ClickHouse engine when the deployment reports them", async () => {
+    mockApi({ ...DEPLOYMENT, installMode: "full", queryEngine: "clickhouse" })
+    render(<DeploymentSettings />)
+    const summary = await screen.findByRole("region", { name: "Installation summary" })
+    expect(within(summary).getByText("Installation mode")).toBeTruthy()
+    expect(within(summary).getByText("Full lakehouse")).toBeTruthy()
+    expect(within(summary).getByText("Query engine")).toBeTruthy()
+    expect(within(summary).getByText("ClickHouse")).toBeTruthy()
+    expect(within(summary).queryByText(/read in place/)).toBeNull()
+  })
+
+  it("names the in-place sources and the Trino engine of a bi-only install", async () => {
+    mockApi({
+      ...DEPLOYMENT,
+      installMode: "bi-only",
+      queryEngine: "trino",
+      supportedInPlaceSources: ["postgresql", "mysql", "clickhouse"],
+    })
+    render(<DeploymentSettings />)
+    const summary = await screen.findByRole("region", { name: "Installation summary" })
+    expect(within(summary).getByText("BI & Assistant only (in-place)")).toBeTruthy()
+    expect(within(summary).getByText("Trino")).toBeTruthy()
+    expect(
+      within(summary).getByText(/Data is read in place through the installed engine; nothing is copied into the lakehouse/)
+    ).toBeTruthy()
+    const sources = within(summary).getByLabelText("Supported external source types")
+    for (const source of ["postgresql", "mysql", "clickhouse"]) {
+      expect(within(sources).getByText(source)).toBeTruthy()
+    }
+  })
+
+  it("shows ClickHouse and an empty-source note for a bi-only install with no sources registered", async () => {
+    mockApi({
+      features: [],
+      installMode: "bi-only",
+      queryEngine: "clickhouse",
+      supportedInPlaceSources: [],
+    })
+    render(<DeploymentSettings />)
+    const summary = await screen.findByRole("region", { name: "Installation summary" })
+    expect(within(summary).getByText("BI & Assistant only (in-place)")).toBeTruthy()
+    expect(within(summary).getByText("ClickHouse")).toBeTruthy()
+    expect(within(summary).queryByText("Trino")).toBeNull()
+    expect(within(summary).getByText("No external source types are registered yet.")).toBeTruthy()
+  })
+
+  it("draws no installation summary for a legacy response with no installMode or queryEngine", async () => {
+    mockApi({ features: [] })
+    render(<DeploymentSettings />)
+    await waitFor(() => expect(screen.getByLabelText("Deployment features")).toBeTruthy())
+    expect(screen.queryByRole("region", { name: "Installation summary" })).toBeNull()
+  })
+
+  it("shows an unknown mode as the server sent it instead of guessing full", async () => {
+    mockApi({ features: [], installMode: "something-else", queryEngine: "other-engine" })
+    render(<DeploymentSettings />)
+    const summary = await screen.findByRole("region", { name: "Installation summary" })
+    expect(within(summary).getByText("something-else")).toBeTruthy()
+    expect(within(summary).getByText("other-engine")).toBeTruthy()
   })
 })

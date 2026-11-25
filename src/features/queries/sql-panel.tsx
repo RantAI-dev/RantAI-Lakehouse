@@ -3,6 +3,7 @@
 import * as React from "react"
 
 import { SqlEditor } from "@/components/sql-editor"
+import type { QueryEngine } from "@/services/contracts/queries"
 import { QueryParameterFields } from "./query-parameter-fields"
 import { StudioStatusBar } from "./studio-status-bar"
 import { SQL_PLACEHOLDER, type useQueryStudio } from "./use-query-studio"
@@ -18,10 +19,17 @@ import { SQL_PLACEHOLDER, type useQueryStudio } from "./use-query-studio"
 export function SqlPanel({
   studio,
   onOpenPlan,
+  availableEngines = ["clickhouse", "trino"],
 }: {
   readonly studio: ReturnType<typeof useQueryStudio>
   /** Opens the side panel's Plan tab, from the estimate in the status bar. */
   readonly onOpenPlan?: () => void
+  /**
+   * The engines this installation can run (`BI-44`). A `bi-only` install
+   * has exactly one; the default keeps every other caller's both-engine
+   * selector unchanged. The API still refuses a stale engine at run time.
+   */
+  readonly availableEngines?: readonly QueryEngine[]
 }) {
   const {
     sql,
@@ -88,7 +96,11 @@ export function SqlPanel({
           onDefinitionChange={setParameterDefinition}
           className="px-3 pb-2"
         />
-        <StudioStatusBar studio={studio} onOpenPlan={onOpenPlan ?? (() => {})} />
+        <StudioStatusBar
+          studio={studio}
+          onOpenPlan={onOpenPlan ?? (() => {})}
+          availableEngines={availableEngines}
+        />
       </div>
       {/* QS-11 (LH-QS-1-12), D9: a batch over the limit is refused here, in
           the page, not in a toast that disappears before it is read. */}

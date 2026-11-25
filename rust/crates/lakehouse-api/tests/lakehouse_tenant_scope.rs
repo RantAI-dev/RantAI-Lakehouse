@@ -2378,9 +2378,10 @@ async fn seed_an_agent_run(pool: &PgPool) -> String {
     "run-sec-20".to_owned()
 }
 
-/// The grant of a plain reader of the agents pages: the run history is open
-/// to any login, so the grant says nothing about the gate under test.
-const AGENTS_READER: &str = "dashboard:read";
+/// The grant of a plain reader of the agents pages. SEC-66 put the run
+/// history behind `agent:read`, so this now carries that grant alongside
+/// `dashboard:read`; the tenant split under test is unchanged.
+const AGENTS_READER: &str = "dashboard:read, agent:read";
 
 #[tokio::test]
 async fn the_quality_list_holds_only_the_tables_the_caller_may_read() {
@@ -3503,7 +3504,7 @@ async fn the_catalog_owner_cannot_resolve_an_incident_on_another_tenants_upload_
 }
 
 #[tokio::test]
-async fn the_agent_run_history_is_read_by_the_catalog_owner_and_by_nobody_else() {
+async fn the_agent_run_detail_is_read_by_the_catalog_owner_and_by_nobody_else() {
     let catalog = MockServer::start().await;
     mount_catalog(&catalog).await;
     let ch = MockServer::start().await;
@@ -3514,11 +3515,10 @@ async fn the_agent_run_history_is_read_by_the_catalog_owner_and_by_nobody_else()
     let other = cookie_in_tenant(&pool, AGENTS_READER, OTHER_TENANT).await;
     let operator = operator_cookie(&pool).await;
 
-    // A tenant that does not own the shared catalog: the list is empty and
-    // the run is unknown, so the refusal says nothing about what runs.
-    let (status, body) = get(&router, "/api/agents/runs", &other, None).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body, json!([]), "{body}");
+    // WEB-4 retired the runs LIST; only `GET /runs/{id}` stays (an approval
+    // links to one run's trace). A tenant that does not own the shared
+    // catalog gets the unknown 404, so the answer says nothing about
+    // whether the run exists.
     let (status, body) = get(&router, &format!("/api/agents/runs/{run_id}"), &other, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(
@@ -3527,18 +3527,12 @@ async fn the_agent_run_history_is_read_by_the_catalog_owner_and_by_nobody_else()
         "{body}"
     );
 
-    // The tenant that owns the shared catalog reads the runs.
-    let (status, body) = get(&router, "/api/agents/runs", &owner, None).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body[0]["id"], json!(run_id), "{body}");
+    // The tenant that owns the shared catalog reads the run.
     let (status, body) = get(&router, &format!("/api/agents/runs/{run_id}"), &owner, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["id"], json!(run_id), "{body}");
 
-    // An operator reaches everything.
-    let (status, body) = get(&router, "/api/agents/runs", &operator, None).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body[0]["id"], json!(run_id), "{body}");
+    // An operator reaches it too.
     let (status, body) = get(
         &router,
         &format!("/api/agents/runs/{run_id}"),

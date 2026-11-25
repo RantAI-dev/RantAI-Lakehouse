@@ -7,6 +7,13 @@
  */
 import type { Measured } from "@/lib/measured"
 
+/**
+ * DATA-65: the publication zone. Silver reads `silver.<mart>` and writes
+ * the `silver` Iceberg namespace; Gold reads `serving.<mart>` and writes
+ * `gold`. Optional on responses so a pre-DATA-65 API shape still types.
+ */
+export type GoldZone = "silver" | "gold"
+
 /** One `serving.*` ClickHouse mart, as `GET /api/dashboard/fields` lists it. */
 export type GoldMart = {
   name: string
@@ -15,6 +22,7 @@ export type GoldMart = {
 
 /** `POST /api/gold/export/{mart}` response — what the export just did. */
 export type GoldExportResult = {
+  zone?: GoldZone
   namespace: string
   table: string
   formatVersion: number
@@ -47,6 +55,7 @@ export type GoldExportResult = {
  * failure and is shown as one, never as "Never exported".
  */
 export type GoldReadBack = {
+  zone?: GoldZone
   namespace: string
   table: string
   /** Whether the catalog holds this mart's published table at all. */
@@ -111,6 +120,7 @@ export type GoldConsumer = {
  */
 export type GoldConsumers = {
   mart: string
+  zone?: GoldZone
   supported: boolean
   windowDays?: number
   consumers: GoldConsumer[] | null
@@ -187,6 +197,7 @@ export type GoldPublicationFailure = {
 
 export type GoldPublication = {
   mart: string
+  zone?: GoldZone
   enabled: boolean
   updatedAt: string | null
   lastChangedAt: string | null
@@ -205,10 +216,10 @@ export type GoldPublication = {
 
 export interface GoldService {
   listMarts(signal?: AbortSignal): Promise<GoldMart[]>
-  getLastExport(mart: string, signal?: AbortSignal): Promise<GoldReadBack>
-  triggerExport(mart: string, signal?: AbortSignal): Promise<GoldExportResult>
-  listExportRuns(mart: string, signal?: AbortSignal): Promise<GoldExportRun[]>
-  getConsumers(mart: string, signal?: AbortSignal): Promise<GoldConsumers>
-  getPublication(mart: string, signal?: AbortSignal): Promise<GoldPublication>
-  setPublication(mart: string, enabled: boolean, signal?: AbortSignal): Promise<GoldPublication>
+  getLastExport(mart: string, signal?: AbortSignal, zone?: GoldZone): Promise<GoldReadBack>
+  triggerExport(mart: string, signal?: AbortSignal, zone?: GoldZone): Promise<GoldExportResult>
+  listExportRuns(mart: string, signal?: AbortSignal, zone?: GoldZone): Promise<GoldExportRun[]>
+  getConsumers(mart: string, signal?: AbortSignal, zone?: GoldZone): Promise<GoldConsumers>
+  getPublication(mart: string, signal?: AbortSignal, zone?: GoldZone): Promise<GoldPublication>
+  setPublication(mart: string, enabled: boolean, signal?: AbortSignal, zone?: GoldZone): Promise<GoldPublication>
 }

@@ -9,6 +9,7 @@ import {
   newNonce,
 } from "@/lib/csp"
 import { embedFrame, type EmbedPageToken } from "@/lib/embed-frame"
+import { EMBED_TRANSPARENT_HEADER, parseEmbedLook } from "@/lib/embed-look"
 
 /**
  * The console's `Content-Security-Policy` for every page (`SEC-47`), and the
@@ -111,6 +112,7 @@ export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl
 
   let policy: string
+  let embedTransparent = false
   if (isRenderPath(pathname)) {
     // `BI-1`: the print view is opened by Gotenberg with a 2-minute token in the
     // address and no session, so there is no content-site list to read (the
@@ -125,6 +127,13 @@ export async function proxy(request: NextRequest) {
       contentSites: frame.contentSites,
       frameAncestors: frame.origins,
     })
+    // `PR #648 review 1`: an embed that asks for a transparent background must
+    // be transparent from the first paint, not from hydration. The root layout
+    // sees this request header and puts `embed-transparent` on `<html>`; the
+    // look is read by the same function the embed pages use.
+    embedTransparent = parseEmbedLook({
+      background: request.nextUrl.searchParams.get("background") ?? undefined,
+    }).transparent
   } else {
     policy = contentSecurityPolicy({
       nonce,
@@ -139,6 +148,8 @@ export async function proxy(request: NextRequest) {
   // own (the console renders none today).
   requestHeaders.set(NONCE_HEADER, nonce)
   requestHeaders.set(CSP_HEADER, policy)
+  // Read back by `src/app/layout.tsx` on `<html>` (`PR #648 review 1`).
+  if (embedTransparent) requestHeaders.set(EMBED_TRANSPARENT_HEADER, "1")
   const response = NextResponse.next({ request: { headers: requestHeaders } })
   response.headers.set(CSP_HEADER, policy)
   if (isRenderPath(pathname)) {

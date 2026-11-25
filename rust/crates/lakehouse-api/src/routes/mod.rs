@@ -91,6 +91,7 @@ pub(crate) mod params;
 // an early answer left behind, so the client is not left writing into a
 // closed connection. See the module's own doc comment.
 mod picture_drain;
+pub(crate) mod pipeline_chain;
 mod pipeline_preview;
 mod pipelines;
 mod quality;
@@ -479,7 +480,15 @@ fn pipeline_preview_router() -> Router<AppState> {
 /// [`crate::policy`], and keeping them together makes that pairing the
 /// thing a reader sees first.
 fn authored_pipelines_router() -> Router<AppState> {
-    pipeline_compile_router().route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+    pipeline_compile_router()
+        .route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+        .route(
+            "/api/pipelines/{id}/schedule-ticks",
+            get(authored_pipelines::schedule_ticks),
+        )
+        // BLD-14: the chain-step write is orchestrator-only here as well as
+        // in `POLICY_TABLE`, so it sits with `runnable` and `compile`.
+        .merge(pipeline_chain_routes())
 }
 
 /// The `/api/pipelines/*` sub-router (Task 2.5), split out of [`router`]
@@ -508,18 +517,13 @@ fn pipelines_router() -> Router<AppState> {
                 .delete(authored_pipelines::delete),
         )
         .route("/api/pipelines/{id}/source", get(pipelines::source))
-        .route(
-            "/api/pipelines/{id}/schedule-ticks",
-            get(authored_pipelines::schedule_ticks),
-        )
-        // BLD-2: the two target-lag routes live in `target_lag_routes`,
-        // merged in above.
+        // BLD-2: target-lag routes live in `target_lag_routes`.
         .merge(target_lag_routes())
         .route("/api/pipelines/{id}/runs", get(pipelines::runs))
-        // Plan R4 2b: definition version history. Static under
-        // `{id}/versions`, so it is registered BEFORE
-        // `{id}/versions/{version}/restore` (which would otherwise
-        // match `{version}/restore` as `{version}`).
+        // BLD-14 review R5: beside `runs`, not in the orchestrator-only router.
+        .merge(chain_read_routes())
+        // Plan R4 2b: static `{id}/versions` comes BEFORE
+        // `{id}/versions/{version}/restore` (which would match `{version}/restore`).
         .route(
             "/api/pipelines/{id}/versions",
             get(pipelines::list_versions),
@@ -660,6 +664,25 @@ fn target_lag_routes() -> Router<AppState> {
         )
 }
 
+/// `BLD-14` D8: the chain sensor's one write per (re-upload, pipeline).
+/// Orchestrator-only like `lag-check`, hence under `/runnable/`.
+fn pipeline_chain_routes() -> Router<AppState> {
+    Router::new().route(
+        "/api/pipelines/runnable/{id}/chain-step",
+        post(pipeline_chain::record_chain_step),
+    )
+}
+
+/// BLD-14 review R5: the page's reason-read is merged into
+/// [`pipelines_router`] beside `runs`, not into the orchestrator-only
+/// [`authored_pipelines_router`] next to `compile`/`lag-check`.
+fn chain_read_routes() -> Router<AppState> {
+    Router::new().route(
+        "/api/pipelines/{id}/reupload-chain",
+        get(pipelines::reupload_chain),
+    )
+}
+
 /// The `/api/storage/*` sub-router (Task 2.6), split out for the same
 /// `clippy::too_many_lines` reason as [`pipelines_router`].
 fn storage_router() -> Router<AppState> {
@@ -696,6 +719,10 @@ fn lakehouse_router() -> Router<AppState> {
             get(lakehouse::list_maintenance_policies),
         )
         .route("/api/lakehouse/capacity", get(lakehouse::capacity))
+        .route(
+            "/api/lakehouse/compaction-status",
+            get(lakehouse::compaction_status),
+        )
 }
 
 /// The static (non-`{kind}`) `/api/governance/*` routes, split out for the
@@ -1330,26 +1357,29 @@ fn knowledge_router() -> Router<AppState> {
 /// `clippy::too_many_lines` reason as [`pipelines_router`].
 fn agents_router() -> Router<AppState> {
     Router::new()
-        .route(
-            "/api/agents/workflows",
-            get(agents::list_workflows).post(agents::create_workflow),
-        )
-        .route(
-            "/api/agents/employees",
-            get(agents::list_employees).post(agents::create_employee),
-        )
+        // WEB-4: the workflows routes, employee creation and the
+        // suspend/resume/revoke lifecycle, and the runs LIST were retired.
+        // No assistant tool, console page, CLI or script calls them. They
+        // are absent from `POLICY_TABLE` too, so they answer 404 — pinned
+        // by `tests/route_auth.rs`'s `web4_retired_paths_are_not_registered`.
+        //
+        // Four employee routes remain, all with live consumers (the fourth
+        // is SEC-68's `PUT /employees/{id}/read-roles`, noted below) — not
+        // console leftovers: `GET /employees` is read at code-load by
+        // Dagster's schedule factory
+        // (`dagster/dispar_orchestrate/agent_runs.py`), `GET /employees/{id}`
+        // names the employee on the retained run-detail page, and `POST
+        // /employees/{id}/run` is the scheduled/manual trigger that same
+        // Dagster job calls. `GET /runs/{id}` stays because an approval
+        // creates a real `agent_run` and its page shows the trace.
+        .route("/api/agents/employees", get(agents::list_employees))
         .route("/api/agents/employees/{id}", get(agents::get_employee))
+        // SEC-68: set an employee's explicit table-access role grant. A
+        // dedicated live route on the employee store/read path — no
+        // dependency on the retired workflows/suspend/resume/revoke routes.
         .route(
-            "/api/agents/employees/{id}/suspend",
-            axum::routing::post(agents::suspend_employee),
-        )
-        .route(
-            "/api/agents/employees/{id}/resume",
-            axum::routing::post(agents::resume_employee),
-        )
-        .route(
-            "/api/agents/employees/{id}/revoke",
-            axum::routing::post(agents::revoke_employee),
+            "/api/agents/employees/{id}/read-roles",
+            axum::routing::put(agents::set_employee_read_roles),
         )
         .route(
             "/api/agents/employees/{id}/run",
@@ -1360,7 +1390,6 @@ fn agents_router() -> Router<AppState> {
         // real ai_registry::TOOLS registry, see routes::agents's module
         // doc comment.
         .route("/api/agents/tools", get(agents::list_tools))
-        .route("/api/agents/runs", get(agents::list_runs))
         .route("/api/agents/runs/{id}", get(agents::get_run))
         .route("/api/agents/approvals", get(agents::list_approvals))
         .route(
@@ -1943,8 +1972,9 @@ pub fn router(state: AppState) -> Router {
         // only — no `search` route here, see `routes::knowledge`'s module
         // doc comment).
         .merge(knowledge_router())
-        // Phase 2, Task 2.9: digital employees, tools, workflows, runs,
-        // and approvals.
+        // Phase 2, Task 2.9 (WEB-4): the employee list/detail/run reads,
+        // tools, run detail and approvals. Workflows, employee creation,
+        // lifecycle changes and the runs list were retired.
         .merge(agents_router())
         // Task 3.2: login/logout/me/change-password.
         .merge(auth_router());

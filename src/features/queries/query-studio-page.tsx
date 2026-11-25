@@ -11,10 +11,12 @@ import { Tabs, TabsContent } from "@/components/ui/tabs"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useCopilot } from "@/features/copilot/use-copilot"
 import { builtInBoardEditable } from "@/features/dashboards/chart-page"
+import { useDeploymentSettings } from "@/hooks/use-deployment-settings"
 import { useService } from "@/hooks/use-service"
 import { useWindowWidth } from "@/hooks/use-window-width"
 import { summarizeQuery } from "@/lib/page-context-summary"
 import { queryDraftKey } from "@/lib/query-draft"
+import { availableQueryEngines } from "@/lib/query-engines"
 import { pinnedSnapshots, unpinSnapshots } from "@/lib/snapshot-picker"
 import { formatSql } from "@/lib/sql-format"
 import { queryEngineLabel } from "@/lib/status"
@@ -84,6 +86,7 @@ function QueryStudioWorkspace({ draftKey }: { draftKey: string | null }) {
   // All the query state lives in the hook; this file is the layout and the
   // page's own controls (panel, dialogs, command menu).
   const studio = useQueryStudio(draftKey)
+  const { engine: studioEngine, setEngine } = studio
   const router = useRouter()
   const { hasPermission } = useAuth()
   const canAuthorSources = hasPermission("dashboard:sql")
@@ -141,6 +144,21 @@ function QueryStudioWorkspace({ draftKey }: { draftKey: string | null }) {
   // chip names its version.
   const [picked, setPicked] = React.useState<Record<string, PinnedVersion>>({})
   const pinned = pinnedSnapshots(studio.sql).length > 0
+  // `BI-44`: the deployment route is admin-gated, so this asks only for a
+  // holder of `settings:write`. Everyone else keeps the two-engine
+  // selector; the API still refuses the inactive engine at run time.
+  const deployment = useDeploymentSettings(hasPermission("settings:write"))
+  const availableEngines = React.useMemo(
+    () => availableQueryEngines(deployment?.installMode, deployment?.queryEngine),
+    [deployment?.installMode, deployment?.queryEngine]
+  )
+  React.useEffect(() => {
+    // A `?engine=` link or an old draft can name an engine this install
+    // does not run. With one installed engine, keep the tab on it instead
+    // of offering a query the API must refuse with a 400.
+    if (availableEngines.length !== 1 || studioEngine === availableEngines[0]) return
+    setEngine(availableEngines[0])
+  }, [availableEngines, studioEngine, setEngine])
 
   /**
    * `WEB-7` D5: saving is its own page now, so the statement it would save
@@ -298,7 +316,11 @@ function QueryStudioWorkspace({ draftKey }: { draftKey: string | null }) {
             {sqlMode ? <RunButton studio={studio} /> : null}
           </div>
           <TabsContent value="sql" className="px-3 sm:px-4">
-            <SqlPanel studio={studio} onOpenPlan={() => showPanel("plan")} />
+            <SqlPanel
+              studio={studio}
+              onOpenPlan={() => showPanel("plan")}
+              availableEngines={availableEngines}
+            />
           </TabsContent>
           <TabsContent value="nl" className="px-3 sm:px-4">
             <NaturalLanguagePanel studio={studio} />

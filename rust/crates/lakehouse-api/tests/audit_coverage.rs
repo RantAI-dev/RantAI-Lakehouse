@@ -24,9 +24,9 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use crate::common::{
-    TestApp, audit_rows, create_principal_with_permissions, create_zero_permission_principal,
-    in_the_catalog_tenant, session_cookie_for_seeded_user, session_cookie_for_user, spin_up,
-    spin_up_with_env,
+    CATALOG_TENANT, TestApp, audit_rows, create_principal_with_permissions,
+    create_zero_permission_principal, in_the_catalog_tenant, session_cookie_for_seeded_user,
+    session_cookie_for_user, spin_up, spin_up_with_env,
 };
 
 // ── The guard ──────────────────────────────────────────────────────────────
@@ -145,7 +145,7 @@ fn every_handler_action_is_a_string_literal_in_a_route_source() {
         .collect();
     let mut absent = Vec::new();
     for (method, pattern, coverage) in AUDIT_TABLE {
-        if let Coverage::Handler { action } = coverage {
+        if let Coverage::Handler { action, .. } = coverage {
             let literal = format!("\"{action}\"");
             if !sources.iter().any(|source| source.contains(&literal)) {
                 absent.push(format!("{method} {pattern}: {action}"));
@@ -156,6 +156,26 @@ fn every_handler_action_is_a_string_literal_in_a_route_source() {
         absent.is_empty(),
         "these Handler routes name an action that is not a string literal under src/routes/:\n{}",
         absent.join("\n")
+    );
+}
+
+/// Check 3b: a `Handler` entry names the kind of object its route
+/// changes (`SEC-75` decision 6), so the refusal row the gate writes names
+/// it too — a refused change says what it would have changed.
+#[test]
+fn every_handler_entry_names_a_resource_kind() {
+    let mut without = Vec::new();
+    for (method, pattern, coverage) in AUDIT_TABLE {
+        if let Coverage::Handler { resource_kind, .. } = coverage
+            && resource_kind.trim().is_empty()
+        {
+            without.push(format!("{method} {pattern}"));
+        }
+    }
+    assert!(
+        without.is_empty(),
+        "these Handler routes name no resource kind:\n{}",
+        without.join("\n")
     );
 }
 
@@ -174,7 +194,7 @@ fn central_actions_are_module_verb_unique_and_read_their_id_from_the_path_or_the
     let handler_actions: BTreeSet<&str> = AUDIT_TABLE
         .iter()
         .filter_map(|(_, _, coverage)| match coverage {
-            Coverage::Handler { action } => Some(*action),
+            Coverage::Handler { action, .. } => Some(*action),
             _ => None,
         })
         .collect();
@@ -1373,7 +1393,14 @@ async fn a_nul_in_the_id_does_not_suppress_the_refused_row_at_the_gate() {
 /// the pipeline it created, like the row of `POST /api/pipelines`.
 #[tokio::test]
 async fn generating_a_pipeline_writes_one_row_that_names_the_pipeline() {
-    let TestApp { router, pool } = spin_up().await;
+    // BLD-13: `generate` now runs `create`'s checks, so the draft's zone
+    // cannot be Bronze and its (unclaimed) source table must be one this
+    // author's tenant can read. Name the catalog tenant and use Silver:
+    // neither changes what this test proves (that generation writes one
+    // audit row naming the pipeline) — it only keeps the draft valid.
+    let mut env = HashMap::new();
+    env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
     let user = create_principal_with_permissions(&pool, "pipeline:write").await;
     in_the_catalog_tenant(&pool, user).await;
     let cookie = session_cookie_for_user(&pool, user).await;
@@ -1383,7 +1410,7 @@ async fn generating_a_pipeline_writes_one_row_that_names_the_pipeline() {
         "POST",
         "/api/pipelines/generate",
         &cookie,
-        Some(json!({"instruction": "load the daily sales files", "database": "bronze"})),
+        Some(json!({"instruction": "load the daily sales files", "database": "silver"})),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");

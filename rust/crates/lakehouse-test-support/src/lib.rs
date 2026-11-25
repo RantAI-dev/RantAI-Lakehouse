@@ -47,8 +47,10 @@
 //! shared server, under three prefixes:
 //!
 //! * `lakehouse_api_test_*` — one per `lakehouse-api` integration test
-//!   (`rust/crates/lakehouse-api/tests/common/mod.rs:219`), which the
-//!   test never drops;
+//!   (`rust/crates/lakehouse-api/tests/common/mod.rs:299`), which the
+//!   test never drops. Since `OPS-23` the name carries the test
+//!   process's own pid (`lakehouse_api_test_p<pid>_<uuid>`), so the
+//!   sweep can tell a crashed run's database from a live test's;
 //! * `lakehouse_api_main_test_*` — one per `lakehouse-api` binary crate's
 //!   own unit test (`rust/crates/lakehouse-api/src/main.rs:1644`), which
 //!   the test never drops either;
@@ -61,13 +63,43 @@
 //! The server's volume reached 177.7 GB in three days and filled the dev
 //! VM on 2026-10-26 (`OPS-13`).
 //!
-//! So this crate sweeps them: every 30 seconds it drops the databases
-//! whose name carries one of the three test prefixes and that were idle
-//! at two passes in a row. A database is idle at a pass when no backend
-//! was connected to it at that pass: `pg_stat_activity` holds one row
-//! per backend, so a database with an open connection is never idle. A
-//! database that was created a moment ago and is not connected to yet
-//! is seen idle for the first time and left alone.
+//! So this crate sweeps them, two rules side by side. Every 30 seconds
+//! it drops the databases whose name carries one of the three test
+//! prefixes and that were idle at two passes in a row — and, since
+//! `OPS-23`, it also drops at the first pass any `lakehouse_api_test_`
+//! database whose owner's pid is dead on this machine. A database is
+//! idle at a pass when no backend was connected to it at that pass:
+//! `pg_stat_activity` holds one row per backend, so a database with an
+//! open connection is never idle. A database that was created a moment
+//! ago and is not connected to yet is seen idle for the first time
+//! and left alone.
+//!
+//! The dead-owner rule exists because the two-pass rule can never
+//! catch a short run: the two sightings live in the memory of one
+//! process, so a process that ends before its second pass drops
+//! nothing, and a crashed or killed test's database then waited for a
+//! later process that happened to live 30 seconds. The pid in the
+//! name is what lets another process drop it at once: a dead owner
+//! cannot be using the database, so the wait that protects a live
+//! test's database does not apply to it. The drop uses
+//! `WITH (FORCE)` because the connections of a killed process linger
+//! on the server for a moment and the server refuses to drop a
+//! database that is in use. A database whose owner is still alive is
+//! never dropped by this rule, even when it is idle; the two-pass
+//! rule applies to it as it does to every other name. Names without
+//! a pid — old-style `lakehouse_api_test_` names,
+//! `lakehouse_api_main_test_` and `_sqlx_test_` — keep the two-pass
+//! rule unchanged.
+//!
+//! The rule is safe beside other batches: every test process on this
+//! machine runs on the host in one pid namespace and shares one
+//! container, so a live pid is a running test somewhere, possibly in
+//! another batch's worktree, and its databases are left alone. Pid
+//! reuse can only make a dead owner look alive, which keeps the
+//! database and lets the two-pass rule catch it later. On CI each job
+//! has a fresh container, so the rule changes nothing there. A pid
+//! that cannot be checked — no `/proc` on this platform or an
+//! unmounted one — counts as alive, never as dead.
 //!
 //! Nothing else on the server is ever dropped: not `postgres`, not
 //! `template0`/`template1`, not a database whose name carries none of the
@@ -109,7 +141,8 @@
 //! state is in the memory of the process, so the passes of two processes
 //! never add up: a database is dropped only by a process that saw it idle
 //! twice itself, 30 seconds apart. A process that ends before its second
-//! pass drops nothing.
+//! pass drops nothing — except the dead-owner rule above, which needs
+//! no second pass.
 //!
 //! So a database that still has a backend on it is left alone by every
 //! sweep, its own process's and another process's alike. A backend lasts
@@ -136,6 +169,12 @@
 //! Docker (or a compatible container runtime) must be reachable from the
 //! environment running `cargo test`. If it is not, the constructor panics
 //! with a clear message instead of silently skipping tests.
+
+// `REL-14`: the one place that starts the `ClickHouse` testcontainer, with a
+// bounded retry around a failed start (a broken image-pull stream used to
+// fail whichever test started first). The Postgres harness below is a
+// different arrangement — one reused, labelled container — and stays as is.
+pub mod clickhouse;
 
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
@@ -361,7 +400,7 @@ fn start_postgres_container() {
 /// Three prefixes, each from a source of its own:
 ///
 /// * `lakehouse_api_test_` — the per-test database of `lakehouse-api`'s
-///   integration tests (`rust/crates/lakehouse-api/tests/common/mod.rs:219`),
+///   integration tests (`rust/crates/lakehouse-api/tests/common/mod.rs:299`),
 ///   which the test never drops.
 /// * `lakehouse_api_main_test_` — the per-test database of `lakehouse-api`'s
 ///   binary crate's own unit tests
@@ -378,6 +417,124 @@ const SWEEPABLE_PREFIXES: [&str; 3] = [
     "lakehouse_api_main_test_",
     "_sqlx_test_",
 ];
+
+/// The prefixes whose database names may carry the pid of the process that
+/// created them (`OPS-23`).
+///
+/// Only `lakehouse_api_test_` is here: the harness of `lakehouse-api`'s
+/// integration tests writes the pid of the test process into the name
+/// (`rust/crates/lakehouse-api/tests/common/mod.rs`), so that the sweep of
+/// another test process can drop the database of a crashed run at once.
+///
+/// The other two prefixes are not here, on purpose:
+///
+/// * `lakehouse_api_main_test_` — the binary crate's own unit tests write no
+///   pid into their name;
+/// * `_sqlx_test_` — sqlx writes that name itself: it is base64url of a
+///   SHA-512 digest, so the part behind the prefix may hold almost
+///   anything, and it must never be read as a pid.
+const OWNER_PID_PREFIXES: [&str; 1] = ["lakehouse_api_test_"];
+
+/// The pid of the process that created the database with this name, if the
+/// name carries one.
+///
+/// The name carries a pid when it starts with one of
+/// [`OWNER_PID_PREFIXES`] and the part behind the prefix reads
+/// `p<digits>_<anything>`: the `p`, then the digits of the pid, then the
+/// `_` that separates the pid from the rest of the name.
+///
+/// A part that is not of that shape is malformed and reads as "no pid":
+/// the database then keeps the old two-pass rule. A malformed part is
+/// never read as a number — not as `0`, not as any other pid — because a
+/// name this crate did not write must never be dropped by the dead-owner
+/// rule (`OPS-23`).
+fn owner_pid(name: &str) -> Option<u32> {
+    OWNER_PID_PREFIXES.iter().find_map(|prefix| {
+        let rest = name.strip_prefix(prefix)?;
+        parse_owner_pid(rest)
+    })
+}
+
+/// The pid in the part of a name that follows an owner prefix.
+fn parse_owner_pid(rest: &str) -> Option<u32> {
+    let digits = rest.strip_prefix('p')?;
+    let (pid, _rest) = digits.split_once('_')?;
+    if !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Digits that do not fit a `u32` are malformed too: no process ever
+    // had such a pid, so the name is not one the harness wrote.
+    let pid = pid.parse::<u32>().ok()?;
+    // Pid 0 is not a process: POSIX gives it the process-group meaning and
+    // `/proc/0` does not exist, so a name that reads as pid 0 is a name
+    // this crate did not write.
+    if pid == 0 {
+        return None;
+    }
+    Some(pid)
+}
+
+/// Whether the process with this pid is still running on this machine.
+///
+/// `OPS-23`: the answer decides whether the database of that process may be
+/// dropped at once. It is the answer that must never be wrong in the
+/// dangerous direction, so a pid that cannot be checked counts as alive:
+///
+/// * off Linux there is no `/proc` to look in, and this crate has no
+///   dependency that could ask the kernel (`kill(pid, 0)` needs `libc` or
+///   `nix`, and the workspace's `nix` has no `signal` feature);
+/// * on Linux without a mounted `/proc` the pid cannot be checked either;
+/// * a zombie still has its `/proc` entry, so it counts as alive. The
+///   owner is not running any more, but the kernel has not reaped it yet,
+///   and the old two-pass rule catches the database a moment later.
+fn pid_is_alive(pid: u32) -> bool {
+    if !cfg!(target_os = "linux") {
+        return true;
+    }
+    let proc_dir = std::path::Path::new("/proc");
+    if !proc_dir.is_dir() {
+        return true;
+    }
+    proc_dir.join(pid.to_string()).exists()
+}
+
+/// Whether the owner of the database with this name is gone.
+///
+/// A name that carries no pid has no owner this crate can see, so it is
+/// never "dead": it keeps the old two-pass rule.
+fn owner_is_dead(name: &str) -> bool {
+    owner_pid(name).is_some_and(|pid| !pid_is_alive(pid))
+}
+
+/// What a sweep pass does with one database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    /// The pass drops the database.
+    Drop,
+    /// The pass leaves the database alone.
+    Keep,
+}
+
+/// The decision for one database, from what the pass knows about it.
+///
+/// `idle_now` says the database had no backend at this pass, and
+/// `idle_last_pass` says it had none at the previous pass. The two of them
+/// are the rule the sweep has always had: a database nobody touches is
+/// dropped between 30 and 60 seconds after its last query.
+///
+/// `OPS-23` adds one rule on top of it: the database of a process that is
+/// gone is dropped at once, without waiting for the second pass. The wait
+/// exists for a database whose owner may still be using it, and a dead
+/// owner may not.
+fn sweep_decision(name: &str, idle_now: bool, idle_last_pass: bool) -> Decision {
+    if owner_is_dead(name) {
+        return Decision::Drop;
+    }
+    if idle_now && idle_last_pass {
+        return Decision::Drop;
+    }
+    Decision::Keep
+}
 
 /// Whether the sweep may drop the database with this name.
 ///
@@ -399,6 +556,9 @@ fn is_sweepable(name: &str) -> bool {
 ///
 /// The state is the set of names that had no connection on the previous
 /// pass: a database is only dropped once it was idle twice in a row.
+///
+/// `OPS-23`: a database whose owner process is gone is the one exception:
+/// it is dropped at the first pass that sees it, without the second one.
 struct Sweeper {
     /// The databases that had no connection on the previous pass.
     idle_seen_last_pass: BTreeSet<String>,
@@ -453,8 +613,9 @@ impl Sweeper {
 
     /// Runs one pass: every database in this sweeper's scope (`in_scope`:
     /// all of them for the sweep of a test process) that carries one of the
-    /// three test prefixes, that nobody is connected to, and that was
-    /// already idle on the previous pass is dropped.
+    /// three test prefixes is dropped when its owner process is gone
+    /// (`OPS-23`), or when nobody is connected to it and it was already
+    /// idle on the previous pass.
     ///
     /// The databases the pass picked are returned, and not only the ones
     /// that are gone: the server itself refuses to drop a database that has
@@ -489,25 +650,79 @@ impl Sweeper {
         .await?;
 
         let mut idle_now = BTreeSet::new();
+        let mut dead_owner_candidates: BTreeSet<String> = BTreeSet::new();
+        let mut two_pass_candidates: BTreeSet<String> = BTreeSet::new();
+
         for row in rows {
             let name: String = row.try_get("name")?;
             let busy: bool = row.try_get("busy")?;
             // OPS-22: a test's sweeper sees only the test's own databases.
-            if is_sweepable(&name) && self.in_scope(&name) && !busy {
-                idle_now.insert(name);
+            if !is_sweepable(&name) || !self.in_scope(&name) {
+                continue;
+            }
+            // The two sightings the two-pass rule reads: the database had
+            // no backend at this pass, and it had none at the previous one.
+            let idle_at_this_pass = !busy;
+            let idle_at_last_pass = self.idle_seen_last_pass.contains(&name);
+            // The liveness of the owner is read twice, once here and once
+            // inside `sweep_decision`. Two reads of `/proc` are cheap, and
+            // they disagree only when the owner dies between them. If the
+            // first read sees the owner alive and the second sees it dead,
+            // `sweep_decision` returns `Drop` but the guard below does not
+            // match, so the database takes the plain two-pass drop instead
+            // of the forced one. A database whose killed owner still has a
+            // backend on it fails that drop, and the next pass takes the
+            // forced one. If the first read sees the owner dead and the
+            // second sees it alive, `sweep_decision` drops the database
+            // only when it was idle at two passes, and that forced drop is
+            // still taken, because this read saw the owner dead. Otherwise
+            // the pass keeps it and the next pass drops it. Neither mixed
+            // read drops a live owner's database, because the forced drop
+            // is taken only when this read saw the owner dead (PR review).
+            let owner_dead = owner_is_dead(&name);
+            match sweep_decision(&name, idle_at_this_pass, idle_at_last_pass) {
+                // OPS-23: the owner is gone, so the database is dropped at
+                // once. It may even still have a backend on it: the
+                // connections of a process that was killed linger on the
+                // server for a moment, which is why the drop of these
+                // databases uses `WITH (FORCE)`.
+                Decision::Drop if owner_dead => {
+                    dead_owner_candidates.insert(name);
+                }
+                // The two-pass rule, unchanged: a database nobody touches
+                // is dropped between 30 and 60 seconds after its last
+                // query.
+                Decision::Drop => {
+                    idle_now.insert(name.clone());
+                    two_pass_candidates.insert(name);
+                }
+                Decision::Keep => {
+                    if idle_at_this_pass {
+                        idle_now.insert(name);
+                    }
+                }
             }
         }
 
-        // A database is dropped only when it was idle on this pass AND on
-        // the previous one: a database created a moment ago and not yet
-        // connected to is seen for the first time and left alone.
-        let candidates: Vec<String> = idle_now
-            .intersection(&self.idle_seen_last_pass)
-            .cloned()
-            .collect();
+        // The next pass reads this set: the two-pass rule drops a database
+        // only when it was idle at this pass AND at the previous one, so a
+        // database created a moment ago and not yet connected to is seen
+        // for the first time and left alone.
+        //
+        // A database of a dead owner is not in that set: it is dropped in
+        // this same pass, and if the drop fails the dead-owner rule tries
+        // again on the next pass, without any bookkeeping.
         self.idle_seen_last_pass = idle_now;
 
-        for name in &candidates {
+        // The databases of a dead owner go first: a pass that dies half
+        // way through a long candidate list must not leave the databases of
+        // a crashed run behind, and those are the urgent ones. Both
+        // candidate sets are sorted, so the order is alphabetical today.
+        for name in &dead_owner_candidates {
+            // `WITH (FORCE)` closes the connections that are still open:
+            // the owner is gone, but the server may not have noticed yet,
+            // and it refuses to drop a database that is in use.
+            //
             // `DROP DATABASE` takes an identifier, which cannot be bound as
             // a parameter. The name was checked by `is_sweepable` against
             // the three test prefixes and the `[A-Za-z0-9_]` charset, so it
@@ -517,6 +732,16 @@ impl Sweeper {
             // testing/mod.rs:190`). That is why the statement may be built
             // with `format!` (`AGENTS.md`: "format! only for constant
             // identifiers").
+            let statement = format!("DROP DATABASE {name:?} WITH (FORCE)");
+            // A drop that fails is ignored: somebody connected to the
+            // database in between, and the next pass tries again.
+            let _ = sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&mut conn)
+                .await;
+        }
+        // The two-pass candidates keep the plain drop of the sweep before
+        // OPS-23, and the same quoting (see above).
+        for name in &two_pass_candidates {
             let statement = format!("DROP DATABASE {name:?}");
             // A drop that fails is ignored: somebody connected to the
             // database in between, and the next pass tries again.
@@ -524,7 +749,10 @@ impl Sweeper {
                 .execute(&mut conn)
                 .await;
         }
-        Ok(candidates)
+        Ok(dead_owner_candidates
+            .into_iter()
+            .chain(two_pass_candidates)
+            .collect())
     }
 }
 
@@ -613,7 +841,17 @@ mod tests {
 
     use sqlx::{Connection, PgConnection};
 
-    use super::{SWEEP_INTERVAL, Sweeper, database_url, error_kind, is_sweepable};
+    use super::{
+        Decision, SWEEP_INTERVAL, Sweeper, database_url, error_kind, is_sweepable, owner_pid,
+        pid_is_alive, sweep_decision,
+    };
+
+    /// A pid that no process on this machine can have.
+    ///
+    /// Linux caps the pid at `pid_max` (4194304 by default), so
+    /// `/proc/4294967295` cannot exist and the owner of a database named
+    /// after that pid is gone.
+    const DEAD_PID: u32 = u32::MAX;
 
     /// A suffix that makes a test database name unique and keeps it inside
     /// the `[A-Za-z0-9_]` charset the sweep allows.
@@ -784,6 +1022,135 @@ mod tests {
         assert!(!is_sweepable("Xsqlx_test_abc"));
         assert!(!is_sweepable("lakehouse_api_test_a-b"));
         assert!(!is_sweepable("lakehouse_api_test_a\"b"));
+    }
+
+    #[test]
+    fn the_database_of_a_dead_owner_is_dropped_in_the_first_pass() {
+        // OPS-23: the owner of the database is gone, so the two-pass wait
+        // does not apply to it: the pass drops it at once.
+        assert!(
+            !pid_is_alive(DEAD_PID),
+            "the liveness check must be able to tell that this pid is gone"
+        );
+        let name = format!("lakehouse_api_test_p{DEAD_PID}_0123456789abcdef");
+        assert_eq!(
+            sweep_decision(&name, true, false),
+            Decision::Drop,
+            "the database of a dead owner is dropped in the first pass"
+        );
+    }
+
+    #[test]
+    fn the_database_of_a_live_owner_is_kept() {
+        // The owner of this database is this test process, which is alive:
+        // the dead-owner rule does not fire, and the two-pass rule applies
+        // to it as it does to every other name.
+        let name = format!(
+            "lakehouse_api_test_p{}_0123456789abcdef",
+            std::process::id()
+        );
+        assert_eq!(
+            sweep_decision(&name, true, false),
+            Decision::Keep,
+            "the database of a live owner is kept at the first pass"
+        );
+        assert_eq!(
+            sweep_decision(&name, false, false),
+            Decision::Keep,
+            "the database of a live owner is kept while it is in use"
+        );
+        assert_eq!(
+            sweep_decision(&name, true, true),
+            Decision::Drop,
+            "the two-pass rule still applies to the database of a live owner"
+        );
+    }
+
+    #[test]
+    fn an_old_style_name_keeps_the_two_pass_rule() {
+        // A name without a pid keeps the rule of the sweep before OPS-23:
+        // two idle passes, 30 seconds apart.
+        let name = "lakehouse_api_test_0123456789abcdef";
+        assert_eq!(
+            sweep_decision(name, true, false),
+            Decision::Keep,
+            "the first sight of an old-style database leaves it alone"
+        );
+        assert_eq!(
+            sweep_decision(name, false, false),
+            Decision::Keep,
+            "a database in use is kept"
+        );
+        assert_eq!(
+            sweep_decision(name, false, true),
+            Decision::Keep,
+            "a database in use is kept"
+        );
+        assert_eq!(
+            sweep_decision(name, true, true),
+            Decision::Drop,
+            "an old-style database is dropped after two idle passes"
+        );
+    }
+
+    #[test]
+    fn a_malformed_pid_part_is_treated_as_an_old_style_name() {
+        // OPS-23: a name this crate did not write must never be read as a
+        // pid, not even as the pid 0. Such a name keeps the two-pass rule.
+        for name in [
+            "lakehouse_api_test_p_0123456789abcdef",
+            "lakehouse_api_test_px_0123456789abcdef",
+            "lakehouse_api_test_p12",
+            "lakehouse_api_test_p12a_0123456789abcdef",
+            "lakehouse_api_test_p99999999999999_0123456789abcdef",
+            // Pid 0 is not a process: it is not alive, so a name that reads
+            // as pid 0 would be dropped as the database of a dead owner.
+            "lakehouse_api_test_p0_0123456789abcdef",
+        ] {
+            assert_eq!(owner_pid(name), None, "{name} carries no pid");
+            assert_eq!(
+                sweep_decision(name, true, false),
+                Decision::Keep,
+                "{name} keeps the two-pass rule"
+            );
+            assert_eq!(
+                sweep_decision(name, true, true),
+                Decision::Drop,
+                "{name} keeps the two-pass rule"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_owner_prefix_names_carry_a_pid() {
+        assert_eq!(
+            owner_pid("lakehouse_api_test_p123_0123456789abcdef"),
+            Some(123)
+        );
+        // The other two prefixes never carry an owner: sqlx writes that
+        // name itself (base64url of a SHA-512 digest, so the part behind
+        // the prefix may hold almost anything), and the binary crate's own
+        // tests write no pid into their name.
+        assert_eq!(owner_pid("_sqlx_test_p123_0123456789abcdef"), None);
+        assert_eq!(
+            owner_pid("lakehouse_api_main_test_p123_0123456789abcdef"),
+            None
+        );
+        // A pid without the `_` that separates it from the rest of the name
+        // is malformed: the name is not one the harness wrote.
+        assert_eq!(owner_pid("lakehouse_api_test_p123"), None);
+    }
+
+    #[test]
+    fn the_name_of_a_per_test_database_is_sweepable_and_short_enough() {
+        // The name the harness of `lakehouse-api`'s integration tests
+        // writes: `lakehouse_api_test_p` (20 bytes) + the pid (at most 7
+        // digits) + `_` + the 32 hex characters of the UUID = 60 bytes,
+        // inside Postgres's 63-byte identifier limit.
+        let name = format!("lakehouse_api_test_p{}_{}", 4_194_304, "0".repeat(32));
+        assert!(is_sweepable(&name), "{name} may be swept");
+        assert!(name.len() <= 63, "{name} is too long for Postgres");
+        assert_eq!(owner_pid(&name), Some(4_194_304));
     }
 
     #[tokio::test]

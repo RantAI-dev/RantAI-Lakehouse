@@ -34,7 +34,17 @@ const SEGMENT =
  * The engine, as an app menu (not a native select), named the way the
  * engines name themselves.
  */
-function EngineMenu({ studio }: { readonly studio: Studio }) {
+function EngineMenu({
+  studio,
+  availableEngines,
+}: {
+  readonly studio: Studio
+  readonly availableEngines: readonly QueryEngine[]
+}) {
+  // BI-44: a `bi-only` install runs one engine. The page keeps the tab on it,
+  // but a stale draft can still name the other one before its effect lands;
+  // the menu never offers an engine the API would refuse with a 400.
+  const engines = ENGINES.filter((engine) => availableEngines.includes(engine.value))
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
@@ -57,7 +67,7 @@ function EngineMenu({ studio }: { readonly studio: Studio }) {
             value={studio.engine}
             onValueChange={(value) => studio.setEngine(value as QueryEngine)}
           >
-            {ENGINES.map((engine) => (
+            {engines.map((engine) => (
               <DropdownMenuRadioItem key={engine.value} value={engine.value} className="items-start">
                 <span className="grid">
                   <span>{queryEngineLabel(engine.value)}</span>
@@ -158,14 +168,17 @@ function EstimateSummary({
 export function StudioStatusBar({
   studio,
   onOpenPlan,
+  availableEngines = ["clickhouse", "trino"],
 }: {
   readonly studio: Studio
   readonly onOpenPlan: () => void
+  /** The engines this installation can run (`BI-44`). */
+  readonly availableEngines?: readonly QueryEngine[]
 }) {
   const keys = useStudioKeys()
   return (
     <div className="flex h-8 items-center gap-1 overflow-x-auto border-t border-border/60 px-2 text-xs text-muted-foreground [scrollbar-width:none]">
-      <EngineMenu studio={studio} />
+      <EngineMenu studio={studio} availableEngines={availableEngines} />
       <span aria-hidden className="text-border">
         |
       </span>

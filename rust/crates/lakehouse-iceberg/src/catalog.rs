@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use iceberg::io::S3_PATH_STYLE_ACCESS;
-use iceberg::spec::{DataFileFormat, FormatVersion, NestedField};
+use iceberg::spec::{DataFile, DataFileFormat, FormatVersion, NestedField};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::IcebergWriter;
@@ -274,15 +274,20 @@ impl IcebergClient {
         Ok(BronzeTable { table })
     }
 
-    /// Ensures the flat `gold` namespace (ADR 0010) exists, creating it if
-    /// not. Idempotent, same shape as [`Self::ensure_bronze_namespace`].
+    /// Ensures the flat namespace for `zone` exists, creating it if not.
+    /// Idempotent, same shape as [`Self::ensure_bronze_namespace`].
     ///
     /// # Errors
     ///
     /// Returns [`IcebergError::Catalog`] for any failure other than the
     /// namespace already existing.
-    pub async fn ensure_gold_namespace(&self) -> Result<NamespaceIdent, IcebergError> {
-        let namespace = gold::gold_namespace().map_err(|e| IcebergError::Bronze(e.to_string()))?;
+    pub async fn ensure_published_namespace(
+        &self,
+        zone: gold::PublishZone,
+    ) -> Result<NamespaceIdent, IcebergError> {
+        let namespace = zone
+            .namespace()
+            .map_err(|e| IcebergError::Bronze(e.to_string()))?;
         if self.catalog.namespace_exists(&namespace).await? {
             return Ok(namespace);
         }
@@ -306,26 +311,40 @@ impl IcebergClient {
         }
     }
 
-    /// Creates a Gold export table named `mart_name` (sanitized per
-    /// `gold::sanitize_mart_name`) in the `gold` namespace (ADR 0010), with
+    /// Ensures the flat `gold` namespace (ADR 0010) exists. Thin wrapper
+    /// over [`Self::ensure_published_namespace`] kept for 100% backward
+    /// compatibility (DATA-65).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::ensure_published_namespace`].
+    pub async fn ensure_gold_namespace(&self) -> Result<NamespaceIdent, IcebergError> {
+        self.ensure_published_namespace(gold::PublishZone::Gold)
+            .await
+    }
+
+    /// Creates a published export table named `table_name` (sanitized per
+    /// `gold::sanitize_mart_name`) in `zone`'s namespace, with
     /// `domain_fields` plus the standard `_exported_at` column, partitioned
-    /// by `day(_exported_at)`, **always at Iceberg format-version 2**.
-    /// Fails if the table already exists — use [`Self::load_gold_table`]
-    /// for idempotent create-or-load.
+    /// by `day(_exported_at)`, **always at Iceberg format-version 2**. DATA-65:
+    /// the mechanics are identical for Silver and Gold; only the namespace
+    /// differs. Fails if the table already exists — use
+    /// [`Self::load_published_table`] for idempotent create-or-load.
     ///
     /// # Errors
     ///
     /// Returns [`IcebergError::Bronze`] if the name/schema/partition spec
     /// cannot be constructed, or [`IcebergError::Catalog`] if the catalog
     /// call fails (including `TableAlreadyExists`).
-    pub async fn create_gold_table(
+    pub async fn create_published_table(
         &self,
-        mart_name: &str,
+        zone: gold::PublishZone,
+        table_name: &str,
         domain_fields: Vec<NestedField>,
     ) -> Result<GoldTable, IcebergError> {
-        let namespace = self.ensure_gold_namespace().await?;
-        let sanitized =
-            gold::sanitize_mart_name(mart_name).map_err(|e| IcebergError::Bronze(e.to_string()))?;
+        let namespace = self.ensure_published_namespace(zone).await?;
+        let sanitized = gold::sanitize_mart_name(table_name)
+            .map_err(|e| IcebergError::Bronze(e.to_string()))?;
         let schema =
             gold::gold_schema(domain_fields).map_err(|e| IcebergError::Bronze(e.to_string()))?;
         let partition_spec = gold::export_day_partition_spec(&schema)
@@ -342,23 +361,57 @@ impl IcebergClient {
         Ok(GoldTable { table })
     }
 
-    /// Loads an existing Gold export table by mart name.
+    /// Creates a Gold export table — thin wrapper over
+    /// [`Self::create_published_table`] with [`gold::PublishZone::Gold`],
+    /// kept for backward compatibility (DATA-65).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::create_published_table`].
+    pub async fn create_gold_table(
+        &self,
+        table_name: &str,
+        domain_fields: Vec<NestedField>,
+    ) -> Result<GoldTable, IcebergError> {
+        self.create_published_table(gold::PublishZone::Gold, table_name, domain_fields)
+            .await
+    }
+
+    /// Loads an existing published table by name from `zone`'s namespace.
     ///
     /// # Errors
     ///
     /// Returns [`IcebergError::Catalog`] if the table does not exist or the
     /// catalog call fails.
-    pub async fn load_gold_table(&self, mart_name: &str) -> Result<GoldTable, IcebergError> {
-        let namespace = gold::gold_namespace().map_err(|e| IcebergError::Bronze(e.to_string()))?;
-        let sanitized =
-            gold::sanitize_mart_name(mart_name).map_err(|e| IcebergError::Bronze(e.to_string()))?;
+    pub async fn load_published_table(
+        &self,
+        zone: gold::PublishZone,
+        table_name: &str,
+    ) -> Result<GoldTable, IcebergError> {
+        let namespace = zone
+            .namespace()
+            .map_err(|e| IcebergError::Bronze(e.to_string()))?;
+        let sanitized = gold::sanitize_mart_name(table_name)
+            .map_err(|e| IcebergError::Bronze(e.to_string()))?;
         let ident = TableIdent::new(namespace, sanitized);
         let table = self.catalog.load_table(&ident).await?;
         Ok(GoldTable { table })
     }
 
-    /// Loads an existing Gold export table by mart name, or `None` when the
-    /// catalog says the table does not exist (`DATA-49`, QA `LH-DATA-1-01`).
+    /// Loads an existing Gold export table — thin wrapper over
+    /// [`Self::load_published_table`] with [`gold::PublishZone::Gold`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::load_published_table`].
+    pub async fn load_gold_table(&self, table_name: &str) -> Result<GoldTable, IcebergError> {
+        self.load_published_table(gold::PublishZone::Gold, table_name)
+            .await
+    }
+
+    /// Loads an existing published table by name from `zone`'s namespace,
+    /// or `None` when the catalog says the table does not exist (`DATA-49`,
+    /// QA `LH-DATA-1-01`).
     ///
     /// The kind is read off the raw [`iceberg::Error`] before
     /// [`IcebergError`]'s conversion keeps only its `Display`; the REST client
@@ -370,14 +423,17 @@ impl IcebergClient {
     ///
     /// Returns [`IcebergError::Catalog`] if the catalog call fails for any
     /// reason other than "table not found", and [`IcebergError::Bronze`] if
-    /// the mart name or namespace cannot be built.
-    pub async fn load_gold_table_if_exists(
+    /// the table name or namespace cannot be built.
+    pub async fn load_published_table_if_exists(
         &self,
-        mart_name: &str,
+        zone: gold::PublishZone,
+        table_name: &str,
     ) -> Result<Option<GoldTable>, IcebergError> {
-        let namespace = gold::gold_namespace().map_err(|e| IcebergError::Bronze(e.to_string()))?;
-        let sanitized =
-            gold::sanitize_mart_name(mart_name).map_err(|e| IcebergError::Bronze(e.to_string()))?;
+        let namespace = zone
+            .namespace()
+            .map_err(|e| IcebergError::Bronze(e.to_string()))?;
+        let sanitized = gold::sanitize_mart_name(table_name)
+            .map_err(|e| IcebergError::Bronze(e.to_string()))?;
         let ident = TableIdent::new(namespace, sanitized);
         match self.catalog.load_table(&ident).await {
             Ok(table) => Ok(Some(GoldTable { table })),
@@ -386,23 +442,59 @@ impl IcebergClient {
         }
     }
 
-    /// Creates the Gold table if it does not already exist, or loads it if
-    /// it does. Every export run after the first hits the `load` branch —
-    /// the schema/partition spec passed here only matters for the table's
-    /// first creation.
+    /// Loads an existing Gold export table, or `None` when not published.
+    /// Thin wrapper over [`Self::load_published_table_if_exists`] with
+    /// [`gold::PublishZone::Gold`] (DATA-65).
     ///
     /// # Errors
     ///
-    /// See [`Self::create_gold_table`] and [`Self::load_gold_table`].
-    pub async fn create_or_load_gold_table(
+    /// See [`Self::load_published_table_if_exists`].
+    pub async fn load_gold_table_if_exists(
         &self,
-        mart_name: &str,
+        table_name: &str,
+    ) -> Result<Option<GoldTable>, IcebergError> {
+        self.load_published_table_if_exists(gold::PublishZone::Gold, table_name)
+            .await
+    }
+
+    /// Creates the published table if it does not already exist, or loads
+    /// it if it does. Every export run after the first hits the `load`
+    /// branch — the schema/partition spec passed here only matters for the
+    /// table's first creation.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::create_published_table`] and
+    /// [`Self::load_published_table`].
+    pub async fn create_or_load_published_table(
+        &self,
+        zone: gold::PublishZone,
+        table_name: &str,
         domain_fields: Vec<NestedField>,
     ) -> Result<GoldTable, IcebergError> {
-        match self.load_gold_table(mart_name).await {
+        match self.load_published_table(zone, table_name).await {
             Ok(table) => Ok(table),
-            Err(_) => self.create_gold_table(mart_name, domain_fields).await,
+            Err(_) => {
+                self.create_published_table(zone, table_name, domain_fields)
+                    .await
+            }
         }
+    }
+
+    /// Creates-or-loads a Gold export table — thin wrapper over
+    /// [`Self::create_or_load_published_table`] with
+    /// [`gold::PublishZone::Gold`] (DATA-65).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::create_or_load_published_table`].
+    pub async fn create_or_load_gold_table(
+        &self,
+        table_name: &str,
+        domain_fields: Vec<NestedField>,
+    ) -> Result<GoldTable, IcebergError> {
+        self.create_or_load_published_table(gold::PublishZone::Gold, table_name, domain_fields)
+            .await
     }
 
     /// Borrows the underlying [`Catalog`] — needed because
@@ -587,13 +679,14 @@ impl GoldTable {
     }
 
     /// The id of the table's current snapshot — the one just committed by
-    /// the most recent [`Self::append`], or `None` for a table that was
-    /// created (via [`IcebergClient::create_gold_table`]) but never
-    /// appended to. `gold_export::export_mart` never creates a table
-    /// without immediately appending at least one batch to it (a zero-row
-    /// source mart is a documented no-op there, per its own doc comment),
-    /// so in practice this is only ever `None` for a table this crate has
-    /// not written to at all.
+    /// the most recent [`Self::commit_staged`] (or [`Self::append`]), or
+    /// `None` for a table that was created (via
+    /// [`IcebergClient::create_gold_table`]) but never committed to.
+    /// `gold_export::export_mart` never creates a table without immediately
+    /// committing at least one staged batch to it (a zero-row source mart
+    /// is a documented no-op there, per its own doc comment), so in
+    /// practice this is only ever `None` for a table this crate has not
+    /// written to at all.
     #[must_use]
     pub fn current_snapshot_id(&self) -> Option<i64> {
         self.table.metadata().current_snapshot_id()
@@ -622,20 +715,30 @@ impl GoldTable {
         gold::latest_copy_of(self.table.metadata().properties())
     }
 
-    /// Appends `batch` as one new Parquet data file, in one fast-append
-    /// snapshot, committed through `catalog`. Same mechanics as
-    /// [`BronzeTable::append`], partitioned by `day(_exported_at)` instead
-    /// of `day(_ingested_at)`.
+    /// Writes `batch` as one or more Parquet data files to object storage
+    /// and returns their [`DataFile`] descriptors, WITHOUT committing an
+    /// `Iceberg` snapshot. The files are invisible to every catalog reader
+    /// until they are handed to [`Self::commit_staged`].
+    ///
+    /// This is the write half of [`Self::append`], split out so a multi-batch
+    /// publish (DATA-63) can stage a whole publish one bounded batch at a
+    /// time — keeping only the small `Vec<DataFile>` descriptors across
+    /// batches, never the `RecordBatch` data — and then commit every file
+    /// in ONE snapshot. Staging a later batch failing therefore cannot
+    /// expose an earlier batch's rows: no snapshot exists until the commit.
+    ///
+    /// The Parquet writer, file naming, and `day(_exported_at)` partition
+    /// value are exactly the ones [`BronzeTable::append`] uses, with the
+    /// Gold prefix and Gold partition key (same mechanics as the old
+    /// `GoldTable::append` write half). Each `DefaultFileNameGenerator` is
+    /// freshly seeded with a UUID, so batches never collide on a file name.
     ///
     /// # Errors
     ///
-    /// Returns [`IcebergError::Write`] if writing the Parquet data file
-    /// fails, or [`IcebergError::Catalog`] if the commit fails.
-    pub async fn append(
-        &mut self,
-        catalog: &dyn Catalog,
-        batch: RecordBatch,
-    ) -> Result<(), IcebergError> {
+    /// Returns [`IcebergError::Bronze`] if the partition value cannot be
+    /// derived from `batch`'s `_exported_at` column, or
+    /// [`IcebergError::Write`] if writing/closing a Parquet data file fails.
+    pub async fn stage_batch(&self, batch: RecordBatch) -> Result<Vec<DataFile>, IcebergError> {
         let metadata = self.table.metadata();
         let location_generator = DefaultLocationGenerator::new(metadata)
             .map_err(|e| IcebergError::Write(e.to_string()))?;
@@ -656,6 +759,12 @@ impl GoldTable {
             file_name_generator,
         );
         let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
+        // Every Gold table is partitioned by `day(_exported_at)` (see
+        // `gold::export_day_partition_spec`), so the writer needs the
+        // partition value for THIS batch up front. `gold::partition_key_for`
+        // computes it from `batch`'s `_exported_at` column; see that
+        // function's doc comment for the one-partition-per-batch assumption
+        // this makes.
         let partition_key = gold::partition_key_for(metadata, &batch)
             .map_err(|e| IcebergError::Bronze(e.to_string()))?;
         let mut writer: data_file_writer::DataFileWriter<_, _, _> = data_file_writer_builder
@@ -672,12 +781,64 @@ impl GoldTable {
             .await
             .map_err(|e| IcebergError::Write(e.to_string()))?;
 
+        Ok(data_files)
+    }
+
+    /// Commits every staged `data_files` descriptor in ONE fast-append
+    /// transaction — one new `Iceberg` snapshot visible to catalog readers
+    /// at one instant, containing all the rows of the whole publish.
+    ///
+    /// An empty `data_files` is a no-op (no empty snapshot is issued): an
+    /// `iceberg-rust` fast append with zero files is invalid, and a publish
+    /// that staged nothing has nothing to commit. This is the zero-row
+    /// publish case (DATA-63).
+    ///
+    /// A caller whose staging failed partway through a publish must simply
+    /// not call this: dropping the staged descriptors commits nothing, so
+    /// no partial copy can ever become visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IcebergError::Catalog`] if the commit fails (including a
+    /// concurrent-modification conflict — `iceberg-rust` retries those
+    /// internally before surfacing an error).
+    pub async fn commit_staged(
+        &mut self,
+        catalog: &dyn Catalog,
+        data_files: Vec<DataFile>,
+    ) -> Result<(), IcebergError> {
+        if data_files.is_empty() {
+            return Ok(());
+        }
         let txn = Transaction::new(&self.table);
         let action = txn.fast_append().add_data_files(data_files);
         let txn = action.apply(txn).map_err(IcebergError::from)?;
         self.table = txn.commit(catalog).await.map_err(IcebergError::from)?;
-
         Ok(())
+    }
+
+    /// Appends `batch` as one new Parquet data file, in one fast-append
+    /// snapshot, committed through `catalog`. Same mechanics as
+    /// [`BronzeTable::append`], partitioned by `day(_exported_at)` instead
+    /// of `day(_ingested_at)`.
+    ///
+    /// This is the single-batch convenience path: it stages `batch` with
+    /// [`Self::stage_batch`] and commits the resulting files with
+    /// [`Self::commit_staged`]. A multi-batch publish must NOT call this per
+    /// batch — that would revert DATA-63 and expose a partial copy between
+    /// batches. Keep this method for callers that have exactly one batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IcebergError::Write`] if writing the Parquet data file
+    /// fails, or [`IcebergError::Catalog`] if the commit fails.
+    pub async fn append(
+        &mut self,
+        catalog: &dyn Catalog,
+        batch: RecordBatch,
+    ) -> Result<(), IcebergError> {
+        let data_files = self.stage_batch(batch).await?;
+        self.commit_staged(catalog, data_files).await
     }
 
     /// Reads every row currently visible in the table's latest snapshot —
@@ -710,27 +871,225 @@ mod tests {
 
     //! `GoldTable::current_snapshot_id`/`current_snapshot_timestamp_ms` are
     //! thin delegations to `iceberg-rust`'s own (already-tested)
-    //! `TableMetadata` accessors — the behavior worth proving here is only
+    //! `TableMetadata` accessors — the behavior worth proving there is only
     //! "before any snapshot exists, both are `None`; once one does, both
-    //! are `Some`". Neither this crate nor its `iceberg` dependency ships
-    //! an in-memory `Catalog` implementation (`iceberg-catalog-memory` is
-    //! not a dependency — confirmed by reading `Cargo.toml`), and the only
-    //! existing Gold-table test in this repository
-    //! (`tests/g1_lakekeeper.rs`) is `#[ignore]`d and needs a live
-    //! Lakekeeper/`RustFS` stack. So these tests build a `Table` directly
-    //! from an in-memory `TableMetadata` (via `TableMetadataBuilder`, the
-    //! same builder `iceberg-catalog-rest`'s own `Catalog` impl uses
-    //! internally) and `FileIO::new_with_memory()` — no network, no disk,
-    //! no new dependency — then construct `GoldTable` by hand since this
-    //! test module is nested inside `catalog.rs` and can see its private
-    //! `table` field directly.
+    //! are `Some`". Those tests build a `Table` directly from an in-memory
+    //! `TableMetadata` (via `TableMetadataBuilder`) and
+    //! `FileIO::new_with_memory()`.
+    //!
+    //! The DATA-63 atomic-publish tests below need a real `Transaction::
+    //! commit` (staging alone must not create a snapshot; a whole publish
+    //! must create exactly one). `iceberg` 0.10.1 keeps its `MemoryCatalog`
+    //! builder behind a private module, so those tests use a minimal
+    //! `Catalog` double that implements exactly the two calls a transaction
+    //! commit makes (`load_table` and `update_table`), backed by the same
+    //! in-memory `FileIO` the fixture above uses — no live Lakekeeper /
+    //! `RustFS` stack and no new dependency.
 
+    use arrow_array::{ArrayRef, StringArray, TimestampMicrosecondArray};
     use iceberg::Runtime;
+    use iceberg::arrow::schema_to_arrow_schema;
     use iceberg::io::FileIO;
     use iceberg::spec::{Operation, Snapshot, SortOrder, Summary, TableMetadataBuilder};
     use iceberg::table::Table;
 
     use super::*;
+
+    /// A catalog double for the transaction-commit tests. A commit only
+    /// calls `load_table` (to refresh its base) and `update_table` (to apply
+    /// the staged `TableUpdates`); every other catalog method is unused and
+    /// fails loudly rather than fabricating a result.
+    #[derive(Debug)]
+    struct CommitCatalog {
+        current: std::sync::Mutex<Table>,
+    }
+
+    fn unsupported<T>() -> iceberg::Result<T> {
+        Err(iceberg::Error::new(
+            iceberg::ErrorKind::FeatureUnsupported,
+            "this test catalog only implements load_table and update_table",
+        ))
+    }
+
+    #[async_trait::async_trait]
+    impl Catalog for CommitCatalog {
+        async fn list_namespaces(
+            &self,
+            _parent: Option<&iceberg::NamespaceIdent>,
+        ) -> iceberg::Result<Vec<iceberg::NamespaceIdent>> {
+            unsupported()
+        }
+
+        async fn create_namespace(
+            &self,
+            _namespace: &iceberg::NamespaceIdent,
+            _properties: HashMap<String, String>,
+        ) -> iceberg::Result<iceberg::Namespace> {
+            unsupported()
+        }
+
+        async fn get_namespace(
+            &self,
+            _namespace: &iceberg::NamespaceIdent,
+        ) -> iceberg::Result<iceberg::Namespace> {
+            unsupported()
+        }
+
+        async fn namespace_exists(
+            &self,
+            _namespace: &iceberg::NamespaceIdent,
+        ) -> iceberg::Result<bool> {
+            unsupported()
+        }
+
+        async fn update_namespace(
+            &self,
+            _namespace: &iceberg::NamespaceIdent,
+            _properties: HashMap<String, String>,
+        ) -> iceberg::Result<()> {
+            unsupported()
+        }
+
+        async fn drop_namespace(
+            &self,
+            _namespace: &iceberg::NamespaceIdent,
+        ) -> iceberg::Result<()> {
+            unsupported()
+        }
+
+        async fn list_tables(
+            &self,
+            _namespace: &iceberg::NamespaceIdent,
+        ) -> iceberg::Result<Vec<iceberg::TableIdent>> {
+            unsupported()
+        }
+
+        async fn create_table(
+            &self,
+            _namespace: &iceberg::NamespaceIdent,
+            _creation: iceberg::TableCreation,
+        ) -> iceberg::Result<Table> {
+            unsupported()
+        }
+
+        async fn load_table(&self, ident: &iceberg::TableIdent) -> iceberg::Result<Table> {
+            let current = self.current.lock().expect("catalog lock is not poisoned");
+            assert_eq!(
+                current.identifier(),
+                ident,
+                "the commit asks for this table"
+            );
+            Ok(current.clone())
+        }
+
+        async fn drop_table(&self, _table: &iceberg::TableIdent) -> iceberg::Result<()> {
+            unsupported()
+        }
+
+        async fn purge_table(&self, _table: &iceberg::TableIdent) -> iceberg::Result<()> {
+            unsupported()
+        }
+
+        async fn table_exists(&self, _table: &iceberg::TableIdent) -> iceberg::Result<bool> {
+            unsupported()
+        }
+
+        async fn rename_table(
+            &self,
+            _src: &iceberg::TableIdent,
+            _dest: &iceberg::TableIdent,
+        ) -> iceberg::Result<()> {
+            unsupported()
+        }
+
+        async fn register_table(
+            &self,
+            _table: &iceberg::TableIdent,
+            _metadata_location: String,
+        ) -> iceberg::Result<Table> {
+            unsupported()
+        }
+
+        async fn update_table(&self, commit: iceberg::TableCommit) -> iceberg::Result<Table> {
+            let mut current = self.current.lock().expect("catalog lock is not poisoned");
+            let staged = commit.apply(current.clone())?;
+            *current = staged.clone();
+            Ok(staged)
+        }
+    }
+
+    /// The existing in-memory fixture plus a catalog double seeded with the
+    /// same table, so a reader loading through `catalog` and the writer's
+    /// `GoldTable` start from identical metadata.
+    fn gold_table_with_catalog() -> (GoldTable, CommitCatalog) {
+        let table = gold_table_fixture();
+        let catalog = CommitCatalog {
+            current: std::sync::Mutex::new(table.table.clone()),
+        };
+        (table, catalog)
+    }
+
+    /// A `RecordBatch` matching `table`'s Gold schema: one publish stamp for
+    /// every row, plus `rows` region values.
+    fn batch_of(table: &GoldTable, rows: usize) -> RecordBatch {
+        let arrow_schema =
+            Arc::new(schema_to_arrow_schema(table.schema()).expect("arrow schema converts"));
+        let exported_at: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            1_795_168_800_123_456_i64;
+            rows
+        ]));
+        let region: ArrayRef = Arc::new(StringArray::from(vec!["west"; rows]));
+        RecordBatch::try_new(arrow_schema, vec![exported_at, region]).expect("record batch builds")
+    }
+
+    /// Reloads the table from the catalog and returns (snapshot count, rows
+    /// visible). Reading through the catalog is the point: a reader outside
+    /// this process sees exactly what the commit made visible.
+    async fn snapshot_count_and_rows(
+        catalog: &CommitCatalog,
+        ident: &iceberg::TableIdent,
+    ) -> (usize, usize) {
+        let table = catalog
+            .load_table(ident)
+            .await
+            .expect("gold table reloads from the catalog");
+        let snapshots = table.metadata().snapshots().len();
+        let gold = GoldTable { table };
+        let rows: usize = gold
+            .read_all()
+            .await
+            .expect("committed rows read back")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        (snapshots, rows)
+    }
+
+    /// Mirrors `gold_export::export_mart`'s publish loop: stage each batch
+    /// into the small descriptor accumulator, then commit ALL of them once
+    /// after the loop. A failure on any batch returns early, dropping the
+    /// staged descriptors without ever committing a snapshot — so the
+    /// failure behavior the real export has is what these tests exercise.
+    async fn publish_batches(
+        table: &mut GoldTable,
+        catalog: &dyn Catalog,
+        batches: &[usize],
+        fail_at: Option<usize>,
+    ) -> Result<(), ()> {
+        let mut staged = Vec::new();
+        for (index, &rows) in batches.iter().enumerate() {
+            if Some(index) == fail_at {
+                return Err(());
+            }
+            staged.extend(
+                table
+                    .stage_batch(batch_of(table, rows))
+                    .await
+                    .map_err(|_| ())?,
+            );
+        }
+        table.commit_staged(catalog, staged).await.map_err(|_| ())
+    }
 
     fn gold_table_fixture() -> GoldTable {
         let schema = gold::gold_schema(vec![NestedField::required(
@@ -758,6 +1117,14 @@ mod tests {
         let table = Table::builder()
             .identifier(identifier)
             .metadata(metadata)
+            // A commit needs a metadata location to derive the next one
+            // from (`Table::metadata_location_result`). The in-memory file
+            // store needs no real file at this path; a real catalog would
+            // have written the initial metadata there.
+            .metadata_location(
+                "memory:///gold/sales/metadata/0-00000000-0000-0000-0000-000000000000.metadata.json"
+                    .to_owned(),
+            )
             .file_io(FileIO::new_with_memory())
             .runtime(Runtime::current())
             .build()
@@ -815,5 +1182,113 @@ mod tests {
         let table = with_one_snapshot(gold_table_fixture());
         assert_eq!(table.current_snapshot_id(), Some(1));
         assert!(table.current_snapshot_timestamp_ms().is_some());
+    }
+
+    // DATA-63: the whole point of the fix. Three batches staged separately
+    // (bounded memory: only descriptors survive between batches) are
+    // committed in ONE snapshot; an outside catalog reader sees all seven
+    // rows at once, never a prefix of the new copy.
+    #[tokio::test]
+    async fn three_staged_batches_commit_as_one_snapshot_with_every_row_visible() {
+        let (mut table, catalog) = gold_table_with_catalog();
+        let ident = table.identifier().clone();
+
+        publish_batches(&mut table, &catalog, &[2, 2, 3], None)
+            .await
+            .expect("the publish commits");
+
+        let (snapshots, rows) = snapshot_count_and_rows(&catalog, &ident).await;
+        assert_eq!(
+            snapshots, 1,
+            "exactly one Iceberg snapshot for the whole publish, not one per batch"
+        );
+        assert_eq!(rows, 7, "all three batches' rows are in that one snapshot");
+        assert_eq!(
+            table.current_snapshot_id(),
+            snapshot_id_of(&catalog, &ident).await
+        );
+    }
+
+    // DATA-63: a failure on batch 2 of a 3-batch publish must leave the
+    // table's snapshot unchanged. The first batch's file is written to
+    // storage but never committed, so no partial copy is visible to a
+    // catalog reader — they still see the previous copy only.
+    #[tokio::test]
+    async fn a_failure_on_a_later_batch_commits_no_partial_snapshot() {
+        let (mut table, catalog) = gold_table_with_catalog();
+        let ident = table.identifier().clone();
+
+        // Seed a first copy so "unchanged" is a specific, observable id and
+        // row count (a zero-snapshot table would make the assertion weak).
+        table
+            .append(&catalog, batch_of(&table, 3))
+            .await
+            .expect("first copy committed");
+        let before_id = table
+            .current_snapshot_id()
+            .expect("first copy has a snapshot");
+        let (before_snapshots, before_rows) = snapshot_count_and_rows(&catalog, &ident).await;
+
+        let failed = publish_batches(&mut table, &catalog, &[2, 2, 3], Some(1)).await;
+        assert!(failed.is_err(), "a failure on batch 2 aborts the publish");
+
+        let (after_snapshots, after_rows) = snapshot_count_and_rows(&catalog, &ident).await;
+        assert_eq!(after_snapshots, before_snapshots);
+        assert_eq!(after_rows, before_rows);
+        assert_eq!(table.current_snapshot_id(), Some(before_id));
+        assert_eq!(
+            after_rows, 3,
+            "no rows from the failed publish leaked into the table"
+        );
+    }
+
+    // DATA-63: a zero-row publish stages nothing, so its single commit is a
+    // no-op — no empty snapshot, no empty table mutation, no error (an
+    // iceberg-rust fast append with zero files is invalid).
+    #[tokio::test]
+    async fn committing_no_staged_files_creates_no_snapshot() {
+        let (mut table, catalog) = gold_table_with_catalog();
+        let ident = table.identifier().clone();
+
+        table
+            .commit_staged(&catalog, Vec::new())
+            .await
+            .expect("an empty commit is a no-op");
+        publish_batches(&mut table, &catalog, &[], None)
+            .await
+            .expect("a publish with no batches is a no-op");
+
+        let (snapshots, rows) = snapshot_count_and_rows(&catalog, &ident).await;
+        assert_eq!(snapshots, 0, "no empty snapshot was issued");
+        assert_eq!(rows, 0);
+        assert_eq!(table.current_snapshot_id(), None);
+    }
+
+    // Existing single-batch callers keep working: `append` delegates to
+    // stage + one commit and still yields exactly one snapshot.
+    #[tokio::test]
+    async fn append_still_commits_a_single_batch_as_one_snapshot() {
+        let (mut table, catalog) = gold_table_with_catalog();
+        let ident = table.identifier().clone();
+
+        table
+            .append(&catalog, batch_of(&table, 4))
+            .await
+            .expect("append commits");
+
+        let (snapshots, rows) = snapshot_count_and_rows(&catalog, &ident).await;
+        assert_eq!(snapshots, 1);
+        assert_eq!(rows, 4);
+    }
+
+    /// The snapshot id as a reader of `catalog` sees it (not the writer's
+    /// in-memory handle).
+    async fn snapshot_id_of(catalog: &CommitCatalog, ident: &iceberg::TableIdent) -> Option<i64> {
+        catalog
+            .load_table(ident)
+            .await
+            .expect("gold table reloads")
+            .metadata()
+            .current_snapshot_id()
     }
 }

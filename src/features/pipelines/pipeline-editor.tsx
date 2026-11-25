@@ -17,6 +17,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { catalogRefusal } from "@/lib/catalog-refusal"
 import { withNotify } from "@/lib/notify"
 import {
   MAX_INPUTS,
@@ -61,7 +62,7 @@ import {
   type SaveBlocker,
 } from "@/lib/pipeline-editor"
 import { cn } from "@/lib/utils"
-import { connectorService, lakehouseService, pipelineService } from "@/services"
+import { assetService, connectorService, lakehouseService, pipelineService } from "@/services"
 import type {
   Pipeline,
   PipelineDetail,
@@ -89,6 +90,13 @@ import {
 } from "./pipeline-editor-panes"
 import { isSchedulable, PipelineScheduleField } from "./pipeline-schedule-field"
 import { BRONZE_ZONE, reuploadTriggerOn, showsReuploadSwitch, withReuploadTrigger } from "./pipeline-reupload-trigger"
+import {
+  catalogAssetId,
+  catalogNamespaceForZone,
+  INPUT_ZONE_VALUES,
+  OUTPUT_ZONE_VALUES,
+  ZONE_LABELS,
+} from "./pipeline-zones"
 
 /** The key a selection is filed under: the item's id, or `output`. */
 function selectionKey(selection: EditorSelection): string {
@@ -105,9 +113,9 @@ function selectionKey(selection: EditorSelection): string {
  *   settings**. Build is a rail (Inputs, Steps, Output) and, beside it, the
  *   pane of the selected item above its preview, the chart builder's layout.
  * - Every save sends `inputs` and `steps`, never the fields of before (D3).
- *   A create sends `kind: "batch"` and an edit sends the stored kind back:
- *   kind and the incremental column left the page (decision 18), because
- *   nothing reads them and every run rebuilds the output (`BLD-12`).
+ *   The Materialization section on the Settings tab owns `kind` and the
+ *   BLD-12 fields: a full rebuild, or an incremental append / partition
+ *   replace with a cursor column, granularity and lookback window.
  * - A refusal that names `inputs[i]` or `steps[i]` selects that item and
  *   shows the message in its pane (D7).
  * - The preview runs the selected input or step as the person looking
@@ -149,6 +157,22 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
   // off and an edit sends the stored value back unchanged. It is not on the
   // page (D17 lists what the second tab holds, and FBIC is not in it).
   const fbicEnabled = def?.fbicEnabled ?? false
+  // BLD-12: the materialization section on the Settings tab. An edit sends
+  // the stored values back; a create starts on the full rebuild the console
+  // has always produced. `batch` still stores the values (the API resets
+  // them) so toggling back and forth does not silently lose an author's
+  // configuration before they save.
+  const [kind, setKind] = React.useState<"batch" | "incremental">(
+    existing?.kind === "incremental" ? "incremental" : "batch"
+  )
+  const [incrementalColumn, setIncrementalColumn] = React.useState(def?.incrementalColumn ?? "")
+  const [incrementalStrategy, setIncrementalStrategy] = React.useState<"append" | "partition_replace">(
+    def?.incrementalStrategy === "partition_replace" ? "partition_replace" : "append"
+  )
+  const [partitionGranularity, setPartitionGranularity] = React.useState<"day" | "month">(
+    def?.partitionGranularity === "month" ? "month" : "day"
+  )
+  const [lookbackHours, setLookbackHours] = React.useState(String(def?.lookbackHours ?? 0))
 
   const connectors = useService((signal) => connectorService.listConnectors(signal), [])
   // BLD-7 decision 5: the connector's ingest targets, from the read the
@@ -196,13 +220,10 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
     )
   }
 
-  // WEB-8 D8: zones are the lakehouse's namespaces; `null` while they are
-  // read or when the read failed, because neither is "there are no zones".
-  const namespaces = useService((signal) => lakehouseService.listNamespaces(undefined, signal), [])
-  const zoneNames = namespaces.status === "success" ? namespaces.data.map((namespace) => namespace.name) : null
-  const zoneNote =
-    namespaces.status === "error" ? "Could not read the lakehouse's namespaces; type the zone name instead." : undefined
-  const icebergZones = React.useMemo(() => new Set(zoneNames ?? []), [zoneNames])
+  // The zone pickers offer the product's medallion zones, not Lakekeeper's
+  // Iceberg namespaces: the latter leak `default` and hide ClickHouse's
+  // `silver` and `serving`. Both lists are fixed, so neither picker has a
+  // loading or failed state. `pipeline-zones.ts` explains the mapping.
 
   // Every input's columns with their types, read per input by
   // `InputColumnsReader` below (BLD-1 part 1 S3 review R1-S6: one read keyed
@@ -211,6 +232,12 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
   const reportColumns = React.useCallback((id: string, columns: Column[] | null) => {
     setInputColumns((prev) => (prev[id] === columns ? prev : { ...prev, [id]: columns }))
   }, [])
+  // Cursor suggestions: the columns already known for the inputs. Free text
+  // stays allowed — a column the editor has not read yet is still valid.
+  const cursorSuggestions = React.useMemo(
+    () => Array.from(new Set(Object.values(inputColumns).flatMap((c) => c?.map((x) => x.name) ?? []))).sort(),
+    [inputColumns]
+  )
 
   // ── the preview (D16) ──────────────────────────────────────────────
   const preview = useServiceAction((signal, body: PipelinePreviewInput) => pipelineService.previewPipelineStep(body, signal))
@@ -342,14 +369,16 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
           ? pipelineService.updatePipeline(
               existing.id,
               {
-                // Decision 18 took kind and the incremental column off the
-                // page, not out of the row: both go back exactly as stored.
-                // BLD-1 part 1 S3 review R1-B1: the store writes
-                // `incremental_column` from the body with no COALESCE
-                // (`lakehouse-store/src/pipelines.rs`, `update`), so leaving
-                // it out would erase it on every save.
-                kind: existing.kind,
-                incrementalColumn: def?.incrementalColumn ?? undefined,
+                // BLD-12: the Materialization section now owns these. The
+                // store writes `incremental_column` from the body with no
+                // COALESCE (`lakehouse-store/src/pipelines.rs`, `update`), so
+                // every save sends all four fields — a `batch` save is reset
+                // by the API, never by the page guessing what to keep.
+                kind,
+                incrementalColumn: kind === "incremental" ? incrementalColumn.trim() : undefined,
+                incrementalStrategy,
+                partitionGranularity,
+                lookbackHours: Number(lookbackHours) || 0,
                 ...body.definition,
                 fbicEnabled,
                 targetZone: body.targetZone,
@@ -368,7 +397,11 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
           : pipelineService.createPipeline(
               {
                 name: body.name,
-                kind: "batch",
+                kind,
+                incrementalColumn: kind === "incremental" ? incrementalColumn.trim() : undefined,
+                incrementalStrategy,
+                partitionGranularity,
+                lookbackHours: Number(lookbackHours) || 0,
                 ...body.definition,
                 fbicEnabled,
                 targetZone: body.targetZone,
@@ -432,15 +465,26 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
   }, [errorItem, saveError, sent])
 
   const scheduleOk = schedule.trim() !== "" && isSchedulable(schedule)
-  const canSubmit = name.trim() !== "" && !hasProblems(problems) && scheduleOk
+  // BLD-12: a cursor is the one field this page makes mandatory for an
+  // incremental pipeline; the API refuses a missing one with a 400, so say
+  // it here instead of sending a save that cannot succeed.
+  const cursorMissing = kind === "incremental" && incrementalColumn.trim() === ""
+  const lookbackInvalid = !/^\d+$/.test(lookbackHours.trim()) || Number(lookbackHours) < 0 || Number(lookbackHours) > 720
+  const materializationProblem = cursorMissing
+    ? "Incremental pipelines need a cursor column."
+    : lookbackInvalid
+      ? "Lookback hours must be a whole number between 0 and 720."
+      : null
+  const canSubmit = name.trim() !== "" && !hasProblems(problems) && scheduleOk && materializationProblem === null
   const blockers = saveBlockers(shownState, problems, { name, scheduleOk })
+  if (materializationProblem) blockers.push({ text: materializationProblem, target: { kind: "materialization" } })
   const nameRef = React.useRef<HTMLInputElement>(null)
   function goTo(target: SaveBlocker["target"]) {
     if (target.kind === "name") {
       nameRef.current?.focus()
       return
     }
-    if (target.kind === "schedule") {
+    if (target.kind === "schedule" || target.kind === "materialization") {
       setTab("settings")
       return
     }
@@ -532,9 +576,8 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
           index={index}
           canRemove={editor.inputs.length > 1}
           connector={connector}
-          zones={zoneNames}
-          zoneNote={zoneNote}
-          icebergZones={icebergZones}
+          zones={INPUT_ZONE_VALUES}
+          zoneLabels={ZONE_LABELS}
           columns={inputColumns[input.id] ?? null}
           problem={problemFor(input.id)}
           invalid={invalidFor(input.id)}
@@ -654,8 +697,8 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
       <OutputPane
         targetZone={targetZone}
         targetTable={targetTable}
-        zones={zoneNames}
-        zoneNote={zoneNote}
+        zones={OUTPUT_ZONE_VALUES}
+        zoneLabels={ZONE_LABELS}
         writtenFrom={outputSourceLine({ inputs, steps: editor.steps }, plainCopy)}
         plainCopy={plainCopy}
         plainCopyAllowed={editor.steps.length === 0}
@@ -779,7 +822,6 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
           id={input.id}
           zone={input.zone.trim()}
           table={input.table.trim()}
-          listable={icebergZones.has(input.zone.trim())}
           onColumns={reportColumns}
         />
       ))}
@@ -928,6 +970,105 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
               <Label>Schedule</Label>
               <PipelineScheduleField value={schedule} onChange={setSchedule} hasTargetLag={Boolean(existing?.targetLag)} />
             </div>
+            <section className="space-y-3 rounded-xl border border-border p-3">
+              <div>
+                <h3 className="text-sm font-medium">Materialization</h3>
+                <p className="text-xs text-muted-foreground">How this pipeline writes its target on each run.</p>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="pipeline-materialization-mode">Mode</Label>
+                <SelectField
+                  id="pipeline-materialization-mode"
+                  className="w-full"
+                  value={kind}
+                  options={[
+                    { value: "batch", label: "Full rebuild" },
+                    { value: "incremental", label: "Incremental" },
+                  ]}
+                  onValueChange={(value) => setKind(value === "incremental" ? "incremental" : "batch")}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Full rebuild replaces the whole target atomically. Incremental writes only new or changed rows.
+                </p>
+              </div>
+              {kind === "incremental" ? (
+                <div className="space-y-3 rounded-lg border border-border/60 p-3">
+                  <div className="space-y-1.5">
+                    <Label htmlFor="pipeline-incremental-strategy">Strategy</Label>
+                    <SelectField
+                      id="pipeline-incremental-strategy"
+                      className="w-full"
+                      value={incrementalStrategy}
+                      options={[
+                        { value: "append", label: "Append new rows" },
+                        { value: "partition_replace", label: "Replace time partitions" },
+                      ]}
+                      onValueChange={(value) =>
+                        setIncrementalStrategy(value === "partition_replace" ? "partition_replace" : "append")
+                      }
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      {incrementalStrategy === "append"
+                        ? "Append: for immutable logs and events — adds rows newer than the last cursor."
+                        : "Partition replace: for mutable tables, rollups and late-arriving data — rewrites whole time partitions."}
+                    </p>
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="pipeline-incremental-column">Cursor column</Label>
+                    <Input
+                      id="pipeline-incremental-column"
+                      list="pipeline-cursor-suggestions"
+                      value={incrementalColumn}
+                      onChange={(e) => setIncrementalColumn(e.target.value)}
+                      placeholder="e.g. updated_at"
+                      aria-invalid={cursorMissing}
+                      aria-describedby={cursorMissing ? "pipeline-cursor-error" : undefined}
+                    />
+                    <datalist id="pipeline-cursor-suggestions">
+                      {cursorSuggestions.map((name) => (
+                        <option key={name} value={name} />
+                      ))}
+                    </datalist>
+                    {cursorMissing ? (
+                      <p id="pipeline-cursor-error" role="alert" className="text-xs text-destructive">
+                        A cursor column is required for an incremental pipeline.
+                      </p>
+                    ) : null}
+                  </div>
+                  {incrementalStrategy === "partition_replace" ? (
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="space-y-1.5">
+                        <Label htmlFor="pipeline-partition-granularity">Partition by</Label>
+                        <SelectField
+                          id="pipeline-partition-granularity"
+                          className="w-full"
+                          value={partitionGranularity}
+                          options={[
+                            { value: "day", label: "Day" },
+                            { value: "month", label: "Month" },
+                          ]}
+                          onValueChange={(value) => setPartitionGranularity(value === "month" ? "month" : "day")}
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label htmlFor="pipeline-lookback-hours">Lookback window (hours)</Label>
+                        <Input
+                          id="pipeline-lookback-hours"
+                          type="number"
+                          min={0}
+                          max={720}
+                          step={1}
+                          value={lookbackHours}
+                          onChange={(e) => setLookbackHours(e.target.value)}
+                          aria-invalid={lookbackInvalid}
+                        />
+                        <p className="text-xs text-muted-foreground">0–720. Late rows land in the partition being replaced.</p>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+            </section>
             <div className="space-y-1.5">
               <Label htmlFor="pipeline-connector">Connector</Label>
               {!existing && connectorIdFromUrl ? (
@@ -1126,40 +1267,68 @@ function TriggerRow({
   )
 }
 
+/** One catalog column, read defensively: a tenant refusal has no `schema` at all. */
+function catalogColumn(field: unknown): Column | null {
+  if (typeof field !== "object" || field === null) return null
+  const value = field as { name?: unknown; dataType?: unknown }
+  if (typeof value.name !== "string" || typeof value.dataType !== "string") return null
+  return { name: value.name, type: value.dataType }
+}
+
 /**
- * Reads one input's columns with their types, from the read the table page
- * uses, and hands them to the editor; it renders nothing. One per input, so
- * an input's columns are read again only when its own zone or table changes
- * (R1-S6). `getTableDetail` answers for an Iceberg namespace only, so an
- * input in a zone it does not list gets `null` (the fields stay free text)
- * instead of asking a question with no answer; a table that cannot be read
- * is `null` too.
+ * Reads one input's columns with their types and hands them to the editor; it
+ * renders nothing. One per input, so an input's columns are read again only
+ * when its own zone or table changes (R1-S6).
+ *
+ * Bronze is an Iceberg table (`getTableDetail`). Silver and Gold (`serving`)
+ * are ClickHouse tables in the catalog, read by asset id the way Query Studio
+ * reads them. A zone that is neither, or a table that cannot be read, leaves
+ * the fields as free text instead of asking a question with no answer. The
+ * `useService` read is keyed on the zone and table: when either changes, the
+ * old request is aborted and `null` is reported while the new one loads, so
+ * a slow answer for the previous zone cannot overwrite the new one's columns.
  */
 function InputColumnsReader({
   id,
   zone,
   table,
-  listable,
   onColumns,
 }: {
   id: string
   zone: string
   table: string
-  listable: boolean
   onColumns: (id: string, columns: Column[] | null) => void
 }) {
-  const detail = useService(
-    (signal) => (listable && table !== "" ? lakehouseService.getTableDetail(zone, table, signal) : Promise.resolve(null)),
-    [zone, table, listable]
+  const catalogNamespace = catalogNamespaceForZone(zone)
+  const columns = useService<Column[] | null>(
+    (signal) => {
+      if (table === "") return Promise.resolve(null)
+      if (catalogNamespace !== null) {
+        return assetService.getAsset(catalogAssetId(catalogNamespace, table), signal).then((detail) => {
+          // The tenant gate answers `200` with `{ supported: false }` and no
+          // `schema`; read the refusal first so nothing throws in this handler.
+          if (catalogRefusal(detail)) return null
+          const schema: unknown = detail.schema
+          if (!Array.isArray(schema)) return null
+          const read = schema.map(catalogColumn).filter((column): column is Column => column !== null)
+          return read.length > 0 ? read : null
+        })
+      }
+      if (zone === BRONZE_ZONE) {
+        return lakehouseService.getTableDetail(zone, table, signal).then((detail) => {
+          if (!Array.isArray(detail.schema)) return null
+          const read = detail.schema.map((field) => ({ name: field.name, type: field.type }))
+          return read.length > 0 ? read : null
+        })
+      }
+      return Promise.resolve(null)
+    },
+    [catalogNamespace, zone, table]
   )
-  const columns = React.useMemo(() => {
-    if (detail.status !== "success" || !Array.isArray(detail.data?.schema)) return null
-    const read = detail.data.schema.map((field) => ({ name: field.name, type: field.type }))
-    return read.length > 0 ? read : null
-  }, [detail.status, detail.data])
+  const ready = columns.status === "success" ? columns.data : null
   React.useEffect(() => {
-    onColumns(id, columns)
-  }, [id, columns, onColumns])
+    onColumns(id, ready)
+  }, [id, ready, onColumns])
   return null
 }
 

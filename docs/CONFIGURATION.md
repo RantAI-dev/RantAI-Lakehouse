@@ -33,6 +33,7 @@ Each commented block in `.env.example` ends by pointing here:
 - <a id="tenant-storage"></a>**Tenant storage on outside S3** — `TENANT_WAREHOUSE_S3_*`, in the P1b table below.
 - <a id="networks"></a>**Networks you allow** — `*_ALLOW_INTERNAL_HOSTS` and `*_ALLOWED_CIDRS`, throughout the tables below.
 - <a id="dagster-run-limits"></a>**Dagster run limits** — `INGEST_RUN_MAX_RUNTIME_SECONDS` and the `DAGSTER_RUN_LIMIT_*_SECONDS` family, in the "Upload limits and ingest retry" table below.
+- <a id="bi-only"></a>**BI and assistant only installation** — `LAKEHOUSE_INSTALL_MODE` and `LAKEHOUSE_QUERY_ENGINE`, with the one-engine rule in the first table below and the operator guide in `ops/bi-only/README.md`.
 
 | Variable | Purpose | Default | Required? | In `.env.example` |
 | --- | --- | --- | --- | --- |
@@ -60,7 +61,9 @@ Each commented block in `.env.example` ends by pointing here:
 | `LAKEHOUSE_MAINTENANCE_TOKEN` | Shared bearer token Dagster's maintenance job uses to authenticate against `GET /api/lakehouse/maintenance-policies`; when set, also seeds the scope-less `lakehouse-maintenance-policy-reader` service identity from it | unset | No, but unset means the API seeds no service identity and the maintenance job's policy fetch fails visibly with 401 | no |
 | `INGEST_SERVICE_TOKEN` | Shared bearer token Dagster's ingest schedule factory uses to authenticate against `GET /api/connectors/ingestible` and a CDC connector's `dial`; when set, also seeds an `ingest-run-service` identity scoped to `ingest:read` ONLY (never `connector:manage`) from it | unset | No, but unset means the API seeds no service identity and the ingest schedule factory's connector fetch fails visibly with 401 | no |
 | `PIPELINE_RUN_TOKEN` | Shared bearer token Dagster's authored-pipeline schedule factory (`authored_factory.py`, Phase E) uses to authenticate against `lakehouse-api`; when set, also seeds an `authored-pipeline-scheduler` identity scoped to `pipeline:write` ONLY (never `*:*`) from it | unset | No, but unset means the API seeds no service identity and the schedule factory's pipeline calls fail visibly with 401 | no |
-| `TRINO_URL` | Base URL of the Trino coordinator `POST /api/query/run`'s `engine: "trino"` path talks to | `http://trino:8080` | No, but unreachable means that path replies 503 | no |
+| `LAKEHOUSE_INSTALL_MODE` | `full` (the whole stack, data copied in) or `bi-only` (dashboards, Query Studio and the assistant read the customer's own database in place; nothing is copied). Trimmed and case-insensitive; an unknown non-empty value stops start-up (`BI-44`) | `full` | No | commented (BI-only block) |
+| `LAKEHOUSE_QUERY_ENGINE` | The one query engine of a `bi-only` installation: `clickhouse` or `trino`, trimmed and case-insensitive. An unknown non-empty value stops start-up. In `full` mode it only sets the default engine of an ad hoc query; in `bi-only` mode naming the other engine is a 400 and no dial happens (`BI-44`) | `clickhouse` | No, but `bi-only` + `trino` requires `TRINO_URL` set and `CH_URL` unset | commented (BI-only block) |
+| `TRINO_URL` | Base URL of the Trino coordinator `POST /api/query/run`'s `engine: "trino"` path talks to | `http://trino:8080` | No, but unreachable means that path replies 503; in `bi-only` mode it must be set for `trino` and must be unset for `clickhouse` | no |
 | `TRINO_MAX_ROWS` | Hard cap on rows a single Trino statement may accumulate across pages before the query is cancelled and refused | `10000` | No | no |
 | `SMTP_HOST` | SMTP host for alert/digest email delivery. Settable in the console (Settings → Email) only when the whole connection is unset in the environment — see "Settings the console owns" below | unset (email disabled) | No | commented |
 | `SMTP_PORT` | SMTP port. Invalid values log a warning and fall back to the default rather than failing boot. Part of the connection, so it is settable in the console only when the whole connection is unset in the environment | `587` | No | commented |
@@ -106,10 +109,24 @@ the chat timeout); they were missing from the table above until 2026-10-15
 | `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS` | Lets connection tests dial internal addresses (the guard against using the console as a port scanner, `SEC-15`); `true` only for the exact string `"true"` | unset (refused) | Only to test connectors that point at internal hosts, such as the seeded ones | commented |
 | `CONNECTOR_PROBE_ALLOWED_CIDRS` | Private networks a connector may dial although internal addresses are refused: the narrow alternative to the setting above | empty | No | commented |
 | `WEBHOOK_ALLOWED_CIDRS` | Internal networks an alert webhook may call (`SEC-10`); never opens loopback, link-local or multicast | empty | No | commented |
+| `TRUSTED_PROXIES` | The addresses, networks or compose service names of the proxies whose `X-Forwarded-For` the API reads (`SEC-75`) | empty (header never read, no per-source 429) | No | commented |
 | `CONNECTOR_SECRETS_DIR` | Where the API itself reads and writes connector credential files; refs keep saying `file:/run/secrets/...`, the orchestrator's path | `/run/secrets` | Only when the API runs outside Docker | no |
 | `CONNECTOR_TLS_CA_FILE` | The CA certificate (PEM) connector dials verify the database server against (`SEC-14` part B); unset still requires TLS but trusts the server's certificate (`require`), set verifies the chain (and, for the PostgreSQL connection test, the host name too: `verify-full`); an unreadable path stops the API at start | unset | No | no |
 | `ICEBERG_QUERY_DB` | The `ClickHouse` `DataLakeCatalog` database the API reads Iceberg tables through (compose creates `icecat_api`) | unset in the API (compose sets `icecat_api`); unset means Iceberg tables stay unreadable for policy checks and the catalog | Only when running the API outside compose | no |
 | `GIT_SHA` | The commit the image was built from; lets the pipeline source view say whether the code shown is the code that ran | `unknown` | No | no |
+
+`TRUSTED_PROXIES` is a list, its entries separated by commas or spaces. An
+entry is a network (`192.168.18.0/24`), one address, or a compose service
+name (`edge`). Only an edge proxy that OVERWRITES `X-Forwarded-For` with the
+address it saw may be listed; never list the console — its Next.js `/api`
+rewrite forwards a client-supplied header verbatim, so listing it lets a
+caller choose its source. An entry that is none of the three stops the API at
+start (fail closed): a dropped entry would quietly stop trusting a proxy the
+operator named, and every caller would then look like one source. The empty
+list is the default and means the header is never read, so a request's source
+is the address of the peer that sent it. A compose service name is resolved
+again every five minutes, because a compose network's addresses are not fixed
+— see [`OPERATIONS.md`](OPERATIONS.md), "Trusted proxies".
 
 `WEBHOOK_TEST_ALLOW_ALL` exists in `config.rs` but is read only in test
 builds; no deployment setting can open loopback for webhooks.
@@ -221,7 +238,7 @@ their opt-in compose profiles:
 | `CH_RUSTFS_S3_ENDPOINT` | S3 endpoint Iceberg clients use for object I/O. Switching this to the SeaweedFS service is what makes the G2 storage matrix a config-only change | `http://rustfs:9000` | No | no |
 | `TENANT_OWNER` / `TENANT_ID` / `TENANT_DOMAIN` / `TENANT_RESIDENCY` / `TENANT_SITE` | Tenant identity surfaced on catalog assets, audit and quota records (`lakehouse-api/src/tenant.rs`). Each falls back to its historical default when blank | unset (historical defaults apply) | No | no / no / no / no / no |
 | `BRONZE_CURATED_SLUGS` | Comma-separated dataset slugs presented as curated rather than raw Bronze | unset | No | no |
-| `CATALOG_TENANT_ID` | UUID of the tenant that owns this deployment's single shared catalog and `Dagster`-job list. With more than one tenant and this unset, both are refused for every principal without the unrestricted grant (fail closed — neither has a tenant column, so they cannot be filtered). A malformed value fails startup | unset | No — but see the upgrade note in `docs/OPERATIONS.md` | yes |
+| `CATALOG_TENANT_ID` | UUID of the tenant that owns this deployment's single shared catalog and `Dagster`-job list. With more than one tenant (the four seeded tenants of a default deployment) and this unset, a principal without the unrestricted `*:*` grant is refused not only both lists but EVERY Silver and Gold query (dashboards, Query Studio, assistant) — a shared table belongs to no tenant and only the catalog tenant may read one. Scheduled jobs (no user) get a 422 naming this setting. A malformed value fails startup | unset | No — but see the upgrade note in `docs/OPERATIONS.md`; `lakehousectl install`/`update` set it when empty (`REL-10`) | yes |
 | `CATALOG_NAMESPACE_META` | JSON object overriding catalog namespace display names/descriptions. Malformed JSON is ignored in favour of the defaults — a bad label is cosmetic, refusing to serve the catalog is an outage | unset | No | no |
 | `BUILTIN_DASHBOARD_SPEC` | Path to a JSON file of built-in "Main" dashboard KPI/chart tiles for this tenant (shape: `{kpis:[...], charts:[...]}`, see `rust/crates/lakehouse-bi/specs/builtin-default.json`); unset, unreadable, or invalid means no built-in tiles at all | unset | No | no |
 | `GOLD_SOURCE_SCHEMA` | ClickHouse schema Gold export reads marts from | `serving` | No | no |

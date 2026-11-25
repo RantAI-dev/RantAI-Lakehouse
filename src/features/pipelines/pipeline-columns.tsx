@@ -13,6 +13,7 @@ import {
   GitBranch,
   Layers,
   MoreHorizontal,
+  Pause,
   Play,
   Timer,
   User,
@@ -39,15 +40,12 @@ import type { Pipeline, PipelineKind } from "@/services/contracts/pipelines"
 import { knownStatus } from "./pipeline-detail-header"
 import { describeCron, isLagTrigger, isScheduleRunning, parseSchedule, triggerSummary } from "./pipeline-schedule"
 
-// `PipelineKind` widens to `string` on `Pipeline.kind` (rows authored
-// before WS1 may still carry `"document"`/`"vector"`, which the database
-// constraint still permits) — the filter offers those legacy values too,
-// so its own value type must widen the same way.
+// BLD-12: only the two kinds a pipeline may be authored as remain in the
+// filter. `Pipeline.kind` still widens to `string` so a legacy row that
+// reports `document`/`vector` renders safely (it just has no filter option).
 export const PIPELINE_KIND_OPTIONS: { value: PipelineKind | string; label: string }[] = [
-  { value: "batch", label: "Batch" },
+  { value: "batch", label: "Full rebuild" },
   { value: "incremental", label: "Incremental" },
-  { value: "document", label: "Document" },
-  { value: "vector", label: "Vector" },
 ]
 
 export const PIPELINE_STATUS_OPTIONS: { value: EntityStatus; label: string }[] =
@@ -70,9 +68,15 @@ function pipelineOrigin(pipeline: Pipeline): "orchestrator" | "authored" {
 export function getPipelineColumns({
   onView,
   onTrigger,
+  onPause,
+  onResume,
 }: {
   onView?: (pipeline: Pipeline) => void
   onTrigger?: (pipeline: Pipeline) => void
+  /** BLD-18: pause an authored pipeline's automatic runs (cron, chain or freshness sensor). */
+  onPause?: (pipeline: Pipeline) => void
+  /** BLD-18: turn automatic runs back on after a pause. */
+  onResume?: (pipeline: Pipeline) => void
 } = {}): ColumnDef<Pipeline>[] {
   return [
     {
@@ -121,11 +125,22 @@ export function getPipelineColumns({
       header: ({ column }) => (
         <DataTableColumnHeader column={column} label="Kind" />
       ),
-      cell: ({ row }) => (
-        <Badge variant="outline" className="capitalize text-xs font-normal">
-          {row.original.kind}
-        </Badge>
-      ),
+      cell: ({ row }) => {
+        const pipeline = row.original
+        const incremental = pipeline.kind === "incremental"
+        return (
+          <div className="flex flex-col gap-0.5">
+            <Badge variant="outline" className="text-xs font-normal">
+              {pipeline.kind === "batch" ? "Full rebuild" : pipeline.kind}
+            </Badge>
+            {incremental ? (
+              <span className="text-[11px] text-muted-foreground">
+                Incremental · {pipeline.incrementalStrategy === "partition_replace" ? "Partition" : "Append"}
+              </span>
+            ) : null}
+          </div>
+        )
+      },
       enableColumnFilter: true,
       enableSorting: true,
       meta: {
@@ -275,7 +290,16 @@ export function getPipelineColumns({
         // cron never fires — name the lag, which is the real trigger.
         const trigger = triggerSummary(parsed, row.original.targetLag)
         if (isLagTrigger(trigger)) {
-          return <span className="text-xs text-foreground">{trigger.label}</span>
+          // BLD-18: the lag sensor, not the stored cron, is what can run this
+          // row — say `paused` here too, not only in the status column.
+          return (
+            <span className="text-xs text-foreground">
+              {trigger.label}
+              {row.original.status === "paused" ? (
+                <span className="text-amber-600 dark:text-amber-400"> · paused</span>
+              ) : null}
+            </span>
+          )
         }
         if (parsed.kind === "manual") return <span className="text-xs text-muted-foreground">On demand</span>
         if (parsed.kind === "other") {
@@ -476,6 +500,27 @@ export function getPipelineColumns({
                       <span>Trigger run — mark it ready first</span>
                     </DropdownMenuItem>
                   )
+                ) : null}
+                {pipelineOrigin(pipeline) === "authored" && pipeline.status !== "draft" ? (
+                  // BLD-18: Pause/Resume are no longer hidden for a row whose
+                  // trigger is a target lag. The API stops the freshness
+                  // sensor next to the cron schedule and dependency sensor,
+                  // so the action is real for every automated authored row.
+                  pipeline.status === "paused" ? (
+                    onResume ? (
+                      <DropdownMenuItem onClick={() => onResume(pipeline)}>
+                        <Play className="size-4" />
+                        <span>Resume</span>
+                      </DropdownMenuItem>
+                    ) : null
+                  ) : pipeline.targetLag != null || parseSchedule(pipeline.schedule).kind === "cron" ? (
+                    onPause ? (
+                      <DropdownMenuItem onClick={() => onPause(pipeline)}>
+                        <Pause className="size-4" />
+                        <span>Pause</span>
+                      </DropdownMenuItem>
+                    ) : null
+                  ) : null
                 ) : null}
                 <DropdownMenuSeparator />
                 <DropdownMenuItem

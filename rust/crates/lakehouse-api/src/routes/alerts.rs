@@ -21,8 +21,8 @@ use axum::extract::{Extension, Query, State};
 use axum::http::HeaderMap;
 use iceberg::{NamespaceIdent, TableIdent};
 use lakehouse_alerts::{
-    AlertKind, AlertRule, AlertRuleInput, AlertState, FreshnessSource, GateRefusal, LateSource,
-    SilenceSource, SqlGate, StateSource,
+    AlertKind, AlertRule, AlertRuleInput, AlertState, DigestClaim, DigestTurn, FreshnessSource,
+    GateRefusal, LateSource, SilenceSource, SqlGate, StateSource,
 };
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
@@ -30,6 +30,7 @@ use lakehouse_iceberg::IcebergClient;
 use lakehouse_notify::EmailSender;
 use lakehouse_store::PgPool;
 use lakehouse_store::overview::{self, FiredRule};
+use lakehouse_store::report_schedule::{Schedule, zone_is_known};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -787,6 +788,7 @@ pub(crate) async fn save_rule_with_checks(
     // chart and the owner are settled here.
     crate::routes::chart_alerts::authorise_save(state, principal, id, stored.as_ref(), input)
         .await?;
+    check_digest_schedule(state, input).await?;
     let rule = lakehouse_alerts::save_rule(&state.clickhouse, &state.webhook_sender(), input, id)
         .await
         .map_err(|err| {
@@ -804,7 +806,70 @@ pub(crate) async fn save_rule_with_checks(
     {
         forget_state(state, id).await;
     }
+    // BI-65: a digest whose schedule or zone changed counts from the next tick,
+    // so a new schedule does not send at once for a time that has already
+    // passed under the old one.
+    if let Some(id) = id
+        && stored
+            .as_ref()
+            .is_some_and(|old| old.schedule != rule.schedule || old.time_zone != rule.time_zone)
+        && let Some(pg) = state.pg.as_deref()
+        && let Err(err) = lakehouse_store::alert_state::clear_digest_clock(pg, id).await
+    {
+        tracing::warn!(%err, rule_id = %id, "a digest's clock could not be started over");
+    }
     Ok(rule)
+}
+
+/// `BI-65`: check a digest's schedule and zone before it is saved, and replace
+/// them with their canonical form, so what is stored is what
+/// [`digest_schedule`] reads and a stale or mistyped client gets a 400, never a
+/// digest that quietly runs on another schedule. A digest with no schedule gets
+/// none here (the store refuses a new one, and an old one keeps its daily
+/// default); a zone without a schedule is refused; the zone defaults to the
+/// report time zone, so the stored rule always says which zone it is read in.
+///
+/// Any other kind is left to `save_rule`, which refuses a schedule on it.
+///
+/// # Errors
+///
+/// 400 for a schedule or zone that is not valid, or a zone with no schedule.
+async fn check_digest_schedule(
+    state: &AppState,
+    input: &mut AlertRuleInput,
+) -> Result<(), ApiError> {
+    if input.kind.as_deref() != Some("digest") {
+        return Ok(());
+    }
+    let zone = input
+        .time_zone
+        .as_deref()
+        .map(str::trim)
+        .filter(|z| !z.is_empty());
+    let Some(raw) = input.schedule.clone() else {
+        return if zone.is_some() {
+            Err(ApiError::BadRequest(
+                "A time zone needs a schedule.".to_owned(),
+            ))
+        } else {
+            Ok(())
+        };
+    };
+    let bad = || ApiError::BadRequest("That schedule is not valid.".to_owned());
+    let parsed =
+        serde_json::from_value::<crate::routes::reports::ScheduleInput>(raw).map_err(|_| bad())?;
+    let schedule = crate::routes::reports::schedule_of(&parsed)?;
+    let zone = match zone {
+        Some(zone) if zone_is_known(zone) => zone.to_owned(),
+        Some(_) => return Err(ApiError::BadRequest("Unknown time zone.".to_owned())),
+        None => crate::routes::settings::time_context(state)
+            .await?
+            .zone()
+            .to_owned(),
+    };
+    input.schedule = Some(crate::routes::reports::schedule_json(schedule));
+    input.time_zone = Some(zone);
+    Ok(())
 }
 
 /// `POST /api/alerts` — create a rule.
@@ -1035,8 +1100,53 @@ impl SilenceSource for ApiSilenceSource<'_> {
 /// migration `0113`). A read that fails is the fixed sentence (principle 4), and
 /// the rule is then skipped rather than judged; a write that fails is logged
 /// here, because the caller has already sent or not sent.
+///
+/// `BI-65`: it also keeps a digest's clock (`digest_clock_at`, migration `0152`)
+/// and reads the digest's schedule, which is why it holds the whole state: a
+/// digest with no zone of its own is read in the report time zone.
 pub(crate) struct ApiStateSource<'a> {
     pub(crate) pg: &'a PgPool,
+    pub(crate) state: &'a AppState,
+}
+
+/// The schedule of a digest saved before schedules existed: every day at 08:00
+/// in the report time zone (`BI-65` decision 3), not on every tick.
+const LEGACY_DIGEST_SCHEDULE: Schedule = Schedule::Daily { hour: 8, minute: 0 };
+
+/// What a run records when a digest's schedule cannot be checked. One fixed
+/// sentence: the cause goes to the log (principle 4).
+const DIGEST_SCHEDULE_UNUSABLE: &str =
+    "the digest's schedule could not be checked, so it was not sent.";
+
+/// The schedule `rule` is sent on, as the report subscription type.
+///
+/// # Errors
+///
+/// [`DIGEST_SCHEDULE_UNUSABLE`] for a stored schedule that does not parse (only
+/// a hand edit of the row gets there: the save path stores a canonical one).
+fn digest_schedule(rule: &AlertRule) -> Result<Schedule, String> {
+    let Some(stored) = &rule.schedule else {
+        return Ok(LEGACY_DIGEST_SCHEDULE);
+    };
+    serde_json::from_value::<crate::routes::reports::ScheduleInput>(stored.clone())
+        .ok()
+        .and_then(|input| crate::routes::reports::schedule_of(&input).ok())
+        .ok_or_else(|| {
+            tracing::warn!(rule_id = %rule.id, "a digest's stored schedule is not valid");
+            DIGEST_SCHEDULE_UNUSABLE.to_owned()
+        })
+}
+
+/// `at` in whole milliseconds since the Unix epoch: the unit a
+/// [`DigestClaim`] carries, and the precision the clock is written with, so a
+/// claim can be matched exactly when it is given back.
+fn millis_of(at: OffsetDateTime) -> i64 {
+    i64::try_from(at.unix_timestamp_nanos() / 1_000_000).unwrap_or(i64::MAX)
+}
+
+/// The instant `ms` milliseconds after the Unix epoch.
+fn at_millis(ms: i64) -> Option<OffsetDateTime> {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()
 }
 
 #[async_trait::async_trait]
@@ -1118,6 +1228,57 @@ impl StateSource for ApiStateSource<'_> {
         .await
         {
             tracing::warn!(%err, rule_id, "an alert's failed check could not be saved");
+        }
+    }
+
+    async fn digest_turn(&self, rule: &AlertRule) -> Result<DigestTurn, String> {
+        let schedule = digest_schedule(rule)?;
+        let zone = match rule.time_zone.as_deref() {
+            Some(zone) => zone.to_owned(),
+            None => crate::routes::settings::time_context(self.state)
+                .await
+                .map(|ctx| ctx.zone().to_owned())
+                .map_err(|err| {
+                    tracing::warn!(%err, rule_id = %rule.id, "the report time zone could not be read for a digest");
+                    DIGEST_SCHEDULE_UNUSABLE.to_owned()
+                })?,
+        };
+        let now_ms = millis_of(OffsetDateTime::now_utc());
+        let unusable = || DIGEST_SCHEDULE_UNUSABLE.to_owned();
+        let now = at_millis(now_ms).ok_or_else(unusable)?;
+        match lakehouse_store::alert_state::digest_turn(self.pg, &rule.id, schedule, &zone, now)
+            .await
+        {
+            Ok(lakehouse_store::alert_state::DigestTurn::Claimed { previous }) => {
+                Ok(DigestTurn::Send(DigestClaim {
+                    claimed_ms: now_ms,
+                    previous_ms: millis_of(previous),
+                }))
+            }
+            // Not due, just started, or claimed by another runner: nothing to send.
+            Ok(
+                lakehouse_store::alert_state::DigestTurn::StartedClock
+                | lakehouse_store::alert_state::DigestTurn::NotYet
+                | lakehouse_store::alert_state::DigestTurn::ClaimedElsewhere,
+            ) => Ok(DigestTurn::Wait),
+            Err(err) => {
+                tracing::warn!(%err, rule_id = %rule.id, "a digest's turn could not be worked out");
+                Err(unusable())
+            }
+        }
+    }
+
+    async fn digest_give_back(&self, rule_id: &str, claim: DigestClaim) {
+        let (Some(claimed), Some(previous)) =
+            (at_millis(claim.claimed_ms), at_millis(claim.previous_ms))
+        else {
+            return;
+        };
+        if let Err(err) =
+            lakehouse_store::alert_state::give_back_digest(self.pg, rule_id, claimed, previous)
+                .await
+        {
+            tracing::warn!(%err, rule_id, "a claimed digest send could not be given back");
         }
     }
 }
@@ -1552,7 +1713,7 @@ pub(crate) async fn run_one(
         _ => None,
     };
     let silence_source = state.pg.as_deref().map(|pg| ApiSilenceSource { pg });
-    let state_source = state.pg.as_deref().map(|pg| ApiStateSource { pg });
+    let state_source = state.pg.as_deref().map(|pg| ApiStateSource { pg, state });
     // `SEC-50` slice 2 T7 (M1): the gate is the caller's, carried whole — the
     // state holds the pool the tenant count reads, the actor says whose reach
     // the rule's statement is measured against.
@@ -2353,7 +2514,9 @@ mod tests {
             .await
             .unwrap();
 
-            let response = run(
+            // SEC-75's extra AppState field pushes this run() future past
+            // clippy's 16 KiB large_futures limit; box it as clippy suggests.
+            let response = Box::pin(run(
                 State(state),
                 HeaderMap::new(),
                 Query(RunQuery {
@@ -2361,7 +2524,7 @@ mod tests {
                     token: None,
                 }),
                 Some(Extension(service_principal())),
-            )
+            ))
             .await
             .expect("a service-identity principal must pass the run-token guard");
 
@@ -2523,7 +2686,9 @@ mod tests {
         }
 
         async fn call_run(state: &AppState, id: Option<&str>) -> Value {
-            run(
+            // SEC-75's extra AppState field pushes this run() future past
+            // clippy's 16 KiB large_futures limit; box it as clippy suggests.
+            Box::pin(run(
                 State(state.clone()),
                 HeaderMap::new(),
                 Query(RunQuery {
@@ -2531,7 +2696,7 @@ mod tests {
                     token: None,
                 }),
                 Some(Extension(service_principal())),
-            )
+            ))
             .await
             .expect("a service-identity principal must pass the run-token guard")
             .0
@@ -2557,7 +2722,11 @@ mod tests {
                 .await;
             let state = state_for(&server.uri());
 
-            let body = call_run(&state, Some("al-no-such-rule")).await;
+            // `call_run` clones `AppState` into its future; OPS-36's per-state
+            // DATA MAP cache adds an `Arc` to that clone, which pushed this
+            // test's future past clippy's 16 KiB threshold. Box it rather than
+            // allowing the lint away.
+            let body = Box::pin(call_run(&state, Some("al-no-such-rule"))).await;
 
             assert_eq!(body["schemaPassStarted"], json!(false));
             assert_eq!(body["qualityPassStarted"], json!(false));
@@ -2580,7 +2749,9 @@ mod tests {
             // so ask again until a pass of ours starts.
             let mut started = false;
             for _ in 0..100 {
-                if call_run(&state, None).await["schemaPassStarted"] == json!(true) {
+                // See the note in `a_single_rule_run_does_not_start_a_schema_pass`:
+                // box the state-cloning future to stay under the size lint.
+                if Box::pin(call_run(&state, None)).await["schemaPassStarted"] == json!(true) {
                     started = true;
                     break;
                 }
@@ -2606,6 +2777,7 @@ mod tests {
     /// run id must not re-deliver, via `pipeline_run_event`).
     mod late_pass {
         use lakehouse_clickhouse::ChClient;
+        use lakehouse_core::secret::SecretValue;
         use lakehouse_notify::{EmailSender, SmtpConfig};
         use wiremock::MockServer;
         use wiremock::matchers::method;
@@ -2620,7 +2792,7 @@ mod tests {
                 port: 587,
                 secure: false,
                 user: None,
-                pass: String::new(),
+                pass: SecretValue::new(String::new()),
                 from: String::new(),
                 ca_bundle: None,
             })
@@ -3275,7 +3447,9 @@ mod alert_run_tenant_scope {
         // four tenants: no tenant's reach covers the shared catalog.
         let state = state_for_with(&pool, &server.uri(), None);
 
-        let response = run(
+        // SEC-75's extra AppState field pushes this run() future past
+        // clippy's 16 KiB large_futures limit; box it as clippy suggests.
+        let response = Box::pin(run(
             State(state),
             HeaderMap::new(),
             Query(RunQuery {
@@ -3283,7 +3457,7 @@ mod alert_run_tenant_scope {
                 token: None,
             }),
             Some(Extension(cron())),
-        )
+        ))
         .await
         .expect("a service identity passes the run-token guard");
 
@@ -3310,7 +3484,9 @@ mod alert_run_tenant_scope {
         let server = engine_for("999").await;
         let state = state_for(&pool, &server.uri());
 
-        let response = run(
+        // SEC-75's extra AppState field pushes this run() future past
+        // clippy's 16 KiB large_futures limit; box it as clippy suggests.
+        let response = Box::pin(run(
             State(state),
             HeaderMap::new(),
             Query(RunQuery {
@@ -3318,7 +3494,7 @@ mod alert_run_tenant_scope {
                 token: None,
             }),
             Some(Extension(cron())),
-        )
+        ))
         .await
         .expect("a service identity passes the run-token guard");
 
@@ -4118,6 +4294,8 @@ mod rule_scope_authorisation {
             filters: Vec::new(),
             condition: None,
             owner_id: None,
+            schedule: None,
+            time_zone: None,
         };
         let rules = vec![
             rule("quality", AlertKind::QualityIncident),
@@ -4231,6 +4409,8 @@ mod hidden_targets {
             filters: Vec::new(),
             condition: None,
             owner_id: owner.map(str::to_owned),
+            schedule: None,
+            time_zone: None,
         }
     }
 

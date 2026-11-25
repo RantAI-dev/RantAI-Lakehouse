@@ -79,6 +79,29 @@ const CATALOG_TENANT: &str = "11111111-1111-4111-8111-000000000001";
 /// the seeded identity migration gives `sari`.
 const OTHER_TENANT: &str = "11111111-1111-4111-8111-000000000002";
 
+/// A BLD-21-valid output table derived from a test pipeline name.
+///
+/// BLD-20 made this fixture derive the table from the unique name (two
+/// pipelines may not claim one output table); BLD-21 then made the engine's
+/// identifier rule apply at save time. `compile-probe-<uuid>` has hyphens, so
+/// folding them to `_` is what keeps the seeded pipeline saveable — and keeps
+/// these tests about the compile route rather than a 400 on the fixture.
+fn safe_test_target_table(name: &str) -> String {
+    let mut out = String::from("t_");
+    let mut last_underscore = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+            last_underscore = ch == '_';
+        } else if !last_underscore {
+            out.push('_');
+            last_underscore = true;
+        }
+    }
+    out.truncate(lakehouse_api::pipeline_compile::MAX_NAME_CHARS);
+    out
+}
+
 async fn mount(ch: &MockServer) {
     // The column metadata the mask needs: the obligations source reads a
     // governed table's columns to decide what a mask is substituted OVER,
@@ -215,24 +238,31 @@ async fn seed_pipeline_reading(
         }],
         FixtureStep::Steps(steps) => steps,
     };
+    // A unique name: one test seeds two pipelines, and the name is the
+    // table's natural key. BLD-20 makes the output table a natural key too,
+    // so derive it from the same unique name rather than pinning both
+    // pipelines to `silver.orders_clean`. BLD-21 requires folding the name's
+    // hyphens into a valid identifier (see `safe_test_target_table`).
+    let name = format!("compile-probe-{}", Uuid::new_v4());
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: vec![pipelines::PipelineInput {
                 name: "source".to_owned(),
                 zone: reads.0.to_owned(),
                 table: reads.1.to_owned(),
             }],
             steps,
-            // A unique name: one test seeds two pipelines, and the name is
-            // the table's natural key.
-            name: format!("compile-probe-{}", Uuid::new_v4()),
+            name: name.clone(),
 
             kind: "batch".to_owned(),
             source_zone: reads.0.to_owned(),
             source_table: reads.1.to_owned(),
             target_zone: "silver".to_owned(),
-            target_table: "orders_clean".to_owned(),
+            target_table: safe_test_target_table(&name),
             schedule: "0 3 * * *".to_owned(),
             description: None,
             incremental_column: None,
@@ -914,6 +944,9 @@ async fn a_join_of_two_governed_inputs_comes_back_with_both_rewritten() {
     let created = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: vec![
                 pipelines::PipelineInput {
                     name: "left_t".to_owned(),
@@ -1221,6 +1254,9 @@ async fn a_join_of_two_governed_inputs_through_a_join_step_comes_back_with_both_
     let created = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: vec![
                 pipelines::PipelineInput {
                     name: "left_t".to_owned(),

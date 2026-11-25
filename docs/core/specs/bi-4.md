@@ -38,7 +38,7 @@ Run on a running console by the product owner. A step not performed is never a p
 
 - `BI-4-AC1` A second open of a dashboard is served from the cache and says so
 - `BI-4-AC2` Two users with different masks never see each other's cached results
-- `BI-4-AC3` A RESULT document records the before/after timings
+- `BI-4-AC3` A RESULT document records the before/after timings (**superseded by `BI-56` D3, owner 2026-11-21:** cold vs remembered; a build before the cache is not required)
 - `BI-4-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
