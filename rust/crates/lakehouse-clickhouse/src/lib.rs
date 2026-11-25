@@ -296,6 +296,17 @@ impl ChClient {
         }
     }
 
+    /// The base URL every statement from this client is sent to, exactly as
+    /// [`ChClient::new`] received it.
+    ///
+    /// The identity a [`ChTableEnsured`] tracks its answer by: two clients
+    /// with the same URL talk to the same server, and a client with another
+    /// URL has not had its tables ensured yet.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
     /// Run `sql` and return the structured result (`FORMAT JSON`).
     ///
     /// `FORMAT JSON` is appended to `sql` unless it already ends in a
@@ -758,6 +769,79 @@ impl ChClient {
             bytes_read: 0,
             checked_first_chunk: false,
         })
+    }
+}
+
+/// Remembers, per `ClickHouse` base URL, that a table's DDL has already run
+/// in this process.
+///
+/// The one guard every `ensure_*_table` in this workspace shares
+/// (`AGENTS.md` rule 4: one helper, not one copy per table). It is keyed by
+/// [`ChClient::url`] because a process can talk to more than one engine —
+/// `cargo test`'s single-process integration binary runs the HTTP tests
+/// against a `wiremock` stand-in and the Gold publication tests against a
+/// real `ClickHouse` container in the same process. An unkeyed flag let the
+/// stand-in's `200 OK` for the DDL mark the table as created, so the
+/// container's tests then skipped `CREATE TABLE IF NOT EXISTS` and failed
+/// with `UNKNOWN_TABLE` (`Coverage & SBOM` runs 45545437095 and
+/// 45531180507).
+///
+/// A failed attempt is never remembered, so a transient `ClickHouse` outage
+/// does not wedge every later call.
+pub struct ChTableEnsured {
+    /// The URLs whose DDL has succeeded; `None` until the first call, so
+    /// [`ChTableEnsured::new`] can be `const` for use in a `static`.
+    ensured: std::sync::OnceLock<tokio::sync::RwLock<std::collections::HashSet<String>>>,
+}
+
+impl ChTableEnsured {
+    /// A guard that has not ensured anything yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            ensured: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The set behind a lock, created on first use.
+    fn set(&self) -> &tokio::sync::RwLock<std::collections::HashSet<String>> {
+        self.ensured
+            .get_or_init(|| tokio::sync::RwLock::new(std::collections::HashSet::new()))
+    }
+
+    /// Run `ddl` unless it has already succeeded for `ch`'s URL.
+    ///
+    /// The read lock answers the common, already-ensured case. Otherwise the
+    /// write lock serialises the DDL: one caller runs it, the rest wait and
+    /// then see the URL in the set. The write lock is held across `ddl`'s
+    /// await on purpose — it is what keeps two first callers from running
+    /// the same `CREATE TABLE` at once.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `ddl` returns. The URL is only remembered after `Ok(())`, so
+    /// a failure is retried by the next call.
+    pub async fn ensure<F, Fut>(&self, ch: &ChClient, ddl: F) -> Result<(), ChError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), ChError>>,
+    {
+        if self.set().read().await.contains(ch.url()) {
+            return Ok(());
+        }
+        let mut ensured = self.set().write().await;
+        if ensured.contains(ch.url()) {
+            return Ok(());
+        }
+        ddl().await?;
+        ensured.insert(ch.url().to_owned());
+        Ok(())
+    }
+}
+
+impl Default for ChTableEnsured {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1232,6 +1316,100 @@ mod tests {
         assert!(!rendered.contains("http"));
         assert!(!rendered.contains(&addr.ip().to_string()));
         assert!(!rendered.contains(&addr.port().to_string()));
+    }
+
+    // -- ChTableEnsured: one answer per ClickHouse URL ---------------------
+
+    /// Counts DDL runs without touching a server: the helper's contract is
+    /// about whether the closure runs, not about the statement.
+    fn counting_ddl(
+        calls: &std::sync::atomic::AtomicUsize,
+    ) -> impl Fn() -> std::future::Ready<Result<(), ChError>> + '_ {
+        move || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn table_ensured_runs_the_ddl_once_per_clickhouse_url() {
+        let ensured = ChTableEnsured::new();
+        let ch = client("http://ch-one.test:8123/");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        for _ in 0..3 {
+            ensured
+                .ensure(&ch, counting_ddl(&calls))
+                .await
+                .expect("the DDL succeeds");
+        }
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn table_ensured_does_not_cache_a_failed_ddl_attempt() {
+        let ensured = ChTableEnsured::new();
+        let ch = client("http://ch-two.test:8123/");
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+
+        let first = ensured
+            .ensure(&ch, || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Err(ChError::Server(
+                    "Code: 210. Connection refused".to_owned(),
+                )))
+            })
+            .await;
+        assert!(first.is_err(), "the failure is reported, not swallowed");
+
+        ensured
+            .ensure(&ch, counting_ddl(&attempts))
+            .await
+            .expect("the retry succeeds");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the failure was not remembered: the second call ran the DDL"
+        );
+
+        ensured
+            .ensure(&ch, counting_ddl(&attempts))
+            .await
+            .expect("an ensured URL is free");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the success was remembered: the third call ran nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn table_ensured_keeps_one_answer_per_url() {
+        let ensured = ChTableEnsured::new();
+        let first_engine = client("http://ch-three.test:8123/");
+        let second_engine = client("http://ch-four.test:8123/");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        ensured
+            .ensure(&first_engine, counting_ddl(&calls))
+            .await
+            .expect("the first engine's DDL succeeds");
+        ensured
+            .ensure(&second_engine, counting_ddl(&calls))
+            .await
+            .expect("the second engine's DDL runs: its URL was never ensured");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        ensured
+            .ensure(&first_engine, counting_ddl(&calls))
+            .await
+            .expect("the first engine is still ensured");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "ensuring another URL must not forget nor repeat the first"
+        );
     }
 
     // -- FORMAT-clause detection edge cases -------------------------------

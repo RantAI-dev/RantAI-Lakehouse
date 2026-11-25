@@ -424,6 +424,29 @@ pub async fn runs(
     (StatusCode::OK, ApiJson(body)).into_response()
 }
 
+/// `GET /api/pipelines/{id}/reupload-chain` — the newest chain outcome the
+/// page shows as one sentence (BLD-14 D8). It is a page read like [`runs`],
+/// so it lives here rather than in the orchestrator-only authored router.
+///
+/// BLD-14 review R5: the per-tenant gate runs first, exactly as [`runs`]
+/// does; an id in another tenant and an unknown id are the same 404.
+///
+/// # Errors
+///
+/// 404 for an unknown id or one outside the caller's tenant; 503 with no
+/// database; 500 on a store failure.
+pub async fn reupload_chain(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id).await?;
+    let pool = pool(&state)?;
+    let last = lakehouse_store::pipeline_chain::latest_chain_step(pool, &id).await?;
+    Ok(ApiJson(json!({ "last": last })))
+}
+
 async fn runs_body(state: &AppState, id: &str) -> Value {
     // An authored pipeline's runs belong to its `authored__<id>` job; the
     // `pl-` id itself names no job, so asking for it always found none.
@@ -2054,7 +2077,9 @@ pub async fn trigger(
     // header requirement and yields `None` for an empty body, the same
     // behavior the existing `routes::connectors::test_connection` call
     // site relies on.
-    let run_config = body.and_then(|Json(b)| b.run_config);
+    let (run_config, full_refresh) = body.map_or((None, false), |Json(b)| {
+        (b.run_config, b.full_refresh.unwrap_or(false))
+    });
     // F2.5: when the caller sent a run_config, check its shape FIRST
     // (object, size, `pl-` refusal, REFUSED hint) before we ever talk
     // to Dagster. These are refusals the route can resolve locally
@@ -2120,7 +2145,19 @@ pub async fn trigger(
     // field" is what a future reader needs to answer, not the actual id
     // value.
     let config_keys: Vec<String> = run_config.as_ref().map(top_level_keys).unwrap_or_default();
-    let launch = match run_config.as_ref() {
+    // BLD-12: `fullRefresh` is an internal request to the op's config
+    // schema, not caller-controlled `runConfig` — it bypasses the caller
+    // allowlist above by construction and is merged into any caller config
+    // that already passed it. The op name is the one
+    // `authored_factory._op_for_pipeline` registers (`authored_<safe id>`,
+    // ONE underscore; the JOB is `authored__<safe id>`). Both sides use the
+    // same `_dagster_safe_name` rule — see `authored_pipelines::op_name`.
+    let launch_config = if full_refresh {
+        full_refresh_config(&id, run_config.clone())
+    } else {
+        run_config.clone()
+    };
+    let launch = match launch_config.as_ref() {
         Some(cfg) => state.dagster.launch_run_with_config(&job, cfg).await,
         None => state.dagster.launch_run(&job).await,
     };
@@ -2450,12 +2487,38 @@ fn payload_too_large_run_config() -> Response {
 pub(super) struct TriggerBody {
     #[serde(default, rename = "runConfig")]
     pub run_config: Option<Value>,
+    /// BLD-12: ask an authored pipeline's op for a full atomic rebuild
+    /// instead of its configured incremental materialization. Only ever
+    /// used for a `pl-…` id; a Dagster-native job ignores it.
+    #[serde(default, rename = "fullRefresh")]
+    pub full_refresh: Option<bool>,
 }
 
 /// Top-level keys of a JSON object, or empty for non-objects (null,
 /// array, string, ...). Used to populate the `configKeys` audit field
 /// without forwarding the values themselves — see [`trigger`]'s
 /// `record_pipeline_audit` call.
+/// BLD-12: the launch config a `fullRefresh` ask produces. An authored
+/// `pl-…` id gets the op config `authored_factory` reads; any other id is
+/// left unchanged (a Dagster-native job has no such op). A caller config that
+/// passed the allowlist is merged rather than replaced, so the existing
+/// pass-through contract still holds.
+fn full_refresh_config(id: &str, caller_config: Option<Value>) -> Option<Value> {
+    if !id.starts_with("pl-") {
+        return caller_config;
+    }
+    let mut cfg = caller_config.unwrap_or_else(|| json!({}));
+    let op_name = authored_pipelines::op_name(id);
+    if let Some(ops) = cfg
+        .as_object_mut()
+        .map(|object| object.entry("ops".to_owned()).or_insert_with(|| json!({})))
+        .and_then(Value::as_object_mut)
+    {
+        ops.insert(op_name, json!({ "config": { "full_refresh": true } }));
+    }
+    Some(cfg)
+}
+
 fn top_level_keys(value: &Value) -> Vec<String> {
     let Some(obj) = value.as_object() else {
         return Vec::new();
@@ -3130,6 +3193,14 @@ pub struct CreatePipelineBody {
     source_table: Option<String>,
     #[serde(default)]
     incremental_column: Option<String>,
+    /// BLD-12: materialization fields, validated together with `kind` before
+    /// anything is written.
+    #[serde(default)]
+    incremental_strategy: Option<String>,
+    #[serde(default)]
+    partition_granularity: Option<String>,
+    #[serde(default)]
+    lookback_hours: Option<i32>,
     /// The legacy form's transforms. Absent is the same as empty for the
     /// legacy form, and is not allowed together with `inputs`/`steps`.
     #[serde(default)]
@@ -3234,6 +3305,16 @@ pub async fn create(
     // assistant's `create_pipeline` tool lands here too, so it gets the
     // same 400 and the same message as a console save.
     crate::routes::authored_pipelines::validate_target_table(&body.target_table)?;
+    // BLD-12: only `batch` and `incremental` may be authored today; an
+    // incremental pipeline must name a safe cursor and a valid strategy.
+    // Refusals are fixed 400s and nothing has been written yet.
+    let materialization = crate::routes::authored_pipelines::validate_materialization(
+        &body.kind,
+        body.incremental_column.clone(),
+        body.incremental_strategy.clone(),
+        body.partition_granularity.clone(),
+        body.lookback_hours,
+    )?;
     // BLD-1 part 1 / D3: whichever of the two body forms this is, one
     // function turns it into D1's shape. A body that sends both is refused
     // here, before anything else reads them.
@@ -3311,11 +3392,14 @@ pub async fn create(
     // until an admin assigns one (D2).
     let run_as = author_id(&principal);
     let input = CreatePipelineInput {
+        incremental_strategy: materialization.incremental_strategy,
+        partition_granularity: materialization.partition_granularity,
+        lookback_hours: materialization.lookback_hours,
         name: body.name,
         kind: body.kind,
         source_zone: first.zone.clone(),
         source_table: first.table.clone(),
-        incremental_column: body.incremental_column,
+        incremental_column: materialization.incremental_column,
         transforms: form.legacy_transforms.unwrap_or_default(),
         inputs: form.inputs,
         steps: form.steps,
@@ -3507,11 +3591,12 @@ pub async fn generate(
         .as_ref()
         .and_then(|d| d.name.clone())
         .unwrap_or(fallback_name.clone());
-    let kind = draft
+    let mut kind = draft
         .as_ref()
         .and_then(|d| d.kind.clone())
         .filter(|k| PIPELINE_KINDS.contains(&k.as_str()))
         .unwrap_or_else(|| "batch".to_owned());
+    let materialization = draft_materialization(draft.as_ref(), &mut kind)?;
     let source_table = draft
         .as_ref()
         .and_then(|d| d.source_table.clone())
@@ -3571,6 +3656,9 @@ pub async fn generate(
     )
     .await?;
     let input = CreatePipelineInput {
+        incremental_strategy: materialization.incremental_strategy,
+        partition_granularity: materialization.partition_granularity,
+        lookback_hours: materialization.lookback_hours,
         inputs: form.inputs,
         steps: form.steps,
         name,
@@ -3587,7 +3675,7 @@ pub async fn generate(
         // (see `PipelineDraft` below); nothing asks it for FBIC, so that
         // stays the same honest "not configured" default `create` uses
         // when a human author leaves it unset.
-        incremental_column: draft.as_ref().and_then(|d| d.incremental_column.clone()),
+        incremental_column: materialization.incremental_column,
         // BLD-13: the grammar-checked transforms from the form, so the
         // stored legacy strings and the stored steps say the same thing.
         transforms: form.legacy_transforms.unwrap_or_default(),
@@ -3638,9 +3726,10 @@ pub async fn generate(
     Ok((StatusCode::CREATED, ApiJson(created)))
 }
 
-/// The kinds a pipeline may be, as the database's `CHECK` constraint
-/// allows. A model is free to propose anything; only these are accepted.
-const PIPELINE_KINDS: [&str; 4] = ["batch", "incremental", "document", "vector"];
+/// The kinds a pipeline may be authored as today (BLD-12). `"document"` and
+/// `"vector"` remain readable in old rows but no model or person may create
+/// one; the same two values are the API's `ACTIVE_PIPELINE_KINDS`.
+const PIPELINE_KINDS: [&str; 2] = ["batch", "incremental"];
 
 /// What the model proposes for a pipeline. Every field is optional: a
 /// missing one falls back to something derived from the instruction, and a
@@ -3662,7 +3751,37 @@ struct PipelineDraft {
     #[serde(default)]
     incremental_column: Option<String>,
     #[serde(default)]
+    incremental_strategy: Option<String>,
+    #[serde(default)]
+    partition_granularity: Option<String>,
+    #[serde(default)]
+    lookback_hours: Option<i32>,
+    #[serde(default)]
     transforms: Vec<String>,
+}
+
+/// BLD-12: validate the materialization a model proposed. A draft that asks
+/// for incremental without a usable cursor (or with an invented strategy)
+/// would fail on its first run, so fall back to the full rebuild the row can
+/// actually execute instead of storing a broken definition.
+fn draft_materialization(
+    draft: Option<&PipelineDraft>,
+    kind: &mut String,
+) -> Result<crate::routes::authored_pipelines::MaterializationConfig, ApiError> {
+    let proposed = crate::routes::authored_pipelines::validate_materialization(
+        kind,
+        draft.and_then(|d| d.incremental_column.clone()),
+        draft.and_then(|d| d.incremental_strategy.clone()),
+        draft.and_then(|d| d.partition_granularity.clone()),
+        draft.and_then(|d| d.lookback_hours),
+    );
+    if let Ok(config) = proposed {
+        return Ok(config);
+    }
+    tracing::warn!("pipeline draft: incomplete incremental config, falling back to batch");
+    kind.clear();
+    kind.push_str("batch");
+    crate::routes::authored_pipelines::validate_materialization(kind, None, None, None, None)
 }
 
 /// Ask the LLM to draft a pipeline for `instruction` against `database`.
@@ -3677,9 +3796,12 @@ async fn llm_pipeline_draft(
             role: ChatRole::System,
             content: "You draft data pipelines. Reply with ONLY a JSON object, no prose \
                       and no code fence, with the keys: name (short snake_case), kind \
-                      (one of batch, incremental, document, vector), sourceTable, \
+                      (one of batch, incremental), sourceTable, \
                       targetTable, schedule (human readable, e.g. \"Every hour\"), \
-                      incrementalColumn (or null), transforms (array of short strings)."
+                      incrementalColumn (or null; required when kind is incremental), \
+                      incrementalStrategy (append or partition_replace, default append), \
+                      partitionGranularity (day or month, default day), \
+                      lookbackHours (0 to 720, default 0), transforms (array of short strings)."
                 .to_owned(),
         },
         ChatMessage {
@@ -4038,14 +4160,15 @@ async fn authored_status(
 }
 
 /// Switch the stored Dagster state of every automation that can launch an
-/// authored pipeline: its cron schedule, its dependency `_after` sensor and
-/// — for `targetLag.kind == "lag"` — its freshness `_lag` sensor (BLD-18).
+/// authored pipeline: its cron schedule, its dependency `_after` sensor, the
+/// re-upload chain `_chain` sensor (BLD-14) and — for `targetLag.kind ==
+/// "lag"` — its freshness `_lag` sensor (BLD-18).
 ///
 /// Each flip is best effort: the status is the record, and a definition that
-/// was never built (no cron schedule, no `dependsOn`, no target lag) is not
-/// an error. [`lakehouse_dagster::DgClient::set_sensor_running`] already
-/// treats a missing sensor on `running=false` as already stopped; a missing
-/// schedule or a `startSensor` on an undefined sensor comes back as an
+/// was never built (no cron schedule, no `dependsOn`, no chain sensor, no
+/// target lag) is not an error. [`lakehouse_dagster::DgClient::set_sensor_running`]
+/// already treats a missing sensor on `running=false` as already stopped; a
+/// missing schedule or a `startSensor` on an undefined sensor comes back as an
 /// `Ok` outcome with `error` set, which is logged here and never surfaced.
 async fn toggle_authored_automation(
     state: &AppState,
@@ -4095,6 +4218,22 @@ async fn toggle_authored_automation(
         {
             tracing::info!(%err, pipeline_id = id, "authored lag sensor not switched");
         }
+    }
+    // BLD-14 D6/D7: the re-upload chain sensor is a fourth automation for
+    // the same pipeline. Its stored state also outlives a reload, so a
+    // paused pipeline would otherwise keep launching the downstream chain.
+    // A pipeline without a chain sensor is tolerated just like a missing
+    // `_after` sensor (SensorNotFoundError on stop, error outcome on start).
+    let chain_sensor = authored_pipelines::chain_sensor_name(id);
+    let chain_switched = state
+        .dagster
+        .set_sensor_running(&chain_sensor, running)
+        .await;
+    if let Ok(SensorOutcome {
+        error: Some(err), ..
+    }) = &chain_switched
+    {
+        tracing::info!(%err, pipeline_id = id, "authored chain sensor not switched");
     }
 }
 
@@ -6687,6 +6826,9 @@ mod tests {
             let seeded = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    incremental_strategy: "append".to_owned(),
+                    partition_granularity: "day".to_owned(),
+                    lookback_hours: 0,
                     inputs: Vec::new(),
                     steps: Vec::new(),
                     name: "source-route-scope".to_owned(),
@@ -9372,6 +9514,12 @@ mod tests {
             let pipeline = lakehouse_store::pipelines::create_pipeline(
                 pool,
                 &CreatePipelineInput {
+                    // BLD-12 (migration `0156`) / PR #715 merge: a `batch`
+                    // fixture keeps the migration's defaults — full rebuild,
+                    // no lookback — so the lag tests exercise BLD-18 only.
+                    incremental_strategy: "append".to_owned(),
+                    partition_granularity: "day".to_owned(),
+                    lookback_hours: 0,
                     inputs: Vec::new(),
                     steps: Vec::new(),
                     name: format!("bld18-lag-{}", uuid::Uuid::new_v4()),
@@ -9881,6 +10029,34 @@ mod tests {
             AppState::new(config)
         }
 
+        /// BLD-12: `fullRefresh` on an authored pipeline addresses the OP
+        /// the factory registers (`authored_<safe id>`, one underscore),
+        /// not the job (`authored__<safe id>`, two). The same sanitizer must
+        /// be used on both sides or the run config silently misses its op.
+        #[test]
+        fn full_refresh_config_targets_the_authored_op_and_keeps_a_caller_config() {
+            let cfg = full_refresh_config("pl-orders-2026", None).expect("a config");
+            assert_eq!(
+                cfg,
+                json!({ "ops": { "authored_pl_orders_2026": {
+                    "config": { "full_refresh": true } } } })
+            );
+
+            let cfg = full_refresh_config(
+                "pl-orders-2026",
+                Some(json!({ "ops": { "other_op": { "config": { "x": 1 } } } })),
+            )
+            .expect("a config");
+            assert_eq!(cfg["ops"]["other_op"]["config"]["x"], json!(1));
+            assert_eq!(
+                cfg["ops"]["authored_pl_orders_2026"]["config"]["full_refresh"],
+                json!(true)
+            );
+
+            // A Dagster-native job is untouched: no invented op config.
+            assert_eq!(full_refresh_config("silver_rebuild", None), None);
+        }
+
         /// No body at all (the existing curl corpus entry) MUST still
         /// launch with no validation step — `Option<Json<TriggerBody>>`
         /// returns `Ok(None)` on an empty body / missing content-type,
@@ -9968,6 +10144,7 @@ mod tests {
 
             let state = state_with_dagster(&server.uri());
             let body = Json(TriggerBody {
+                full_refresh: None,
                 run_config: Some(json!({
                     "ops": { "silver_rebuild_op": { "config": { "target_table": "x" } } }
                 })),
@@ -10033,6 +10210,7 @@ mod tests {
 
             let state = state_with_dagster(&server.uri());
             let body = Json(TriggerBody {
+                full_refresh: None,
                 run_config: Some(json!({
                     "ops": { "silver_rebuild_op": { "config": { "target_table": "x" } } }
                 })),
@@ -10103,6 +10281,7 @@ mod tests {
 
             let state = state_with_dagster(&server.uri());
             let body = Json(TriggerBody {
+                full_refresh: None,
                 run_config: Some(json!({
                     "ops": { "silver_rebuild_op": { "config": { "target_table": "x" } } }
                 })),
@@ -10167,6 +10346,7 @@ mod tests {
 
             let state = state_with_dagster(&server.uri());
             let body = Json(TriggerBody {
+                full_refresh: None,
                 run_config: Some(json!({ "ops": {} })),
             });
             let response = trigger(
@@ -10230,6 +10410,7 @@ mod tests {
 
             let state = state_with_dagster(&server.uri());
             let body = Json(TriggerBody {
+                full_refresh: None,
                 run_config: Some(json!({
                     "ops": { "silver_rebuild_op": { "config": { "target_table": "x" } } }
                 })),
@@ -10278,6 +10459,7 @@ mod tests {
 
             let state = state_with_dagster(&server.uri());
             let body = Json(TriggerBody {
+                full_refresh: None,
                 run_config: Some(json!({
                     "ops": { "run_ingest": { "config": { "connector_id": "conn-x" } } }
                 })),
@@ -10334,6 +10516,7 @@ mod tests {
 
             let state = state_with_dagster(&server.uri());
             let body = Json(TriggerBody {
+                full_refresh: None,
                 run_config: Some(json!({
                     "ops": { "agent_run_op": { "config": { "employee_id": "emp-x" } } }
                 })),
@@ -10407,6 +10590,9 @@ mod tests {
             let seeded = create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    incremental_strategy: "append".to_owned(),
+                    partition_granularity: "day".to_owned(),
+                    lookback_hours: 0,
                     inputs: Vec::new(),
                     steps: Vec::new(),
                     name: id.clone(),
@@ -10463,6 +10649,7 @@ mod tests {
             let state = AppState::new(config);
 
             let body = Json(TriggerBody {
+                full_refresh: None,
                 run_config: Some(json!({ "ops": {} })),
             });
             let response = trigger(
@@ -10503,6 +10690,7 @@ mod tests {
 
             let state = state_with_dagster(&server.uri());
             let body = Json(TriggerBody {
+                full_refresh: None,
                 run_config: Some(json!("not-an-object")),
             });
             let response = trigger(
@@ -10535,6 +10723,7 @@ mod tests {
 
             let state = state_with_dagster(&server.uri());
             let body = Json(TriggerBody {
+                full_refresh: None,
                 run_config: Some(json!([1, 2, 3])),
             });
             let response = trigger(
@@ -10572,6 +10761,7 @@ mod tests {
             // (object) passes and only the size check fires.
             let big_value = "x".repeat(70 * 1024);
             let body = Json(TriggerBody {
+                full_refresh: None,
                 run_config: Some(json!({ "ops": { "k": big_value } })),
             });
             let response = trigger(
@@ -10632,6 +10822,7 @@ mod tests {
 
             let state = state_with_dagster(&server.uri());
             let body = Json(TriggerBody {
+                full_refresh: None,
                 run_config: Some(json!({
                     "ops": { "silver_rebuild_op": { "config": { "target_table": "x" } } },
                     "resources": { "io_manager": { "config": { "path": "x" } } }
@@ -10702,6 +10893,7 @@ mod tests {
 
             let state = state_with_dagster(&server.uri());
             let body = Json(TriggerBody {
+                full_refresh: None,
                 run_config: Some(json!({
                     "ops": { "silver_rebuild_op": { "config": { "evil": 1 } } }
                 })),
@@ -10767,6 +10959,7 @@ mod tests {
 
             let state = state_with_dagster(&server.uri());
             let body = Json(TriggerBody {
+                full_refresh: None,
                 run_config: Some(json!({
                     "ops": { "silver_rebuild_op": { "config": { "target_table": "x" } } }
                 })),
@@ -10819,6 +11012,7 @@ mod tests {
 
             let state = state_with_dagster(&server.uri());
             let body = Json(TriggerBody {
+                full_refresh: None,
                 run_config: Some(json!({
                     "ops": { "silver_rebuild_op": { "config": { "target_table": "x" } } }
                 })),
@@ -11012,6 +11206,7 @@ mod tests {
 
             let state = state_for(&pool, &server.uri());
             let body = Json(TriggerBody {
+                full_refresh: None,
                 run_config: Some(json!({
                     "ops": { "silver_rebuild_op": { "config": { "target_table": "x" } } }
                 })),
@@ -11489,6 +11684,9 @@ mod tests {
 
         fn seed_input(name: &str) -> CreatePipelineInput {
             CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
@@ -12566,6 +12764,9 @@ mod tests {
             tenant_id: Option<uuid::Uuid>,
         ) -> CreatePipelineInput {
             CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),

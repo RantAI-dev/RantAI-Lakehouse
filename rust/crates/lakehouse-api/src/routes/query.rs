@@ -2642,8 +2642,9 @@ fn cell_value(v: Option<&Value>) -> Value {
 
 /// Convert a [`TrinoResult`] into the same `(columns, rows)` shape the
 /// `ClickHouse` branch of [`run`] produces, so both engines answer with an
-/// identical `QueryResult` row format.
-fn trino_result_to_rows(result: &TrinoResult) -> (Vec<String>, Vec<Value>) {
+/// identical `QueryResult` row format. `pub(crate)` so an in-place dashboard
+/// preview reuses the one cell conversion rather than writing a second one.
+pub(crate) fn trino_result_to_rows(result: &TrinoResult) -> (Vec<String>, Vec<Value>) {
     let columns: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
     let rows: Vec<Value> = result
         .rows

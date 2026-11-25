@@ -264,7 +264,7 @@ export function AssetOverview({
       )}
 
       {/* ── Gold publish per mart (DATA-1): published as an open format ── */}
-      {a.layer === "gold" && <OpenFormatCard assetId={a.id} />}
+      {(a.layer === "gold" || a.layer === "silver") && <OpenFormatCard assetId={a.id} />}
 
       {/* ── How do I use it? ────────────────────────────────────────── */}
       <SectionCard

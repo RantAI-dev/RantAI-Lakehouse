@@ -6,7 +6,7 @@
 | Backlog | `BI-44` |
 | Kind | Feature |
 | Spec | `docs/core/specs/bi-44.md` |
-| Status | Building (slice 1 handed off) |
+| Status | Building (slices 1–3 handed off; slice 4 console and installer built) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. |
 | Acceptor | The product owner. |
@@ -41,6 +41,18 @@ from them.
 5. Later slices register external catalogs, keep masks and row filters on
    their columns, run dashboard tiles and SQL sources over them, and let
    the assistant use them.
+6. Install with one command:
+   `lakehousectl install --mode bi-only --engine clickhouse|trino`. It
+   writes `LAKEHOUSE_INSTALL_MODE`, `LAKEHOUSE_QUERY_ENGINE` and exactly
+   one engine URL into the install's mode-0600 `.env`; `--mode full`
+   (the default) keeps the old byte-for-byte output. See
+   `ops/bi-only/README.md`.
+7. See the mode and the engine on Admin > Settings > Deployment, as the
+   deployment route reports them. In a `bi-only` install the console also
+   lists the external source types the engine can read in place and says
+   that nothing is copied into the lakehouse. With that mode it hides the
+   warehouse-only sidebar pages (Pipelines and the Gold exports entry)
+   and offers only the installed engine in Query Studio's engine picker.
 
 ## Decisions
 
@@ -65,7 +77,34 @@ from them.
 - A warehouse-only route in a BI-only installation answers from its own
   guard (503 / unsupported), not by dialing a service that was not
   installed.
-- Peak memory numbers are unmeasured until the slice 4 gate.
+- Peak memory numbers are unmeasured until the slice 4 gate. No
+  `docs/plans/BI-44-RESULT.md` measurement exists yet; the structural target
+  is one engine process, not a measured RSS figure.
+- `GET /api/settings/deployment` needs `settings:write`. The console reads
+  it only for a holder of that permission, so the deployment card, the
+  hidden sidebar pages and the one-engine picker are available to an
+  administrator. Other roles get the unchanged menu and both engine
+  choices; the API still refuses an inactive engine at run time, and
+  warehouse-only pages answer honestly from their own guard. Fetching the
+  route for everyone would mean a 403 on every page load (`WEB-11`,
+  `ADM-13`).
+- `lakehousectl install --mode bi-only ...` writes the mode variables into
+  the install's `.env`; it does not change the release's root Compose file.
+  To deploy only the seven named services, use the standalone files in
+  `ops/bi-only/` as described there. A full-mode install keeps its exact
+  former `.env` bytes.
+- Slice 3 moves unsaved dashboard SQL-source preview and the assistant's
+  `run_sql` / dataset tools to the active engine. It does **not** add a
+  metadata store: saved SQL sources, charts and boards still live in
+  `ClickHouse` tables, which a `bi-only+trino` install does not deploy. Those
+  persistence routes answer a fixed 503 naming the missing store instead of
+  dialing it; only a preview over unsaved SQL works there. Inline chart
+  previews are refused honestly for the same reason — the chart builder
+  still emits `ClickHouse` `SETTINGS` text. No persistence is fabricated.
+- The assistant tool schemas and
+  `tests/fixtures/tool_schemas.json` are unchanged by slice 3: the engine
+  context is appended to the system prompt only in `bi-only` mode, so every
+  `AI-32` full-mode prompt pin stays byte-identical.
 
 ## Acceptance checklist
 
