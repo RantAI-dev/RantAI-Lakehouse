@@ -196,7 +196,7 @@ from dispar_orchestrate.adapters.kafka import consume_one_batch
 from dispar_orchestrate.adapters.sink import LoadPlan, UnsupportedLoadMode, load_via_sink
 from dispar_orchestrate.bronze_catalog import record_ingest_offset, record_ingest_run
 from dispar_orchestrate.column_gate import UnsupportedColumnType, reject_unsupported_column_types
-from dispar_orchestrate.ingest_errors import UnknownAdapter, UnsupportedKafkaAuth
+from dispar_orchestrate.ingest_errors import KafkaTargetMissing, UnknownAdapter, UnsupportedKafkaAuth
 from dispar_orchestrate.op_metadata import source_metadata
 from dispar_orchestrate.saas import vendors as saas_vendors
 from dispar_orchestrate.secret_map import secret_field_names
@@ -238,6 +238,136 @@ class IngestFactoryConfig:
 
 def _headers(cfg: IngestFactoryConfig) -> dict[str, str]:
     return {} if not cfg.service_token else {"Authorization": f"Bearer {cfg.service_token}"}
+
+
+# How long one `ingest_job` run may run, in seconds (`SRC-39`, QA `TC-1702`).
+# Six hours is the bound the console already uses to treat a run with no end
+# as stopped (`STALE_RUN_MS`, `connector-ingest-panel.tsx`), and the retry
+# policy alone holds a failing table's run open for about 21 minutes (`SRC-11`
+# decision 1); the longest measured loads are minutes
+# (`docs/plans/DATA-17-RESULT.md`, `docs/plans/SRC-11-RESULT.md`).
+RUN_LIMIT_ENV = "INGEST_RUN_MAX_RUNTIME_SECONDS"
+DEFAULT_RUN_LIMIT_SECONDS = 21_600
+# The largest value the API can read (`u32::MAX`): both services must read the
+# setting by the same rule, or one lets a run go for a day while the other
+# cancels it at six hours (`review round 1, R9`).
+MAX_RUN_LIMIT_SECONDS = 4_294_967_295
+
+
+@dataclass(frozen=True)
+class RunLimitSettings:
+    """How long one job's run may run, in seconds (`SRC-39`).
+
+    `run_limit_tags` reads it into the `dagster/max_runtime` tag of every
+    run. The tag is a tag on ONE job alone, not
+    `run_monitoring.max_runtime_seconds`, which would cap every job of the
+    instance (D9), and the orchestrator enforces it only while run monitoring
+    is on (`dagster/dagster.yaml`, T10).
+
+    `from_env` takes the setting's own name and default, so a second job
+    with its own limit reuses this ONE parsing rule instead of copying it
+    (`AGENTS.md` rule 4): `ingest_job` keeps six hours, and
+    `storage_snapshot_job` (OPS-8 part C) keeps thirty minutes.
+    """
+
+    max_runtime_seconds: int = DEFAULT_RUN_LIMIT_SECONDS
+
+    @classmethod
+    def from_env(
+        cls,
+        env_name: str = RUN_LIMIT_ENV,
+        default_seconds: int = DEFAULT_RUN_LIMIT_SECONDS,
+    ) -> "RunLimitSettings":
+        raw = _env(env_name, "")
+        if not raw:
+            return cls(max_runtime_seconds=default_seconds)
+        # `review round 1, R9`: the API's rule (`parse_run_limit`,
+        # `lakehouse-api/src/config.rs`), so both services read one setting the
+        # same way: surrounding spaces trimmed (`_env` does it), ASCII digits
+        # only, a value from 1 to `u32::MAX`. `int()` alone would take
+        # "86_400" and 4294967296, which the API rejects.
+        seconds = int(raw) if raw.isascii() and raw.isdigit() else 0
+        if not 1 <= seconds <= MAX_RUN_LIMIT_SECONDS:
+            # The value is the operator's own setting, but a malformed one is
+            # not worth echoing into a log line the whole team reads.
+            logger.warning(
+                "%s cannot be used (expected a whole number of seconds, 1 or more); using the default %d",
+                env_name,
+                default_seconds,
+            )
+            return cls(max_runtime_seconds=default_seconds)
+        return cls(max_runtime_seconds=seconds)
+
+
+def run_limit_tags(env_name: str, default_seconds: int) -> dict[str, str]:
+    """The `dagster/max_runtime` tag a job carries, read from `env_name`
+    with `default_seconds` as its fallback (`SRC-39`, QA `TC-1702`).
+
+    One function for every job that needs a run limit, so the parsing rule
+    above stays in one place: a job that wants a limit of its own asks for
+    it here with its own setting name, and never touches
+    `ingest_job`'s.
+    """
+    settings = RunLimitSettings.from_env(env_name, default_seconds)
+    return {"dagster/max_runtime": str(settings.max_runtime_seconds)}
+
+
+# The tag that keeps one job from overlapping ANOTHER RUN OF ITSELF
+# (`OPS-37`). Its value is the job's own Dagster name, so the run queue's
+# per-value limit applies to that job alone: a second `bronze_maintenance_job`
+# waits in the queue, while `gold_export_job` may run beside it.
+#
+# The rule itself lives in `dagster/dagster.yaml`
+# (`concurrency.runs.tag_concurrency_limits`), not here: this module owns
+# the tag, the instance config owns the limit.
+SERIAL_TAG = "lakehouse/serial"
+
+# The jobs that must never overlap another run of THEMSELVES. Each of them
+# writes to the same tables a second run of it would write, so two
+# overlapping runs fight over the same rows -- the staging outage of
+# 2026-11-18, where a scheduled `bronze_maintenance_job` and one started by
+# hand overlapped for an hour.
+#
+# The list is here, next to the tag, so it is read with the code that uses
+# it. A job that waits for its own previous run stays QUEUED and is never
+# dropped.
+#
+# `gold_latest_copy_job` (DATA-6 D16): one run at a time per the whole
+# code location's serial rule; two updates of the same table never race,
+# and runs queue behind the one in flight instead of being dropped.
+SERIAL_JOB_NAMES = frozenset(
+    {
+        "bronze_maintenance_job",
+        "capacity_snapshot_job",
+        "discover_job",
+        "gold_export_job",
+        "gold_latest_copy_job",
+        "storage_snapshot_job",
+    }
+)
+
+
+def job_tags(job_name: str, env_name: str, default_seconds: int) -> dict[str, str]:
+    """The tags every run of `job_name` carries: its own run limit and, for
+    a serial job, the `lakehouse/serial` tag (`OPS-37`).
+
+    ONE helper for every job of this code location, so both rules stay in
+    one place (`AGENTS.md` rule 4): a job added later carries its run limit
+    and the serial tag the same way, and neither tag is ever written by hand
+    at a call site.
+
+    `run_limit_tags` stays the ONE place that parses the limit setting; this
+    helper adds the serial tag to its result.
+    """
+    tags = run_limit_tags(env_name, default_seconds)
+    if job_name in SERIAL_JOB_NAMES:
+        tags[SERIAL_TAG] = job_name
+    return tags
+
+
+def _ingest_job_tags() -> dict[str, str]:
+    """The tags every `ingest_job` run carries (`SRC-39`, QA `TC-1702`)."""
+    return job_tags("ingest_job", RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS)
 
 
 def _fetch_one_connector(cfg: IngestFactoryConfig, connector_id: str) -> dict[str, Any]:
@@ -757,8 +887,18 @@ def _run_one_object(
 
     try:
         reject_unsupported_column_types(obj.get("columns", []))
-        plan = _load_plan(adapter_name, obj, refresh=_REFRESH_OF_ACTION.get(action or ""))
-        gate = _make_gate(connector, obj, run_id)
+        # SRC-4 T1.2/T1.3: the console's column names for Oracle are Oracle's own spelling
+        # (`CREATED_AT`); the reflected table and the rows say `created_at`. The plan (cursor,
+        # key) and the gate (columns left out) are matched against the reflection, so they get
+        # the reflected spelling. `obj` itself stays as saved: its `name` and `target` are not
+        # column names.
+        column_obj = (
+            oracle_adapter.in_reflected_spelling(obj)
+            if adapter_name == "sql" and dial.get("driver") == "oracle"
+            else obj
+        )
+        plan = _load_plan(adapter_name, column_obj, refresh=_REFRESH_OF_ACTION.get(action or ""))
+        gate = _make_gate(connector, column_obj, run_id)
 
         if adapter_name == "sql" and dial.get("driver") in _POSTGRES_DRIVERS:
             # See this module's docstring, "Postgres routing" -- pinned
@@ -769,6 +909,10 @@ def _run_one_object(
                 dlt_pipeline.BronzeIngestConfig.from_dial(dial, secrets, [obj]),
                 plan,
                 gate=gate,
+                # `DATA-52`, review round 1 R2: this load is a connector's replace,
+                # append or incremental, and it records the run's label like the
+                # Clear, Oracle and generic paths below do.
+                author=_run_author(connector_id, run_id),
             )
             if outcome.get("waiting"):
                 _record(rows=None, status="waiting", error=_WAITING_MESSAGE)
@@ -1019,19 +1163,35 @@ def run_kafka_stream_batch(
     closes it in `finally`; a caller-supplied consumer is the caller's to
     close.
     """
+    # SRC-45 (QA `LH-SRC-6-41`): the Bronze table is the first source object's
+    # `target`. A spec with none used to stop at the first message with a bare
+    # `IndexError` ("failed, not classified"); it now fails closed, before any
+    # consumer exists, with a classified `setting_rejected` and a sentence that
+    # says what to do. `source_objects[0]` is read only through this check.
+    first = source_objects[0] if source_objects else {}
+    target = first.get("target") if isinstance(first, dict) else None
+    if not isinstance(target, str) or not target:
+        raise KafkaTargetMissing(
+            "This Kafka connector has no Bronze table yet: pick its topic again on the Ingest tab."
+        )
     owns_consumer = consumer is None
     if owns_consumer:
         consumer = KafkaConsumer(
             bootstrap_servers=spec["bootstrapServers"],
             group_id=spec["groupId"],
             enable_auto_commit=False,
+            # SRC-45 (QA `LH-SRC-6-41`): a group with no committed offset reads the
+            # topic from its start, not from its end (kafka-python's default
+            # `latest`, which loaded nothing on the first run). A group that has
+            # committed resumes where it stopped; this changes only the first run.
+            auto_offset_reset="earliest",
             value_deserializer=lambda v: v,  # raw bytes -- consume_one_batch does its own json.loads
             **kafka_security_kwargs(spec, secrets),
         )
         consumer.subscribe([spec["topic"]])
     topic = spec.get("topic", "")
     job_name = "ingest_job"
-    object_name = source_objects[0]["target"] if source_objects else topic
+    object_name = target
     started_at = datetime.now(timezone.utc).isoformat()
 
     def _record(*, rows, status, error=""):
@@ -1051,8 +1211,12 @@ def run_kafka_stream_batch(
             batch = consume_one_batch(consumer, topic=topic, max_seconds=spec.get("microBatchSeconds", 60))
             if not batch.rows:
                 return 0
-            sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env())
-            outcome = load_via_sink(batch.rows, source_objects[0]["target"], sink_config)
+            # `DATA-52`, review round 1 R2: a micro-batch is a load like any other,
+            # and its commits record the run's label (`_run_author`).
+            sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(
+                dlt_pipeline.BronzeIngestConfig.from_env(), author=_run_author(connector_id, run_id)
+            )
+            outcome = load_via_sink(batch.rows, target, sink_config)
             # Committed ONLY after the sink write above returned
             # successfully (an exception there propagates out of this
             # try block before this point is ever reached -- see this
@@ -1072,13 +1236,13 @@ def run_kafka_stream_batch(
             # failed batch wrote nothing, so they register nothing.
             _register_in_catalog(
                 connector_id,
-                {"name": source_objects[0].get("name") or topic, "target": source_objects[0]["target"]},
+                {"name": first.get("name") or topic, "target": target},
             )
             # SRC-8 (D4): a micro-batch is observed AFTER it loads, like every
             # source whose columns cannot be read first. The offsets are
             # already committed; a failed post changes nothing (see
             # `_observe_after_load`).
-            _observe_after_load(connector_id, source_objects[0].get("name") or topic, outcome.columns, run_id)
+            _observe_after_load(connector_id, first.get("name") or topic, outcome.columns, run_id)
             return outcome.rows
         except ssrf_guard.SsrfBlocked as exc:
             _record(rows=None, status="rejected", error=str(exc))
@@ -1537,7 +1701,14 @@ A failure is classified by `ingest_errors.classify` and either retried or
     return rows
 
 
-@job(name="ingest_job")
+# The `dagster/max_runtime` tag is what run monitoring enforces (`SRC-39`,
+# QA `TC-1702`): a run still going after the limit is cancelled and failed by
+# the daemon, which then frees the connector. It is only enforced while run
+# monitoring is on (`dagster/dagster.yaml`, T10), and it sits on `ingest_job`
+# alone: `run_monitoring.max_runtime_seconds` would cap every job of the
+# instance. `tags` and not `run_tags`: both launch paths (the GraphQL launch
+# and the sensor) copy a job's `tags` onto the run when `run_tags` is unset.
+@job(name="ingest_job", tags=_ingest_job_tags())
 def ingest_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `ingest_job` -- the SAME
     static job for every ingestible connector, launched with run config

@@ -95,7 +95,7 @@ impl FromRequestParts<AppState> for AuthenticatedPrincipal {
             // is a hard structural discriminator, not a heuristic.
             let principal = match bearer_credential_kind(&token) {
                 BearerCredentialKind::JwtLike => {
-                    let Some(oidc) = auth.oidc.as_ref() else {
+                    let Some(oidc) = crate::runtime_settings::oidc(state).await else {
                         return Err(unauthenticated());
                     };
                     let credential = Credential::Bearer(Secret::new(token));

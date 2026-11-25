@@ -114,6 +114,17 @@ impl ChartKind {
             Self::Text | Self::Heading | Self::Divider | Self::Section | Self::Image | Self::Web
         )
     }
+
+    /// Whether this kind draws its breakdown as a series (`BI-46`, plan D12;
+    /// QA `LH-BI-6-01`): bar, hbar, line and area, where the second column is
+    /// one line or one stack per value and the chart's limit keeps the N
+    /// breakdown values with the largest total. A heatmap's second column is
+    /// an axis, a sankey's a target and a sunburst's a ring, so they keep
+    /// their own statements.
+    #[must_use]
+    pub fn breakdown_is_series(self) -> bool {
+        matches!(self, Self::Bar | Self::Hbar | Self::Line | Self::Area)
+    }
 }
 
 /// Numeric display format for a chart or KPI value.
@@ -160,6 +171,9 @@ pub enum Aggregate {
 }
 
 impl Aggregate {
+    /// The decimals every aggregate but `count` keeps (`BI-55`, `BI-57`).
+    pub const DECIMAL_SCALE: u8 = 6;
+
     /// The lowercase `ClickHouse` function name this aggregate renders as
     /// (`count` renders as `count()`, callers handle that specially).
     #[must_use]
@@ -170,6 +184,27 @@ impl Aggregate {
             Self::Max => "max",
             Self::Min => "min",
             Self::Count => "count",
+        }
+    }
+
+    /// The statement fragment this aggregate writes for `operand`, rounded
+    /// per `BI-55` (QA `LH-BI-6-04`) and `BI-57` (D9).
+    ///
+    /// Every aggregate but `count` keeps [`Aggregate::DECIMAL_SCALE`]
+    /// decimals: enough for a percent shown with four decimals, and it cuts
+    /// the tail of a binary fraction (`1466.1833333333334`). A count is whole
+    /// by construction. `round(x, 6)` of a whole number is that number in
+    /// `ClickHouse`, of the same type, so a sum, a minimum or a maximum of
+    /// whole numbers stays whole, and a sum of a `Float*` or `Decimal*`
+    /// column keeps its decimals without the builder having to know the
+    /// column's type (`BI-57`, D9).
+    #[must_use]
+    pub fn rounded(self, operand: &str) -> String {
+        match self {
+            Self::Count => "count()".to_owned(),
+            Self::Sum | Self::Avg | Self::Max | Self::Min => {
+                format!("round({self}({operand}), {})", Self::DECIMAL_SCALE)
+            }
         }
     }
 
@@ -487,6 +522,18 @@ mod tests {
             serde_json::to_string(&ChartSource::Builtin).unwrap(),
             "\"builtin\""
         );
+    }
+
+    // QA LH-BI-6-04 (BI-55, D4): an average, a minimum and a maximum keep six
+    // decimals. QA LH-BI-6-04 (BI-55), BI-57 (D9): a sum keeps them too, and a
+    // count is whole by construction.
+    #[test]
+    fn every_aggregate_but_a_count_keeps_six_decimals() {
+        assert_eq!(Aggregate::Sum.rounded("v"), "round(sum(v), 6)");
+        assert_eq!(Aggregate::Avg.rounded("v"), "round(avg(v), 6)");
+        assert_eq!(Aggregate::Max.rounded("v"), "round(max(v), 6)");
+        assert_eq!(Aggregate::Min.rounded("v"), "round(min(v), 6)");
+        assert_eq!(Aggregate::Count.rounded("v"), "count()");
     }
 
     // `charts()`/`kpis()`/`spec_sql()` all read the process-wide

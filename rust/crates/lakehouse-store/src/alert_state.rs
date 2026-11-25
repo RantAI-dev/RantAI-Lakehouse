@@ -13,6 +13,7 @@ use sqlx::{FromRow, PgPool};
 use time::OffsetDateTime;
 
 use crate::StoreError;
+use crate::report_schedule::{Schedule, ScheduleError};
 
 /// A stored state row.
 #[derive(Debug, Clone, PartialEq, FromRow)]
@@ -216,4 +217,162 @@ pub async fn resolve_open_instances(
     .execute(pool)
     .await?;
     Ok(done.rows_affected())
+}
+
+// ── Digests: when a dashboard digest is due (`BI-65`, migration `0152`) ────
+
+/// Why a digest's turn could not be worked out.
+#[derive(Debug, thiserror::Error)]
+pub enum DigestTurnError {
+    /// The clock could not be read or written.
+    #[error("{0}")]
+    Store(#[from] StoreError),
+    /// The schedule or its zone is not usable.
+    #[error("{0}")]
+    Schedule(#[from] ScheduleError),
+}
+
+/// What one tick should do about one digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DigestTurn {
+    /// The digest was never seen: its clock starts now and nothing is sent. Its
+    /// first send is the first schedule time after this tick.
+    StartedClock,
+    /// The next schedule time after the clock is still ahead.
+    NotYet,
+    /// Due, and this caller moved the clock to `now`, so only it sends.
+    /// `previous` is the clock before, for [`give_back_digest`].
+    Claimed {
+        /// The clock before this claim.
+        previous: OffsetDateTime,
+    },
+    /// Due, but another runner moved the clock first.
+    ClaimedElsewhere,
+}
+
+/// Whether a digest counted from `clock` is due at `now`: the first run of
+/// `schedule` (in `zone`) after `clock` is at or before `now`. Pure, so the
+/// whole rule is a unit test. A missed run happens once: the next time is
+/// worked out from the claim, never from the time that was missed
+/// (`report_schedule`, feature decision 8).
+///
+/// # Errors
+///
+/// [`ScheduleError`] from [`Schedule::next_run_after`].
+pub fn digest_is_due(
+    schedule: Schedule,
+    zone: &str,
+    clock: OffsetDateTime,
+    now: OffsetDateTime,
+) -> Result<bool, ScheduleError> {
+    Ok(schedule.next_run_after(zone, clock)? <= now)
+}
+
+/// The instant digest `rule_id` is counted from, or `None` when it has not been
+/// seen yet.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the query fails.
+pub async fn digest_clock(
+    pool: &PgPool,
+    rule_id: &str,
+) -> Result<Option<OffsetDateTime>, StoreError> {
+    let row: Option<Option<OffsetDateTime>> =
+        sqlx::query_scalar("SELECT digest_clock_at FROM alert_rule_state WHERE rule_id = $1")
+            .bind(rule_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.flatten())
+}
+
+/// Move the clock of `rule_id` from `expected` to `to`, only if it is still at
+/// `expected` (`None` means never seen), and say whether this call won. One
+/// conditional upsert, so of two overlapping runners that read the same clock
+/// exactly one gets `true` and sends (the same claim as [`claim`]).
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the statement fails.
+pub async fn move_digest_clock(
+    pool: &PgPool,
+    rule_id: &str,
+    expected: Option<OffsetDateTime>,
+    to: OffsetDateTime,
+) -> Result<bool, StoreError> {
+    let won: Option<(String,)> = sqlx::query_as(
+        "INSERT INTO alert_rule_state (rule_id, state, since, last_checked_at, digest_clock_at) \
+         VALUES ($1, 'ok', $3, $3, $3) \
+         ON CONFLICT (rule_id) DO UPDATE SET digest_clock_at = EXCLUDED.digest_clock_at \
+         WHERE alert_rule_state.digest_clock_at IS NOT DISTINCT FROM $2::timestamptz \
+         RETURNING rule_id",
+    )
+    .bind(rule_id)
+    .bind(expected)
+    .bind(to)
+    .fetch_optional(pool)
+    .await?;
+    Ok(won.is_some())
+}
+
+/// Decide what this tick does about digest `rule_id` and, when it is due, claim
+/// the send before anything is sent (so two runners cannot both send).
+///
+/// # Errors
+///
+/// [`DigestTurnError::Store`] when the clock cannot be read or written,
+/// [`DigestTurnError::Schedule`] for a zone or schedule that is not usable.
+pub async fn digest_turn(
+    pool: &PgPool,
+    rule_id: &str,
+    schedule: Schedule,
+    zone: &str,
+    now: OffsetDateTime,
+) -> Result<DigestTurn, DigestTurnError> {
+    let Some(clock) = digest_clock(pool, rule_id).await? else {
+        // Losing this race changes nothing: the other runner started the clock.
+        move_digest_clock(pool, rule_id, None, now).await?;
+        return Ok(DigestTurn::StartedClock);
+    };
+    if !digest_is_due(schedule, zone, clock, now)? {
+        return Ok(DigestTurn::NotYet);
+    }
+    if move_digest_clock(pool, rule_id, Some(clock), now).await? {
+        Ok(DigestTurn::Claimed { previous: clock })
+    } else {
+        Ok(DigestTurn::ClaimedElsewhere)
+    }
+}
+
+/// Give a claimed send back when the digest could not be delivered: the clock
+/// goes from `claimed` back to `previous`, so the next tick sends again. Only
+/// if the clock is still at `claimed` (a later claim is left alone).
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the statement fails.
+pub async fn give_back_digest(
+    pool: &PgPool,
+    rule_id: &str,
+    claimed: OffsetDateTime,
+    previous: OffsetDateTime,
+) -> Result<(), StoreError> {
+    move_digest_clock(pool, rule_id, Some(claimed), previous).await?;
+    Ok(())
+}
+
+/// Start a digest's clock over: it is read as never seen again, so its next send
+/// is the first schedule time after the next tick. Used when its schedule or
+/// zone is edited, so a new schedule does not send at once for a time that has
+/// already passed under the old one.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the statement fails.
+pub async fn clear_digest_clock(pool: &PgPool, rule_id: &str) -> Result<(), StoreError> {
+    sqlx::query("UPDATE alert_rule_state SET digest_clock_at = NULL WHERE rule_id = $1")
+        .bind(rule_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }

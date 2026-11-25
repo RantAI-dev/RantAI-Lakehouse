@@ -32,6 +32,11 @@ beforeEach(() => {
   mockPermissions = ["pipeline:write"]
 })
 
+/** The value beside the "Current lag" label — the pill also says "Not measured". */
+function currentLagValue(): string {
+  return screen.getByText("Current lag").nextElementSibling?.textContent ?? ""
+}
+
 function makePipeline(overrides: Partial<PipelineDetail> = {}): PipelineDetail {
   return {
     id: "pl-orders",
@@ -68,7 +73,8 @@ describe("PipelineFreshnessPanel display", () => {
     render(<PipelineFreshnessPanel pipeline={p} />)
 
     expect(screen.getByText("10 minutes")).toBeTruthy()
-    expect(screen.getByText("45s")).toBeTruthy()
+    // BLD-11 D4: a measured number goes through the shared duration formatter.
+    expect(screen.getByText("45.0 s")).toBeTruthy()
     expect(screen.getByText("Met")).toBeTruthy()
     expect(screen.getByLabelText("Freshness")).toBeTruthy()
   })
@@ -85,7 +91,8 @@ describe("PipelineFreshnessPanel display", () => {
     render(<PipelineFreshnessPanel pipeline={p} />)
 
     expect(screen.getByText("Behind")).toBeTruthy()
-    expect(screen.getByText("700s")).toBeTruthy()
+    // BLD-11 D4: same formatter, not raw seconds (700 s = 11m 40s).
+    expect(screen.getByText("11m 40s")).toBeTruthy()
     expect(screen.getByText("lag 700s exceeds target 600s")).toBeTruthy()
   })
 
@@ -100,7 +107,8 @@ describe("PipelineFreshnessPanel display", () => {
     })
     render(<PipelineFreshnessPanel pipeline={p} />)
 
-    expect(screen.getByText("Not measured")).toBeTruthy()
+    // BLD-11 D4: both the status pill AND the Current lag figure say it.
+    expect(currentLagValue()).toBe("Not measured")
     expect(screen.getByText("no check recorded in the last 90 seconds")).toBeTruthy()
   })
 
@@ -239,6 +247,37 @@ describe("PipelineFreshnessPanel authorization and controls", () => {
     }
   })
 
+  // QA LH-BLD-2-03 F1 (WEB-11): the panel would print `permission_denied:
+  // pipeline:write`; a refusal is the sentence that names the permission.
+  it("says a refused target lag in words, not the API's code", async () => {
+    const p = makePipeline()
+    const originalFetch = global.fetch
+    global.fetch = mock(
+      async () =>
+        new Response(JSON.stringify({ error: "permission_denied: pipeline:write" }), {
+          status: 403,
+          headers: { "Content-Type": "application/json" },
+        })
+    ) as unknown as typeof fetch
+
+    try {
+      render(<PipelineFreshnessPanel pipeline={p} />)
+
+      fireEvent.click(screen.getByLabelText("Configure target lag"))
+      const form = screen.getByText("Save target lag").closest("form")!
+      fireEvent.submit(form)
+
+      await waitFor(() => {
+        expect(
+          screen.getByText("You don't have access. This needs the pipeline:write permission.")
+        ).toBeTruthy()
+      })
+      expect(document.body.textContent ?? "").not.toMatch(/permission_denied/)
+    } finally {
+      global.fetch = originalFetch
+    }
+  })
+
   it("surfaces honest API error text on rejection", async () => {
     const p = makePipeline()
     const orig = pipelineService.setTargetLag
@@ -291,5 +330,51 @@ describe("PipelineFreshnessPanel authorization and controls", () => {
     } finally {
       pipelineService.setTargetLag = orig
     }
+  })
+})
+
+describe("PipelineFreshnessPanel current lag wording (BLD-11 D4/D6)", () => {
+  it("a met pipeline with no pending change shows 'Up to date', not a dash", () => {
+    const p = makePipeline({
+      lag: { status: "met", lagSeconds: null, lastCheckAt: "2026-10-15T12:00:00Z", reason: null },
+    })
+    render(<PipelineFreshnessPanel pipeline={p} />)
+
+    expect(screen.getByText("Up to date")).toBeTruthy()
+    expect(screen.queryByText("—")).toBeNull()
+  })
+
+  it("a not measured pipeline shows 'Not measured' as its current lag", () => {
+    const p = makePipeline({
+      lag: {
+        status: "not_measured",
+        lagSeconds: null,
+        lastCheckAt: "2026-10-15T12:00:00Z",
+        reason: "no check recorded in the last 90 seconds",
+      },
+    })
+    render(<PipelineFreshnessPanel pipeline={p} />)
+
+    expect(currentLagValue()).toBe("Not measured")
+  })
+
+  it("a pending lag of 125 seconds shows as 2m 05s", () => {
+    const p = makePipeline({
+      lag: { status: "behind", lagSeconds: 125, lastCheckAt: "2026-10-15T12:00:00Z", reason: null },
+    })
+    render(<PipelineFreshnessPanel pipeline={p} />)
+
+    // Pin the shared formatter's output (formatDuration(125_000)).
+    expect(screen.getByText("2m 05s")).toBeTruthy()
+  })
+
+  it("the panel says how lag is counted", () => {
+    render(<PipelineFreshnessPanel pipeline={makePipeline()} />)
+
+    expect(
+      screen.getByText(
+        "Lag counts from when a Bronze input was loaded, and from the first check that saw the change for a Silver or Gold input."
+      )
+    ).toBeTruthy()
   })
 })

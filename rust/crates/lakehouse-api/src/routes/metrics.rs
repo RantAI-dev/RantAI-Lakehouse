@@ -1045,12 +1045,49 @@ mod tests {
         .await;
     }
 
+    /// Answer the BI table bootstrap (`lakehouse_bi::store::ensure_bi_table`).
+    ///
+    /// The bootstrap runs its DDL once per PROCESS (the `BI_TABLE_ENSURED`
+    /// guard), so a test cannot lean on an earlier test having run it: under
+    /// `cargo-nextest` every test gets its own process, the guard starts
+    /// "not started", and the DDL is sent to THIS test's mock server. An
+    /// unanswered statement is a 404, and the read that follows it fails.
+    ///
+    /// Two kinds of statement are answered here:
+    ///
+    /// - the DDL itself (`CREATE DATABASE IF NOT EXISTS`, `CREATE TABLE IF NOT
+    ///   EXISTS`, `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`); its body is
+    ///   discarded by `ChClient::exec`, so an empty 200 is enough;
+    /// - the bootstrap's last step, a read of `system.columns` asking whether
+    ///   the legacy embed columns are still on `console.bi_board`. No rows
+    ///   means "no legacy columns", so the copy is skipped, exactly as on a
+    ///   fresh database.
+    ///
+    /// `REL-20` D6: a test that breaks under `cargo-nextest` is fixed in the
+    /// test, never skipped and never `#[ignore]`d.
+    async fn answer_bi_ddl(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(body_string_contains("IF NOT EXISTS"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM system.columns"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": [], "rows": 0 })),
+            )
+            .mount(server)
+            .await;
+    }
+
     /// BI-18 part C, part 2: a chart on somebody's personal board uses a metric
     /// as much as any other, so a delete is blocked, but the caller is not told
     /// which board or chart it is: only that something they cannot see uses it.
     #[tokio::test]
     async fn a_chart_the_caller_cannot_see_blocks_a_delete_without_being_named() {
         let server = MockServer::start().await;
+        answer_bi_ddl(&server).await;
         let mine = "owner_id != '' AND owner_id != 'u_me'";
         answer(
             &server,
@@ -1105,6 +1142,7 @@ mod tests {
     async fn a_chart_on_a_restricted_dashboard_blocks_a_delete_without_being_named() {
         use lakehouse_bi::access::{AccessMap, BoardPlacement, ItemKind, Level};
         let server = MockServer::start().await;
+        answer_bi_ddl(&server).await;
         answer(
             &server,
             &["FROM console.bi_chart FINAL", "NOT IN ('b_secret')"],

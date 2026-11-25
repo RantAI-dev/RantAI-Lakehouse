@@ -61,6 +61,15 @@ def test_a_transient_failure_waits_one_then_five_then_fifteen_minutes(monkeypatc
     assert waits == [60, 300, 900]
 
 
+def test_an_unreachable_object_store_is_retried_after_one_five_and_fifteen_minutes() -> None:
+    # QA LH-SRC-6-53 (SRC-38): the object-storage endpoint is down, and the
+    # `botocore` error is `unreachable`, so the default waits apply.
+    from botocore.exceptions import EndpointConnectionError
+
+    error = EndpointConnectionError(endpoint_url="http://storage.invalid:9000/b")
+    assert [f._decide(error, n).wait_seconds for n in range(4)] == [60, 300, 900, None]
+
+
 def test_after_the_third_retry_the_step_fails_with_a_fixed_text_and_is_not_retried_again(monkeypatch) -> None:
     secret_text = "host db.internal.example refused"
     monkeypatch.setattr(f, "_run_one_object", _raising(ConnectionRefusedError(secret_text)))

@@ -1,5 +1,6 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, render, screen, waitFor } from "@testing-library/react"
 import { afterAll, afterEach, describe, expect, it, mock } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import * as realThemes from "next-themes"
 import * as realTileBody from "./tile-body"
 import * as realGrid from "./dashboard-grid"
@@ -57,7 +58,7 @@ function payload(extra: Record<string, unknown> = {}, board: Record<string, unkn
 type Call = { url: string; body: Record<string, unknown> }
 
 /** Serves the embed's three routes and records what was asked. */
-function serve(opts: { data?: unknown; origins?: string[]; values?: string[] } = {}): Call[] {
+function serve(opts: { data?: unknown; origins?: string[]; values?: string[]; branding?: unknown } = {}): Call[] {
   const calls: Call[] = []
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
@@ -65,6 +66,11 @@ function serve(opts: { data?: unknown; origins?: string[]; values?: string[] } =
     calls.push({ url, body })
     if (url === "/api/embed/frame") return json({ origins: opts.origins ?? [] })
     if (url === "/api/embed/values") return json({ column: body.column, values: opts.values ?? [], truncated: false })
+    // The workspace's own branding (`ADM-2`). Nothing set unless a test
+    // says otherwise, so the product's own name is what shows.
+    if (url.includes("/api/branding")) {
+      return json(opts.branding ?? { workspaceName: null, logo: null, logoDark: null, icon: null })
+    }
     return json(opts.data ?? payload())
   }) as unknown as typeof fetch
   return calls
@@ -74,12 +80,12 @@ describe("the look in the embed address (BI-26 D6)", () => {
   it("shows our name on a single chart, and logo=none hides it", async () => {
     serve()
     render(<EmbedView jwt="j" chartId="c1" />)
-    await screen.findByText("Rantai Lake")
+    await screen.findByText("RantAI Lakehouse")
     cleanup()
     serve()
     render(<EmbedView jwt="j" chartId="c1" look={{ ...DEFAULT_EMBED_LOOK, showName: false }} />)
     await screen.findByText("Visits")
-    expect(screen.queryByText("Rantai Lake")).toBeNull()
+    expect(screen.queryByText("RantAI Lakehouse")).toBeNull()
   })
 
   it("theme=dark draws a light dashboard dark, theme=light a dark one light, 'dashboard' keeps its own", async () => {
@@ -103,19 +109,19 @@ describe("the look in the embed address (BI-26 D6)", () => {
     serve()
     render(<EmbedView jwt="j" />)
     await screen.findByTestId("tile")
-    expect(screen.getByText("Rantai Lake")).toBeTruthy()
+    expect(screen.getByText("RantAI Lakehouse")).toBeTruthy()
     cleanup()
     serve()
     render(<EmbedView jwt="j" look={{ ...DEFAULT_EMBED_LOOK, showName: false }} />)
     await screen.findByTestId("tile")
-    expect(screen.queryByText("Rantai Lake")).toBeNull()
+    expect(screen.queryByText("RantAI Lakehouse")).toBeNull()
   })
 
   it("links our name on a public-link dashboard embed, like the single chart", async () => {
     // Decision 12: a public-link embed gets the look too.
     serve()
     render(<EmbedView token="p_tok" />)
-    const name = await screen.findByText("Rantai Lake ↗")
+    const name = await screen.findByText("RantAI Lakehouse ↗")
     const link = name.closest("a")
     expect(link?.getAttribute("href")).toBe("/public/dashboard/p_tok")
     expect(link?.getAttribute("target")).toBe("_blank")
@@ -158,23 +164,74 @@ describe("the look in the embed address (BI-26 D6)", () => {
   })
 })
 
+describe("the embed footer shows the workspace's own name (ADM-2)", () => {
+  it("shows the workspace name from settings, not a fixed product name", async () => {
+    serve({ branding: { workspaceName: "Acme Data", logo: null, logoDark: null, icon: null } })
+    render(<EmbedView jwt="j" />)
+    expect(await screen.findByText("Acme Data")).toBeTruthy()
+    // The product's own name is nowhere in the footer: a workspace that
+    // set a name must not still be called RantAI Lakehouse.
+    expect(screen.queryByText("RantAI Lakehouse")).toBeNull()
+  })
+
+  it("links the workspace name on a public-link embed, like the single chart", async () => {
+    serve({ branding: { workspaceName: "Acme Data", logo: null, logoDark: null, icon: null } })
+    render(<EmbedView token="p_tok" />)
+    const name = await screen.findByText("Acme Data ↗")
+    const link = name.closest("a")
+    expect(link?.getAttribute("href")).toBe("/public/dashboard/p_tok")
+    expect(link?.getAttribute("target")).toBe("_blank")
+  })
+
+  it("falls back to the product's own name when the workspace set none", async () => {
+    serve()
+    render(<EmbedView jwt="j" />)
+    expect(await screen.findByText("RantAI Lakehouse")).toBeTruthy()
+  })
+
+  it("shows no lone arrow in the footer until the branding has answered", async () => {
+    let answer: (response: Response) => void = () => {}
+    const pending = new Promise<Response>((resolve) => {
+      answer = resolve
+    })
+    serve()
+    const served = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) =>
+      String(input).includes("/api/branding") ? pending : served(input, init),
+    ) as unknown as typeof fetch
+    const { container } = render(<EmbedView token="p_tok" />)
+    await screen.findByTestId("tile")
+    expect(container.textContent).not.toContain("↗")
+    expect(container.querySelector("a[href='/public/dashboard/p_tok']")).toBeNull()
+
+    answer(json({ workspaceName: "Acme Data", logo: null, logoDark: null, icon: null }))
+    expect(await screen.findByText("Acme Data ↗")).toBeTruthy()
+  })
+
+  it("hides the workspace name when the address says logo=none", async () => {
+    serve({ branding: { workspaceName: "Acme Data", logo: null, logoDark: null, icon: null } })
+    render(<EmbedView jwt="j" look={{ ...DEFAULT_EMBED_LOOK, showName: false }} />)
+    await screen.findByTestId("tile")
+    expect(screen.queryByText("Acme Data")).toBeNull()
+  })
+})
+
 describe("editable filters in a signed embed (BI-26 D4, D5)", () => {
   const filters = [{ column: "region", kind: "text", filter: { values: ["Bali"] } }]
 
   it("lists the allowed values, starts at the saved value, and asks again with the viewer's choice", async () => {
     const calls = serve({ data: payload({ embedFilters: filters }), values: ["Bali", "Java"] })
     render(<EmbedView jwt="the.jwt" />)
-    const select = (await screen.findByLabelText("region")) as HTMLSelectElement
-    await waitFor(() => expect(select.options.length).toBe(3))
-    expect(select.value).toBe("Bali")
+    const select = await screen.findByRole("combobox", { name: "region" })
+    await waitFor(() => expect(select.textContent).toContain("Bali"))
     expect(calls.some((c) => c.url === "/api/embed/values" && c.body.column === "region" && c.body.jwt === "the.jwt")).toBe(true)
 
-    fireEvent.change(select, { target: { value: "Java" } })
+    chooseOption(select, "Java")
     await waitFor(() =>
       expect(calls.some((c) => c.url === "/api/embed/data" && JSON.stringify(c.body.filters) === JSON.stringify([{ column: "region", op: "in", values: ["Java"] }]))).toBe(true),
     )
     // "All" clears it: an inactive filter replaces the saved one.
-    fireEvent.change(select, { target: { value: "" } })
+    chooseOption(select, "All")
     await waitFor(() =>
       expect(calls.some((c) => c.url === "/api/embed/data" && JSON.stringify(c.body.filters) === JSON.stringify([{ column: "region", op: "in", values: [] }]))).toBe(true),
     )
@@ -191,7 +248,7 @@ describe("editable filters in a signed embed (BI-26 D4, D5)", () => {
     const calls = serve({ data: payload({ embedFilters: filters }) })
     render(<EmbedView token="p_tok" />)
     await screen.findByTestId("tile")
-    expect(screen.queryByLabelText("region")).toBeNull()
+    expect(screen.queryByRole("combobox", { name: "region" })).toBeNull()
     expect(calls.some((c) => c.url === "/api/embed/values")).toBe(false)
   })
 })
@@ -236,7 +293,7 @@ describe("height messages (BI-26 D7, decision 9)", () => {
     await waitFor(() => expect(posted.length).toBe(1), { timeout: 2000 })
     const root = measured()
     expect(root).not.toBeNull()
-    expect(root?.contains(screen.getByText("Rantai Lake"))).toBe(true)
+    expect(root?.contains(screen.getByText("RantAI Lakehouse"))).toBe(true)
   })
 
   it("posts nothing while the payload is still loading, then the real height (BI-26 review fix R5)", async () => {

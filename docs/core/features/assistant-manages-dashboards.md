@@ -69,10 +69,12 @@ audit and the console's own refusals all carry through unchanged.
 - `rename_board` (`dashboard:write`, WriteLow): renames a board; the
   built-in Main board is refused.
 - `delete_board` (`dashboard:write`, WriteHigh): waits for approval; the
-  approval reason names the board and says its charts are deleted too;
-  the built-in Main board is refused.
+  approval reason names the board and says the board and its charts go
+  to the trash, restorable for 30 days (#529); the built-in Main board
+  is refused.
 - `arrange_board` (`dashboard:write`, WriteLow): takes the tiles that
-  change and their boxes; the others keep their boxes; the grid is 12
+  change and their boxes; the others keep their boxes, unless one
+  overlaps a tile the call moved, which then moves down; the grid is 12
   columns wide; a box outside the grid or with `w` or `h` below 1 is
   refused.
 - `move_chart` (`dashboard:write`, WriteLow): moves a chart from one
@@ -89,11 +91,13 @@ audit and the console's own refusals all carry through unchanged.
 The chart tools say what they did. `delete_chart` refuses a chart that does
 not exist or that the person cannot see ("this tile does not exist"),
 instead of reporting a delete that never happened. `update_chart` keeps the
-formatting and the board the call leaves out, so changing a chart's title
-does not move it to another board or cost it its colours; a change of the
-chart's kind resets the formatting, because the old formatting does not fit
-the new kind. `update_chart` keeps the data source the call leaves out
-too, so a rename does not have to repeat the mart. `list_charts` names
+fields the call leaves out, so a rename does not empty the chart. That
+covers the formatting, the data source, the board, and the other fields
+such as the measures, filters and sort. A field the call names replaces the
+stored one, and `null` clears it. A change of the chart's kind resets the
+formatting, because the old formatting does not fit the new kind. The chart
+keeps its board and its place on it, so changing its title does not move it
+to another board or to the last tile. `list_charts` names
 each chart's board and its tab, so the assistant can read what an update
 keeps.
 
@@ -156,8 +160,13 @@ carries; a part the result does not carry is left out) and says not to
 draft those objects again, then "Continue:" with the steps that are left;
 it names what was saved, it does not re-send the tool results. A
 cancelled or failed draft sends nothing, so a refused step stops the
-request there. At most three such continuations follow one typed
-message.
+request there. At most three such continuations follow one typed message.
+Once the person confirms a draft, the chat also shows a `Saved: <title>` line
+under the reply, or `Not saved: <error>` when the save fails. A cancelled
+draft shows no such line, and the assistant's own text is not changed.
+A chart draft carries a short `definition` line with the chart's fields (a
+chart update carries it in the saved result), and the prompt tells the
+assistant to describe only what that line lists.
 
 ## Decisions
 
@@ -165,7 +174,7 @@ message.
 | --- | --- | --- | --- |
 | 1 | Six tools, with names that contain `board` or `chart` so the console's capability test covers them unchanged: `rename_board`, `delete_board`, `arrange_board`, `move_chart`, `set_board_view_filters`, `save_board_filters` | Planner default | Owner to confirm at QA |
 | 2 | The tools go through the console's route handlers (`tools/calc_fields.rs` pattern); where a handler is private it is widened to `pub(in crate::routes)`; errors pass through the existing classification (`api_result_to_value`) | Planner default | Owner to confirm at QA |
-| 3 | `arrange_board` takes only the tiles that change (`{chartId: {x, y, w, h}}`); the server reads the current layout, refuses a chart id that is not on that board, refuses a box outside the 12-column grid or with `w` or `h` below 1, merges and saves through the console's `boards_update` with `layout`. The prompt says the grid has 12 columns and that `list_boards` gives the current layout | Planner default | Owner to confirm at QA |
+| 3 | `arrange_board` takes only the tiles that change (`{chartId: {x, y, w, h}}`); the server reads the current layout, refuses a chart id that is not on that board, refuses a box outside the 12-column grid or with `w` or `h` below 1, merges and saves through the console's `boards_update` with `layout`. The prompt says the grid has 12 columns and that `list_boards` gives the current layout. The server settles the layout before it saves it: the tiles the call names keep their boxes, and every other tile that overlaps one of them moves down, just below what it hits; two tiles collide only when they are on the same tab | Planner default | Owner to confirm at QA |
 | 4 | `move_chart` reads the stored chart, changes only its board, saves through the path `specs_update` uses, and removes the chart's tile from the old board's layout | Planner default | Owner to confirm at QA |
 | 5 | `set_board_view_filters` validates filters and writes nothing; returns `{applyViewFilters: true, board, filters}` (the full list that should be active; an empty list clears). Read risk, so it is offered in Ask mode too | Planner default | Owner to confirm at QA |
 | 6 | The dashboard page applies a view-filter result. When a chat reply's trace holds a `set_board_view_filters` step with `ok: true` and its `board` is the board on screen, the page writes the filters into the address with the existing helpers (`encodeFilters` / `filtersToParam`). On any other page or another board the step card shows a link to that board with the filters in the address, built with the same helpers. The hook sits beside the existing way the dock tells the page about a tool result (`use-copilot.ts:301`, `:405`); no new channel | Planner default | Owner to confirm at QA |
@@ -190,8 +199,14 @@ message.
   and leaves the row unmet; no code for it.
 - Filters are validated by the same `validate_filters` the console uses;
   one board accepts at most `MAX_FILTERS` (20, from `BI-18`).
-- A delete is the only WriteHigh tool. It asks for approval, names the
-  board and says its charts go too.
+- A delete is not the only WriteHigh tool: the registry (`registry.rs`)
+  holds 17, of which a dashboard request reaches `delete_chart`,
+  `delete_tab`, `delete_board`, `delete_calculated_field`,
+  `delete_metric`, `delete_hierarchy`, `delete_parameter`,
+  `delete_alert_rule`, `delete_report_subscription`, `enable_embed`
+  and `set_embed_filter_modes`; the rest are platform tools. A delete
+  asks for approval, names the board, and the board and its charts go
+  to the trash, restorable for 30 days (#529).
 - The active filters in the page context are written as compact JSON
     within a 4,000-character budget of their own, which leaves room inside
     the page context's 6,000-character cap. When they do not, the JSON
@@ -212,8 +227,8 @@ quoted requests come from the specs.
 | `AI-1-AC1` | Ask "rename this dashboard to 'Q3 Tourism' and move the Bali chart to the top" (the spec's quoted request) | The board is renamed and the named chart's tile is at the top of its grid | Not run |
 | `AI-1-AC2` | Ask to delete a board with charts, then reject the approval | Nothing on the board or its charts changes; the board is still there with all its charts | Not run |
 | `AI-1-AC3` | As a role without `dashboard:write`, ask to rename a board, delete a board, arrange tiles, move a chart, or save filters | A plain refusal naming the missing permission; nothing changes | Not run |
-| `AI-2-AC1` | Ask "show only 2025 and only Bali" (the spec's quoted request) | The view's filters become a 2025 number filter and a Bali filter; the address carries them | Not run |
-| `AI-2-AC2` | After the step above, open the same board as another viewer | The board's saved default is unchanged; the address carries only what that viewer set, if anything | Not run |
+| `AI-2-AC1` | Ask "show only 2025 and only Bali" (the spec's quoted request) | The view's filters become a 2025 number filter and a Bali filter; the address carries them | Pass — Accepted by the AI owner, 2026-11-14 (staging `240d2e62`) |
+| `AI-2-AC2` | After the step above, open the same board as another viewer | The board's saved default is unchanged; the address carries only what that viewer set, if anything | Pass — Accepted by the AI owner, 2026-11-14 (staging `240d2e62`) |
 | `AI-20-AC1` | Open a dashboard with the filter-row grain control set to a value that is not the chart's own grain; ask the assistant about the dashboard's time grain | The answer names the override, not the chart's own grain | Not run |
 
 **Accepted by:** __________ **Date:** ______ **Build:** ______

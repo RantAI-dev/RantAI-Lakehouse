@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import { MoveEffectNote } from "./folder-dialogs"
 import { NOBODY_MANAGES_NOTE, PeoplePanel, RESTRICTION_NOTE } from "./people-panel"
 
@@ -84,7 +85,7 @@ describe("PeoplePanel (BI-19 part B1)", () => {
     const calls = stub(ACCESS)
     render(<PeoplePanel kind="board" id="b_1" />)
     await screen.findByText("Dewi")
-    fireEvent.change(screen.getByLabelText("Level of Dewi"), { target: { value: "edit" } })
+    chooseOption(screen.getByRole("combobox", { name: "Level of Dewi" }), "Can edit")
     fireEvent.click(screen.getByText("Save people"))
     await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
     const put = calls.find((c) => c.method === "PUT")!
@@ -95,8 +96,9 @@ describe("PeoplePanel (BI-19 part B1)", () => {
     stub({ ...ACCESS, yourLevel: "edit" })
     render(<PeoplePanel kind="board" id="b_1" />)
     await screen.findByText("Dewi")
-    const options = Array.from(screen.getByLabelText("Level of Dewi").querySelectorAll("option")).map((o) => o.getAttribute("value"))
-    expect(options).toEqual(["view", "edit"])
+    fireEvent.click(screen.getByRole("combobox", { name: "Level of Dewi" }))
+    const options = screen.getAllByRole("option").map((o) => o.textContent)
+    expect(options).toEqual(["Can view", "Can edit"])
   })
 
   it("says why when the caller does not manage the item", async () => {

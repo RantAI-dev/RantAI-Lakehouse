@@ -22,6 +22,7 @@ from dispar_orchestrate.capacity_snapshot import (
     capacity_snapshot_job,
     capacity_snapshot_schedule,
 )
+from dispar_orchestrate.cdc_apply import cdc_apply_job, cdc_apply_sensor
 from dispar_orchestrate.discover import discover_job
 from dispar_orchestrate.file_ingest import file_ingest_job
 from dispar_orchestrate.gold_export import (
@@ -29,6 +30,7 @@ from dispar_orchestrate.gold_export import (
     gold_export_job,
     gold_export_schedule,
 )
+from dispar_orchestrate.gold_latest_copy import gold_latest_copy_job
 from dispar_orchestrate.ingest_factory import ingest_job, ingest_schedule_sensor
 from dispar_orchestrate.maintenance import (
     bronze_maintenance_job,
@@ -41,6 +43,11 @@ from dispar_orchestrate.pipeline_events import (
 from dispar_orchestrate.replication_metrics import (
     replication_slot_check_job,
     replication_slot_check_schedule,
+)
+from dispar_orchestrate.run_queue_sensor import run_queue_near_limit_sensor
+from dispar_orchestrate.storage_snapshot import (
+    storage_snapshot_job,
+    storage_snapshot_schedule,
 )
 
 # P4 adds `bronze_maintenance_job` (+ its daily schedule), P5 adds
@@ -66,6 +73,11 @@ from dispar_orchestrate.replication_metrics import (
 # see `capacity_snapshot.py`'s module doc for its own design and the
 # schema-ownership split with `bronze_catalog.py`.
 #
+# `storage_snapshot_job` (+ its daily schedule) adds OPS-8 part C's
+# per-layer storage measurement, into the SAME code location for the same
+# ADR 0005 reason — see `storage_snapshot.py`'s module doc for its own
+# design and the schema-ownership split with `bronze_catalog.py`.
+#
 # WS4 items E1/E3/E4 add `authored_jobs`: one real `authored__<id>` job per
 # console-authored pipeline in status `ready` or `paused`, built from
 # `GET /api/pipelines/runnable` at code-load time, and `authored_schedules`:
@@ -80,7 +92,7 @@ from dispar_orchestrate.replication_metrics import (
 # also launchable on demand from the Dagster UI, same as before.
 # `agent_run_job`'s own schedules are no longer permanently empty: with
 # `AGENT_RUN_TOKEN` set (see `lakehouse-api::main::bootstrap_agent_run_service`
-# and this repo's `.env.example`), `agent_run_schedules` holds one entry
+# and docs/CONFIGURATION.md), `agent_run_schedules` holds one entry
 # per scheduled employee; with it unset, `agent_run_schedules` is `[]` and
 # `agent_run_job` stays launchable on demand only, exactly like
 # `gold_export_job`.
@@ -103,10 +115,17 @@ defs = Definitions(
         bronze_maintenance_job,
         replication_slot_check_job,
         gold_export_job,
+        # DATA-6 (D6): launched only by `routes::gold::export`, with one
+        # publish's run config — no schedule, no sensor, same reason as
+        # `file_ingest_job` above.
+        gold_latest_copy_job,
         agent_run_job,
         alerts_run_job,
         capacity_snapshot_job,
+        storage_snapshot_job,
         ingest_job,
+        # SRC-4 slice 2: writes a change-capture connector's topics to Bronze.
+        cdc_apply_job,
         file_ingest_job,
         discover_job,
         *authored_jobs,
@@ -117,6 +136,7 @@ defs = Definitions(
         alerts_run_schedule,
         *agent_run_schedules,
         capacity_snapshot_schedule,
+        storage_snapshot_schedule,
         gold_export_schedule,
         *authored_schedules,
     ],
@@ -125,6 +145,8 @@ defs = Definitions(
         # lakehouse-api, so a schedule saved in the console needs no reload --
         # see `ingest_factory.py`'s "Schedules" section.
         ingest_schedule_sensor,
+        # SRC-4 slice 2: starts cdc_apply_job for a connector with changes to apply.
+        cdc_apply_sensor,
         pipeline_run_failed_sensor,
         pipeline_run_finished_sensor,
         gold_export_after_authored_sensor,
@@ -140,5 +162,10 @@ defs = Definitions(
         # BLD-2 D6: one lag sensor per authored pipeline with a time-based target lag
         # (named authored__<safe_id>_lag, running every 30 seconds).
         *authored_lag_sensors,
+        # OPS-37: warns when the run queue stays one below its limit for
+        # fifteen minutes. It starts no run — the warning is the skipped
+        # tick's reason — see `run_queue_sensor.py`'s module doc for why
+        # the console's System status page cannot show it instead.
+        run_queue_near_limit_sensor,
     ],
 )

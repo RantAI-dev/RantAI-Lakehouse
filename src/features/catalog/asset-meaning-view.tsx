@@ -489,9 +489,12 @@ function MeaningDialog({ state, target, onClose }: { state: Ready; target: Dialo
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
+          {/* UX-4: the meaning is required while synonyms and role are
+              optional, so the star stays; the form is too short for a
+              legend. */}
           <div className="grid gap-1.5">
             <div className="flex items-center justify-between gap-2">
-              <Label htmlFor={`${id}-meaning`}>Meaning</Label>
+              <Label htmlFor={`${id}-meaning`} required>Meaning</Label>
               <span className={cn("text-xs", tooLong ? "text-destructive" : "text-muted-foreground")}>
                 {`${length}/${max}`}
               </span>
@@ -500,6 +503,7 @@ function MeaningDialog({ state, target, onClose }: { state: Ready; target: Dialo
               id={`${id}-meaning`}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
+              aria-required
               aria-invalid={text === "" || tooLong}
               rows={4}
             />

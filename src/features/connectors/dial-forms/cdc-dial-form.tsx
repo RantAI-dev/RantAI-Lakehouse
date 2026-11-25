@@ -1,23 +1,46 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import type { CdcDial, SqlDriver } from "@/services/contracts/connectors"
 import { DEFAULT_SQL_PORT } from "./sql-dial-form"
+import { CDC_SSL_MODES, ORACLE_SSL_MODES } from "./ssl-modes"
 
 /**
- * `dial` for the `cdc` adapter — `SqlDialForm`'s fields plus
- * `slotName`/`publicationName`, both required server-side with no
- * fallback (`ingest_spec.rs`'s `CdcDial`, no `Option`). This form does
- * not add a client-side required-field rule for either — `Dial::parse`
- * already rejects an empty/missing value with its own error text on
- * every `PUT`, and duplicating that check here would risk drifting from
- * it.
+ * `dial` for the `cdc` adapter — `SqlDialForm`'s fields plus the setting of
+ * the driver (`SRC-4` decision S3-a): `slotName` and `publicationName` for
+ * PostgreSQL only, `serverId` for MySQL only, `pdbName` for Oracle only, nothing for SQL Server. A field
+ * the driver does not use is not in the dial at all (the server refuses a
+ * present one). This form does not add a client-side required-field rule:
+ * `Dial::parse` already rejects a missing value with its own fixed sentence
+ * on every `PUT`, and duplicating that check here would risk drifting from it.
  *
  * `driver` works as in `SqlDialForm`: the type already names the database,
  * so the form starts there and only asks when a stored dial disagrees.
  */
+export const DEFAULT_CDC_SSL_MODE = "require"
+
+/** The dial as the driver wants it: only its own setting, PostgreSQL's two names
+ * kept as typed (empty until typed), MySQL's server id only when a number was given, Oracle's
+ * pluggable database only when one was typed. */
+export function shapeCdcDial(dial: CdcDial): CdcDial {
+  const { slotName, publicationName, serverId, pdbName, sslMode, ...rest } = dial
+  // The TLS mode is always sent, `require` unless a person chose another (`SRC-4 S3 review SHOULD-FIX 1`).
+  const common = { ...rest, sslMode: sslMode || DEFAULT_CDC_SSL_MODE }
+  if (dial.driver === "oracle") {
+    return pdbName ? { ...common, pdbName } : common
+  }
+  if (dial.driver === "postgres") {
+    return { ...common, slotName: slotName ?? "", publicationName: publicationName ?? "" }
+  }
+  if (dial.driver === "mysql") {
+    return typeof serverId === "number" ? { ...common, serverId } : common
+  }
+  return common
+}
+
 export function CdcDialForm({
   value,
   onChange,
@@ -34,36 +57,41 @@ export function CdcDialForm({
     port: DEFAULT_SQL_PORT[initialDriver],
     database: "",
     user: "",
-    slotName: "",
-    publicationName: "",
-    serverId: null,
+    sslMode: DEFAULT_CDC_SSL_MODE,
+    ...(initialDriver === "postgres" ? { slotName: "", publicationName: "" } : {}),
   }
   const askDriver = !driver || dial.driver !== driver
+  const isOracle = dial.driver === "oracle"
+  const sslModes = isOracle ? ORACLE_SSL_MODES : CDC_SSL_MODES
   function set<K extends keyof CdcDial>(key: K, v: CdcDial[K]) {
-    onChange({ ...dial, [key]: v })
+    onChange(shapeCdcDial({ ...dial, [key]: v }))
   }
   return (
     <div className="grid gap-3 sm:grid-cols-2">
       {askDriver ? (
         <div className="space-y-1.5 sm:col-span-2">
           <Label htmlFor="cdc-dial-driver">Driver</Label>
-          <select
+          {/* WEB-9 D3: the four drivers this form serves, in the same order. */}
+          <SelectField
             id="cdc-dial-driver"
-            className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+            className="w-full"
             value={dial.driver}
-            onChange={(e) => set("driver", e.target.value as CdcDial["driver"])}
-          >
-            <option value="postgres">PostgreSQL</option>
-            <option value="mysql">MySQL</option>
-            <option value="mssql">SQL Server</option>
-          </select>
+            options={[
+              { value: "postgres", label: "PostgreSQL" },
+              { value: "mysql", label: "MySQL" },
+              { value: "mssql", label: "SQL Server" },
+              { value: "oracle", label: "Oracle" },
+            ]}
+            onValueChange={(next) => set("driver", next as CdcDial["driver"])}
+          />
         </div>
       ) : null}
       <div className="grid gap-3 sm:col-span-2 sm:grid-cols-[minmax(0,1fr)_7rem]">
         <div className="space-y-1.5">
-          <Label htmlFor="cdc-dial-host">Host</Label>
+          <Label htmlFor="cdc-dial-host" required>Host</Label>
           <Input
             id="cdc-dial-host"
+            aria-required
             value={dial.host}
             onChange={(e) => set("host", e.target.value)}
             placeholder="db.internal.example.com"
@@ -71,9 +99,10 @@ export function CdcDialForm({
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="cdc-dial-port">Port</Label>
+          <Label htmlFor="cdc-dial-port" required>Port</Label>
           <Input
             id="cdc-dial-port"
+            aria-required
             type="number"
             value={dial.port}
             onChange={(e) => set("port", Number(e.target.value))}
@@ -82,55 +111,106 @@ export function CdcDialForm({
         </div>
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="cdc-dial-database">Database</Label>
+        <Label htmlFor="cdc-dial-database" required>{isOracle ? "Container database (service name)" : "Database"}</Label>
         <Input
           id="cdc-dial-database"
+          aria-required
           value={dial.database}
           onChange={(e) => set("database", e.target.value)}
-          placeholder="sales"
+          placeholder={isOracle ? "FREE" : "sales"}
           autoComplete="off"
         />
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="cdc-dial-user">User</Label>
+        <Label htmlFor="cdc-dial-user" required>User</Label>
         <Input
           id="cdc-dial-user"
+          aria-required
           value={dial.user}
           onChange={(e) => set("user", e.target.value)}
           placeholder="lakehouse_cdc"
           autoComplete="off"
         />
       </div>
-      <div className="space-y-1.5">
-        <Label htmlFor="cdc-dial-slot-name">Replication slot name</Label>
-        <Input
-          id="cdc-dial-slot-name"
-          value={dial.slotName}
-          onChange={(e) => set("slotName", e.target.value)}
-          placeholder="lakehouse_slot"
-          autoComplete="off"
+      <div className="space-y-1.5 sm:col-span-2">
+        <Label htmlFor="cdc-dial-ssl-mode">TLS mode</Label>
+        {/* WEB-9 D3: the adapter's modes, plus a stored mode it no longer
+            lists, kept last and shown as it is. */}
+        <SelectField
+          id="cdc-dial-ssl-mode"
+          className="w-full"
+          value={dial.sslMode || DEFAULT_CDC_SSL_MODE}
+          options={[
+            ...sslModes,
+            ...(dial.sslMode && !sslModes.some((m) => m.value === dial.sslMode)
+              ? [{ value: dial.sslMode, label: dial.sslMode }]
+              : []),
+          ]}
+          onValueChange={(next) => set("sslMode", next)}
         />
+        <p className="text-xs text-muted-foreground">
+          {isOracle
+            ? "Oracle's driver cannot check the server's certificate, so there are only two modes: the connection is encrypted with Oracle's own network encryption, or it is not."
+            : "Verify modes use the Kafka Connect worker's own trust store."}
+          {dial.driver === "mssql" ? " For SQL Server, Verify CA also checks the host name." : ""}
+        </p>
       </div>
-      <div className="space-y-1.5">
-        <Label htmlFor="cdc-dial-publication-name">Publication name</Label>
-        <Input
-          id="cdc-dial-publication-name"
-          value={dial.publicationName}
-          onChange={(e) => set("publicationName", e.target.value)}
-          placeholder="lakehouse_pub"
-          autoComplete="off"
-        />
-      </div>
-      <div className="space-y-1.5">
-        <Label htmlFor="cdc-dial-server-id">Server id (optional)</Label>
-        <Input
-          id="cdc-dial-server-id"
-          type="number"
-          value={dial.serverId ?? ""}
-          onChange={(e) => set("serverId", e.target.value === "" ? null : Number(e.target.value))}
-          autoComplete="off"
-        />
-      </div>
+      {isOracle ? (
+        <div className="space-y-1.5 sm:col-span-2">
+          <Label htmlFor="cdc-dial-pdb-name">PDB name</Label>
+          <Input
+            id="cdc-dial-pdb-name"
+            value={dial.pdbName ?? ""}
+            onChange={(e) => set("pdbName", e.target.value)}
+            placeholder="FREEPDB1"
+            autoComplete="off"
+          />
+          <p className="text-xs text-muted-foreground">
+            The pluggable database to read. Leave it empty for a database that is not a container database.
+          </p>
+        </div>
+      ) : null}
+      {dial.driver === "postgres" ? (
+        <>
+          <div className="space-y-1.5">
+            <Label htmlFor="cdc-dial-slot-name" required>Replication slot name</Label>
+            <Input
+              id="cdc-dial-slot-name"
+              aria-required
+              value={dial.slotName ?? ""}
+              onChange={(e) => set("slotName", e.target.value)}
+              placeholder="lakehouse_slot"
+              autoComplete="off"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="cdc-dial-publication-name" required>Publication name</Label>
+            <Input
+              id="cdc-dial-publication-name"
+              aria-required
+              value={dial.publicationName ?? ""}
+              onChange={(e) => set("publicationName", e.target.value)}
+              placeholder="lakehouse_pub"
+              autoComplete="off"
+            />
+          </div>
+        </>
+      ) : null}
+      {dial.driver === "mysql" ? (
+        <div className="space-y-1.5 sm:col-span-2">
+          <Label htmlFor="cdc-dial-server-id">Server id</Label>
+          <Input
+            id="cdc-dial-server-id"
+            type="number"
+            min={1}
+            max={4294967295}
+            value={dial.serverId ?? ""}
+            onChange={(e) => set("serverId", e.target.value === "" ? undefined : Number(e.target.value))}
+            autoComplete="off"
+          />
+          <p className="text-xs text-muted-foreground">A number no other MySQL replica uses (1 to 4294967295).</p>
+        </div>
+      ) : null}
     </div>
   )
 }

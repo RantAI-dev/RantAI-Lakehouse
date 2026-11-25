@@ -14,8 +14,10 @@
 //! | [`StoreError`]            | [`ApiError`]         | status | why                                                          |
 //! |----------------------------|-----------------------|--------|---------------------------------------------------------------|
 //! | [`StoreError::Conflict`]   | `Conflict`            | 409    | caller-supplied data collides with a unique constraint         |
+//! | [`StoreError::Contended`]  | `Conflict`            | 409    | a bounded retry lost to a concurrent writer (`PR #638 review 1`) |
 //! | [`StoreError::ForeignKeyViolation`] | `BadRequest`  | 400    | caller referenced a row that doesn't exist                     |
 //! | [`StoreError::NotFound`]   | `NotFound`            | 404    | caller asked for a row that doesn't exist                      |
+//! | [`StoreError::NotAllowed`] | `PermissionDenied`    | 403    | the store's own rule refuses the action on a row that does exist (`QS-3` review of #382: a move needs manage) |
 //! | [`StoreError::Unavailable`]| `Unavailable`         | 503    | no pool configured at all (see [`crate::connect_lazy`])         |
 //! | [`StoreError::Validation`] | `BadRequest`          | 400    | this crate's own validator rejected caller input (never a raw `sqlx` error) |
 //! | [`StoreError::Database`]   | `Internal`            | 500    | anything else — connection refused, timeout, syntax error, ...  |
@@ -47,6 +49,29 @@ pub enum StoreError {
     /// A unique-constraint violation (e.g. a duplicate email or slug).
     #[error("a record with that value already exists")]
     Conflict,
+    /// A bounded retry gave up: another writer kept changing the row
+    /// between this write's own steps, so the write is refused instead of
+    /// spinning on a row that keeps disappearing. The one rule that raises
+    /// it today is the workspace name save (`workspace_settings::upsert_name`,
+    /// `PR #638 review 1`): a concurrent save or reset deleted the
+    /// settings row between the save's insert and its lock three tries in
+    /// a row. The message is this crate's own fixed sentence — never an
+    /// upstream error's text — and the status is 409: the write lost to
+    /// the row's state, and a retry once the other writer stops succeeds.
+    #[error(
+        "the workspace settings were changed by another save or reset at the same time; try again"
+    )]
+    Contended,
+    /// A field the caller tried to set is already taken by ANOTHER user's
+    /// username or email, compared case-insensitively (ADM-11 D5: one
+    /// sign-in box must never match two people). Unlike [`Self::Conflict`],
+    /// which says only "some value collides", this names the field so the
+    /// route can answer 409 with the field-specific sentence the invite and
+    /// rename forms show. The message is this crate's own fixed sentence —
+    /// never an upstream error's text — the same discipline
+    /// [`Self::Validation`] and [`Self::NotAllowed`] follow.
+    #[error("{0}")]
+    FieldConflict(String),
     /// A foreign-key violation: the caller referenced a row that does not
     /// exist (or tried to delete a row something else still references,
     /// under `ON DELETE RESTRICT`).
@@ -55,6 +80,17 @@ pub enum StoreError {
     /// A query expected to find a row (e.g. `fetch_one`) found none.
     #[error("record not found")]
     NotFound,
+    /// The caller may not do this to a row that does exist and may even
+    /// be visible to them: the store's own rule refuses the action, not
+    /// the row's existence — unlike [`Self::NotFound`], which says the
+    /// row is not there at all. The one rule that raises it today is the
+    /// move rule (`QS-3` review of #382): a query move needs manage on the query.
+    /// The message is this crate's own
+    /// fixed sentence — the one the fix ships to callers — never an
+    /// upstream error's text, so it is safe to surface the way
+    /// [`Self::Validation`]'s is.
+    #[error("Only someone who manages this can move it.")]
+    NotAllowed,
     /// No Postgres pool is configured/available for this request. See the
     /// boot-behavior note on [`crate::connect_lazy`]: an unreachable
     /// Postgres is not fatal at startup, so this is the error a Phase 2
@@ -82,6 +118,17 @@ pub enum StoreError {
     /// `sqlx::migrate!` failed to apply the migration set.
     #[error("migration failed")]
     Migration(#[source] sqlx::migrate::MigrateError),
+    /// A stored pipeline definition whose `inputs`, `steps` or `transforms`
+    /// column does not decode into the shape the store wrote there.
+    ///
+    /// BLD-1 part 1 review R1-B5: this used to be `unwrap_or_default()`,
+    /// which made an unreadable `steps` column compile to a plain
+    /// `SELECT * FROM <first input>` and overwrite the pipeline's output with
+    /// unfiltered rows (AGENTS.md principle 3). A definition this crate
+    /// cannot read is refused instead — 422, the status the orchestrator
+    /// treats as final, with this fixed sentence and never a serde message.
+    #[error("this pipeline's stored definition cannot be read")]
+    CorruptDefinition,
     /// `serde_json` failed to encode or decode a value this crate owns
     /// (a `pipeline_definition_version.snapshot`, the row that every
     /// `created`/`updated`/`restored`/`deleted` event captures). A
@@ -137,7 +184,19 @@ impl From<StoreError> for ApiError {
     fn from(err: StoreError) -> Self {
         let message = err.to_string();
         match err {
-            StoreError::Conflict => Self::Conflict(message),
+            // ADM-11 D5: a username/email that would make one sign-in box
+            // match two people is a 409 that names the field ("Username
+            // already in use"), so the invite and rename forms can point at
+            // the field that must change. Same refusal shape as
+            // `Conflict`, with the field-specific sentence instead of the
+            // generic one — hence one arm for both variants.
+            // `Contended` joins the same arm (PR #638 review 1): a write
+            // that lost a bounded race to a concurrent writer conflicts
+            // with the row's state, its sentence is this crate's own —
+            // safe to surface — and the caller can simply try again.
+            StoreError::Conflict | StoreError::Contended | StoreError::FieldConflict(_) => {
+                Self::Conflict(message)
+            }
             // `ForeignKeyViolation` and `Validation` both map to `BadRequest`
             // for different reasons (see the module doc comment's mapping
             // table): the former because the caller referenced a row that
@@ -149,7 +208,15 @@ impl From<StoreError> for ApiError {
             StoreError::ForeignKeyViolation | StoreError::Validation(_) => {
                 Self::BadRequest(message)
             }
+            // `NotAllowed` is the store's own refusal of an action on a
+            // row that exists: 403, the caller's fault, carrying the
+            // fixed sentence the store wrote — never 404, which would
+            // tell the caller the row is not there at all.
+            StoreError::NotAllowed => Self::PermissionDenied(message),
             StoreError::NotFound => Self::NotFound(message),
+            // A stored definition the store cannot read is a refusal no retry
+            // changes: 422, with the fixed sentence above (R1-B5).
+            StoreError::CorruptDefinition => Self::Unprocessable(message),
             StoreError::Unavailable => Self::Unavailable(message),
             StoreError::Database(_) | StoreError::Migration(_) | StoreError::Serialization(_) => {
                 Self::Internal(message)
@@ -168,6 +235,30 @@ mod tests {
     fn conflict_maps_to_409() {
         let api: ApiError = StoreError::Conflict.into();
         assert_eq!(api.status(), 409);
+    }
+
+    /// PR #638 review 1: a save that lost a bounded race against a
+    /// concurrent save or reset is a 409 that carries the store's own
+    /// fixed sentence, so the caller knows to save again rather than
+    /// that "something failed".
+    #[test]
+    fn contended_maps_to_409_and_carries_the_fixed_sentence() {
+        let api: ApiError = StoreError::Contended.into();
+        assert_eq!(api.status(), 409);
+        assert_eq!(
+            api.to_string(),
+            "the workspace settings were changed by another save or reset at the same time; try again"
+        );
+    }
+
+    /// ADM-11 D5: a field-specific username/email clash maps to 409 and
+    /// carries the store's own fixed sentence, so an invite or rename form
+    /// can show "Username already in use" at the field that must change.
+    #[test]
+    fn field_conflict_maps_to_409_and_carries_the_field_sentence() {
+        let api: ApiError = StoreError::FieldConflict("Username already in use".to_owned()).into();
+        assert_eq!(api.status(), 409);
+        assert_eq!(api.to_string(), "Username already in use");
     }
 
     /// `Validation` must map to 400, never `Internal` (500) -- an invalid
@@ -193,6 +284,24 @@ mod tests {
     fn not_found_maps_to_404() {
         let api: ApiError = StoreError::NotFound.into();
         assert_eq!(api.status(), 404);
+    }
+
+    /// `NotAllowed` must map to 403 and never to 404: the row exists and
+    /// is even visible to the caller, and what is refused is the action —
+    /// a refusal that looked like a missing row would hide the rule
+    /// (`QS-3` review finding 1). The asserted body is the full
+    /// `Display` the caller receives: [`ApiError::PermissionDenied`]'s
+    /// own `permission_denied:` prefix — kept by lakehouse-core so its
+    /// 403s stay distinguishable from [`ApiError::Forbidden`]'s fixed
+    /// body — followed by this store's fixed sentence, unchanged.
+    #[test]
+    fn not_allowed_maps_to_403_and_carries_the_fixed_sentence() {
+        let api: ApiError = StoreError::NotAllowed.into();
+        assert_eq!(api.status(), 403);
+        assert_eq!(
+            api.to_string(),
+            "permission_denied: Only someone who manages this can move it."
+        );
     }
 
     /// `Unavailable` is the one 5xx that is NOT a 500: "there is no pool

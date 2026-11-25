@@ -5,7 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -57,6 +57,7 @@ struct Fixture {
     app: TestApp,
     gotenberg: MockServer,
     cookie: String,
+    user: uuid::Uuid,
     _ch: MockServer,
 }
 
@@ -91,6 +92,7 @@ async fn fixture(env: &[(&str, Option<&str>)], pdf: ResponseTemplate) -> Fixture
         app,
         gotenberg,
         cookie,
+        user,
         _ch: ch,
     }
 }
@@ -124,6 +126,50 @@ async fn get(f: &Fixture, uri: &str) -> (StatusCode, axum::http::HeaderMap, Vec<
 
 fn text(bytes: &[u8]) -> Value {
     serde_json::from_slice(bytes).unwrap_or(Value::Null)
+}
+
+async fn get_as(
+    f: &Fixture,
+    uri: &str,
+    tenant: &str,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let resp = f
+        .app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("cookie", &f.cookie)
+                .header("x-tenant", tenant)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, headers, bytes)
+}
+
+/// The minted token of this PDF from the Gotenberg request, for the tests
+/// that need to read what the print view will be allowed to do.
+async fn token_sent(f: &Fixture) -> String {
+    let sent = f.gotenberg.received_requests().await.unwrap();
+    let form = String::from_utf8_lossy(&sent[0].body).into_owned();
+    let url_line = form
+        .split("name=\"url\"\r\n\r\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\r\n").next())
+        .unwrap();
+    url_line
+        .strip_prefix(&format!("{CONSOLE}/render/dashboard/"))
+        .unwrap()
+        .to_owned()
 }
 
 #[tokio::test]
@@ -187,6 +233,69 @@ async fn the_pdf_request_opens_only_the_console_print_view_with_a_token_for_this
     assert_eq!(
         claims.principal, user_id,
         "the person who asked, audited under the same id"
+    );
+}
+
+/// `SEC-54` (SEC-50 slice 2 M5): the token names the tenant the caller worked
+/// under, which is the tenant the print view reads with — not the person's
+/// first tenant. The seeded ids sort so the catalog tenant is first.
+#[tokio::test]
+async fn the_pdf_token_carries_the_second_tenant_the_caller_exported_under() {
+    let f = fixture(
+        &[("CATALOG_TENANT_ID", Some(common::CATALOG_TENANT))],
+        ok_pdf(),
+    )
+    .await;
+    let second = "11111111-1111-4111-8111-000000000002";
+    common::in_the_catalog_tenant(&f.app.pool, f.user).await;
+    sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(f.user)
+    .bind(second.parse::<uuid::Uuid>().unwrap())
+    .execute(&f.app.pool)
+    .await
+    .unwrap();
+
+    let (status, _, body) = get_as(
+        &f,
+        &format!("/api/dashboard/export/pdf?board={BOARD}"),
+        second,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let claims =
+        lakehouse_embed::verify_render(&token_sent(&f).await, SECRET, lakehouse_embed::unix_now())
+            .unwrap();
+    assert_eq!(claims.tenant.as_deref(), Some(second), "{claims:?}");
+    assert_eq!(claims.principal, f.user.to_string());
+}
+
+/// `SEC-54`: a caller cannot mint a token for a tenant they do not belong
+/// to. `tenant_scope::resolve` refuses the forged header before the token is
+/// signed, so Gotenberg is never asked to open anything.
+#[tokio::test]
+async fn a_pdf_request_for_a_tenant_the_caller_is_not_in_is_refused_before_minting() {
+    let f = fixture(
+        &[("CATALOG_TENANT_ID", Some(common::CATALOG_TENANT))],
+        ok_pdf(),
+    )
+    .await;
+    let (status, _, body) = get_as(
+        &f,
+        &format!("/api/dashboard/export/pdf?board={BOARD}"),
+        &uuid::Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        f.gotenberg.received_requests().await.unwrap().is_empty(),
+        "no token was minted and no page was sent to the renderer"
     );
 }
 

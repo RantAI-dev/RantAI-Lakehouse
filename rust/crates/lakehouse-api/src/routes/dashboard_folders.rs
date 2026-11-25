@@ -362,6 +362,24 @@ pub async fn delete(
         .iter()
         .filter(|s| s.folder_id == id)
         .count();
+    // BI-18 part D (T1): a report names its folder and has no rules of its
+    // own, so a folder that still holds one (live or in the trash) stays.
+    let report_count = match state.pg.as_deref() {
+        Some(pool) => usize::try_from(
+            lakehouse_store::dashboard_reports::count_in_folder(pool, &id)
+                .await
+                .map_err(|e| crate::routes::dashboard_reports::store_failure(&e))?,
+        )
+        .unwrap_or(usize::MAX),
+        None => 0,
+    };
+    if report_count > 0 {
+        return Err(ApiError::Conflict(format!(
+            "folder is not empty: it holds {report_count} report(s), live or in the trash. \
+             Move or delete them first."
+        ))
+        .into());
+    }
     if subfolders + boards + trashed + source_count > 0 {
         let in_trash = if trashed > 0 {
             format!(" and {trashed} dashboard(s) in the trash (empty the trash or move them first)")

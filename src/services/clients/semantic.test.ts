@@ -131,3 +131,30 @@ describe("semanticService.saveEntry", () => {
     }
   })
 })
+
+describe("semantic refusals (WEB-12)", () => {
+  it("a refused read of the meanings rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: catalog:read" }, 403))
+    await expect(semanticService.getEntries("serving.mart_x")).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the catalog:read permission.",
+    })
+  })
+
+  it("a refused save of a meaning rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: catalog:write" }, 403))
+    await expect(
+      semanticService.saveEntry("serving.mart_x", {
+        column: "order_id",
+        description: "One row per order",
+        synonyms: ["order"],
+        role: "key",
+      }),
+    ).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the catalog:write permission.",
+    })
+  })
+})

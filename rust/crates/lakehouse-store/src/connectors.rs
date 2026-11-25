@@ -954,6 +954,65 @@ pub struct ConnectorTestResult {
     /// an unsupported type was never actually dialed, so no test time was
     /// stamped — see [`record_test_result`].
     pub tested_at: Option<String>,
+    /// `true` only for a test launched in the orchestrator that has not
+    /// finished (`SRC-4` T1.1): nothing was dialled yet, so `ok` is `false`
+    /// without being a failure, and the result is read from
+    /// `GET /api/connectors/{id}/discovery/test` and the probe history.
+    /// Left out of the JSON otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
+    /// For a change-capture connector (`SRC-4` decision S4-f): what the source
+    /// must have switched on, read with fixed statements. Empty, and left out of
+    /// the JSON, for every other connector. Never decides `ok`: a connector can
+    /// be saved whatever these say.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub setup_checks: Vec<SetupCheck>,
+}
+
+/// How one setting a change-capture source needs came out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SetupStatus {
+    /// The setting is as change capture needs it.
+    Ok,
+    /// It is not; `command` says how to set it.
+    Missing,
+    /// It could not be read (usually a permission); nothing is claimed.
+    Unchecked,
+}
+
+/// One setting a change-capture source needs (`SRC-4` decision S4-f). Every
+/// word is chosen by this build from a fixed table; none is text from the
+/// server, so none can leak one (principle 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupCheck {
+    /// The setting's name, as the person would look for it.
+    pub setting: String,
+    /// How it came out.
+    pub status: SetupStatus,
+    /// A fixed sentence about the result.
+    pub message: String,
+    /// The statement or line that sets it; present for `missing`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+impl ConnectorTestResult {
+    /// The answer of a test launched in the orchestrator: supported, not
+    /// passed, no latency, no time (nothing has run), `message` saying so.
+    #[must_use]
+    pub fn pending(message: &str) -> Self {
+        Self {
+            ok: false,
+            supported: true,
+            latency_ms: None,
+            message: message.to_owned(),
+            tested_at: None,
+            pending: true,
+            setup_checks: Vec::new(),
+        }
+    }
 }
 
 /// Fetch the connectivity-relevant fields (`type`, `host`, `secret_ref`,
@@ -1626,6 +1685,8 @@ pub async fn record_test_result(
         latency_ms,
         message: message.to_owned(),
         tested_at: iso_opt(tested_at),
+        pending: false,
+        setup_checks: Vec::new(),
     })
 }
 
@@ -1901,10 +1962,62 @@ pub async fn record_run_once(
 /// (`failure`, `success`, `*_alerted`, `slow`, `volume_drop`).
 const AUTO_DISABLED_KIND: &str = "auto_disabled";
 
+/// The `paused_reason` a person's pause writes (`SRC-4` decision S2-e), a fixed
+/// sentence like the other two reasons. [`resume_connector`] lifts it.
+pub const PERSON_PAUSE_REASON: &str = "Paused by a person";
+
+/// Whether `reason` is the pause a person set with [`pause_connector`].
+#[must_use]
+pub fn is_person_pause_reason(reason: &str) -> bool {
+    reason == PERSON_PAUSE_REASON
+}
+
+/// What [`pause_connector`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseOutcome {
+    /// The connector is paused now, with [`PERSON_PAUSE_REASON`].
+    Paused,
+    /// It was paused already (for this or another reason); nothing changed.
+    AlreadyPaused,
+}
+
+/// Pause a connector on a person's request (`SRC-4` decision S2-e): it runs
+/// nothing until [`resume_connector`] lifts the pause. A pause that is already
+/// there, whatever its reason, is left as it is, so a schema-change pause is not
+/// relabelled.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `id` does not name a connector, or
+/// [`StoreError::Database`] on any other failure.
+pub async fn pause_connector(pool: &PgPool, id: &str) -> Result<PauseOutcome, StoreError> {
+    let paused: Option<(String,)> = sqlx::query_as(
+        "UPDATE connector SET paused_reason = $2, paused_at = now() \
+         WHERE id = $1 AND paused_at IS NULL RETURNING id",
+    )
+    .bind(id)
+    .bind(PERSON_PAUSE_REASON)
+    .fetch_optional(pool)
+    .await?;
+    if paused.is_some() {
+        return Ok(PauseOutcome::Paused);
+    }
+    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM connector WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    if exists.is_some() {
+        Ok(PauseOutcome::AlreadyPaused)
+    } else {
+        Err(StoreError::NotFound)
+    }
+}
+
 /// What [`resume_connector`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeOutcome {
-    /// The auto-disable pause was lifted and the failure streak is 0.
+    /// The auto-disable pause (or a person's) was lifted and the failure streak
+    /// is 0.
     Resumed,
     /// The connector is not paused; nothing changed.
     NotPaused,
@@ -1913,11 +2026,12 @@ pub enum ResumeOutcome {
     PausedForAnotherReason,
 }
 
-/// Resume a connector that an auto-disable paused (`SRC-11` decision D4): lift
-/// the pause, set the failure streak back to 0 (so it gets the full number of
-/// tries again) and its health to `unknown` until its next run says. Only a
-/// pause [`is_auto_disable_pause_reason`] recognises is lifted; a
-/// schema-change pause is lifted by approving the change (`SRC-8`).
+/// Resume a connector that an auto-disable paused (`SRC-11` decision D4) or a
+/// person paused (`SRC-4` decision S2-e): lift the pause, set the failure streak
+/// back to 0 (so it gets the full number of tries again) and its health to
+/// `unknown` until its next run says. Only a pause [`is_auto_disable_pause_reason`]
+/// or [`is_person_pause_reason`] recognises is lifted; a schema-change pause is
+/// lifted by approving the change (`SRC-8`).
 ///
 /// The row is locked while the reason is read, so a pause set a moment later
 /// by something else is not lifted by mistake.
@@ -1939,7 +2053,10 @@ pub async fn resume_connector(pool: &PgPool, id: &str) -> Result<ResumeOutcome, 
     if paused_at.is_none() {
         return Ok(ResumeOutcome::NotPaused);
     }
-    let Some(reason) = reason.filter(|r| is_auto_disable_pause_reason(r)) else {
+    // `SRC-4` decision S2-e: a person's own pause is lifted by the same route.
+    let Some(reason) =
+        reason.filter(|r| is_auto_disable_pause_reason(r) || is_person_pause_reason(r))
+    else {
         return Ok(ResumeOutcome::PausedForAnotherReason);
     };
     sqlx::query(
@@ -1949,6 +2066,17 @@ pub async fn resume_connector(pool: &PgPool, id: &str) -> Result<ResumeOutcome, 
     )
     .bind(id)
     .bind(&reason)
+    .execute(&mut *tx)
+    .await?;
+    // Slice 4 review SHOULD-FIX 3: a person's pause is not lag. No report counts as "up to
+    // date" while the capture is paused, so without this a pause longer than the lag limit
+    // would alert as soon as the connector runs again. After a resume the lag counts from the
+    // resume; changes made during the pause show as backlog until they are applied.
+    sqlx::query(
+        "UPDATE connector_capture_table SET caught_up_at = GREATEST(caught_up_at, now()) \
+         WHERE connector_id = $1",
+    )
+    .bind(id)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;

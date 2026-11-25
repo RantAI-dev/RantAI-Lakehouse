@@ -292,6 +292,31 @@ fn a_formula_parameter_is_a_literal_in_a_governed_statement() {
     assert_ne!(seen[0], seen[1]);
 }
 
+/// QA `LH-BI-11-05` (`BI-52`, plan D27, T5): a value the request sent that
+/// does not fit never reaches a statement. The values T3's `resolve_each`
+/// hands the builder hold only checked values, so a refused text is not spliced
+/// into the formula's literal: the statement is the one the value in force
+/// (here the default) builds, byte for byte.
+#[test]
+fn a_refused_value_reaches_no_statement() {
+    let defs = [def("target", ParamType::Number, json!(1000), &json!({}))];
+    let ratio = field(POINTS, "ratio", "[visitors] / {target}", "number");
+    let c = chart(
+        POINTS,
+        &json!({ "measures": ["ratio"], "aggregate": "sum" }),
+    );
+    let outcome = ParamValues::resolve_each(
+        &defs,
+        &[],
+        json!({ "target": "1; DROP TABLE t" }).as_object(),
+    );
+    assert_eq!(outcome.refused.len(), 1, "{outcome:?}");
+    let refused = tile_sql(&c, outcome.values, vec![ratio.clone()]).expect("the tile builds");
+    let in_force = tile_sql(&c, values(&defs, &json!({})), vec![ratio]).expect("the tile builds");
+    assert_eq!(refused, in_force);
+    assert!(!refused.contains("DROP"), "{refused}");
+}
+
 /// Hostile values of a text parameter used in a formula: the statement keeps
 /// them inside one escaped literal, every read stays governed.
 #[test]

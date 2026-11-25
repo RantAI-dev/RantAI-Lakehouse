@@ -120,6 +120,34 @@
 //! checked with the other two in the same place and under the same lock, so two
 //! starts at the same moment cannot both take the last large place. A load that is
 //! not large never counts against it and is never refused by it.
+//!
+//! # Dropped tables (`DATA-55`, QA `LH-DATA-15-06`, `TC-1731`,
+//! `0141_upload_table_drop.sql`), and the functions below
+//!
+//! A table a file upload made can be dropped from its page in the console and
+//! restored there for 7 days (`DEC-21`). [`record_table_drop`] is the record of
+//! that drop: one row per raw table name holding the CURRENT state — who
+//! dropped it, for which tenant, which asset it belongs to, its row count (NULL
+//! when it could not be counted), when, and when the window ends. The history
+//! is the audit trail's, not this table's.
+//!
+//! - [`record_table_drop`] writes the row in ONE statement, so the primary key
+//!   decides between two drops of the same name sent at the same moment: the
+//!   second answers `None` and is refused rather than naming a second person on
+//!   a drop they did not make.
+//! - [`dropped_table`] answers "is this name dropped inside its window right
+//!   now" — asked at every load, which is what keeps a dropped table's name
+//!   closed while it can still be restored: a new table of that name would make
+//!   the dropped one impossible to bring back.
+//! - [`forget_table_drop_at`] removes the row a restore, a refused drop or a
+//!   drop the catalog answered read — and only that row: a record written after
+//!   that read belongs to another drop and stays.
+//! - [`heal_table_drop`] removes a row that says "dropped" for a table that is
+//!   there, once it is too old for its own drop to be in flight.
+//! - [`list_dropped_tables`] is the Catalog's list: the given tenants'
+//!   unexpired drops, newest first.
+//! - [`loading_into`] is the uploads loading into a name, for the check that
+//!   refuses a drop while a load is in progress.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -633,7 +661,8 @@ pub enum FolderFilter<'a> {
 }
 
 /// What narrows a listing before the newest-first window is cut, so that a
-/// folder's files and a search are not hidden by newer files elsewhere.
+/// folder's files, a search and one table's uploads are not hidden by newer
+/// files elsewhere.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ListFilter<'a> {
     /// The folder to show.
@@ -641,11 +670,17 @@ pub struct ListFilter<'a> {
     /// Text a file name or a table name must contain, case-insensitively.
     /// The text is bound as a value; `%`, `_` and `\` in it match themselves.
     pub text: Option<&'a str>,
+    /// Exactly this raw table name. Bound as a value and compared with `=`, so
+    /// `%` and `_` are ordinary characters and the case must match.
+    pub table: Option<&'a str>,
 }
 
 /// `tenant_id`'s uploads that match `filter`, newest first. `limit` is clamped to
 /// `1..=500`. A folder of another tenant matches nothing: the tenant is bound
-/// in the same statement.
+/// in the same statement. A table filter is an exact match on the raw
+/// `bronze_table`, not the contains-match [`ListFilter::text`] is: `stock` does
+/// not bring `stock_2026`, which is how the Table step asks which uploads of
+/// this tenant loaded into one table (`DATA-47`, QA `LH-DATA-35-03`).
 ///
 /// # Errors
 ///
@@ -674,6 +709,7 @@ pub async fn list_filtered(
         "SELECT {COLS} FROM file_upload WHERE tenant_id = $1 \
            AND (NOT $3 OR folder_id IS NOT DISTINCT FROM $4) \
            AND ($5::text IS NULL OR original_filename ILIKE $5 OR bronze_table ILIKE $5) \
+           AND ($6::text IS NULL OR bronze_table = $6) \
          ORDER BY created_at DESC, id DESC LIMIT $2"
     );
     // safe: only the constant `COLS` is formatted in; values are bound.
@@ -683,6 +719,7 @@ pub async fn list_filtered(
         .bind(by_folder)
         .bind(folder_id)
         .bind(pattern)
+        .bind(filter.table)
         .fetch_all(pool)
         .await?)
 }
@@ -1212,29 +1249,6 @@ pub async fn mark_group_within_limits(
     Ok(MarkOutcome::Marked(Box::new(marked)))
 }
 
-/// Keep the report of values that did not fit on the upload the load belongs to
-/// (`DATA-18`, plan AD6). Written when the API settles the row, whatever the
-/// outcome: a `stop` load fails with the report, a `null` load succeeds with it.
-/// Only a row that is `ingesting` or just settled under `run_id` takes it.
-///
-/// # Errors
-///
-/// Returns [`StoreError::Database`] on a database failure.
-pub async fn record_bad_values(
-    pool: &PgPool,
-    id: &str,
-    run_id: &str,
-    report: &Value,
-) -> Result<bool, StoreError> {
-    let done = sqlx::query("UPDATE file_upload SET bad_values = $3 WHERE id = $1 AND run_id = $2")
-        .bind(id)
-        .bind(run_id)
-        .bind(Json(report.clone()))
-        .execute(pool)
-        .await?;
-    Ok(done.rows_affected() > 0)
-}
-
 /// Give a claimed upload the Dagster run that carries its load out: sets
 /// `run_id` on a row that is `ingesting` and has no run yet.
 ///
@@ -1269,7 +1283,9 @@ pub async fn attach_run(
         .await?)
 }
 
-/// Settle a load: `ingested` when `error` is `None`, `failed` otherwise.
+/// Settle a load with no report of values that did not fit: `ingested` when
+/// `error` is `None`, `failed` otherwise. The same transition as
+/// [`mark_finished_with_bad_values`], with `bad_values = NULL`.
 ///
 /// `run_id` is the run the caller is settling, as recorded by
 /// [`mark_ingesting`] or [`attach_run`]; `None` names a claim that never got
@@ -1298,11 +1314,46 @@ pub async fn mark_finished(
     error: Option<&str>,
     row_count: Option<i64>,
 ) -> Result<Option<Upload>, StoreError> {
+    mark_finished_with_bad_values(pool, id, run_id, error, row_count, None).await
+}
+
+/// Settle a typed load and keep the job's report of values that did not fit in
+/// the same database transition (`DATA-18`, plan AD6; `REL-15`).
+///
+/// `REL-15`: status, `error`, `row_count` and `bad_values` are set by ONE
+/// `UPDATE`, returning the finished row. The API reads the report from object
+/// storage *before* calling this, so no reader — not a concurrent
+/// `GET /api/uploads/{id}`, not another caller settling the same run — can see
+/// a terminal status before its report. A `stop` load fails with the report;
+/// a `null` load succeeds with it. `bad_values = None` is the common case of a
+/// load that found none, and stays `NULL`.
+///
+/// The run, count and secondary-file rules are exactly those of
+/// [`mark_finished`]: only a row `ingesting` under `run_id` changes, a failed
+/// load stores no count, and the files loaded with it end in the same
+/// transaction with the same reason (their own report is not written — the
+/// report belongs to the primary that was typed).
+///
+/// Returns `None` when no row changed, so a report attached to a run another
+/// reader has already settled is never written to the newer load.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn mark_finished_with_bad_values(
+    pool: &PgPool,
+    id: &str,
+    run_id: Option<&str>,
+    error: Option<&str>,
+    row_count: Option<i64>,
+    bad_values: Option<&Value>,
+) -> Result<Option<Upload>, StoreError> {
     let sql = format!(
         "UPDATE file_upload \
          SET status = CASE WHEN $3::text IS NULL THEN 'ingested' ELSE 'failed' END, \
              error = $3, \
              row_count = CASE WHEN $3::text IS NULL THEN $4::bigint ELSE NULL END, \
+             bad_values = $5, \
              updated_at = now() \
          WHERE id = $1 AND status = 'ingesting' AND run_id IS NOT DISTINCT FROM $2 \
          RETURNING {COLS}"
@@ -1314,6 +1365,7 @@ pub async fn mark_finished(
         .bind(run_id)
         .bind(error)
         .bind(row_count)
+        .bind(bad_values.map(|report| Json(report.clone())))
         .fetch_optional(&mut *tx)
         .await?;
     if settled.is_some() {
@@ -1400,6 +1452,41 @@ pub async fn table_claim(
         Some(Some(holder)) if holder == tenant_id => TableClaim::Ours,
         Some(_) => TableClaim::Theirs,
     })
+}
+
+/// Who holds each of `tables`, as `tenant_id` sees it, in ONE query.
+///
+/// The answer for a name is the one [`table_claim`] gives. A name nobody holds
+/// is not in the map: a caller reads a missing name as
+/// [`TableClaim::Unclaimed`]. It exists for a listing that asks about every
+/// table of a namespace (hundreds in one), where a query per table cost a
+/// round trip each.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn table_claims(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    tables: &[String],
+) -> Result<std::collections::HashMap<String, TableClaim>, StoreError> {
+    // `Option<Uuid>` as in `table_claim`: a row whose tenant is NULL.
+    let held: Vec<(String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT bronze_table, tenant_id FROM upload_table_claim WHERE bronze_table = ANY($1)",
+    )
+    .bind(tables)
+    .fetch_all(pool)
+    .await?;
+    Ok(held
+        .into_iter()
+        .map(|(table, holder)| {
+            let claim = match holder {
+                Some(holder) if holder == tenant_id => TableClaim::Ours,
+                _ => TableClaim::Theirs,
+            };
+            (table, claim)
+        })
+        .collect())
 }
 
 /// Claim `table` for `tenant_id`, on behalf of `upload_id`, in ONE statement:
@@ -1569,4 +1656,244 @@ pub async fn table_being_loaded(
     .bind(exclude_id)
     .fetch_one(pool)
     .await?)
+}
+
+/// One dropped table's record while its window is open (`DATA-55`,
+/// `0141_upload_table_drop.sql`): the current state of the name, not one row
+/// per drop. A restore removes the row; the audit trail holds the history.
+///
+/// `row_count` is `None` when the rows could not be counted, never 0 for an
+/// unknown count (D7). `tenant_id` is `None` when the tenant that owned the
+/// name is gone: the row then shows in no tenant's list and still closes the
+/// name (the migration's header).
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub struct TableDrop {
+    /// The raw table name (`upload_table_drop.bronze_table`).
+    pub bronze_table: String,
+    /// The tenant whose upload claimed the name, when it still exists.
+    pub tenant_id: Option<Uuid>,
+    /// The asset id the table's page is served under.
+    pub asset_id: String,
+    /// The display name of the person who dropped it.
+    pub dropped_by: String,
+    /// The whole table's row count at the drop; `None` when not counted.
+    pub row_count: Option<i64>,
+    /// When the drop was recorded, by the database clock.
+    pub dropped_at: OffsetDateTime,
+    /// When the catalog's keep ends: `dropped_at` plus `kept_seconds`.
+    pub expires_at: OffsetDateTime,
+}
+
+/// What [`record_table_drop`] writes: the name, who dropped it for which
+/// tenant, the asset's id, its row count (if it was counted), and how long the
+/// catalog keeps the dropped table.
+#[derive(Debug, Clone)]
+pub struct NewTableDrop<'a> {
+    /// The raw table name being dropped.
+    pub bronze_table: &'a str,
+    /// The tenant whose upload claimed the name.
+    pub tenant_id: Uuid,
+    /// The asset id the table's page is served under.
+    pub asset_id: &'a str,
+    /// The display name of the person dropping it.
+    pub dropped_by: &'a str,
+    /// The whole table's row count, or `None` when it could not be counted.
+    pub row_count: Option<i64>,
+    /// The catalog's keep, in seconds (`DELETE_RETENTION_SECONDS`).
+    pub kept_seconds: i64,
+}
+
+/// Record that `new.bronze_table` was dropped, unless a drop inside its window
+/// is already on record. `DATA-55` D8/D9/D10.
+///
+/// ONE statement, so two drops of one name sent at the same moment cannot both
+/// succeed: the primary key is the arbiter, and the `DO UPDATE … WHERE
+/// d.expires_at <= now()` decides against the row the winner wrote. `None`
+/// means a drop inside its window is already there, and the caller refuses the
+/// second one; a row whose window has passed is replaced, because the name is
+/// free again.
+///
+/// `expires_at` is `now() + kept_seconds` in the same statement, so the window
+/// is the database clock's answer throughout, not the API's.
+///
+/// # Errors
+///
+/// Returns [`StoreError::ForeignKeyViolation`] when `new.tenant_id` names no
+/// tenant, and [`StoreError::Database`] on any other failure.
+pub async fn record_table_drop(
+    pool: &PgPool,
+    new: &NewTableDrop<'_>,
+) -> Result<Option<TableDrop>, StoreError> {
+    Ok(sqlx::query_as(
+        "INSERT INTO upload_table_drop AS d \
+             (bronze_table, tenant_id, asset_id, dropped_by, row_count, dropped_at, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, now(), now() + ($6::bigint * interval '1 second')) \
+         ON CONFLICT (bronze_table) DO UPDATE \
+            SET tenant_id = EXCLUDED.tenant_id, asset_id = EXCLUDED.asset_id, \
+                dropped_by = EXCLUDED.dropped_by, row_count = EXCLUDED.row_count, \
+                dropped_at = EXCLUDED.dropped_at, expires_at = EXCLUDED.expires_at \
+          WHERE d.expires_at <= now() \
+         RETURNING d.bronze_table, d.tenant_id, d.asset_id, d.dropped_by, d.row_count, \
+                   d.dropped_at, d.expires_at",
+    )
+    .bind(new.bronze_table)
+    .bind(new.tenant_id)
+    .bind(new.asset_id)
+    .bind(new.dropped_by)
+    .bind(new.row_count)
+    .bind(new.kept_seconds)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// The drop on record for `table`, while its window is open; `None` means the
+/// name is not dropped inside its window. Asked at every load (`DATA-55` D11)
+/// and before every drop (D4 rule 4).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn dropped_table(pool: &PgPool, table: &str) -> Result<Option<TableDrop>, StoreError> {
+    Ok(sqlx::query_as(
+        "SELECT bronze_table, tenant_id, asset_id, dropped_by, row_count, dropped_at, expires_at \
+           FROM upload_table_drop WHERE bronze_table = $1 AND expires_at > now()",
+    )
+    .bind(table)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Remove the drop on record for `table` ONLY when that row is still the one
+/// the caller read — the removal a restore, a drop the catalog refused and a
+/// drop whose second load check found a load all use (`DATA-55` review U1, U2).
+///
+/// The name's record can change under a caller that waited: a restore reads the
+/// record, then waits for the catalog's undrop; if the answer is slow and the
+/// old record is past its window, a second person can drop the table in those
+/// seconds and replace the row. Removing "the record of this name" would then
+/// delete THAT drop's record while its own `DELETE` goes out, which is the one
+/// state this feature must never reach: a dropped table with no record of it.
+/// `dropped_at` is the value the caller read, bound (never built into the SQL),
+/// and the row is removed only while it still carries exactly that value.
+///
+/// No grace here: these callers know their own outcome, so the record they wrote
+/// or read is theirs to clear at once. Healing a record for a table that exists
+/// is the other function, [`heal_table_drop`].
+///
+/// Returns whether a row went; `false` means there is no record, or a different
+/// one is on record now — both of which leave the caller's answer as it is.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn forget_table_drop_at(
+    pool: &PgPool,
+    table: &str,
+    dropped_at: OffsetDateTime,
+) -> Result<bool, StoreError> {
+    remove_table_drop(pool, table, dropped_at, 0).await
+}
+
+/// Remove the drop on record for `table` ONLY when that record cannot belong to
+/// a drop still in flight — the guarded removal the healing rule uses
+/// (`DATA-55` review S1, [`dropped_now`] in `routes::catalog_drop`).
+///
+/// A drop writes its record first and sends the catalog's `DELETE` afterwards,
+/// so from the insert until the catalog has applied the `DELETE` the table
+/// exists and the record is TRUE. Healing therefore cannot be "the table
+/// exists, so the record is stale": that would let anything reading the record
+/// in that stretch remove it. Two guards make the removal safe: the record must
+/// be older than `grace_seconds`, longer than any drop can be in flight, and
+/// the row removed must still carry the `dropped_at` the caller read, so a
+/// record replaced since that read is never the one removed.
+///
+/// Returns whether a row went; `false` means the record is younger than the
+/// grace, was replaced, or is gone — all of which leave the caller's answer as
+/// "the record stands".
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn heal_table_drop(
+    pool: &PgPool,
+    table: &str,
+    dropped_at: OffsetDateTime,
+    grace_seconds: i64,
+) -> Result<bool, StoreError> {
+    remove_table_drop(pool, table, dropped_at, grace_seconds).await
+}
+
+/// The one guarded removal, written once for both callers above (`DATA-55`
+/// review U1): the row must carry the `dropped_at` that the caller read, and —
+/// when a grace is given — must be at least that old. `grace_seconds` of 0 asks
+/// for the `dropped_at` guard alone, which is what a caller that knows its own
+/// outcome wants.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+async fn remove_table_drop(
+    pool: &PgPool,
+    table: &str,
+    dropped_at: OffsetDateTime,
+    grace_seconds: i64,
+) -> Result<bool, StoreError> {
+    let done = sqlx::query(
+        "DELETE FROM upload_table_drop \
+          WHERE bronze_table = $1 AND dropped_at = $2 \
+            AND dropped_at <= now() - ($3::bigint * interval '1 second')",
+    )
+    .bind(table)
+    .bind(dropped_at)
+    .bind(grace_seconds)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// The unexpired drops of `tenant_ids`, newest first, at most `limit` — the
+/// Catalog's list (`DATA-55` D13). An empty `tenant_ids` lists nothing: the
+/// tenant rule has no "every tenant" reading here, unlike the unscoped
+/// [`list_claims`]. A caller of the list CAN have none — an unrestricted
+/// principal that belongs to no tenant — and such a caller is shown nothing,
+/// not everything: the list is read per tenant, and "every tenant" is exactly
+/// the answer that rule must not give.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn list_dropped_tables(
+    pool: &PgPool,
+    tenant_ids: &[Uuid],
+    limit: i64,
+) -> Result<Vec<TableDrop>, StoreError> {
+    Ok(sqlx::query_as(
+        "SELECT bronze_table, tenant_id, asset_id, dropped_by, row_count, dropped_at, expires_at \
+           FROM upload_table_drop \
+          WHERE tenant_id = ANY($1) AND expires_at > now() \
+          ORDER BY dropped_at DESC, bronze_table LIMIT $2",
+    )
+    .bind(tenant_ids)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// The uploads loading into `table` (`status = 'ingesting'`, any tenant: a
+/// table name is shared), for the check that refuses a drop while a load is in
+/// progress (`DATA-55` D4 rule 5). The route settles each row first
+/// (`routes::uploads::settle_loading_upload`), the way the upload routes do, so
+/// a load that has already ended is not counted as running.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn loading_into(pool: &PgPool, table: &str) -> Result<Vec<Upload>, StoreError> {
+    let sql =
+        format!("SELECT {COLS} FROM file_upload WHERE bronze_table = $1 AND status = 'ingesting'");
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(table)
+        .fetch_all(pool)
+        .await?)
 }

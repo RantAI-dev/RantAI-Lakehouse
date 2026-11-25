@@ -186,7 +186,7 @@ describe("a refused dashboard write is an error, not a success (BI-18 part C rev
       expect((err as ServiceError).code).toBe("permission_denied")
       // The page shows the readable sentence: the code is for the log.
       expect(readableErrorMessage((err as ServiceError).message)).toBe(
-        "This account does not have permission. Ask a workspace admin.",
+        "You don't have access. This needs the dashboard:write permission.",
       )
     })
   }
@@ -269,5 +269,135 @@ describe("history, trash, personal space, favourites and search (BI-18 part C, p
     const hits = await clickhouseDashboardService.searchItems("50% off")
     expect(calls[0].url).toBe("/api/dashboard/search?q=50%25%20off")
     expect(hits[0].name).toBe("50% off")
+  })
+})
+
+// `WEB-7` D6: the chart builder's save and the Edit chart page's read live
+// here now, instead of a feature file calling `/api/dashboard/specs` by hand.
+describe("the chart builder's write and read (WEB-7 D6)", () => {
+  it("creates with POST and changes with PUT, carrying the body as the builder built it", async () => {
+    const calls = stubFetch(() => json({ chart: { id: "c1" } }))
+    await clickhouseDashboardService.saveChart({ title: "Visitors", kind: "bar" }, false)
+    expect(calls[0].init.method).toBe("POST")
+    expect(sent(calls[0])).toEqual({ title: "Visitors", kind: "bar" })
+
+    await clickhouseDashboardService.saveChart({ id: "c1", title: "Visitors" }, true)
+    expect(calls[1].init.method).toBe("PUT")
+    expect(sent(calls[1])).toEqual({ id: "c1", title: "Visitors" })
+  })
+
+  /** `BI-48`: the tile's Duplicate places the copy by the id the create answers. */
+  it("returns the new chart's id, and an empty id when the answer carries none", async () => {
+    stubFetch(() => json({ ok: true, chart: { id: "c_new" } }))
+    expect(await clickhouseDashboardService.saveChart({ title: "T", kind: "bar" }, false)).toEqual({ id: "c_new" })
+    stubFetch(() => json({ ok: true }))
+    expect(await clickhouseDashboardService.saveChart({ title: "T", kind: "bar" }, false)).toEqual({ id: "" })
+  })
+
+  it("throws the server's own sentence when the save is refused", async () => {
+    stubFetch(() => json({ error: "invalid or missing measure column" }, 400))
+    await expect(
+      clickhouseDashboardService.saveChart({ title: "T" }, false)
+    ).rejects.toThrow("invalid or missing measure column")
+  })
+
+  it("finds the chart by id in the chart list, and says so when it is not there", async () => {
+    const calls = stubFetch(() =>
+      json({
+        charts: [
+          { id: "c1", title: "Visitors", board: "b_1", def: { kind: "bar" } },
+          { id: "c2", board: "b_2" },
+        ],
+      })
+    )
+    expect(await clickhouseDashboardService.getChart("c1")).toEqual({
+      id: "c1",
+      title: "Visitors",
+      board: "b_1",
+      def: { kind: "bar" },
+    })
+    expect(calls[0].url).toBe("/api/dashboard/specs")
+    expect(await clickhouseDashboardService.getChart("gone")).toBeNull()
+  })
+})
+
+describe("a refusal reads as the sentence that names the permission (WEB-12)", () => {
+  it("listBoards rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: dashboard:read" }, 403))
+    await expect(clickhouseDashboardService.listBoards()).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the dashboard:read permission.",
+    })
+  })
+
+  it("deleteBoard rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: dashboard:write" }, 403))
+    await expect(clickhouseDashboardService.deleteBoard("b1")).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the dashboard:write permission.",
+    })
+  })
+
+  it("revokeAllEmbedTokens rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: dashboard:write" }, 403))
+    await expect(clickhouseDashboardService.revokeAllEmbedTokens("b_1")).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the dashboard:write permission.",
+    })
+  })
+
+  it("saveChart rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: dashboard:write" }, 403))
+    await expect(clickhouseDashboardService.saveChart({ title: "T" }, false)).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the dashboard:write permission.",
+    })
+  })
+})
+
+describe("the Dashboards page's chart outlines (BI-59, P3)", () => {
+  it("reads the specs list once and keeps the board, the kind and a full-row span", async () => {
+    const calls = stubFetch(() =>
+      json({
+        charts: [
+          { id: "u1", board: "b_1", kind: "bar", span: 1, title: "A", def: { kind: "bar" } },
+          { id: "u2", board: "b_1", span: 2, def: { kind: "line" } },
+          { id: "u3", kind: "kpi" },
+        ],
+      }),
+    )
+    expect(await clickhouseDashboardService.listChartOutlines()).toEqual([
+      { id: "u1", board: "b_1", kind: "bar" },
+      { id: "u2", board: "b_1", kind: "line", span: 2 },
+      { id: "u3", board: "default", kind: "kpi" },
+    ])
+    expect(calls.map((c) => c.url)).toEqual(["/api/dashboard/specs"])
+  })
+})
+
+describe("clickhouseDashboardService.filterValues", () => {
+  it("asks /api/dashboard/values by board, narrowed by the other filters and the search, and stringifies the values (BI-29)", async () => {
+    const calls = stubFetch(() => json({ values: ["Bali", 7], truncated: true }))
+
+    const answer = await clickhouseDashboardService.filterValues({
+      column: "province", scope: { board: "b1" }, others: [{ column: "year", values: ["2026"] }], search: " ba ",
+    })
+
+    expect(answer).toEqual({ values: ["Bali", "7"], truncated: true })
+    const url = new URL(calls[0].url, "http://console.invalid")
+    expect(url.pathname).toBe("/api/dashboard/values")
+    expect(url.searchParams.get("board")).toBe("b1")
+    expect(url.searchParams.get("q")).toBe("ba")
+    expect(url.searchParams.get("filters")).toBe(JSON.stringify([{ column: "year", values: ["2026"] }]))
+  })
+
+  it("throws a service error on a refusal, so the hook can show its fixed sentence", async () => {
+    stubFetch(() => json({ error: "nope" }, 500))
+    await expect(clickhouseDashboardService.filterValues({ column: "c", scope: { board: "b" }, others: [], search: "" }))
+      .rejects.toBeInstanceOf(ServiceError)
   })
 })

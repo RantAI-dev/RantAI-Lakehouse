@@ -13,7 +13,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 
@@ -21,9 +21,6 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use lakehouse_clickhouse::ChClient;
 use serde_json::{Value, json};
-use testcontainers::ImageExt;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::clickhouse::ClickHouse;
 use tower::ServiceExt;
 
 use common::{
@@ -77,28 +74,13 @@ const ENGINE_ROW_BOUND: usize = 130_000;
 
 /// ONE `ClickHouse` per test binary; see `tests/gold_publication.rs` for why
 /// per-test containers race. The container is never stopped by the test.
-static CLICKHOUSE: tokio::sync::OnceCell<(String, testcontainers::ContainerAsync<ClickHouse>)> =
+static CLICKHOUSE: tokio::sync::OnceCell<lakehouse_test_support::clickhouse::Started> =
     tokio::sync::OnceCell::const_new();
 
-async fn shared_clickhouse() -> &'static (String, testcontainers::ContainerAsync<ClickHouse>) {
+async fn shared_clickhouse() -> &'static lakehouse_test_support::clickhouse::Started {
     CLICKHOUSE
         .get_or_init(|| async {
-            // The compose service's env trio; all three are required, see
-            // `tests/gold_publication.rs`.
-            let container = ClickHouse::default()
-                .with_env_var("CLICKHOUSE_USER", "default")
-                .with_env_var("CLICKHOUSE_PASSWORD", "")
-                .with_env_var("CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT", "1")
-                .with_tag("26.8")
-                .start()
-                .await
-                .expect("start the ClickHouse testcontainer");
-            let host = container.get_host().await.expect("container host");
-            let port = container
-                .get_host_port_ipv4(8123)
-                .await
-                .expect("container HTTP port");
-            let url = format!("http://{host}:{port}");
+            let (url, container) = lakehouse_test_support::clickhouse::start().await;
             seed_huge_table(&ChClient::new(
                 url.clone(),
                 "default".to_owned(),
@@ -320,6 +302,27 @@ async fn a_result_under_both_caps_carries_no_cut_by() {
     // The key is absent when nothing was cut — not `null`, which would claim
     // a cut that did not happen.
     assert!(body.get("cutBy").is_none(), "no cut means no cutBy");
+}
+
+/// `DATA-53` (QA `LH-DATA-9-32`): the route asks the engine for decimals as text, so a
+/// value the engine holds exactly reaches the caller with every digit instead of the
+/// fifteen or so a 64-bit float keeps.
+#[tokio::test]
+async fn a_decimal_keeps_every_digit_the_engine_holds() {
+    let (app, _ch) = spin_up_with_clickhouse().await;
+
+    let (status, body) = run_as_reader(
+        &app,
+        "SELECT toDecimal128('123456789012345.678901234', 9) AS d",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["rows"][0]["d"],
+        json!("123456789012345.678901234"),
+        "{body}"
+    );
 }
 
 #[tokio::test]

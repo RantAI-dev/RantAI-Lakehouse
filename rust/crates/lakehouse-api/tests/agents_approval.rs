@@ -7,11 +7,11 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use lakehouse_store::audit::{AuditFilter, list};
+use lakehouse_store::audit::{AuditFilter, AuditScope, list};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -128,7 +128,7 @@ async fn approve_executes_the_tool_and_flips_run_status() {
         "the pending step plus the execution step"
     );
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let approved: Vec<_> = events.iter().filter(|e| e.outcome == "approved").collect();
@@ -180,7 +180,7 @@ async fn reject_executes_nothing_and_flips_run_to_rejected() {
     assert_eq!(run.steps.len(), 2);
     assert_eq!(run.steps[1].status, "rejected");
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let rejected: Vec<_> = events.iter().filter(|e| e.outcome == "rejected").collect();
@@ -243,8 +243,9 @@ async fn double_decide_does_not_execute_twice() {
 /// Plan invariant 3 / the permission rule: an approver who holds
 /// `agent:approve` but NOT the tool's own permission (`dashboard:write`
 /// for `delete_chart`) can decide the approval, but the tool is never
-/// executed — the run ends `failed`/"not executed", and the HTTP response
-/// is an explicit error, not a silent 200.
+/// executed — the run ends `failed`/"not executed". The answer is a 200
+/// with `executed: false`: `AI-28`/`LH-AI-18-07` requires a recorded
+/// decision to say it was recorded, not to answer with an error.
 #[tokio::test]
 async fn approver_lacking_the_tools_own_permission_does_not_execute() {
     let TestApp { router, pool } = spin_up().await;
@@ -260,7 +261,16 @@ async fn approver_lacking_the_tools_own_permission_does_not_execute() {
         json!({ "decision": "approved" }),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // AI-28 / LH-AI-18-07: the decision was recorded, so a 403 here was
+    // wrong — the console showed "Failed to record decision". The answer
+    // reports the recorded decision and why the action did not run.
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["executed"], json!(false));
+    assert_eq!(
+        body["notExecuted"],
+        json!({ "reason": "permission", "required": "dashboard:write" })
+    );
 
     // The approval itself WAS decided (approved) — `decide_approval`'s own
     // transaction already committed by the time the permission check
@@ -287,7 +297,7 @@ async fn approver_lacking_the_tools_own_permission_does_not_execute() {
         run.steps[1].detail
     );
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     // One `approved` (the decision itself) and one `failed` (not
@@ -560,6 +570,65 @@ async fn access_decide_route_allows_a_different_access_approve_holder_and_the_gr
     assert!(after.has("catalog:write"));
 }
 
+/// An approved access request writes a grant, and its audit row names who
+/// received which permission until when, not only that a request was decided.
+/// A rejection grants nothing, so its row names no grantee.
+#[tokio::test]
+async fn an_access_decision_row_names_the_grantee_the_permission_and_the_expiry() {
+    let TestApp { router, pool } = spin_up().await;
+    let approval_to_grant = create_pending_access_request(
+        &router,
+        &pool,
+        "sari@meridian.example",
+        "cat-1",
+        "catalog:write",
+    )
+    .await;
+    let approval_to_reject = create_pending_access_request(
+        &router,
+        &pool,
+        "sari@meridian.example",
+        "cat-2",
+        "catalog:write",
+    )
+    .await;
+    let decider = create_principal_with_permissions(&pool, "access:approve, catalog:write").await;
+    let cookie = session_cookie_for_user(&pool, decider).await;
+    for (id, decision) in [
+        (&approval_to_grant, "approved"),
+        (&approval_to_reject, "rejected"),
+    ] {
+        let resp = post(
+            &router,
+            &format!("/api/catalog/access-requests/{id}/decide"),
+            Some(&cookie),
+            json!({ "decision": decision }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let (requester,): (uuid::Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+        .bind("sari@meridian.example")
+        .fetch_one(&pool)
+        .await
+        .expect("seeded user");
+    let rows = common::audit_rows(&pool, "access:catalog:write").await;
+    let row_of = |id: &str| {
+        rows.iter()
+            .find(|row| row["resource_id"] == json!(id))
+            .unwrap_or_else(|| panic!("a decision row for {id}: {rows:#?}"))
+    };
+    let granted = row_of(&approval_to_grant);
+    assert_eq!(granted["outcome"], "approved");
+    assert_eq!(granted["args"]["permission"], "catalog:write");
+    assert_eq!(granted["args"]["grantee"], json!(requester.to_string()));
+    assert!(granted["args"]["expiresAt"].is_string(), "{granted}");
+    let rejection = row_of(&approval_to_reject);
+    assert_eq!(rejection["outcome"], "rejected");
+    assert!(rejection["args"].get("grantee").is_none(), "{rejection}");
+}
+
 // ── SEC-45: an approver may only approve a permission they hold ──────────
 //
 // `access:approve` says "you may decide access requests"; it does not say
@@ -803,7 +872,7 @@ async fn delete_board_creates_a_pending_approval_and_does_not_execute() {
 
     // The gate audit row carries the board as the resource, the
     // `needs_approval` outcome, and is linked to the run/approval.
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let ours: Vec<_> = events
@@ -1011,7 +1080,7 @@ async fn agent_decide_route_refuses_the_requester_approving_their_own_tool_call(
         "only the pending step — the delete tool never ran, so the chart still exists"
     );
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let for_this_run: Vec<_> = events
@@ -1105,5 +1174,137 @@ async fn agent_decide_route_allows_a_different_approver() {
     assert_ne!(
         run.status, "waiting_approval",
         "a different approver's decision moves the run on"
+    );
+}
+
+/// AI-28 / LH-AI-18-10 (feature decision 6, "one immutable row per gate
+/// decision"): a self-decision that is refused writes exactly ONE audit
+/// row — the approval's own action, `resource_kind: "approval"`, outcome
+/// `refused`, the detail naming the refusal — while deciding nothing:
+/// the approval stays `pending` and the run stays `waiting_approval`.
+#[tokio::test]
+async fn a_refused_self_approval_leaves_one_refused_audit_row_and_decides_nothing() {
+    let TestApp { router, pool } = spin_up().await;
+    let approval_id = create_pending_delete_chart_approval(&router, &pool).await;
+
+    // fajar@meridian.example asked for the deletion and also holds
+    // `agent:approve`; SEC-57 still refuses his own decision.
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let resp = post(
+        &router,
+        &format!("/api/agents/approvals/{approval_id}/decide"),
+        Some(&cookie),
+        json!({ "decision": "approved" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["error"],
+        json!("permission_denied: tidak boleh menyetujui permintaan milik sendiri")
+    );
+
+    // Nothing was decided: the approval is still pending, the run still
+    // waiting, and no execution step was appended.
+    let approval = lakehouse_store::agents::get_approval(&pool, &approval_id)
+        .await
+        .expect("read the approval")
+        .expect("the approval exists");
+    assert_eq!(approval.status, "pending");
+    let run_id = approval.run_id.clone().expect("run_id present");
+    let run = lakehouse_store::agents::get_run(&pool, &run_id)
+        .await
+        .expect("get run")
+        .expect("run exists");
+    assert_eq!(run.status, "waiting_approval");
+    assert_eq!(run.steps.len(), 1, "the delete tool never ran");
+
+    // One and only one `refused` row for this approval, with the detail
+    // naming why (AI-28 / LH-AI-18-10).
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
+        .await
+        .expect("list audit events");
+    let refused: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.approval_id.as_deref() == Some(approval_id.as_str()) && e.outcome == "refused"
+        })
+        .collect();
+    assert_eq!(
+        refused.len(),
+        1,
+        "exactly one refused audit row for the self-decision: {refused:?}"
+    );
+    let row = refused[0];
+    assert_eq!(row.action, "delete_chart", "the approval's own action");
+    assert_eq!(row.resource_kind.as_deref(), Some("approval"));
+    assert_eq!(row.resource_id.as_deref(), Some(approval_id.as_str()));
+    assert_eq!(
+        row.detail.as_deref(),
+        Some("the requester may not decide their own request")
+    );
+}
+
+/// AI-28 / LH-AI-18-10: the second decision (409) writes exactly one
+/// `refused` audit row with detail "already decided"; the first
+/// decision's single `executed` row is left untouched.
+#[tokio::test]
+async fn a_second_decision_leaves_one_refused_audit_row() {
+    let TestApp { router, pool } = spin_up().await;
+    let approval_id = create_pending_delete_chart_approval(&router, &pool).await;
+    let approver_id =
+        create_principal_with_permissions(&pool, "dashboard:write, dashboard:read, agent:approve")
+            .await;
+    let cookie = session_cookie_for_user(&pool, approver_id).await;
+
+    let first = post(
+        &router,
+        &format!("/api/agents/approvals/{approval_id}/decide"),
+        Some(&cookie),
+        json!({ "decision": "approved" }),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let _ = json_body(first).await;
+
+    let second = post(
+        &router,
+        &format!("/api/agents/approvals/{approval_id}/decide"),
+        Some(&cookie),
+        json!({ "decision": "approved" }),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
+        .await
+        .expect("list audit events");
+    let for_this_approval: Vec<_> = events
+        .iter()
+        .filter(|e| e.approval_id.as_deref() == Some(approval_id.as_str()))
+        .collect();
+    let refused: Vec<_> = for_this_approval
+        .iter()
+        .filter(|e| e.outcome == "refused")
+        .collect();
+    assert_eq!(
+        refused.len(),
+        1,
+        "exactly one refused row for the losing decision: {for_this_approval:?}"
+    );
+    assert_eq!(refused[0].detail.as_deref(), Some("already decided"));
+    // The first decision's tool dispatch writes exactly one row (this
+    // harness has no chart store, so its outcome is `failed` rather than
+    // `executed` — what the assertion proves is that the losing 409 wrote
+    // no SECOND dispatch row). A dispatch row is the one whose
+    // `resource_kind` is unset; the decision rows use "approval" and the
+    // gate row uses "chart".
+    assert_eq!(
+        for_this_approval
+            .iter()
+            .filter(|e| e.action == "delete_chart" && e.resource_kind.is_none())
+            .count(),
+        1,
+        "the first decision's dispatch is recorded once, the 409 adds none: {for_this_approval:?}"
     );
 }

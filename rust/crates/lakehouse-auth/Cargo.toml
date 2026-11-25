@@ -4,6 +4,16 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# OPS-32: the integration tests are the explicit `[[test]]` target below, not
+# one crate per file. `tests/it.rs` declares every file in `tests/` as a module
+# and links the crate once instead of 8 times; a file that is not declared does
+# not run at all, which `scripts/ci/check_test_modules.sh` fails the build for.
+autotests = false
+
+# OPS-32: every integration test module, in one binary.
+[[test]]
+name = "it"
+path = "tests/it.rs"
 
 [dependencies]
 lakehouse-core = { path = "../lakehouse-core" }

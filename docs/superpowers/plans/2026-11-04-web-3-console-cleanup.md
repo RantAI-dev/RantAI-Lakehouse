@@ -196,17 +196,158 @@ bun run typecheck && bun run lint && bun run test
 git status
 ```
 
-## 6. Slice 3 (outline; plan check before it starts)
+## 6. Slice 3 plan check (planner, 2026-11-04; anchors at slice 2's branch `2eae89d1`)
 
-- Column sensitivity and masks set on the table's columns; the Classification & Masking page
-  goes; a "sensitive columns" filter in the Catalog. The classification `masking_rule` text
-  field is replaced by a real column-mask policy (it is never applied today).
-- Policies becomes a read-only "Access rules" overview linking to each table.
-- Data Quality gains the check schedules and freshness targets that live only on the table
-  page.
-- Tag keys and Maps become Settings sections; Sessions a tab in Users; "Teams & Roles"
-  becomes "Roles", with edit and delete.
-- The Lineage page's deep links move to the table's Lineage tab; the page goes.
+Split in two, because the screens need API the product does not have yet:
+
+- **3a: API** (DeepSeek developer, bluefin). Branch `feat/web-3-slice-3a-api` from `main`.
+- **3b: the screens** (Opus developer, desktop; owner 2026-11-04). Branch
+  `feat/web-3-slice-3b-screens` from slice 2's branch, with `origin/main` and 3a's branch merged in
+  once they land.
+
+3b starts with the parts that need no new API (S3-T1 to S3-T4) while 3a is built.
+
+### 6.1 Evidence (survey 2026-11-04)
+
+- **Columns.** The Schema tab (`catalog/asset-schema.tsx:132-185`, `asset-columns.tsx:544-575`)
+  shows a `masked` pill and a classification badge per column, with no controls.
+  - `masked` means masked *for the viewer* (`routes/catalog.rs:2360-2366`), not that a mask policy
+    exists. The policies in force are in `AssetDetail.policySummary`.
+  - A classification is set and removed on the Access tab (`asset-access.tsx:108-135`, `:197-290`).
+  - A mask is a policy made by the Access tab's Add policy dialog (`:302-370`), which writes the
+    structured conditions `PolicyCondition::parse` enforces.
+  - The classification `maskingRule` text is never applied anywhere.
+  - Classification keys a table by `lineageKey`; a policy keys it by `policyTable`.
+- **`GET /api/governance/classification`** (`routes/governance.rs:455-481`) emits one row per
+  registry dataset with `classification: "internal"`, hardcoded. The `tier` it selects is unused, and
+  `asset` is the dataset's title, not a key. That is an invented value (principle 2).
+- **Policies.** A policy carries no asset id. The table is only in `conditions.table`.
+  - `silver.*` and `serving.*`: the table is the asset id (`catalog.rs:1726`).
+  - `bronze.<table>`: the asset id is a registry slug that nothing on the policy names.
+  - There is no `PUT /api/governance/policies/{id}`.
+- **Quality.**
+  - Schedules: `GET /api/governance/quality/schedules` lists every table; `PUT .../{asset}` sets one.
+    There is no reset.
+  - Freshness targets: `GET` / `PUT /api/governance/sla` and `DELETE /api/governance/sla/{table}`.
+  - Today both are shown only on the asset page (`quality-schedule.tsx:46`, `asset-activity.tsx:282-430`).
+- **Roles.** Only `GET` / `POST /api/identity/roles`.
+  - The store has `delete_role` (FK violation while a user holds the role) but no `update_role`.
+  - The page is create-only and calls itself "Teams & Roles".
+- **Lineage links.**
+  - The asset page reads `?tab=`, so `/data/assets/<id>?tab=lineage` works.
+  - The asset's own link (`asset-lineage.tsx:298`) can use it.
+  - A pipeline has an optional `targetAssetId`.
+  - A run has none.
+  - A chart's lineage spans several tables.
+  So the Lineage page **stays** for charts, runs and pipelines without a target; only the links
+  that know their asset move to the tab. (This revises section 0's "the page goes".)
+
+### 6.2 Slice 3a: API (DeepSeek)
+
+- **S3a-D1. Policies say which table page they belong to.** The policy views (`PolicyView`, from
+  `SEC-61` #373) gain `assetId: Option<String>`, resolved server-side from `conditions.table`:
+  - `silver.*` / `serving.*`: the table itself;
+  - `bronze.<table>`: the registry slug, from the same registry reader the catalog uses (rule 4);
+  - unparseable conditions, or a table with no catalog entry: `None`.
+  Contract `assetId?: string`. Build on `SEC-61`: merge #373's branch, or main once #373 merges.
+- **S3a-D2. Roles can be edited and deleted.**
+  - `PUT /api/identity/roles/{id}` (name, description, permissions) and
+    `DELETE /api/identity/roles/{id}`, each `POLICY_TABLE`-classified with the permission
+    `POST /api/identity/roles` uses.
+  - Both asserted both ways in `tests/route_auth.rs`.
+  - Both audited, as role creation is.
+  - A store `update_role`.
+  - Delete while users hold the role → 409 with the fixed sentence "This role is still given to
+    N people. Take it away from them first."
+  - A seeded system role (check how the seed marks one) → 409 "A built-in role cannot be deleted."
+  - Never pass an FK violation's text through (principle 4).
+- **S3a-D3. A schedule can go back to the default.** `DELETE /api/governance/quality/schedules/{asset}`
+  → 204, after which `GET` shows the default for that asset. Same permission as `PUT`.
+- **S3a-D4. No invented classification.** `classification()` emits a registry-derived row only
+  when the dataset's `tier` is one of the product's classification levels (read the levels from
+  the code: the classification badge and the `create_rule` validation), with that level as its
+  classification, and `asset` as the same key the stored rules use. Otherwise it emits no row.
+  Report the `tier` values seen in the seed. If the levels and the tiers do not match at all,
+  stop and report: the derived rows are then simply removed (planner default).
+- **S3a-D5. Tests and docs.**
+  - Route tests for each new route, both ways, in `route_auth.rs`.
+  - A unit test for each `assetId` case.
+  - A test that the derived classification row carries the tier, not "internal".
+  - CHANGELOG `### Added` / `### Fixed`.
+  - Mutation check: hardcode `"internal"` again and the D4 test fails.
+- *Verification:* the `AGENTS.md` Rust block for `lakehouse-api` and `lakehouse-store`, scoped
+  per commit; the workspace run once before handoff (`CARGO_BUILD_JOBS=4` on bluefin).
+
+### 6.3 Slice 3b: the screens (Opus)
+
+- **S3-D1. Sensitivity and masks live on the column** (Schema tab). Opening a column shows a
+  "Sensitivity and masking" section:
+  - **Sensitivity:** the column's classification, with Set / Change / Remove. The create and
+    delete classification calls already exist; "change" is delete then create, in that order,
+    with the new value shown only after both succeed.
+  - **Masked for:** the roles of every enforced column-mask policy in `policySummary` that names
+    this column, each linking to its policy.
+    - **Add a mask** writes a Column mask policy for this column and the chosen roles, through the
+      same `createPolicy` call and the same `policyTable` / `policyCondition` builders the Access
+      tab uses today. Move those helpers to one shared module (rule 4); do not copy them.
+    - **Remove** deletes a policy that masks only this column. A policy that also masks other
+      columns is not deleted from here: the row says "Part of <policy name>, which also masks
+      <columns>" with a link to the Access tab.
+  - Needs `governance:write` / `policy:write`, as today. A reader sees the facts without the buttons.
+- **S3-D2. The Access tab** keeps grants, request access and the table's policies (with
+  SEC-61's not-enforced notice). Its Classify dialog and classification card go: one place per
+  fact.
+- **S3-D3. The Classification & Masking page goes.**
+  - `/governance/classification` becomes redirect-only to `/catalog`.
+  - The Catalog gains a "Has sensitive columns" filter **only if** the catalog list carries the
+    asset's classification (`AssetSummary`). If not, the filter is left out and the handoff says
+    so; no new endpoint.
+- **S3-D4. Policies becomes "Access rules"** at `/governance/policies` (the address is kept).
+  - A read-only list: name, table (linking to `/data/assets/<assetId>?tab=access` when `assetId`
+    is known, plain text otherwise), roles, what it does (masks <columns> / filters rows), and
+    enforced or not (SEC-61).
+  - No Enforce, Stop or Delete here: those stay on the table's Access tab. The drawer is read-only
+    and links to the table.
+  - Needs S3a-D1.
+- **S3-D5. Data Quality gains two tabs: Schedules and Freshness targets.**
+  - **Schedules:** every table's schedule from the list endpoint, with Edit (the existing
+    `QualitySchedulePanel` controls, reused) and Reset (S3a-D3).
+  - **Freshness targets:** every target from `GET /api/governance/sla`, with Add, Edit and Remove
+    (the existing dialog, reused).
+  - A table key that is not an asset id shows as plain text (the Bronze slug gap). Do not
+    fabricate a link.
+  - The asset page keeps its own controls.
+- **S3-D6. Settings has sections:** Reporting, Remembered results, Query limits, Sign-in, Tag keys,
+  Maps.
+  - A section list or tabs, and the section is in the URL (`?section=`).
+  - Reuse the Tag keys page body and `MapsAdmin` as they are.
+  - `/governance/tag-keys` and `/admin/maps` become redirect-only to their section.
+- **S3-D7. Users has tabs:** People | Sessions (the Sessions page body).
+  `/admin/sessions` → `/admin/users?tab=sessions`.
+- **S3-D8. "Teams & Roles" becomes "Roles"**, with Edit and Delete (S3a-D2). A 409 shows the
+  API's sentence.
+- **S3-D9. Lineage links:**
+  - the asset page's link → `?tab=lineage`;
+  - a pipeline with a `targetAssetId` → that asset's tab;
+  - everything else keeps `/lineage?focus=`.
+- **S3-D10. The sidebar after slice 3:**
+  - Governance: Access rules, Data Quality, Approvals.
+  - Administration: Users, Roles, Tenants, Service Identities, Settings.
+  - Page context (`copilot/page-context.ts`) follows. No tool or `tool_schemas.json` change.
+- **S3-D11. QA.** The planner updates the Lark QA cases that name the moved pages when 3b merges.
+
+**Tasks** (one commit each, push after each; 3a-dependent ones last):
+
+- **S3-T1** Settings sections (D6).
+- **S3-T2** Users tabs (D7).
+- **S3-T3** Data Quality tabs: schedules Edit and freshness targets (D5, without Reset).
+- **S3-T4** Column sensitivity and masks, the Access tab change, and the page removal (D1–D3).
+- **S3-T5** (after 3a) Access rules (D4), schedule Reset, Roles edit/delete (D8).
+- **S3-T6** Lineage links, sidebar, page context, docs, CHANGELOG (D9, D10).
+
+*Verification:* `bun run typecheck && bun run lint && bun run test`. On the desktop, run Rust
+tests scoped only (its loopback hangs on closed ports), and leave the full run to CI.
+Screenshots: only if `libnss3` / `libnspr4` are installed by then; otherwise *not verified*.
 
 ## 7. Out of scope
 
@@ -446,6 +587,221 @@ the diff checked.
 **Not verified.** The page against a real install with no CDC connector (no stack was brought up). The empty line
 was not checked in a browser.
 
+### Handoff (slice 3b) — developer (Opus), 2026-11-04
+
+Branch `feat/web-3-slice-3b-screens` (from `b2b55d9a`), one commit per task, pushed after each. No
+rebase, no force-push. **S3-T5 is not built: slice 3a is not done.** At the last check (after S3-T6)
+`origin/feat/web-3-slice-3a-api` had S3a-D1 (`632df1df`) and S3a-D2 (`1f279d10`) but no schedule
+`DELETE` (S3a-D3) and no "Handoff (slice 3a)" entry, so it was not merged and nothing of its API was
+used. `origin/main` has neither #373 nor #374, so `origin/main` was not merged either.
+
+| Task | Commit | What |
+| --- | --- | --- |
+| S3-T1 | `9216e132` | Settings sections in `?section=`; Tag keys and Maps inside; three redirects (S3-D6) |
+| S3-T2 | `56eac7da` | Users: People and Sessions tabs in `?tab=`; `/admin/sessions` redirect (S3-D7) |
+| S3-T3 | `34d79561` | Data Quality: Schedules (Edit) and Freshness targets (Add, Edit, Remove) tabs (S3-D5 without Reset) |
+| S3-T4 | `bf637397` | Column "Sensitivity and masking"; Access tab loses classification; Classification page gone (S3-D1 to S3-D3) |
+| S3-T5 | — | **Waits for 3a** (Access rules S3-D4, schedule Reset, Roles edit/delete S3-D8, and the two sidebar renames) |
+| S3-T6 | `6d7fe3d2` | Pipeline lineage link, sidebar removals, page context, user guide, CHANGELOG (S3-D9, S3-D10 in part) |
+| — | the commit that adds this entry | This handoff |
+
+No Rust, Python or compose change; no `cargo` command was run.
+
+**Per-task checks** (each: `bun run typecheck` exit 0; `bun run lint` 0 errors, 10 warnings, the same
+pre-existing list as slices 1 and 2). Scoped runs used `bun test <paths>` (`bun run test <paths>` runs everything):
+
+- S3-T1: `bun test src/features/admin src/features/governance/tag-keys-page.test.tsx src/lib/url-tab.test.ts` 67 pass, 0 fail.
+- S3-T2: `bun test src/features/admin/users-page.test.tsx src/features/admin/sessions-page.test.tsx` 17 pass, 0 fail.
+- S3-T3: `bun test src/features/catalog src/features/governance src/lib/table-key-href.test.ts` 385 pass, 0 fail.
+- S3-T4: `bun test src/features/catalog src/features/governance src/lib/column-masks.test.ts src/services` 547 pass, 0 fail.
+- S3-T6: `bun test src/features/pipelines/pipeline-detail-page.test.tsx src/features/copilot src/components/app-shell`
+  130 pass, 0 fail; `./rust/tests/parity/check-no-secrets.sh` corpus clean.
+
+**Before handoff, on `6d7fe3d2`, foreground.**
+
+- `bun run typecheck` — exit 0.
+- `bun run lint` — exit 0; 0 errors, 10 warnings, none in a file this slice touched.
+- `bun run test` — first run: 3253 pass, 1 skip, **1 fail**, 3255 tests, 331 files, 206.18 s. The failure was
+  `UploadsPanel > refreshes while a row is loading and stops when none is` (a poll-count assertion, expected 3), in
+  `src/features/connectors/uploads-panel.test.tsx`, which this slice does not touch (no file under
+  `src/features/connectors` changed). It passed 3 of 3 runs alone (27 pass each), and the second full run was green:
+  **3254 pass, 1 skip, 0 fail, 8804 expect() calls, 3255 tests, 331 files, 196.39 s.** Read as a timing flake under
+  load, not proven.
+- `git status` — empty.
+
+**Not verified.** Screenshots and every look at 1280 px and 390 px: `libnss3` / `libnspr4` are still not installed,
+so no browser starts. The redirects were not exercised against a running server this time (the five redirect
+pages are one `redirect()` each). The assistant's page context with a model (no test covers `page-context.ts`).
+
+**Mismatches with the plan, reported, not improvised.**
+
+1. *S3-D2 leaves the table's own classification without a control.* The Access tab's Classify dialog was the only
+   place that set or removed a classification rule for **the whole table** (no column). S3-D1 gives columns their
+   controls; nothing replaces the table-level one, so after S3-T4 a table-level rule can neither be set nor removed
+   in the console (the header badge still shows the level and where it comes from). Built as decided; the planner
+   should decide whether the header or the Overview gets a Set / Remove for the table, or whether a table is only
+   ever as sensitive as its columns.
+2. *S3-D9's first bullet is a self-link.* The asset page's only lineage link (`asset-lineage.tsx:298`, "Open lineage
+   graph") is on the Lineage tab itself, so pointing it at `?tab=lineage` would link the page to itself. It was left
+   pointing at `/lineage?focus=` (the full graph page, which S3-D9 keeps). Remove the button, or keep it?
+3. *S3-D5 "every table's schedule".* `GET /api/governance/quality/schedules` lists only tables with a saved schedule
+   (`routes/quality_schedules.rs:43`). The tab lists those and says in one line that any other table runs every
+   N minutes (the endpoint's `defaultIntervalMinutes`). There is no Add on the Schedules tab (not decided); a new
+   schedule is set from the table's Quality tab, and the empty state says so.
+4. *S3-D3 filter left out.* The catalog list row carries the asset's own `classification` (asset level, which a
+   table-level rule can raise on its own), not whether any column is classified, so a "Has sensitive columns" filter
+   would be approximate (rule 14). Not added; no endpoint added.
+5. *S3-D10 in part.* The sidebar removals are in S3-T6; the renames "Policies" → "Access rules" and "Teams & Roles"
+   → "Roles" wait for S3-T5, so the sidebar never names a page by a title the page does not have.
+
+**Choices made inside the decisions, for the reviewer.**
+
+1. *One URL-tab helper.* Three pages needed the asset page's `?tab=` posture, so it is `useUrlTab`
+   (`src/hooks/use-url-tab.ts`, pure parts and tests in `src/lib/url-tab.ts`): first tab is the bare address, an
+   unknown value opens the first tab. The asset, connector and Sources pages keep their own copies (not refactored).
+2. *Settings* uses the asset page's line tabs (six sections, sideways scroll on a phone), under one "Settings"
+   header. The sections are the old components unchanged except their titles: Reporting's header said "Settings"
+   and now says "Reporting"; Sign-in's said "Single Sign-On" and now says "Sign-in". Tag keys and Maps keep their own
+   headers (they carry the New tag key action and the upload form). Only the open section loads.
+   `/admin/sso` now redirects to `?section=sign-in` (was `/admin/settings`).
+3. *Users and Data Quality* use the plain tab list, as Sources does. Invite User shows only on People; Add Quality
+   Rule only on the rules tab, now named "Incidents and rules". The page descriptions were rewritten to say what the
+   tabs hold. The stale user-guide line "Roles cannot yet be changed here once a person is invited" was dropped
+   (`ADM-4` D1 shipped a role editor).
+4. *Reuse, not copies (rule 4).* The asset page's freshness dialog moved to
+   `governance/freshness-target-dialog.tsx`, keyed by the SLA's table key, with a Table field when adding from the
+   tab; the schedule control moved into `ScheduleControls` in `quality-schedule.tsx`; `policyTable` /
+   `policyCondition` moved to `catalog/asset-policy.ts` (their test file moved with them). A table key links only
+   for `silver.` / `serving.` keys (`src/lib/table-key-href.ts`), which `lineage-graph.tsx`'s `nodeHref` now uses
+   too; a Bronze key is plain text.
+5. *The column section* sits under the opened column's facts on the Schema tab (`column-sensitivity.tsx`); the
+   Sample tab's inspector opens the same `ColumnDetail` without it. When the section is shown, the facts no longer
+   repeat Masked / Classification. The `masked` pill has the title "Masked for you", and the fact reads
+   "Masked for you" (it is masked for the viewer, section 6.1).
+   - Change is one action, delete then create. A failed create after a successful delete says the old level is
+     already gone and reloads, so the page shows what is stored.
+   - **Add a mask is enforced at once** (`activate: true`), because the section lists enforced masks only and a
+     draft would be added and not appear. The policy name defaults to `mask_<table>_<column>_for_<roles>` (names are
+     `UNIQUE`, `0003_governance.sql:48`) and can be edited.
+   - A policy with a row filter counts as "does more than this column" even when it masks only this column, so it
+     is not deleted from here ("Part of X, which also filters rows"): deleting it would also lift the row filter.
+   - Drafts that mask the column are not listed (S3-D1 says enforced).
+   - Without `policy:read` the API sends no roles: the section says "You. Who else it is masked for is shown with
+     policy:read." (or "Not for you. …") instead of "No one".
+6. *The asset page keeps its data on screen while it reloads* (`useService`'s existing `keepDataOnReload`), so the
+   opened column stays open after a change instead of the page flashing to a skeleton. This applies to every
+   reload on that page (certification, Access tab policies, and so on).
+7. *Removed with the Classification page:* `classification-page.tsx`, `classification-columns.tsx`, their test, and
+   `listClassifications` from the contract and client (its only consumer). The `GET /api/governance/classification`
+   route is untouched (S3a-D4 is 3a's).
+8. *Tests.* Added: `url-tab` (4), `table-key-href` (2), `column-masks` (4), `settings-page` (3), two Users tab cases,
+   eight Data Quality tab cases, ten column-section cases in `asset-detail-tabs.test.tsx`, two pipeline lineage-link
+   cases. Removed with what they tested: the six Access-tab classification cases (replaced by the column cases) and
+   `classification-page.test.tsx`. Renamed: `asset-access.test.ts` → `asset-policy.test.ts`. One assertion changed
+   its label: "Masked" → "Masked for you" (`asset-columns.test.tsx`).
+
+**What S3-T5 needs when 3a lands:** merge `origin/feat/web-3-slice-3a-api` once its handoff is in; then Access rules
+(S3-D4, read-only list with `assetId` links, drawer read-only), Reset on the Schedules tab (S3a-D3), Roles edit and
+delete with the API's 409 sentence (S3-D8), the sidebar renames, and the user-guide rows for Policies and Roles.
+
+### Handoff (slice 3a) — developer, 2026-11-04
+
+Branch `feat/web-3-slice-3a-api`, built on the `SEC-61` merge (`e3f79fac`), one commit per
+task, pushed after each. No migration. At takeover `git status` was clean: the previous
+session's D5 work was already committed and pushed, not left uncommitted.
+
+| Task | Commit | What |
+| --- | --- | --- |
+| S3a-D1 | `632df1df` | `PolicyView.assetId` from `conditions.table`, list/create/status alike |
+| S3a-D2 | `1f279d10` | `PUT`/`DELETE /api/identity/roles/{id}`, `identity:write`, audited, both 409s |
+| S3a-D3 | `359f6de5` | `DELETE /api/governance/quality/schedules/{asset}`, 204, audited |
+| S3a-D4 | `bf0c1786` | Registry-derived classification row only for a real level; `### Fixed` entry |
+| S3a-D5 | `2d9e2203` | Bronze `assetId` integration test (real `ClickHouse` + registry row); `### Added` entry |
+| S3a-D5 | `74995151` | Malformed-conditions `assetId` unit case |
+| — | the commit that adds this entry | This handoff |
+
+**D5 coverage, as the plan asks.**
+
+- Route gates both ways in `tests/route_auth.rs`: `role_edit_and_delete_are_gated_in_both_directions`
+  (`PUT`/`DELETE /api/identity/roles/{id}`: anonymous 401, `identity:read` 403 with the row
+  and membership unchanged, `identity:write` reaching the handler) and the extended
+  `quality_schedule_routes_are_gated_in_both_directions` (`DELETE …/quality/schedules/{asset}`:
+  reader 403, `governance:write` 204). Both entries are also in `POLICY_TABLE` and in the
+  table-driven loops that walk every entry (401/403), plus the registered-route test.
+- `assetId` unit cases in `routes/governance.rs`: `a_silver_or_serving_table_is_its_own_asset_id`
+  (silver and serving), `a_bronze_table_asks_the_registry_for_its_slug`,
+  `absent_conditions_name_no_asset`, `free_text_conditions_name_no_asset`,
+  `malformed_conditions_name_no_asset` (added here), `a_condition_with_no_obligation_names_no_asset`,
+  `a_table_no_zone_addresses_name_no_asset`, `the_wire_shape_omits_an_unknown_asset_id_and_keeps_a_known_one`.
+  The "not catalogued → none" case is the integration test
+  `a_bronze_policy_names_the_registry_slug_of_its_table` (`2d9e2203`): a real `ClickHouse`,
+  a seeded `dataset_catalog` row, `bronze.policy_orders_raw` → `policy_orders`,
+  `bronze.no_such_table` → `None`, `silver.orders` → itself.
+- The tier-carrying classification test is `a_registry_tier_that_is_a_level_is_reported_as_that_level`
+  (`bf0c1786`): a `confidential` tier produces `"classification": "confidential"`, never
+  `"internal"`; `a_source_tier_is_not_a_classification_and_reports_nothing` and
+  `every_product_level_is_accepted` pin the rest.
+- The role-delete 409s are in `tests/identity_roles.rs`:
+  `a_role_people_still_hold_is_refused_with_the_count` ("This role is still given to 1
+  people. Take it away from them first.") and `a_built_in_role_cannot_be_deleted`
+  ("A built-in role cannot be deleted."), with the delete audit test beside them.
+
+**CHANGELOG.** `### Added` names role edit/delete, schedule reset and `assetId` on policies
+(written in `2d9e2203`); `### Fixed` names the invented "internal" classification (written
+in `bf0c1786`, the commit that fixed it). No further entry was needed, so there was no
+separate changelog commit to make: both entries were already in commits pushed before this
+session, and splitting them out would rewrite a pushed branch (forbidden).
+
+**D4 tiers found in the seed, and how they map.**
+
+- `scripts/seed-clickhouse.sql:420-423` — primary registry `bronze_meta.dataset_catalog`:
+  four rows, every one `tier='primer'`.
+- `scripts/seed-clickhouse.sql:452-454` — secondary registry
+  `bronze_meta_sec.dataset_catalog`: two rows, both `tier='sekunder'`.
+- `dagster/dispar_orchestrate/bronze_catalog.py:370` — every real ingest
+  (`register_bronze_table`) writes `'primer'`; the secondary registry has no in-repo
+  writer (the DATA-39 plan says "another producer or by hand"), and the catalog detail
+  read labels it `'sekunder'` (`rust/crates/lakehouse-api/src/routes/catalog.rs:2622`).
+- Map: the product's levels are `public`, `internal`, `confidential`, `restricted`
+  (`CLASSIFICATION_LEVELS`, matching `CLASSIFICATION_LABEL` and the `classification_rule`
+  `CHECK`). `primer` and `sekunder` are source tiers, not levels, so **no seeded dataset
+  produces a derived row** and the list carries the authored rules alone — the plan's D4
+  fallback. The tests seed a level tier (`confidential`) to exercise the branch that is
+  kept.
+- `dataset_sync.klasifikasi` in the same seed carries `'Terbuka'`/`'Internal'`; that column
+  is not what `classification()` reads, and it is not mapped.
+
+**Mutation check (run this session, not taken on trust).** Changed
+`"classification": tier` to `"classification": "internal"` in `registry_classification`;
+`cargo test -p lakehouse-api a_registry_tier_that_is_a_level_is_reported_as_that_level`
+failed: `left: String("internal")`, `right: String("confidential")`. Restored; the
+governance module's 57 tests pass and `git status` is clean.
+
+**Verification, final commit `74995151`, foreground, `CARGO_BUILD_JOBS=4`, the checkout's
+`rust/target` (shared; no `cargo clean`).**
+
+- `cargo fmt --check` — exit 0.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — exit 0, finished
+  in 1m 09s.
+- `cargo test --workspace` — exit 0: **9629 passed, 0 failed, 52 ignored**, 185 result
+  lines over 171 suites. Named: `route_auth` 77, `identity_roles` 17, `quality_schedules` 4,
+  `sec11_guard` 4.
+- `bun run typecheck` — exit 0.
+- `bun run test` — **3212 pass, 1 skip, 0 fail**, 8752 expect() calls, 328 files, 92.41s.
+- `git status` — empty after this handoff commit's parent. The three ClickHouse containers
+  this test run left behind were removed. `dreamy_bouman` (`postgres:16-alpine`, up 3 h
+  before this session) was not started here and was left alone.
+- `docker compose … config` was not run: no compose file changed in slice 3a.
+
+**Not verified.**
+
+- No browser run and no stack brought up: slice 3a is API only; the screens are 3b's.
+- The contract field, client and type were not exercised through a console page (none
+  calls the new routes yet).
+- The D4 fallback (no derived rows in this deployment's seed) is asserted by unit tests and
+  by the seed's `primer`/`sekunder` values, not observed on a running deployment's
+  classification page.
+
 ## 9. Review (planner appends below)
 
 ### Review slice 2, round 1 (planner, 2026-11-04, at `e566187b`)
@@ -485,3 +841,172 @@ dated feature-page records alone. The command-palette test that failed once and 
 - **Follow-up, not this slice (handoff point 6):** Iceberg tables with no catalog entry
   (e.g. some Gold export tables) are no longer reachable from any list. The planner files it
   as a backlog item.
+
+### Review slice 3b, round 1 (planner, 2026-11-04, at `03093545`)
+
+S3-T1 to S3-T4 and S3-T6 read against S3-D1 to S3-D11. No BLOCKER. The handoff's design choices
+are accepted: a mask added on a column is enforced at once; a policy that also filters rows is
+not removed from the column; "roles hidden" without `policy:read`; `keepDataOnReload` on the
+asset page; the shared `useUrlTab`, freshness dialog, schedule control and policy builders;
+Bronze keys as plain text. The one full-suite failure (an `uploads-panel` poll count, passing
+3/3 alone and in the second run) is noted; CI judges.
+
+Decisions on the five mismatches the handoff reports:
+
+1. **Table-level sensitivity (S3-D2 removed its only control).** Planner decision: it moves to
+   the asset's About card (`catalog/asset-about.tsx`) as "Sensitivity (whole table)", with
+   Set / Change / Remove, using the same classification calls with no column. The rule is
+   unchanged: a table is never less strict than its strictest column, so the header badge may
+   show a stricter level than the table-level rule, and the card says why in one muted line.
+   Built in the next run, as **S3-T5a**, before S3-T5.
+2. **The asset Lineage tab's "Open lineage graph" button** keeps pointing at
+   `/lineage?focus=`: it opens the full page, so it is not a self-link. Accepted as built.
+3. **Schedules lists only tables with a saved schedule**, with the default line. Accepted. Adding
+   a schedule for another table from this tab is a follow-up (a table picker), not this slice.
+4. **No "Has sensitive columns" filter.** Accepted: the list does not carry it, and an
+   approximate filter would mislead.
+5. **The sidebar renames ship with their pages (S3-T5).** Accepted.
+
+Next run: S3-T5a now; S3-T5 when slice 3a's handoff entry is on its branch.
+
+### Handoff (slice 3b, round 2) — developer, 2026-11-04
+
+Branch `feat/web-3-slice-3b-screens`, on top of review round 1 (`dccddafc`).
+
+| Commit | Task | What |
+|---|---|---|
+| `8d2ce73c` | S3-T5a | "Sensitivity (whole table)" on the About card (review round 1, decision 1) |
+| — | the commit that adds this entry | This handoff |
+
+**Built (S3-T5a), as decision 1 says.**
+- The About card (`catalog/asset-about.tsx`) has a "Sensitivity (whole table)" row with
+  Set / Change / Remove. It uses the same calls as a column: `createClassificationRule` with
+  the table's lineage key and **no `column`**, and `deleteClassificationRule` for the table
+  rule in force (the rule in `classificationRules` without a `column` key). Change removes
+  that rule, then adds the new one; column rules are never touched. Needs `governance:write`;
+  without it the level shows with no buttons.
+- The level shown is the table rule's own, not the header's. When a column makes the header
+  badge stricter, one muted line says so: "The header shows Restricted because column amount
+  is Restricted: a table is never less restrictive than its most restrictive column."
+  (`stricterBecauseOfColumns`). No line when the table rule is already the strictest.
+- No second copy of the controls (rule 4): the column's `SensitivityControls` in
+  `column-sensitivity.tsx` now takes an optional `column`; without it, it writes and words
+  everything for the whole table (label, toast, remove dialog, half-done Change message).
+  `LEVELS` is exported there as `SENSITIVITY_LEVELS`.
+- Six tests in `asset-detail-tabs.test.tsx` ("About card: sensitivity of the whole table"):
+  Set with no column, Change (delete then post, column rule left alone), Remove with what
+  applies instead, the muted line, no line when the table rule is strictest, no buttons
+  without `governance:write`.
+
+**Still waits: S3-T5** (Access rules D4, schedule Reset D5, Roles edit/delete D8, sidebar
+renames to "Access rules" and "Roles"). At this run `origin/feat/web-3-slice-3a-api` is at
+`bf0c1786` with S3a-D1 to S3a-D4 committed, but its plan has no "Handoff (slice 3a)" entry
+(`grep -n -i handoff` on that file finds slice 1 and slice 2 only). Per the brief, the branch
+was not merged and S3-T5 was not started; no API shape was assumed.
+
+**Commands run (foreground, on `8d2ce73c` plus this docs commit):**
+- Per task: `bun run typecheck` (0 errors), `bun run lint` (0 errors, 10 warnings, all in
+  files this slice does not touch), `bun test src/features/catalog/asset-detail-tabs.test.tsx`
+  (143 pass, 0 fail), `bun test src/features/catalog` (350 pass, 0 fail, 14 files).
+- Before handoff: `bun run typecheck && bun run lint && bun run test`: typecheck clean, lint
+  0 errors / 10 warnings, test **3260 pass, 0 fail, 3261 tests across 331 files**.
+- No Rust, Python or compose change, so no cargo, pytest or compose command was run.
+
+**Not verified.** The About card row was not looked at in a running console (no dev stack
+started); it is checked by the tests above only.
+
+### Handoff (slice 3b, round 3) — developer, 2026-11-04
+
+Branch `feat/web-3-slice-3b-screens`, from `91a7e105` (round 2). No rebase, no force-push.
+
+| Commit | Task | What |
+|---|---|---|
+| `cf12097c` | merge | `origin/feat/web-3-slice-3a-api` (at `7f5d6140`, its handoff in) |
+| `de92f504` | merge | `origin/main` (at `c41a5f1f`) |
+| `7ae9023e` | S3-T5 | Access rules, read-only (S3-D4), sidebar "Access rules" |
+| `4566bf7e` | S3-T5 | Reset on Data Quality's Schedules tab (S3-D5, S3a-D3) |
+| `1481bd44` | S3-T5 | Roles: Edit and Delete with the API's 409 sentence (S3-D8), sidebar "Roles" |
+| — | the commit that adds this entry | This handoff |
+
+**Merges.**
+- 3a: one conflict, in this plan file only (section 8, and the end of section 9): both sides only
+  appended. Kept both, hunk by hunk: 3b's handoff, then 3a's handoff, then 3a's side of the
+  section 9 hunk was empty, so 3b's round-1 review and round-2 handoff stay as they were. Every
+  other file (Rust, `CHANGELOG.md`, contracts, clients, `asset-access.tsx`) auto-merged.
+  `bun run typecheck` exit 0 right after.
+- `origin/main`: no conflict. It brings `REL-10` (`lakehousectl`, `.env.example`, docs) and a
+  dependabot `Cargo.lock` bump. Slice 2 (#374) was already in this branch's history. No Rust change
+  was needed from me, so none was made.
+
+**Built (S3-T5).**
+- *Access rules* (`policies-page.tsx`, now `AccessRulesPage`; `policy-columns.tsx`; new
+  `access-rules.ts`). Columns: Rule, Table, Roles, What it does, Status (SEC-61's
+  `PolicyStatusPill`, reused: Draft / Ready / Not enforced). The table links to
+  `/data/assets/<assetId>?tab=access` when `assetId` is present; otherwise it is plain text. The
+  drawer is read-only: it has the same facts plus Kind, Effect, Version, Owner, Updated, SEC-61's
+  notice for an unenforceable rule, and a line linking to the table's Access tab (or to the
+  Catalog when there is no `assetId`). No Enforce, Stop or Delete on the page. `PolicyActions`
+  stays, used by the Access tab only. The sidebar, the Access tab's button ("Open access
+  rules"), the page context and the user guide use the new name.
+- *Reset* (`quality-schedules-tab.tsx`): beside Edit, behind a confirmation ("Its checks then run
+  every <default>"). Calls `resetQualitySchedule`, then reloads, so the table leaves the list. A
+  failure keeps the dialog open and shows the API's sentence. Needs `governance:write`, like Edit.
+- *Roles* (`roles-page.tsx`, `roles-columns.tsx`): titled "Roles". With `identity:write`, the row
+  menu has Edit role (the create sheet's three fields, now one `RoleFields` component, used by
+  both sheets) and Delete role (a confirmation that says how many people hold the role). A 409
+  is shown in the dialog with the API's sentence exactly as sent, and the dialog stays open.
+  Without `identity:write` the menu only copies the name.
+
+**Choices made inside the decisions, for the reviewer.**
+1. *What a rule does* is read from `conditions` only when the API says `enforceable: true`. Any
+   other rule shows its stored `subjects` / `resources` text and "Nothing: written as text, so the
+   engine skips it". So the console never says a rule does something the engine skips (SEC-61
+   D1 stays the server's call). `listOf` is exported from `lib/column-masks.ts` and reused
+   (rule 4).
+2. *Errors in the dialogs come from the next render.* `useServiceAction`'s `error` is read from a
+   closure right after `await run()`, and there it is still the old (stale) value
+   (`lib/notify.ts`'s comment says the same). So Reset and Delete role render `action.error`
+   inside the dialog. `PolicyActions` and others read it right after the `await` (an existing
+   pattern, not changed here). Their failure toasts may lack the sentence. That needs a check
+   and a follow-up of its own.
+3. *A rename warns.* `UpdateRoleInput` says a rename is not carried into policies, and the
+   engine matches `conditions.roles` by name. So once the name field differs, the Edit sheet
+   says: "A rule that names <old> stops applying to this role once it is called <new>." This is
+   a sentence only, with no behaviour change. **Reported:** renaming a role silently lifts every
+   mask and row filter that names it. The planner may want the API to refuse a rename while a
+   rule names the role, or to rewrite the rules. Neither is in S3a-D2.
+4. The Delete role item is offered even when `members > 0` (the confirmation says people hold
+   it). The API's 409 is the source of truth, and the console does not try to decide first.
+
+**Checks per commit** (each: `bun run typecheck` exit 0; `bun run lint` 0 errors, 10 warnings,
+the same pre-existing list, none in a file this round touched):
+- merge 3a: typecheck only before the main merge; merge main:
+  `bun test src/services src/features/governance src/features/identity` 206 pass, 0 fail.
+- Access rules: `bun test src/features/governance src/features/catalog src/lib/column-masks.test.ts src/components/app-shell src/features/copilot`
+  533 pass, 0 fail (new `access-rules.test.tsx`, 8 cases).
+- Reset: `bun test src/features/governance` 58 pass, 0 fail (two new cases, and the reader case
+  also asserts no Reset).
+- Roles: `bun test src/features/admin src/components/app-shell` 77 pass, 0 fail (new
+  `roles-page.test.tsx`, 5 cases).
+
+**Before handoff, on `1481bd44`, foreground.**
+- `bun run typecheck` — exit 0.
+- `bun run lint` — exit 0; 0 errors, 10 warnings.
+- `bun run test` — **3282 pass, 1 skip, 0 fail, 8883 expect() calls, 3283 tests, 334 files,
+  206.98 s.**
+- `git status` — empty.
+- No Rust, Python or compose file changed in this round's own commits, so no cargo, pytest or
+  compose command was run. The Rust that came in with the merges was not built or tested here
+  (no full Rust run on this machine). 3a's handoff and CI cover it.
+
+**Not verified.** No browser: `libnss3` / `libnspr4` are still missing, so there are no screenshots
+and no look at 1280 px or 390 px. The new routes were not called against a running API: the
+pages are tested against stubbed `fetch` with the response shapes 3a's handoff and tests name
+(204 for the deletes, `{ "error": "<sentence>" }` with 409). Nobody has seen the base-ui row menu
+on Roles open in a real browser. In the tests it opens on click.
+
+**Slice 3 against section 6.** With this round, every decision is built: S3a-D1 to D5 (3a);
+S3-D1 to D10 (3b), with the planner's round-1 decisions on the reported mismatches (table-level
+sensitivity on the About card as S3-T5a; the lineage button, the Schedules list, and the dropped
+catalog filter accepted as built). S3-D11 (the Lark QA cases) is the planner's, at merge. Open
+for the planner: choice 3 above (the rename lifts rules), and the stale-error pattern in choice 2.

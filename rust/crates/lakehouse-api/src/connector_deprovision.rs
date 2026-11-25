@@ -4,27 +4,21 @@
 //! replication slot pins WAL and fills the customer's production database
 //! disk").
 //!
-//! # This makes `ops/debezium/deprovision_connector.sh`'s comment false
+//! # History
 //!
-//! That script's header says `DELETE /api/connectors/{id}` doesn't call it
-//! "because the Rust API has no mechanism to safely resolve an arbitrary
-//! connector's secretRef and dial an arbitrary host from inside the
-//! product process". That was true when it was written. It no longer is:
-//! [`crate::connector_probe`] does exactly that today (real dial, resolved
-//! secretRef, SSRF-checked host) for `POST /api/connectors/{id}/test`. This
-//! module is the same capability aimed at deprovisioning instead of
-//! testing, and `routes::connectors::delete` calls it directly —
-//! `ops/debezium/deprovision_connector.sh` stays as the mechanism
-//! `ops/g4/g4_test.py` drives from outside the process (it has no Rust
-//! process to call into), but the product's own delete path no longer
-//! orphans a slot the way it used to.
+//! Until `SRC-4` slice 2 a shell script (`ops/debezium/deprovision_connector.sh`)
+//! did this from outside the product, because the API had no way to dial an
+//! arbitrary host safely. [`crate::connector_probe`] gave it one, this module
+//! is that capability aimed at deprovisioning, `routes::connectors::delete`
+//! calls it directly, and the script is gone (decision S2-h): the `g4-cdc` gate
+//! now proves the slot is dropped through `DELETE /api/connectors/{id}`.
 //!
-//! # Ordering — mirrors the shell script exactly
+//! # Ordering
 //!
 //! 1. `DROP PUBLICATION IF EXISTS` — safe to do regardless of slot state.
 //! 2. `pg_terminate_backend` any backend actively consuming the slot — a
 //!    slot cannot be dropped while something is consuming it, so whatever
-//!    that consumer is (a live `debezium-server` process, most likely)
+//!    that consumer is (a live `Kafka Connect` task, most likely)
 //!    must be kicked off it first.
 //! 3. Poll briefly for the slot to go inactive, then `pg_drop_replication_slot`.
 //!
@@ -394,7 +388,7 @@ async fn drop_slot(
         source,
     })?;
     // A slot must be inactive before it can be dropped — if some process
-    // (most likely a live `debezium-server`) is still consuming it,
+    // (most likely a live `Kafka Connect` task) is still consuming it,
     // terminate that backend's replication connection first. Absent slot
     // means this simply affects zero rows, which is fine.
     with_timeout(
@@ -413,8 +407,7 @@ async fn drop_slot(
     .await?;
 
     // Give Postgres a moment to mark the slot inactive after the terminate
-    // above, same 5-attempt/1s-apart shape as
-    // `ops/debezium/deprovision_connector.sh`.
+    // above, 5 attempts, 1s apart.
     for _ in 0..SLOT_INACTIVE_POLL_ATTEMPTS {
         let active: Option<(bool,)> = with_timeout(
             slot_name,

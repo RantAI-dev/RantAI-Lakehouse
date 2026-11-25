@@ -429,7 +429,35 @@ impl ChartInput {
     /// rebuilt from its definition at read time, like a grained one.
     #[must_use]
     pub fn uses_shaping(&self) -> bool {
-        self.measures.has_own_aggregates() || self.shape.is_used()
+        // `BI-46` (plan D14; QA `LH-BI-6-01`): a chart whose limit keeps the
+        // breakdown's top values is rebuilt from its definition on every read,
+        // like a grained one, so the rule reaches charts saved before it — with
+        // or without a dashboard filter. `finish_shaping` builds the stored
+        // statement from the same builder, so the two cannot disagree.
+        self.measures.has_own_aggregates() || self.shape.is_used() || self.caps_breakdown()
+    }
+
+    /// Whether the chart's limit keeps the breakdown's top values (`BI-46`,
+    /// plan D12): a bar, hbar, line or area chart with a breakdown, where the
+    /// second column is a series and the N values with the largest total of
+    /// the chart's measure are kept.
+    #[must_use]
+    pub fn caps_breakdown(&self) -> bool {
+        self.kind.breakdown_is_series()
+            && self
+                .breakdown
+                .as_ref()
+                .is_some_and(|breakdown| !breakdown.is_empty())
+    }
+
+    /// Whether a grained chart of this definition keeps the LATEST buckets
+    /// (`BI-46`, plan D12): only when its limit is not the breakdown's. A
+    /// chart with a breakdown keeps every period; its budget is the
+    /// breakdown's, and a relative date filter is how it narrows to recent
+    /// periods.
+    #[must_use]
+    pub fn keeps_latest_buckets(&self, grain: crate::grain::Grain) -> bool {
+        !self.caps_breakdown() && crate::grain::cuts_to_latest(grain, &self.effective_order())
     }
 
     /// The fixed limit, or `None` when the chart has none or takes it from a
@@ -641,7 +669,11 @@ fn new_board_id() -> String {
     format!("b_{}", random_hex(4))
 }
 
-fn new_chart_id() -> String {
+/// A fresh chart id (`u_` and 8 hex characters). Public for the copy a
+/// dashboard template makes (`BI-18` part D, T3), which gives every chart of
+/// the new dashboard its own id, as [`duplicate_board`] does.
+#[must_use]
+pub fn new_chart_id() -> String {
     format!("u_{}", random_hex(4))
 }
 
@@ -2100,6 +2132,60 @@ pub async fn place_new_chart(ch: &ChClient, board_id: &str, chart_id: &str) -> R
     Ok(())
 }
 
+/// The id of the board a chart's `board` value names: a blank value is the
+/// built-in board, as for a chart saved with no board.
+#[must_use]
+pub fn canonical_board_id(board_id: &str) -> &str {
+    match board_id.trim() {
+        "" => DEFAULT_BOARD_ID,
+        id => id,
+    }
+}
+
+/// Give every tile of a board a stored box, in the order the page draws them
+/// now, before one of its charts is rewritten.
+///
+/// Why: a chart row is rewritten with a new `created_at` (the version column of
+/// `bi_chart`), and the charts are listed `ORDER BY created_at`. A tile with no
+/// stored box is placed by that order, so a rewritten chart would jump to the
+/// end of the board. A board write boxes every unboxed tile in the current list
+/// order (`save_board_patch` does it for every write), so one write before
+/// the rewrite keeps each tile where the person sees it. Only `layout` can
+/// change: the rest of the board is carried forward as it is. On a tabbed
+/// board a tile that gets a box sits on the first tab, as the page draws a tile
+/// with none.
+///
+/// A board whose tiles all have a box is not written. A blank `board_id` is the
+/// built-in board, as for a chart saved with no board, and it is frozen on its
+/// shell row. A board with no live row is left as it is: a chart update does
+/// not create a board. That is why this does not reuse `board_for_update`,
+/// which refuses a missing board other than the built-in one with
+/// [`BiError::Validation`], and an error here would block the update.
+///
+/// # Errors
+///
+/// Returns [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn freeze_board_layout(ch: &ChClient, board_id: &str) -> Result<(), BiError> {
+    ensure_bi_table(ch).await?;
+    let board_id = canonical_board_id(board_id);
+    let board = match get_board(ch, board_id, &Viewer::system()).await? {
+        Some(board) => board,
+        None if board_id == DEFAULT_BOARD_ID => shell_board(board_id),
+        None => return Ok(()),
+    };
+    let live = live_charts_of(ch, &board.id).await?;
+    let layout = board.layout.as_ref();
+    if live
+        .iter()
+        .all(|chart| layout.is_some_and(|l| l.contains_key(&chart.id)))
+    {
+        return Ok(());
+    }
+    save_board_patch(ch, &board, BoardPatch::default())
+        .await
+        .map_err(BiError::Clickhouse)
+}
+
 /// Take a deleted chart's tile out of its board's layout and close the space it
 /// leaves on its tab (`BI-18` part C review fix (SHOULD-FIX) R9). A board with
 /// no tile for it, or none at all, is left as it is. When the chart comes back
@@ -3113,6 +3199,22 @@ pub fn stored_from_document(doc: &Value, board: &str, created_by: &str) -> Optio
     })
 }
 
+/// A stored chart's document (`{ spec, def, hasYear }`), the exact shape
+/// `spec_json` holds and [`stored_from_document`] reads back: what a dashboard
+/// template keeps of each chart (`BI-18` part D, T3), so a dashboard started
+/// from it is a copy of the charts as they were, like [`duplicate_board`]'s,
+/// and not a rebuild against today's schema (a chart whose table is gone then
+/// keeps its tile and says so, decision T2). No row of data is in it.
+#[must_use]
+pub fn stored_document(chart: &StoredChartSpec) -> Value {
+    serde_json::to_value(StoredPayload {
+        spec: &chart.spec,
+        def: &chart.def,
+        has_year: chart.has_year,
+    })
+    .unwrap_or(Value::Null)
+}
+
 fn empty_chart_input() -> ChartInput {
     ChartInput {
         title: String::new(),
@@ -3835,6 +3937,9 @@ fn grained_chart_sql(
         limit: crate::grain::effective_limit(grain, input.order, input.limit),
         // A chart with a sort is saved by `finish_shaping`, which rebuilds it.
         sort: None,
+        // `BI-46` (plan D12, D14): so is a chart whose limit caps its
+        // breakdown, so this path never sees one; it keeps every bucket.
+        cap_breakdown: false,
     };
     crate::builder::grained_sql(from, Vec::new(), &chart, input.column, time).ok_or_else(|| {
         BiError::Validation("a grain needs a date or timestamp dimension.".to_owned())
@@ -4085,7 +4190,7 @@ struct CommonFields {
 /// Validate/normalize the fields shared by every `specFromInput` branch:
 /// `title` (required), `kind` (must be one of [`KINDS`]), `id` (generated if
 /// absent), `board` (defaults to `"default"`), `span` (`1` or `2`), and
-/// `subtitle` (blank becomes `None`).
+/// `subtitle` (blank becomes `None`, and so does the word "null").
 fn derive_common_fields(input: &ChartInput, id: Option<String>) -> Result<CommonFields, BiError> {
     let title = input.title.trim().to_owned();
     if title.is_empty() {
@@ -4108,11 +4213,17 @@ fn derive_common_fields(input: &ChartInput, id: Option<String>) -> Result<Common
         .unwrap_or("default")
         .to_owned();
     let span = if input.span == Some(2) { 2 } else { 1 };
+    // A blank subtitle is no subtitle, and so is the word "null": the field is
+    // normalised for every caller of the store, the assistant's tools and the
+    // console's own chart builder alike, so whoever sends the text "null" gets
+    // no subtitle and never sees that word under the title (AI-3, 2026-11-08).
+    // The whole subtitle is compared, so a subtitle that only starts with the
+    // word ("Null values by province") is kept.
     let subtitle = input
         .subtitle
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
         .map(str::to_owned);
     Ok(CommonFields {
         title,
@@ -4261,6 +4372,15 @@ pub async fn ensure_sources_visible(
     keep: &[String],
 ) -> Result<(), BiError> {
     let named = sql_sources_named(input);
+    // GOV-17 review R7: chart create/preview/update use this BI-side guard,
+    // not the API's source-list predicate. Keeping an existing source may
+    // preserve its folder access, but must never override current table denial.
+    if let Some(id) = named
+        .iter()
+        .find(|id| viewer.hidden_source_ids().contains(id))
+    {
+        return Err(BiError::Validation(format!("SQL source '{id}' not found.")));
+    }
     for id in named.iter().filter(|id| !keep.contains(id)) {
         if let Some(found) = crate::sources::get_source(ch, id).await?
             && !found.folder_id.is_empty()
@@ -5843,6 +5963,26 @@ mod tests {
 
     use super::*;
 
+    /// GOV-17 review R7: the preserved-source exemption is for folder access,
+    /// never a bypass of the caller's fresh table dependency restriction.
+    #[tokio::test]
+    async fn keeping_a_source_does_not_override_its_table_visibility() {
+        let mut input = empty_chart_input();
+        input.sql_source = Some("s_hidden".to_owned());
+        let viewer = Viewer::user("u", false).with_hidden_sources(vec!["s_hidden".to_owned()]);
+        // Both the old keep exemption and the new denial return before any
+        // network read, so this regression needs no external source server.
+        let ch = ChClient::new(
+            "http://example.invalid".to_owned(),
+            "default".to_owned(),
+            String::new(),
+        );
+        let result = ensure_sources_visible(&ch, &input, &viewer, &["s_hidden".to_owned()]).await;
+        assert!(
+            matches!(result, Err(BiError::Validation(message)) if message == "SQL source 's_hidden' not found.")
+        );
+    }
+
     // BI-9: the builders take the time settings; the tests that predate it
     // call these shims, which pass the default context and no grain.
     static DEFAULT_TIME: std::sync::LazyLock<TimeContext> =
@@ -6221,7 +6361,7 @@ mod tests {
             "avg",
         )
         .unwrap();
-        assert!(sql.contains("round(avg(visitors)) AS visitors"), "{sql}");
+        assert!(sql.contains("round(avg(visitors), 6) AS visitors"), "{sql}");
         assert!(sql.ends_with("LIMIT 5000"), "{sql}");
     }
 
@@ -7040,6 +7180,33 @@ mod tests {
         assert_eq!(input.measures, vec!["total".to_owned()]);
     }
 
+    // ── the subtitle ───────────────────────────────────────────────────
+
+    /// A subtitle that is only the word "null" is no subtitle: the
+    /// assistant's model writes that text when it follows the build prompt's
+    /// "send `subtitle: null`" against a schema that types the field as a
+    /// string (AI-3, 2026-11-08).
+    #[test]
+    fn a_subtitle_that_is_only_the_word_null_is_no_subtitle() {
+        let subtitle_of = |subtitle: &str| -> Option<String> {
+            let input: ChartInput = serde_json::from_value(serde_json::json!({
+                "title": "t", "kind": "bar", "mart": "mart_x", "subtitle": subtitle,
+            }))
+            .expect("the chart input decodes");
+            derive_common_fields(&input, None)
+                .expect("the common fields derive")
+                .subtitle
+        };
+        for cleared in ["null", " Null ", "NULL", "nUlL", ""] {
+            assert_eq!(subtitle_of(cleared), None, "{cleared:?} is no subtitle");
+        }
+        // A subtitle that only starts with the word is a subtitle.
+        assert_eq!(
+            subtitle_of("Null values by province"),
+            Some("Null values by province".to_owned())
+        );
+    }
+
     // ── charts over SQL that is not stored (`spec_from_inline_sql`) ──────
 
     fn source_columns(pairs: &[(&str, &str)]) -> Vec<crate::sources::SourceColumn> {
@@ -7175,7 +7342,7 @@ mod tests {
             spec.spec.sql
         );
         assert!(
-            spec.spec.sql.contains("round(sum(double)) AS double"),
+            spec.spec.sql.contains("round(sum(double), 6) AS double"),
             "{}",
             spec.spec.sql
         );
@@ -7785,7 +7952,7 @@ mod tests {
         assert!(
             goal.spec
                 .sql
-                .starts_with("SELECT round(sum(visitors)) AS v FROM"),
+                .starts_with("SELECT round(sum(visitors), 6) AS v FROM"),
             "{}",
             goal.spec.sql
         );
@@ -7847,12 +8014,14 @@ mod tests {
             ChartY::Multi(vec!["visitors".to_owned(), "avg_stay".to_owned()])
         );
         assert!(
-            spec.spec.sql.contains("round(avg(stay)) AS avg_stay"),
+            spec.spec.sql.contains("round(avg(stay), 6) AS avg_stay"),
             "{}",
             spec.spec.sql
         );
         assert!(
-            spec.spec.sql.contains("round(sum(visitors)) AS visitors"),
+            spec.spec
+                .sql
+                .contains("round(sum(visitors), 6) AS visitors"),
             "{}",
             spec.spec.sql
         );
@@ -7863,6 +8032,94 @@ mod tests {
             serde_json::json!(["visitors", {"column": "stay", "aggregate": "avg"}])
         );
         assert!(spec.def.uses_shaping());
+    }
+
+    /// QA `LH-BI-6-25` (`BI-49`, plan D8): a radar is a grouped kind, so the
+    /// server already saves it with several measures, each keeping its own
+    /// aggregate. The console starts to rely on this in T8; the test pins it
+    /// so a later change cannot take it away unseen.
+    #[test]
+    fn a_radar_with_two_measures_is_saved_with_both_columns() {
+        let spec = bi6_save(&serde_json::json!({
+            "kind": "radar",
+            "measures": ["visitors", {"column": "stay", "aggregate": "avg"}],
+        }))
+        .expect("a radar takes several measures (plan D8)");
+        assert_eq!(
+            spec.spec.y,
+            ChartY::Multi(vec!["visitors".to_owned(), "avg_stay".to_owned()])
+        );
+        assert!(
+            spec.spec
+                .sql
+                .contains("round(sum(visitors), 6) AS visitors"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec.sql.contains("round(avg(stay), 6) AS avg_stay"),
+            "{}",
+            spec.spec.sql
+        );
+    }
+
+    /// QA `LH-BI-6-25` (`BI-49`, plan D7): a radar has no breakdown, before and
+    /// after this slice, so the "a breakdown or several measures" rule is never
+    /// reached for one. Pinned for the console's benefit.
+    #[test]
+    fn a_radar_is_refused_a_breakdown() {
+        assert!(
+            bi6_refusal(&serde_json::json!({ "kind": "radar", "breakdown": "cat" }))
+                .contains("breakdown is only for"),
+        );
+    }
+
+    /// `BI-46` (plan D12, D14; QA `LH-BI-6-01`): a bar chart with a breakdown
+    /// is marked as shaped — it is rebuilt on every read — and the statement it
+    /// is saved with already holds the breakdown cap, so the stored statement
+    /// and the read agree.
+    #[test]
+    fn a_bar_chart_with_a_breakdown_is_saved_with_the_capped_statement() {
+        let spec = bi6_save(&serde_json::json!({
+            "kind": "bar", "breakdown": "cat", "limit": 3,
+        }))
+        .unwrap();
+        assert!(spec.def.caps_breakdown());
+        assert!(spec.def.uses_shaping(), "rebuilt on every read (D14)");
+        assert!(
+            spec.spec.sql.contains(
+                "(isNull(cat), ifNull(toString(cat), '')) IN \
+                 (SELECT isNull(cat), ifNull(toString(cat), '') FROM ("
+            ),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec
+                .sql
+                .contains("GROUP BY cat ORDER BY sum(visitors) DESC, cat LIMIT 3)"),
+            "{}",
+            spec.spec.sql
+        );
+    }
+
+    /// `BI-46` (plan D12) review round 1, R5: the exact statement a chart with
+    /// no breakdown is saved with — today's one, byte for byte, not just a
+    /// statement that happens to lack a cap.
+    #[test]
+    fn a_chart_without_a_breakdown_is_saved_with_the_statement_it_always_had() {
+        let spec = bi6_save(&serde_json::json!({
+            "kind": "bar", "breakdown": serde_json::Value::Null, "limit": 3,
+        }))
+        .unwrap();
+        assert!(!spec.def.caps_breakdown());
+        assert_eq!(
+            spec.spec.sql,
+            "SELECT place, round(sum(visitors), 6) AS visitors FROM (\n\
+             SELECT place, cat, d, visitors, stay FROM serving.mart_x\n\
+             ) AS src GROUP BY place ORDER BY visitors DESC LIMIT 3 SETTINGS \
+             max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 60"
+        );
     }
 
     #[test]
@@ -8377,7 +8634,7 @@ mod tests {
             rooms
                 .spec
                 .sql
-                .contains("round(avg(capacity__rooms)) AS capacity__rooms"),
+                .contains("round(avg(capacity__rooms), 6) AS capacity__rooms"),
             "{}",
             rooms.spec.sql
         );
@@ -8895,7 +9152,7 @@ mod tests {
             fixed
                 .spec
                 .sql
-                .starts_with("SELECT round(sum(visitors)) AS v FROM")
+                .starts_with("SELECT round(sum(visitors), 6) AS v FROM")
         );
         assert_eq!(
             fixed.def.types.goal,
@@ -9062,5 +9319,232 @@ mod tests {
         let mut clicked = card("image", "https://img.example/logo.png");
         clicked["click"] = serde_json::json!({"kind": "url", "url": "https://img.example/{value}"});
         assert!(save_b_with(&clicked, &time).is_err());
+    }
+
+    // ── freezing a board's layout before a chart is rewritten ───────────
+
+    /// A `ClickHouse` stand-in for one board: serves its row (when it has
+    /// one) and its live charts in list order, takes every write, and fails
+    /// the board's write when told to.
+    struct FreezeCh {
+        board: Option<serde_json::Value>,
+        charts: Vec<&'static str>,
+        fail_board_write: bool,
+    }
+    impl wiremock::Respond for FreezeCh {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let sql = String::from_utf8_lossy(&request.body);
+            let rows = |data: Vec<serde_json::Value>| {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "meta": [], "data": data, "rows": data.len()
+                }))
+            };
+            if sql.starts_with("INSERT INTO console.bi_board ") && self.fail_board_write {
+                return ResponseTemplate::new(500).set_body_string("planted-upstream-text");
+            }
+            if sql.contains("FROM console.bi_board FINAL") {
+                return rows(self.board.iter().cloned().collect());
+            }
+            if sql.contains("FROM console.bi_chart FINAL") {
+                return rows(
+                    self.charts
+                        .iter()
+                        .map(|id| {
+                            serde_json::json!({
+                                "id": id,
+                                "spec_json": serde_json::json!({
+                                    "spec": {
+                                        "id": id, "title": "t", "kind": "bar",
+                                        "mart": "mart_x", "sql": "SELECT 1",
+                                        "x": "a", "y": "b",
+                                    },
+                                    "hasYear": false,
+                                })
+                                .to_string(),
+                            })
+                        })
+                        .collect(),
+                );
+            }
+            if sql.starts_with("SELECT") {
+                return rows(Vec::new());
+            }
+            ResponseTemplate::new(200).set_body_string("Ok.\n")
+        }
+    }
+
+    /// The row `FROM console.bi_board` serves for board `b_1`.
+    fn board_row(layout_json: &str, tabs_json: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "b_1", "name": "Sales", "description": "Monthly", "created_by": "Ann",
+            "layout_json": layout_json,
+            "filters_json": "[]", "public_token": "", "embed_enabled": 0,
+            "folder_id": "", "refresh_seconds": 0, "grain": "",
+            "params_json": "[]", "tabs_json": tabs_json, "phone_layout_json": "[]",
+            "theme": "dark", "font": "", "cache_json": "", "owner_id": "",
+            "created_at": "2026-10-22 00:00:00",
+        })
+    }
+
+    /// Run [`freeze_board_layout`] on `board_id` against `stand_in`, and
+    /// return its result with the statements that were written.
+    async fn freeze_against(
+        stand_in: FreezeCh,
+        board_id: &str,
+    ) -> (Result<(), BiError>, Vec<String>) {
+        let _lock = TEST_DDL_LOCK.lock().await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(stand_in)
+            .mount(&server)
+            .await;
+        let result = freeze_board_layout(&client(&server.uri()), board_id).await;
+        let written = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|sql| sql.starts_with("INSERT"))
+            .collect();
+        (result, written)
+    }
+
+    /// Three tiles nobody has placed are drawn in list order, and a rewrite
+    /// of the middle one would send it last. The freeze gives each a box in
+    /// that order and carries everything else of the board unchanged.
+    #[tokio::test]
+    async fn the_freeze_gives_every_unboxed_tile_a_box_in_list_order() {
+        let (result, written) = freeze_against(
+            FreezeCh {
+                board: Some(board_row("{}", "[]")),
+                charts: vec!["c_a", "c_b", "c_c"],
+                fail_board_write: false,
+            },
+            "b_1",
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(written.len(), 1, "{written:#?}");
+        let row = &written[0];
+        assert!(row.starts_with("INSERT INTO console.bi_board "), "{row}");
+        assert!(
+            row.contains(
+                r#"'{"c_a":{"x":0,"y":0,"w":6,"h":6},"c_b":{"x":6,"y":0,"w":6,"h":6},"c_c":{"x":0,"y":6,"w":6,"h":6}}'"#
+            ),
+            "{row}"
+        );
+        // Only the layout changes: the name, the description, the author and
+        // the theme are written back as they were.
+        for kept in ["'b_1'", "'Sales'", "'Monthly'", "'Ann'", "'dark'"] {
+            assert!(row.contains(kept), "{kept} missing from {row}");
+        }
+    }
+
+    /// A board whose tiles all have a box has nothing to freeze, so it is not
+    /// written: a write would be a version of the board for no change.
+    #[tokio::test]
+    async fn the_freeze_writes_nothing_when_every_tile_has_a_box() {
+        let layout = r#"{"c_b":{"x":0,"y":0,"w":12,"h":6},"c_a":{"x":0,"y":6,"w":6,"h":6}}"#;
+        let (result, written) = freeze_against(
+            FreezeCh {
+                board: Some(board_row(layout, "[]")),
+                charts: vec!["c_a", "c_b"],
+                fail_board_write: false,
+            },
+            "b_1",
+        )
+        .await;
+        result.unwrap();
+        assert!(written.is_empty(), "{written:#?}");
+    }
+
+    /// A board with no live row (deleted, or never there) is not made by a
+    /// chart update: the freeze leaves it and does not fail.
+    #[tokio::test]
+    async fn the_freeze_leaves_a_board_with_no_row_alone() {
+        let (result, written) = freeze_against(
+            FreezeCh {
+                board: None,
+                charts: vec!["c_a"],
+                fail_board_write: false,
+            },
+            "b_gone",
+        )
+        .await;
+        result.unwrap();
+        assert!(written.is_empty(), "{written:#?}");
+    }
+
+    /// The built-in board has no row until something about it is first
+    /// saved, and a chart saved with no board is on it. A blank board id
+    /// names it, so those charts are frozen on its shell row.
+    #[tokio::test]
+    async fn a_blank_board_is_the_built_in_board_and_is_frozen_on_its_shell() {
+        let (result, written) = freeze_against(
+            FreezeCh {
+                board: None,
+                charts: vec!["c_a", "c_b"],
+                fail_board_write: false,
+            },
+            "",
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(written.len(), 1, "{written:#?}");
+        assert!(
+            written[0].contains("VALUES ('default', 'Dashboard',"),
+            "{}",
+            written[0]
+        );
+        assert!(
+            written[0]
+                .contains(r#"'{"c_a":{"x":0,"y":0,"w":6,"h":6},"c_b":{"x":6,"y":0,"w":6,"h":6}}'"#),
+            "{}",
+            written[0]
+        );
+    }
+
+    /// On a tabbed board the frozen tiles sit on the first tab, where the page
+    /// draws a tile with none, and the tabs are written back as they were.
+    #[tokio::test]
+    async fn the_freeze_keeps_the_tabs_and_boxes_on_the_first_tab() {
+        let tabs = r#"[{"id":"t_1","title":"Main"},{"id":"t_2","title":"More"}]"#;
+        let (result, written) = freeze_against(
+            FreezeCh {
+                board: Some(board_row("{}", tabs)),
+                charts: vec!["c_a", "c_b"],
+                fail_board_write: false,
+            },
+            "b_1",
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(written.len(), 1, "{written:#?}");
+        assert!(written[0].contains(tabs), "{}", written[0]);
+        assert!(
+            written[0].contains(
+                r#"'{"c_a":{"x":0,"y":0,"w":6,"h":6,"tab":"t_1"},"c_b":{"x":6,"y":0,"w":6,"h":6,"tab":"t_1"}}'"#
+            ),
+            "{}",
+            written[0]
+        );
+    }
+
+    /// A failed write of the board is an error, so the caller can stop before
+    /// it touches the chart.
+    #[tokio::test]
+    async fn a_failed_board_write_fails_the_freeze() {
+        let (result, written) = freeze_against(
+            FreezeCh {
+                board: Some(board_row("{}", "[]")),
+                charts: vec!["c_a"],
+                fail_board_write: true,
+            },
+            "b_1",
+        )
+        .await;
+        assert!(matches!(result, Err(BiError::Clickhouse(_))), "{result:?}");
+        assert_eq!(written.len(), 1, "{written:#?}");
     }
 }

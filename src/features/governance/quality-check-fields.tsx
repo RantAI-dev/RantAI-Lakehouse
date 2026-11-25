@@ -1,6 +1,8 @@
 "use client"
 
+import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
+import { RequiredMarker } from "@/components/ui/required"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import {
@@ -14,7 +16,27 @@ import {
   type Stat,
 } from "./quality-checks"
 
-const selectClassName = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+const KIND_OPTIONS = (Object.keys(KINDS) as Kind[]).map((k) => ({
+  value: k,
+  label: KINDS[k].label,
+}))
+
+const NULL_UNIT_OPTIONS = [
+  { value: "percent", label: "% of rows" },
+  { value: "count", label: "rows" },
+]
+
+const DURATION_UNIT_OPTIONS = [
+  { value: "m", label: "minutes" },
+  { value: "h", label: "hours" },
+  { value: "d", label: "days" },
+]
+
+const STAT_OPTIONS = [
+  { value: "min", label: "Minimum" },
+  { value: "max", label: "Maximum" },
+  { value: "avg", label: "Average" },
+]
 
 /**
  * The picker for one quality check: which check, the column it reads, and
@@ -24,6 +46,10 @@ const selectClassName = "h-8 w-full rounded-lg border border-input bg-transparen
  * `columns` is the table's column names where the table is known; `null`
  * where it is not (the Data Quality page names the table by hand), and the
  * column is typed instead.
+ *
+ * UX-1-R10: the fields already carry required stars; their controls now carry
+ * matching `aria-required` (UX-1-R10). The bounds fieldset is deliberately a
+ * group — at least one bound, but neither input required on its own.
  */
 export function CheckFields({
   form,
@@ -40,8 +66,17 @@ export function CheckFields({
   note?: (kind: Kind) => React.ReactNode
 }) {
   const id = (name: string) => `${idPrefix}-${name}`
+  // UX-1-R4: neither bound is required on its own — either one satisfies
+  // the range check. Mark the group, not both inputs.
   const bounds = (
-    <div className="grid gap-3 sm:grid-cols-2">
+    <fieldset className="grid gap-3 sm:grid-cols-2" aria-describedby={`${idPrefix}-bounds-help`}>
+      <legend className="flex items-center gap-1.5 text-sm font-medium sm:col-span-2">
+        Bounds <RequiredMarker />
+        <span className="text-xs font-normal text-muted-foreground">— at least one</span>
+      </legend>
+      <p id={`${idPrefix}-bounds-help`} className="text-xs text-muted-foreground sm:col-span-2">
+        At least one bound is required; leave the other blank for no bound.
+      </p>
       <div className="grid gap-1.5">
         <Label htmlFor={id("min")}>Minimum</Label>
         <Input
@@ -62,45 +97,49 @@ export function CheckFields({
           placeholder="no upper bound"
         />
       </div>
-    </div>
+    </fieldset>
   )
 
   return (
     <>
       <div className="grid gap-1.5">
         <Label htmlFor={id("kind")}>Check</Label>
-        <select
+        <SelectField
           id={id("kind")}
-          className={selectClassName}
+          className="w-full"
           value={form.kind}
-          onChange={(e) => onChange({ kind: e.target.value as Kind })}
-        >
-          {(Object.keys(KINDS) as Kind[]).map((k) => (
-            <option key={k} value={k}>
-              {KINDS[k].label}
-            </option>
-          ))}
-        </select>
+          options={KIND_OPTIONS}
+          onValueChange={(next) => onChange({ kind: next as Kind })}
+        />
       </div>
       {KINDS[form.kind].column ? (
         <div className="grid gap-1.5">
-          <Label htmlFor={id("column")}>Column</Label>
+          <Label htmlFor={id("column")} required>Column</Label>
           {columns ? (
-            <select
+            <SelectField
               id={id("column")}
-              className={selectClassName}
+              className="w-full"
+              /* WEB-9 S1 review R1-S1 (D2a): a new rule's column starts as
+                 `""`, so without this the trigger is an empty box that says
+                 nothing about what to pick. */
+              placeholder="Pick a column"
+              aria-required
               value={form.column}
-              onChange={(e) => onChange({ column: e.target.value })}
-            >
-              {columns.map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-            </select>
+              options={[
+                /* WEB-8 D8: a column the rule already names that this table
+                   does not have is still shown, so opening the picker cannot
+                   replace it with whatever sorts first. */
+                ...(form.column !== "" && !columns.includes(form.column)
+                  ? [{ value: form.column, label: `${form.column} (not in this table)` }]
+                  : []),
+                ...columns.map((c) => ({ value: c, label: c })),
+              ]}
+              onValueChange={(next) => onChange({ column: next })}
+            />
           ) : (
             <Input
               id={id("column")}
+              aria-required
               className="font-mono"
               value={form.column}
               onChange={(e) => onChange({ column: e.target.value })}
@@ -112,9 +151,10 @@ export function CheckFields({
       {note?.(form.kind)}
       {form.kind === "rows" ? (
         <div className="grid gap-1.5">
-          <Label htmlFor={id("rows")}>Minimum rows</Label>
+          <Label htmlFor={id("rows")} required>Minimum rows</Label>
           <Input
             id={id("rows")}
+            aria-required
             inputMode="numeric"
             value={form.rows}
             onChange={(e) => onChange({ rows: e.target.value })}
@@ -123,9 +163,10 @@ export function CheckFields({
       ) : null}
       {form.kind === "not-null" ? (
         <div className="grid gap-1.5">
-          <Label htmlFor={id("percent")}>Rows that must have a value (%)</Label>
+          <Label htmlFor={id("percent")} required>Rows that must have a value (%)</Label>
           <Input
             id={id("percent")}
+            aria-required
             inputMode="decimal"
             value={form.percent}
             onChange={(e) => onChange({ percent: e.target.value })}
@@ -145,15 +186,13 @@ export function CheckFields({
           </div>
           <div className="grid gap-1.5">
             <Label htmlFor={id("null-unit")}>Counted as</Label>
-            <select
+            <SelectField
               id={id("null-unit")}
-              className={selectClassName}
+              className="w-full"
               value={form.nullUnit}
-              onChange={(e) => onChange({ nullUnit: e.target.value as NullUnit })}
-            >
-              <option value="percent">% of rows</option>
-              <option value="count">rows</option>
-            </select>
+              options={NULL_UNIT_OPTIONS}
+              onValueChange={(next) => onChange({ nullUnit: next as NullUnit })}
+            />
           </div>
         </div>
       ) : null}
@@ -183,16 +222,13 @@ export function CheckFields({
           </div>
           <div className="grid gap-1.5">
             <Label htmlFor={id("duration-unit")}>Unit</Label>
-            <select
+            <SelectField
               id={id("duration-unit")}
-              className={selectClassName}
+              className="w-full"
               value={form.durationUnit}
-              onChange={(e) => onChange({ durationUnit: e.target.value as DurationUnit })}
-            >
-              <option value="m">minutes</option>
-              <option value="h">hours</option>
-              <option value="d">days</option>
-            </select>
+              options={DURATION_UNIT_OPTIONS}
+              onValueChange={(next) => onChange({ durationUnit: next as DurationUnit })}
+            />
           </div>
         </div>
       ) : null}
@@ -216,16 +252,13 @@ export function CheckFields({
         <>
           <div className="grid gap-1.5">
             <Label htmlFor={id("stat")}>Statistic</Label>
-            <select
+            <SelectField
               id={id("stat")}
-              className={selectClassName}
+              className="w-full"
               value={form.stat}
-              onChange={(e) => onChange({ stat: e.target.value as Stat })}
-            >
-              <option value="min">Minimum</option>
-              <option value="max">Maximum</option>
-              <option value="avg">Average</option>
-            </select>
+              options={STAT_OPTIONS}
+              onValueChange={(next) => onChange({ stat: next as Stat })}
+            />
           </div>
           {bounds}
         </>

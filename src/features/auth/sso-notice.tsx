@@ -28,12 +28,23 @@ export const SSO_NOTICE_PARAM = "ssoNotice";
 const NOTICES: Record<string, string> = {
   group_overage:
     "Your account is in more groups than the sign-in token can list, so no group-based role was applied. Ask an administrator to assign your role directly or to limit the groups sent in the token.",
+  // `SEC-65` D2: the provider did not confirm the address, so the sign-in
+  // was not joined to the existing account. The API sends this code on the
+  // redirect to the sign-in page; the sentence is the same whether the
+  // account is active or not.
+  email_not_verified:
+    "Your identity provider did not confirm your email address, so this sign-in cannot be joined to your existing account. Ask an administrator.",
 };
 
 /**
- * A one-line notice under the navbar for a sign-in that succeeded with a
- * caveat. Renders nothing otherwise, so it is safe to mount once for the
- * whole authenticated console.
+ * A one-line notice for a sign-in that succeeded with a caveat (`SEC-39`),
+ * or that was refused because the provider did not confirm the email
+ * (`SEC-65` D2). Renders nothing otherwise, so it is safe to mount on every
+ * page.
+ *
+ * Mounted in two places: under the navbar for the whole authenticated
+ * console (`AppFrame`), and on the sign-in page (`LoginPage`) — the latter
+ * is where `SEC-65`'s refusal redirect lands.
  *
  * Must be rendered under a `<Suspense>` boundary: it reads
  * `useSearchParams()`, which Next.js requires to be wrapped for pages it

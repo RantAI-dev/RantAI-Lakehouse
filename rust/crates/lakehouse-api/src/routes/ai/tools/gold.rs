@@ -156,12 +156,10 @@ pub(super) async fn get_gold_export(state: &AppState, args: &Map<String, Value>)
         Err(err) => return err,
     };
     match crate::gold_export::read_back_row_count(&iceberg_config, mart_ident.as_str()).await {
-        Ok(readback) => json!({
-            "namespace": lakehouse_iceberg::gold::GOLD_NAMESPACE,
-            "table": mart_ident.as_str(),
-            "formatVersion": readback.format_version,
-            "rowsInIceberg": readback.rows,
-        }),
+        // `DATA-49` (QA `LH-DATA-1-01`): the same body as the route, so the
+        // tool and `GET /api/gold/export/{mart}` cannot drift — a mart never
+        // published answers `published: false`, not an error.
+        Ok(readback) => crate::routes::gold::read_back_body(mart_ident.as_str(), readback.as_ref()),
         Err(err) => {
             response_to_value(crate::error::ApiRejection(ApiError::from(err)).into_response()).await
         }

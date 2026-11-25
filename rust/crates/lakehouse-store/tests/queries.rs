@@ -21,19 +21,29 @@ use lakehouse_test_support as _;
 
 use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::queries::{
-    HistoryFilter, RecordHistoryInput, SavedQueryPatch, SavedQueryScope, SavedQueryViewer,
-    VERSION_KEEP, create_saved_query, get_history_item, get_saved, history_mentioning,
-    history_recent, list_history, list_saved, list_saved_matching, list_saved_trash_entries,
-    list_versions, purge_trashed_before, record_history, restore_saved_query, trash_saved_query,
-    update_saved_query,
+    FolderMove, HistoryFilter, RecordHistoryInput, SavedQueryPatch, SavedQueryPlacement,
+    SavedQueryScope, SavedQueryViewer, VERSION_KEEP, count_history, create_saved_query,
+    create_saved_query_at, create_saved_query_with_parameters, get_history_item, get_saved,
+    history_mentioning, history_recent, list_history, list_saved, list_saved_matching,
+    list_saved_trash_entries, list_versions, purge_trashed_before, record_history,
+    restore_saved_query, revert_to_version, trash_saved_query, update_saved_query,
 };
 use lakehouse_store::saved_query_access::{
     FolderError, Level, NewGrant, create_folder, delete_folder, ensure_personal_space,
-    grants_for_viewer, move_folder, rename_folder, replace_grants, rules_for_item, search_grantees,
+    grantee_labels, grants_for_viewer, manages_folder_and_contents, move_folder_for_viewer,
+    rename_folder, replace_grants, rules_for_item, search_grantees,
 };
+use serde_json::{Value, json};
 use sqlx::PgPool;
+use sqlx::migrate::Migrator;
+use std::borrow::Cow;
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+/// The migration set this repository applies, compiled in (`sqlx::migrate!`
+/// embeds the files at compile time, so a migration edit needs a rebuild
+/// before a test result means anything).
+static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 
 /// The seed lands two saved queries, pointed at marts this lakehouse
 /// actually serves (`0027_query_ownership.sql` repointed them — the
@@ -87,6 +97,7 @@ async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<(
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -112,6 +123,170 @@ async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<(
     Ok(())
 }
 
+/// QS-12 (LH-QS-4-07): `?id=` finds one run inside the owner's own history,
+/// and another owner's id finds nothing — an id is a lookup, not a way out of
+/// the owner scope.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_id_filter_finds_one_run_of_the_owner_only(pool: PgPool) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    for (id, who, sql) in [
+        ("q-100", owner, "SELECT first"),
+        ("q-200", owner, "SELECT second"),
+        ("q-300", other, "SELECT other"),
+    ] {
+        record_history(
+            &pool,
+            &RecordHistoryInput {
+                id,
+                sql,
+                user: "Bootstrap Admin",
+                owner_id: Some(who),
+                status: "completed",
+                duration_ms: 42,
+                scanned_bytes: 1024,
+                cost_units: 0.5,
+                workload_class: "hot-analytics",
+                engine: "hot-store",
+                cache_assisted: false,
+                tables_read: &[],
+                message: None,
+                tenant_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let one = HistoryFilter {
+        id: Some("q-100"),
+        ..Default::default()
+    };
+    let found = list_history(&pool, owner, &one).await.unwrap();
+    assert_eq!(row_ids(&found), ["q-100"]);
+    assert_eq!(found[0].sql, "SELECT first");
+    assert_eq!(count_history(&pool, owner, &one).await.unwrap(), 1);
+
+    let stranger = HistoryFilter {
+        id: Some("q-300"),
+        ..Default::default()
+    };
+    assert_eq!(
+        list_history(&pool, owner, &stranger).await.unwrap(),
+        [] as [lakehouse_store::queries::QueryHistoryItem; 0]
+    );
+    assert_eq!(count_history(&pool, owner, &stranger).await.unwrap(), 0);
+    Ok(())
+}
+
+/// `OPS-8`: the tenant a run acted as is stored with it, so a usage view
+/// can sum per tenant. The tenant is one the seeded identity migration
+/// creates, because `query_history.tenant_id` references `tenant(id)`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_history_stores_the_tenant_the_run_acted_as(pool: PgPool) -> sqlx::Result<()> {
+    let tenant = Uuid::parse_str("11111111-1111-4111-8111-000000000002").unwrap();
+    record_history(
+        &pool,
+        &RecordHistoryInput {
+            id: "q-tenant",
+            sql: "SELECT 1",
+            user: "Bootstrap Admin",
+            owner_id: Some(Uuid::new_v4()),
+            status: "completed",
+            duration_ms: 1,
+            scanned_bytes: 1,
+            cost_units: 0.1,
+            workload_class: "hot-analytics",
+            engine: "clickhouse",
+            cache_assisted: false,
+            tables_read: &[],
+            message: None,
+            tenant_id: Some(tenant),
+        },
+    )
+    .await
+    .unwrap();
+
+    let stored: Option<Uuid> =
+        sqlx::query_scalar("SELECT tenant_id FROM query_history WHERE id = 'q-tenant'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(stored, Some(tenant));
+    Ok(())
+}
+
+/// `OPS-8`, migration `0144`: a caller with no tenant (a service identity)
+/// records `NULL`, and a row inserted the way every row was before the
+/// column existed (no `tenant_id` in the statement) reads back `NULL` too,
+/// not a guessed tenant. The column and its index exist.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_history_row_with_no_tenant_reads_back_null_and_the_column_has_its_index(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO query_history \
+         (id, sql, user_name, status, duration_ms, scanned_bytes, cost_units, \
+          workload_class, engine, cache_assisted) \
+         VALUES ('q-old', 'SELECT 1', 'someone', 'completed', 1, 1, 0.1, \
+                 'hot-analytics', 'hot-store', false)",
+    )
+    .execute(&pool)
+    .await?;
+    record_history(
+        &pool,
+        &RecordHistoryInput {
+            id: "q-service",
+            sql: "SELECT 1",
+            user: "gold-export-scheduler",
+            owner_id: Some(Uuid::new_v4()),
+            status: "completed",
+            duration_ms: 1,
+            scanned_bytes: 1,
+            cost_units: 0.1,
+            workload_class: "hot-analytics",
+            engine: "clickhouse",
+            cache_assisted: false,
+            tables_read: &[],
+            message: None,
+            tenant_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let unattributed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM query_history \
+         WHERE id IN ('q-old', 'q-service') AND tenant_id IS NULL",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(unattributed, 2, "no row is attributed to a guessed tenant");
+
+    let column: Option<String> = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns \
+         WHERE table_name = 'query_history' AND column_name = 'tenant_id'",
+    )
+    .fetch_optional(&pool)
+    .await?;
+    assert_eq!(
+        column.as_deref(),
+        Some("YES"),
+        "a nullable tenant_id column"
+    );
+    let index: Option<String> = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes \
+         WHERE tablename = 'query_history' AND indexname = 'query_history_tenant_at_idx'",
+    )
+    .fetch_optional(&pool)
+    .await?;
+    let definition = index.expect("the (tenant_id, at DESC) index exists");
+    assert!(
+        definition.contains("(tenant_id, at DESC)"),
+        "the index is per tenant, newest first: {definition}"
+    );
+    Ok(())
+}
+
 /// Recording the same id twice must not fail or duplicate the row — a
 /// caller retrying, or a genuinely reused id, degrades to a no-op rather
 /// than a 500 that would (per `routes::query::run`'s contract) still not
@@ -133,6 +308,7 @@ async fn record_history_is_idempotent_per_id(pool: PgPool) -> sqlx::Result<()> {
         cache_assisted: false,
         tables_read: &[],
         message: None,
+        tenant_id: None,
     };
     record_history(&pool, &input).await.unwrap();
     record_history(&pool, &input).await.unwrap();
@@ -179,6 +355,7 @@ async fn history_item_has_no_audit_id_without_a_real_event(pool: PgPool) -> sqlx
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -214,6 +391,7 @@ async fn history_item_resolves_the_real_audit_event_id(pool: PgPool) -> sqlx::Re
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -279,6 +457,7 @@ async fn history_item_uses_the_newest_of_several_events_without_duplicating_the_
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -332,6 +511,7 @@ async fn record_history_carries_the_real_engine_and_is_scoped_by_owner_id(
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -366,6 +546,7 @@ async fn get_history_item_fetches_one_row_by_id(pool: PgPool) -> sqlx::Result<()
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -422,6 +603,7 @@ async fn history_mentioning_finds_queries_by_substring_across_users(
                     cache_assisted: false,
                     tables_read: &[],
                     message: None,
+                    tenant_id: None,
                 },
             )
             .await
@@ -500,6 +682,7 @@ async fn history_recent_is_newest_first_and_respects_days_and_limit(
                 cache_assisted: false,
                 tables_read: &[],
                 message: None,
+                tenant_id: None,
             },
         )
         .await
@@ -688,6 +871,7 @@ async fn insert_history_row(
             cache_assisted: false,
             tables_read: &tables,
             message,
+            tenant_id: None,
         },
     )
     .await
@@ -719,6 +903,7 @@ async fn insert_history_row_at(pool: &PgPool, id: &str, owner: Uuid, at: OffsetD
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -921,11 +1106,13 @@ async fn a_row_fifteen_days_old_is_never_listed_even_when_from_asks_for_it(
     Ok(())
 }
 
-/// The cursor pages by the `at` *and* `id` of the last row seen: 55 rows
-/// that share one `at` come back as 50 then 5, with nothing repeated and
-/// nothing skipped — the millisecond tie is what the id half is for.
+/// Numbered pages walk the rows: 55 rows that share one `at` come back as
+/// 50 then 5, with nothing repeated and nothing skipped — the `id`
+/// tie-break in the order is what keeps the page boundary stable inside
+/// one millisecond. (`QS-4` QA of 2026-11-05 replaced the `before` cursor
+/// with `page`; the no-repeat, no-skip assertions stayed.)
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_cursor_pages_without_repeats_or_skips(pool: PgPool) -> sqlx::Result<()> {
+async fn numbered_pages_walk_the_rows_without_repeats_or_skips(pool: PgPool) -> sqlx::Result<()> {
     let owner = Uuid::new_v4();
     for i in 0..55 {
         insert_history_row(
@@ -946,16 +1133,12 @@ async fn the_cursor_pages_without_repeats_or_skips(pool: PgPool) -> sqlx::Result
         .await
         .unwrap();
     assert_eq!(page_one.len(), 50);
-    let last = page_one.last().unwrap();
-    let cursor_at =
-        OffsetDateTime::parse(&last.at, &time::format_description::well_known::Rfc3339).unwrap();
 
     let page_two = list_history(
         &pool,
         owner,
         &HistoryFilter {
-            before_at: Some(cursor_at),
-            before_id: Some(&last.id),
+            page: 2,
             ..Default::default()
         },
     )
@@ -972,6 +1155,265 @@ async fn the_cursor_pages_without_repeats_or_skips(pool: PgPool) -> sqlx::Result
     assert_eq!(sorted.len(), 55, "no skips");
     assert_eq!(sorted[0], "q-00");
     assert_eq!(sorted[54], "q-54");
+    Ok(())
+}
+
+/// Page 2 of 120 rows is rows 51 to 100, newest first; page 3 is the
+/// remaining 20; the count is 120 whichever page is asked for. The rows sit
+/// one second apart so the expected ids are a literal order, not something
+/// the test recomputes the way the store does.
+#[sqlx::test(migrations = "../../migrations")]
+async fn page_two_of_120_rows_is_rows_51_to_100_newest_first(pool: PgPool) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
+    let base = OffsetDateTime::now_utc() - time::Duration::hours(2);
+    for i in 0..120 {
+        insert_history_row_at(
+            &pool,
+            &format!("q-{i:03}"),
+            owner,
+            base + time::Duration::seconds(i),
+        )
+        .await;
+    }
+    let page = |n: i64| HistoryFilter {
+        page: n,
+        ..Default::default()
+    };
+
+    let one = list_history(&pool, owner, &page(1)).await.unwrap();
+    let two = list_history(&pool, owner, &page(2)).await.unwrap();
+    let three = list_history(&pool, owner, &page(3)).await.unwrap();
+    assert_eq!(one.len(), 50);
+    assert_eq!(row_ids(&one)[0], "q-119", "page 1 starts at the newest row");
+    assert_eq!(row_ids(&one)[49], "q-070");
+    assert_eq!(two.len(), 50);
+    assert_eq!(row_ids(&two)[0], "q-069", "page 2 is rows 51 to 100");
+    assert_eq!(row_ids(&two)[49], "q-020");
+    assert_eq!(
+        row_ids(&three),
+        (0..20)
+            .rev()
+            .map(|i| format!("q-{i:03}"))
+            .collect::<Vec<_>>()
+    );
+
+    for n in 1..=3 {
+        assert_eq!(
+            count_history(&pool, owner, &page(n)).await.unwrap(),
+            120,
+            "the total does not depend on the page"
+        );
+    }
+    Ok(())
+}
+
+/// A page past the end is an empty page, not an error, and the count stays
+/// true; so does a page so large that its offset would overflow.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_page_past_the_end_is_empty_and_the_count_stays_true(pool: PgPool) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
+    for i in 0..3 {
+        insert_history_row(
+            &pool,
+            &format!("q-{i}"),
+            owner,
+            "completed",
+            "clickhouse",
+            1,
+            &[],
+            None,
+            0,
+        )
+        .await;
+    }
+    for page in [2, 3, 1_000_000, i64::MAX] {
+        let filter = HistoryFilter {
+            page,
+            ..Default::default()
+        };
+        assert!(
+            list_history(&pool, owner, &filter)
+                .await
+                .unwrap()
+                .is_empty(),
+            "page {page} is past the end"
+        );
+        assert_eq!(count_history(&pool, owner, &filter).await.unwrap(), 3);
+    }
+    Ok(())
+}
+
+/// The count carries the same `WHERE` as the list: each filter alone, the
+/// 14-day window, and the owner scope, so `total` can never count a row the
+/// list would not show.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_count_follows_every_filter_the_list_follows(pool: PgPool) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
+    insert_history_row(
+        &pool,
+        "q-a",
+        owner,
+        "completed",
+        "clickhouse",
+        100,
+        &["marts.retails"],
+        None,
+        0,
+    )
+    .await;
+    insert_history_row(
+        &pool,
+        "q-b",
+        owner,
+        "failed",
+        "clickhouse",
+        5_000,
+        &["bronze.orders"],
+        Some("Arrow table is missing"),
+        3,
+    )
+    .await;
+    insert_history_row(
+        &pool,
+        "q-c",
+        owner,
+        "blocked",
+        "trino",
+        2_500,
+        &["marts.retails", "bronze.orders"],
+        Some("another tenant claims orders"),
+        10,
+    )
+    .await;
+    insert_history_row(
+        &pool,
+        "q-d",
+        owner,
+        "stopped",
+        "clickhouse",
+        7_000,
+        &[],
+        Some("Stopped"),
+        1,
+    )
+    .await;
+    // Outside the 14-day window: listed by nobody, counted by nobody.
+    insert_history_row(
+        &pool,
+        "q-old",
+        owner,
+        "failed",
+        "trino",
+        9_000,
+        &["bronze.orders"],
+        None,
+        20,
+    )
+    .await;
+    // Another user's row.
+    insert_history_row(
+        &pool,
+        "q-other",
+        Uuid::new_v4(),
+        "failed",
+        "trino",
+        9_000,
+        &["bronze.orders"],
+        None,
+        0,
+    )
+    .await;
+
+    let count = |filter: HistoryFilter<'static>| {
+        let pool = pool.clone();
+        async move { count_history(&pool, owner, &filter).await.unwrap() }
+    };
+    let list = |filter: HistoryFilter<'static>| {
+        let pool = pool.clone();
+        async move {
+            let rows = list_history(&pool, owner, &filter).await.unwrap();
+            i64::try_from(rows.len()).unwrap()
+        }
+    };
+    let filters: [(&str, HistoryFilter<'static>, i64); 8] = [
+        (
+            "no filter: the window and the owner only",
+            HistoryFilter::default(),
+            4,
+        ),
+        (
+            "status",
+            HistoryFilter {
+                status: Some("failed"),
+                ..Default::default()
+            },
+            1,
+        ),
+        (
+            "status stopped",
+            HistoryFilter {
+                status: Some("stopped"),
+                ..Default::default()
+            },
+            1,
+        ),
+        (
+            "engine",
+            HistoryFilter {
+                engine: Some("trino"),
+                ..Default::default()
+            },
+            1,
+        ),
+        (
+            "min duration",
+            HistoryFilter {
+                min_duration_ms: Some(2_000),
+                ..Default::default()
+            },
+            3,
+        ),
+        (
+            "table",
+            HistoryFilter {
+                table: Some("orders"),
+                ..Default::default()
+            },
+            2,
+        ),
+        (
+            "from and to",
+            HistoryFilter {
+                from: Some(OffsetDateTime::now_utc() - time::Duration::days(5)),
+                to: Some(OffsetDateTime::now_utc() - time::Duration::days(2)),
+                ..Default::default()
+            },
+            1,
+        ),
+        (
+            "several at once",
+            HistoryFilter {
+                engine: Some("clickhouse"),
+                min_duration_ms: Some(2_000),
+                table: Some("orders"),
+                ..Default::default()
+            },
+            1,
+        ),
+    ];
+    for (name, filter, expected) in filters {
+        assert_eq!(count(filter.clone()).await, expected, "count: {name}");
+        assert_eq!(
+            list(filter).await,
+            expected,
+            "list agrees with count: {name}"
+        );
+    }
+
+    let stranger = count_history(&pool, Uuid::new_v4(), &HistoryFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(stranger, 0, "a user with no runs has a total of 0");
     Ok(())
 }
 
@@ -1092,20 +1534,19 @@ async fn a_percent_or_underscore_in_the_table_filter_is_literal(pool: PgPool) ->
 }
 
 /// Two rows of one owner inside one millisecond come back exactly once
-/// across the page boundary.
+/// across the page boundary, in the order a row's `at` shows.
 ///
-/// The value a row's `at` leaves the store with is cut to milliseconds, so
-/// the cursor the console carries for the last row of a page is that
-/// millisecond. The page after it must compare on the same value: a
-/// comparison against the stored microsecond `at` skips every row inside
-/// the last page's millisecond, and those rows are never seen again.
+/// The value a row's `at` leaves the store with is cut to milliseconds
+/// (`iso_millis`), so two rows inside one millisecond look equal to the
+/// caller and only the id tells them apart. The order therefore cuts `at` to
+/// the millisecond and falls back to the id, so the page boundary is
+/// stable and matches what the console shows (`QS-4` QA of 2026-11-05: the
+/// `before` cursor is gone, this ordering assertion stays).
 ///
 /// The two rows are placed so their ids disagree with their microseconds:
-/// `q-a` is the newer of the two by a microsecond and the older by id. The
-/// order therefore has to cut to the millisecond and fall back to the id,
-/// the way the comparison does. An order on the raw microsecond puts `q-a`
-/// at the end of the page and leaves `q-b` behind the cursor, so `q-b` is
-/// never seen again.
+/// `q-a` is the newer of the two by a microsecond and the older by id. An
+/// order on the raw microsecond puts `q-a` at the end of the page, which
+/// shows two rows of one displayed millisecond out of id order.
 #[sqlx::test(migrations = "../../migrations")]
 async fn two_rows_in_one_millisecond_come_back_exactly_once_across_the_page_boundary(
     pool: PgPool,
@@ -1119,7 +1560,7 @@ async fn two_rows_in_one_millisecond_come_back_exactly_once_across_the_page_boun
         - time::Duration::hours(1);
     // A page holds 50 rows, so 49 newer rows put the two rows of one
     // millisecond at the end of the first page and at the start of the
-    // next — the boundary the console's cursor is built from.
+    // next — the boundary between page 1 and page 2.
     for i in 0..49 {
         insert_history_row_at(
             &pool,
@@ -1132,7 +1573,7 @@ async fn two_rows_in_one_millisecond_come_back_exactly_once_across_the_page_boun
     // The newer of the two by microsecond is the older one by id: only an
     // order that cuts to the millisecond and falls back to the id puts `q-b`
     // at the end of the page. An order on the raw microsecond puts `q-a`
-    // there and leaves `q-b` behind the cursor.
+    // there.
     insert_history_row_at(
         &pool,
         "q-a",
@@ -1153,17 +1594,9 @@ async fn two_rows_in_one_millisecond_come_back_exactly_once_across_the_page_boun
         .unwrap();
     assert_eq!(page_one.len(), 50);
     let last = page_one.last().unwrap();
-    let cursor_at =
-        OffsetDateTime::parse(&last.at, &time::format_description::well_known::Rfc3339).unwrap();
     assert!(
         last.at.ends_with('Z'),
-        "the cursor carries an ISO timestamp: {}",
-        last.at
-    );
-    assert_eq!(
-        cursor_at.millisecond(),
-        0,
-        "the cursor carries whole milliseconds: {}",
+        "a row's at is an ISO timestamp: {}",
         last.at
     );
 
@@ -1171,8 +1604,7 @@ async fn two_rows_in_one_millisecond_come_back_exactly_once_across_the_page_boun
         &pool,
         owner,
         &HistoryFilter {
-            before_at: Some(cursor_at),
-            before_id: Some(&last.id),
+            page: 2,
             ..Default::default()
         },
     )
@@ -1274,6 +1706,18 @@ fn viewer(id: Option<Uuid>, tenant_id: Option<Uuid>) -> SavedQueryViewer {
         role_names: Vec::new(),
         tenant_id,
         all: false,
+    }
+}
+
+/// A viewer who holds `"*:*"` in one tenant: it manages everything of the
+/// organisation, so a test that is about the tree's own rules (a cycle, the
+/// depth, another tenant's folder) is not also about the access rule.
+fn manager_of_everything(tenant_id: Uuid) -> SavedQueryViewer {
+    SavedQueryViewer {
+        id: None,
+        role_names: Vec::new(),
+        tenant_id: Some(tenant_id),
+        all: true,
     }
 }
 
@@ -1450,6 +1894,212 @@ async fn a_version_is_written_for_a_change_and_skipped_when_nothing_changed(
     assert_eq!(versions.len(), 2, "a new title is a new version");
     assert_eq!(versions[0].version, 2);
     assert_eq!(versions[0].title, "Second");
+    Ok(())
+}
+
+/// The two definitions the `QS-5` tests save (decision 3): the store keeps them as
+/// the JSON the route validated and never reads inside them.
+fn region_definitions() -> Value {
+    json!([{"name": "region", "type": "text", "default": "EU"}])
+}
+
+/// The same query with a different default, so a patch that changes only
+/// this differs from the stored list by a single value.
+fn region_definitions_with_default_us() -> Value {
+    json!([{"name": "region", "type": "text", "default": "US"}])
+}
+
+/// `query-parameters.md` decision 3: a saved query keeps its parameters beside its SQL. A change
+/// of the parameters alone writes a version, a change that leaves them as
+/// they were writes none, a change of the title alone keeps them, and a
+/// revert brings back the parameters of the version it went back to.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_saved_query_keeps_its_parameters_in_every_version_and_a_revert_restores_them(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let caller = viewer(Some(person(RINA)), Some(tenant(GROUP_TENANT)));
+    let scope = SavedQueryScope::All {
+        viewer: caller.clone(),
+    };
+    let saved = create_saved_query_with_parameters(
+        &pool,
+        &caller,
+        "By region",
+        "SELECT {{region}}",
+        &region_definitions(),
+        "Rina Wijaya",
+        &[],
+        SavedQueryPlacement::SharedSpace,
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved.parameters, region_definitions());
+    let query_id = Uuid::parse_str(&saved.id).expect("the saved query id");
+    let read = get_saved(&pool, &saved.id, &scope).await.unwrap().unwrap();
+    assert_eq!(read.parameters, region_definitions(), "get carries them");
+    let listed = list_saved(&pool, scope.clone()).await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .find(|q| q.id == saved.id)
+            .map(|q| q.parameters.clone()),
+        Some(region_definitions()),
+        "the list carries them"
+    );
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].parameters, region_definitions());
+
+    // The same list sent again changes nothing.
+    update_saved_query(
+        &pool,
+        &caller,
+        &saved.id,
+        &SavedQueryPatch {
+            parameters: Some(region_definitions()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        list_versions(&pool, query_id).await.unwrap().len(),
+        1,
+        "parameters that are as they were write no version"
+    );
+
+    // A change of the parameters alone is a version.
+    let patched = update_saved_query(
+        &pool,
+        &caller,
+        &saved.id,
+        &SavedQueryPatch {
+            parameters: Some(region_definitions_with_default_us()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(patched.parameters, region_definitions_with_default_us());
+    assert_eq!(patched.sql, "SELECT {{region}}", "the SQL did not move");
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions.len(), 2, "a parameters-only change is a version");
+    assert_eq!(
+        versions[0].parameters,
+        region_definitions_with_default_us(),
+        "the new version holds the new parameters"
+    );
+    assert_eq!(
+        versions[1].parameters,
+        region_definitions(),
+        "the old version keeps the old ones"
+    );
+
+    // A title-only patch leaves the parameters where they are.
+    let renamed = update_saved_query(
+        &pool,
+        &caller,
+        &saved.id,
+        &SavedQueryPatch {
+            title: Some("By region, renamed".to_owned()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(renamed.parameters, region_definitions_with_default_us());
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions.len(), 3);
+    assert_eq!(
+        versions[0].parameters,
+        region_definitions_with_default_us(),
+        "a version written for a new title still holds the current parameters"
+    );
+
+    // Going back to version 1 brings back its parameters with its SQL.
+    let reverted = revert_to_version(&pool, &caller, query_id, 1)
+        .await
+        .unwrap();
+    assert_eq!(reverted.parameters, region_definitions());
+    assert_eq!(reverted.title, "By region");
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions.len(), 4, "the revert is itself a version");
+    assert_eq!(versions[0].label, "Restored version 1");
+    assert_eq!(versions[0].parameters, region_definitions());
+    Ok(())
+}
+
+/// A query saved the way every caller did before `QS-5` has no parameters:
+/// the list is empty, not missing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_query_saved_without_parameters_reads_an_empty_list(pool: PgPool) -> sqlx::Result<()> {
+    let caller = viewer(Some(person(RINA)), Some(tenant(GROUP_TENANT)));
+    let saved = create_saved_query(
+        &pool,
+        &caller,
+        "Plain",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved.parameters, json!([]));
+    let query_id = Uuid::parse_str(&saved.id).expect("the saved query id");
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions[0].parameters, json!([]));
+    Ok(())
+}
+
+/// The migrations a database that stopped at `version` would have applied.
+fn migrations_up_to(version: i64) -> Migrator {
+    let upto: Vec<_> = MIGRATOR
+        .iter()
+        .filter(|m| m.version <= version)
+        .cloned()
+        .collect();
+    Migrator {
+        migrations: Cow::Owned(upto),
+        ..Migrator::DEFAULT
+    }
+}
+
+/// `0131` gives every row written before it an empty parameter list, on the
+/// query and on its versions, and the store reads them back as such.
+#[sqlx::test(migrations = false)]
+async fn migration_0131_gives_old_queries_and_versions_an_empty_parameter_list(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    migrations_up_to(130).run(&pool).await.unwrap();
+    let query_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO saved_query (id, title, sql, owner) VALUES ($1, 'Old', 'SELECT 1', 'Rina Wijaya')")
+        .bind(query_id)
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO saved_query_version (query_id, version, title, sql, author_name, label) \
+         VALUES ($1, 7, 'Old', 'SELECT 1', 'Rina Wijaya', '')",
+    )
+    .bind(query_id)
+    .execute(&pool)
+    .await?;
+
+    MIGRATOR.run(&pool).await.unwrap();
+
+    let on_query: Value = sqlx::query_scalar("SELECT parameters FROM saved_query WHERE id = $1")
+        .bind(query_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(on_query, json!([]));
+    let on_version: Value =
+        sqlx::query_scalar("SELECT parameters FROM saved_query_version WHERE query_id = $1")
+            .bind(query_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(on_version, json!([]));
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions[0].parameters, json!([]));
     Ok(())
 }
 
@@ -1724,14 +2374,16 @@ async fn another_tenants_query_gives_nothing(pool: PgPool) -> sqlx::Result<()> {
     let group = tenant(GROUP_TENANT);
     let retail = tenant(RETAIL_TENANT);
     let rina = viewer(Some(person(RINA)), Some(group));
-    let saved = create_saved_query(
+    // The query sits in the shared space, so only the tenant check can
+    // hide it from Sari (`QS-3` review finding 8).
+    let saved = create_saved_query_at(
         &pool,
         &rina,
         "The group's",
         "SELECT 1",
         "Rina Wijaya",
         &[],
-        None,
+        SavedQueryPlacement::SharedSpace,
     )
     .await
     .unwrap();
@@ -1764,6 +2416,530 @@ async fn another_tenants_query_gives_nothing(pool: PgPool) -> sqlx::Result<()> {
     assert!(
         matches!(written, Err(lakehouse_store::StoreError::NotFound)),
         "another tenant's query is not found at all"
+    );
+    Ok(())
+}
+
+// ── A move across a space needs manage (plan 55) ─────────────────────────
+
+/// An edit grantee cannot move a query across a space: the move is
+/// refused, and neither the title nor the SQL the same body carries is
+/// written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edit_grantees_move_across_a_space_is_refused_and_changes_nothing(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+    let saved = create_saved_query(
+        &pool,
+        &rina,
+        "Private",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+    let personal = saved.folder_id.clone().expect("a personal space folder");
+
+    let query_id = Uuid::parse_str(&saved.id).expect("the saved query id");
+    replace_grants(
+        &pool,
+        Some(query_id),
+        None,
+        &[NewGrant {
+            user_id: Some(person(SARI)),
+            role_id: None,
+            level: Level::Edit,
+        }],
+        None,
+    )
+    .await
+    .unwrap();
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+
+    let refused = update_saved_query(
+        &pool,
+        &sari,
+        &saved.id,
+        &SavedQueryPatch {
+            title: Some("Hijacked".to_owned()),
+            sql: Some("SELECT 2".to_owned()),
+            folder: Some(FolderMove::Root),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(lakehouse_store::StoreError::NotAllowed)),
+        "an edit grantee cannot move a query across a space: {refused:?}"
+    );
+
+    let rina_scope = SavedQueryScope::Tenant {
+        tenant_id,
+        include_tenantless: false,
+        viewer: rina,
+    };
+    let row = get_saved(&pool, &saved.id, &rina_scope)
+        .await
+        .unwrap()
+        .expect("the query is there");
+    assert_eq!(
+        row.title, "Private",
+        "the title of the same body is not written"
+    );
+    assert_eq!(
+        row.sql, "SELECT 1",
+        "the SQL of the same body is not written"
+    );
+    assert_eq!(
+        row.folder_id,
+        Some(personal),
+        "the query stays in the personal space"
+    );
+    Ok(())
+}
+
+/// A manager's move across a space succeeds: a rule that names the mover
+/// at `manage` is enough, the author is not the only manager.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_managers_move_across_a_space_succeeds(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+    let saved = create_saved_query(
+        &pool,
+        &rina,
+        "Private",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+    let query_id = Uuid::parse_str(&saved.id).expect("the saved query id");
+    replace_grants(
+        &pool,
+        Some(query_id),
+        None,
+        &[NewGrant {
+            user_id: Some(person(SARI)),
+            role_id: None,
+            level: Level::Manage,
+        }],
+        None,
+    )
+    .await
+    .unwrap();
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+
+    let moved = update_saved_query(
+        &pool,
+        &sari,
+        &saved.id,
+        &SavedQueryPatch {
+            folder: Some(FolderMove::Root),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        moved.is_ok(),
+        "a manager moves the query across a space: {moved:?}"
+    );
+    assert_eq!(
+        moved.unwrap().folder_id,
+        None,
+        "the query sits in the shared space"
+    );
+    Ok(())
+}
+
+/// A move inside one space needs manage too: a query of Rina's personal
+/// space does not move into a folder of that same space on an edit rule.
+/// This test used to expect success: an edit rule let a query move inside one space,
+/// and that was the way to publish, hide or raise a query in two steps
+/// (`QS-3` review of #382, BLOCKER 1).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edit_grantees_move_inside_one_space_is_refused_and_changes_nothing(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+    let personal = ensure_personal_space(&pool, tenant_id, person(RINA), "Rina Wijaya")
+        .await
+        .unwrap();
+    let week = create_folder(&pool, tenant_id, None, "Week", Some(personal.id))
+        .await
+        .unwrap();
+    let saved = create_saved_query(
+        &pool,
+        &rina,
+        "Private",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+    let query_id = Uuid::parse_str(&saved.id).expect("the saved query id");
+    replace_grants(
+        &pool,
+        Some(query_id),
+        None,
+        &[NewGrant {
+            user_id: Some(person(SARI)),
+            role_id: None,
+            level: Level::Edit,
+        }],
+        None,
+    )
+    .await
+    .unwrap();
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+
+    let refused = update_saved_query(
+        &pool,
+        &sari,
+        &saved.id,
+        &SavedQueryPatch {
+            title: Some("Hijacked".to_owned()),
+            folder: Some(FolderMove::Into(week.id)),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(lakehouse_store::StoreError::NotAllowed)),
+        "a move inside one space needs manage too: {refused:?}"
+    );
+    let (title, folder): (String, Option<Uuid>) =
+        sqlx::query_as("SELECT title, folder_id FROM saved_query WHERE id = $1")
+            .bind(query_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        title, "Private",
+        "the title of the same body is not written"
+    );
+    assert_eq!(folder, Some(personal.id), "the query stays where it was");
+    Ok(())
+}
+
+/// An edit holder's query move is refused wherever it goes: the shared
+/// root, a sibling folder of the same space, and a folder of another space.
+/// The row does not change in any of the three (`QS-3` review of #382).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edit_holders_query_move_is_refused_to_the_root_a_sibling_and_another_space(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+    let weekly = create_folder(&pool, tenant_id, Some(person(RINA)), "Weekly", None)
+        .await
+        .unwrap();
+    let sibling = create_folder(&pool, tenant_id, Some(person(RINA)), "Sibling", None)
+        .await
+        .unwrap();
+    let saris_space = ensure_personal_space(&pool, tenant_id, person(SARI), "Sari")
+        .await
+        .unwrap();
+    let saved = create_saved_query(
+        &pool,
+        &rina,
+        "Rina's",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        Some(weekly.id),
+    )
+    .await
+    .unwrap();
+    let query_id = Uuid::parse_str(&saved.id).expect("the saved query id");
+    replace_grants(
+        &pool,
+        Some(query_id),
+        None,
+        &[NewGrant {
+            user_id: Some(person(SARI)),
+            role_id: None,
+            level: Level::Edit,
+        }],
+        None,
+    )
+    .await
+    .unwrap();
+
+    for (place, target) in [
+        ("the shared root", FolderMove::Root),
+        (
+            "a sibling folder of the same space",
+            FolderMove::Into(sibling.id),
+        ),
+        (
+            "a folder of another space",
+            FolderMove::Into(saris_space.id),
+        ),
+    ] {
+        let refused = update_saved_query(
+            &pool,
+            &sari,
+            &saved.id,
+            &SavedQueryPatch {
+                folder: Some(target),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(lakehouse_store::StoreError::NotAllowed)),
+            "an edit holder cannot move the query to {place}: {refused:?}"
+        );
+        let folder: Option<Uuid> =
+            sqlx::query_scalar("SELECT folder_id FROM saved_query WHERE id = $1")
+                .bind(query_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            folder,
+            Some(weekly.id),
+            "the row stays after a move to {place}"
+        );
+    }
+    Ok(())
+}
+
+/// A manager's move inside one space succeeds, to a folder and to the
+/// root.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_managers_move_inside_one_space_succeeds(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+    let weekly = create_folder(&pool, tenant_id, Some(person(RINA)), "Weekly", None)
+        .await
+        .unwrap();
+    let saved = create_saved_query(
+        &pool,
+        &rina,
+        "Rina's",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        Some(weekly.id),
+    )
+    .await
+    .unwrap();
+    replace_grants(
+        &pool,
+        Some(Uuid::parse_str(&saved.id).expect("the saved query id")),
+        None,
+        &[NewGrant {
+            user_id: Some(person(SARI)),
+            role_id: None,
+            level: Level::Manage,
+        }],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let to_root = update_saved_query(
+        &pool,
+        &sari,
+        &saved.id,
+        &SavedQueryPatch {
+            folder: Some(FolderMove::Root),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(to_root.folder_id, None, "the manager moves it to the root");
+    let back = update_saved_query(
+        &pool,
+        &sari,
+        &saved.id,
+        &SavedQueryPatch {
+            folder: Some(FolderMove::Into(weekly.id)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        back.folder_id,
+        Some(weekly.id.to_string()),
+        "the manager moves it into a folder"
+    );
+    Ok(())
+}
+
+/// A PATCH that names the folder the query is already in is not a move: an
+/// edit holder who renames with the folder re-sent still succeeds, for a
+/// query in a folder and for a query at the root.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edit_holders_patch_that_names_the_current_folder_is_not_a_move(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+    let weekly = create_folder(&pool, tenant_id, Some(person(RINA)), "Weekly", None)
+        .await
+        .unwrap();
+    let in_folder = create_saved_query(
+        &pool,
+        &rina,
+        "In a folder",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        Some(weekly.id),
+    )
+    .await
+    .unwrap();
+    let at_root = create_saved_query_at(
+        &pool,
+        &rina,
+        "At the root",
+        "SELECT 2",
+        "Rina Wijaya",
+        &[],
+        SavedQueryPlacement::SharedSpace,
+    )
+    .await
+    .unwrap();
+    for saved in [&in_folder, &at_root] {
+        replace_grants(
+            &pool,
+            Some(Uuid::parse_str(&saved.id).expect("the saved query id")),
+            None,
+            &[NewGrant {
+                user_id: Some(person(SARI)),
+                role_id: None,
+                level: Level::Edit,
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let renamed = update_saved_query(
+        &pool,
+        &sari,
+        &in_folder.id,
+        &SavedQueryPatch {
+            title: Some("Renamed".to_owned()),
+            folder: Some(FolderMove::Into(weekly.id)),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        renamed.is_ok(),
+        "the folder the query is in, sent again, is no move: {renamed:?}"
+    );
+    assert_eq!(renamed.unwrap().title, "Renamed");
+
+    let renamed = update_saved_query(
+        &pool,
+        &sari,
+        &at_root.id,
+        &SavedQueryPatch {
+            title: Some("Renamed too".to_owned()),
+            folder: Some(FolderMove::Root),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        renamed.is_ok(),
+        "the root, sent again for a query at the root, is no move: {renamed:?}"
+    );
+    Ok(())
+}
+
+/// A move into a folder of another tenant than the query's is refused as
+/// an unseen folder — even for a caller that sees every tenant's rows,
+/// and even for a caller of the tenant the query belongs to.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_move_into_another_tenants_folder_is_refused_as_an_unseen_folder(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+    let retail = tenant(RETAIL_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(group));
+    // The query sits in the shared space, so only the tenant check can
+    // hide the folder from the move.
+    let saved = create_saved_query_at(
+        &pool,
+        &rina,
+        "The group's",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        SavedQueryPlacement::SharedSpace,
+    )
+    .await
+    .unwrap();
+    let theirs = create_folder(&pool, retail, None, "Theirs", None)
+        .await
+        .unwrap();
+    let query_id = Uuid::parse_str(&saved.id).expect("the saved query id");
+    replace_grants(
+        &pool,
+        Some(query_id),
+        None,
+        &[NewGrant {
+            user_id: Some(person(SARI)),
+            role_id: None,
+            level: Level::Edit,
+        }],
+        None,
+    )
+    .await
+    .unwrap();
+
+    // A caller that acts as no tenant in particular reaches every row,
+    // and the folder of another tenant is still no place to move into.
+    let wildcard = viewer(Some(person(SARI)), None);
+    let refused = update_saved_query(
+        &pool,
+        &wildcard,
+        &saved.id,
+        &SavedQueryPatch {
+            folder: Some(FolderMove::Into(theirs.id)),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(lakehouse_store::StoreError::NotFound)),
+        "another tenant's folder is not found at all: {refused:?}"
+    );
+
+    // A caller of the tenant the query belongs to is refused the same
+    // way.
+    let sari = viewer(Some(person(SARI)), Some(group));
+    let refused = update_saved_query(
+        &pool,
+        &sari,
+        &saved.id,
+        &SavedQueryPatch {
+            folder: Some(FolderMove::Into(theirs.id)),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(lakehouse_store::StoreError::NotFound)),
+        "another tenant's folder is not found for the tenant either: {refused:?}"
     );
     Ok(())
 }
@@ -2025,7 +3201,8 @@ async fn a_personal_space_is_not_renamed_not_moved_and_not_deleted(
         "a personal space is not renamed"
     );
 
-    let moved = move_folder(&pool, space.id, None).await;
+    let moved =
+        move_folder_for_viewer(&pool, &manager_of_everything(tenant_id), space.id, None).await;
     assert!(
         matches!(moved, Err(FolderError::PersonalSpace)),
         "a personal space is not moved"
@@ -2059,13 +3236,15 @@ async fn a_folder_may_not_move_into_its_own_descendant(pool: PgPool) -> sqlx::Re
         .await
         .unwrap();
 
-    let into_itself = move_folder(&pool, parent.id, Some(parent.id)).await;
+    let everything = manager_of_everything(tenant_id);
+    let into_itself = move_folder_for_viewer(&pool, &everything, parent.id, Some(parent.id)).await;
     assert!(
         matches!(into_itself, Err(FolderError::Cycle)),
         "a folder is not its own parent"
     );
 
-    let into_a_descendant = move_folder(&pool, parent.id, Some(grandchild.id)).await;
+    let into_a_descendant =
+        move_folder_for_viewer(&pool, &everything, parent.id, Some(grandchild.id)).await;
     assert!(
         matches!(into_a_descendant, Err(FolderError::Cycle)),
         "a folder is not moved under its own descendant"
@@ -2106,13 +3285,16 @@ async fn a_move_that_would_make_the_tree_five_deep_is_refused(pool: PgPool) -> s
         .await
         .unwrap();
 
-    let too_deep = move_folder(&pool, branch.id, Some(four.id)).await;
+    let everything = manager_of_everything(tenant_id);
+    let too_deep = move_folder_for_viewer(&pool, &everything, branch.id, Some(four.id)).await;
     assert!(
         matches!(too_deep, Err(FolderError::TooDeep)),
         "the subtree would reach past the limit"
     );
 
-    let allowed = move_folder(&pool, branch.id, Some(two.id)).await.unwrap();
+    let allowed = move_folder_for_viewer(&pool, &everything, branch.id, Some(two.id))
+        .await
+        .unwrap();
     assert_eq!(allowed.parent_id, Some(two.id));
     Ok(())
 }
@@ -2215,10 +3397,475 @@ async fn another_tenants_folder_is_not_reachable(pool: PgPool) -> sqlx::Result<(
     let mine = create_folder(&pool, group, None, "Mine", None)
         .await
         .unwrap();
-    let into_theirs = move_folder(&pool, mine.id, Some(theirs.id)).await;
+    let into_theirs = move_folder_for_viewer(
+        &pool,
+        &manager_of_everything(group),
+        mine.id,
+        Some(theirs.id),
+    )
+    .await;
     assert!(
         matches!(into_theirs, Err(FolderError::NotFound)),
         "another tenant's folder is not a place to move into"
+    );
+    Ok(())
+}
+
+/// An edit grantee on a folder cannot move it across a space: a folder of
+/// Rina's personal space does not move to the shared root on an edit rule
+/// alone, and the folder stays where it was.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edit_grantees_folder_move_across_a_space_is_refused(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let personal = ensure_personal_space(&pool, tenant_id, person(RINA), "Rina Wijaya")
+        .await
+        .unwrap();
+    let week = create_folder(&pool, tenant_id, None, "Week", Some(personal.id))
+        .await
+        .unwrap();
+    replace_grants(
+        &pool,
+        None,
+        Some(week.id),
+        &[NewGrant {
+            user_id: Some(person(SARI)),
+            role_id: None,
+            level: Level::Edit,
+        }],
+        None,
+    )
+    .await
+    .unwrap();
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+
+    let refused = move_folder_for_viewer(&pool, &sari, week.id, None).await;
+    assert!(
+        matches!(refused, Err(FolderError::MoveNeedsManage)),
+        "an edit grantee cannot move a folder across a space: {refused:?}"
+    );
+    let parent: Option<Uuid> =
+        sqlx::query_scalar("SELECT parent_id FROM saved_query_folder WHERE id = $1")
+            .bind(week.id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        parent,
+        Some(personal.id),
+        "the folder stays in the personal space"
+    );
+    Ok(())
+}
+
+/// The owner of a personal space manages what is inside it: Rina moves a
+/// folder of her space to the shared root.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_managers_folder_move_across_a_space_succeeds(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let personal = ensure_personal_space(&pool, tenant_id, person(RINA), "Rina Wijaya")
+        .await
+        .unwrap();
+    let week = create_folder(&pool, tenant_id, None, "Week", Some(personal.id))
+        .await
+        .unwrap();
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+
+    let moved = move_folder_for_viewer(&pool, &rina, week.id, None).await;
+    assert!(
+        moved.is_ok(),
+        "the space's owner moves the folder across: {moved:?}"
+    );
+    assert_eq!(
+        moved.unwrap().parent_id,
+        None,
+        "the folder sits at the root"
+    );
+    Ok(())
+}
+
+/// A folder move inside one space needs manage too: a folder of Rina's
+/// personal space does not move under another folder of that space on an
+/// edit rule. This test used to expect success (`QS-3` review of #382, BLOCKER 1).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edit_grantees_folder_move_inside_one_space_is_refused(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let personal = ensure_personal_space(&pool, tenant_id, person(RINA), "Rina Wijaya")
+        .await
+        .unwrap();
+    let week = create_folder(&pool, tenant_id, None, "Week", Some(personal.id))
+        .await
+        .unwrap();
+    let notes = create_folder(&pool, tenant_id, None, "Notes", Some(personal.id))
+        .await
+        .unwrap();
+    replace_grants(
+        &pool,
+        None,
+        Some(week.id),
+        &[NewGrant {
+            user_id: Some(person(SARI)),
+            role_id: None,
+            level: Level::Edit,
+        }],
+        None,
+    )
+    .await
+    .unwrap();
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+
+    let refused = move_folder_for_viewer(&pool, &sari, week.id, Some(notes.id)).await;
+    assert!(
+        matches!(refused, Err(FolderError::MoveNeedsManage)),
+        "a folder move inside one space needs manage too: {refused:?}"
+    );
+    let parent: Option<Uuid> =
+        sqlx::query_scalar("SELECT parent_id FROM saved_query_folder WHERE id = $1")
+            .bind(week.id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(parent, Some(personal.id), "the folder stays where it was");
+    Ok(())
+}
+
+/// A folder whose parent does not change is not moved: an edit holder who
+/// sends the parent again is not refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_folder_move_to_the_parent_it_already_has_is_no_move(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let personal = ensure_personal_space(&pool, tenant_id, person(RINA), "Rina Wijaya")
+        .await
+        .unwrap();
+    let week = create_folder(&pool, tenant_id, None, "Week", Some(personal.id))
+        .await
+        .unwrap();
+    let at_root = create_folder(&pool, tenant_id, None, "At the root", None)
+        .await
+        .unwrap();
+    for folder in [week.id, at_root.id] {
+        replace_grants(
+            &pool,
+            None,
+            Some(folder),
+            &[NewGrant {
+                user_id: Some(person(SARI)),
+                role_id: None,
+                level: Level::Edit,
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+
+    let same = move_folder_for_viewer(&pool, &sari, week.id, Some(personal.id)).await;
+    assert!(same.is_ok(), "the same parent is no move: {same:?}");
+    let same = move_folder_for_viewer(&pool, &sari, at_root.id, None).await;
+    assert!(same.is_ok(), "the root, again, is no move: {same:?}");
+    Ok(())
+}
+
+/// A folder tree of the `QS-3` review of #382: Sari wrote `X` at the root, so she
+/// manages it, and `X` holds what Rina wrote.
+struct CarriedTree {
+    x: Uuid,
+    /// A root folder of Sari's the move goes under.
+    target: Uuid,
+}
+
+async fn carried_tree(pool: &PgPool, tenant_id: Uuid, suffix: &str) -> CarriedTree {
+    let x = create_folder(
+        pool,
+        tenant_id,
+        Some(person(SARI)),
+        &format!("X {suffix}"),
+        None,
+    )
+    .await
+    .unwrap();
+    let target = create_folder(
+        pool,
+        tenant_id,
+        Some(person(SARI)),
+        &format!("Target {suffix}"),
+        None,
+    )
+    .await
+    .unwrap();
+    CarriedTree {
+        x: x.id,
+        target: target.id,
+    }
+}
+
+/// The author of a folder does not manage what others put inside it: the
+/// move is refused when the folder holds a query the mover does not
+/// manage, live or in the trash, and the folder stays.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_folder_move_is_refused_when_it_holds_a_query_the_mover_does_not_manage(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+
+    for trashed in [false, true] {
+        let tree = carried_tree(&pool, tenant_id, &format!("trashed {trashed}")).await;
+        let saved = create_saved_query(
+            &pool,
+            &rina,
+            "Rina's",
+            "SELECT 1",
+            "Rina Wijaya",
+            &[],
+            Some(tree.x),
+        )
+        .await
+        .unwrap();
+        if trashed {
+            trash_saved_query(&pool, &rina, &saved.id).await.unwrap();
+        }
+
+        let refused = move_folder_for_viewer(&pool, &sari, tree.x, Some(tree.target)).await;
+        assert!(
+            matches!(refused, Err(FolderError::MoveNeedsManage)),
+            "a query of somebody else (in the trash: {trashed}) stops the move: {refused:?}"
+        );
+        let parent: Option<Uuid> =
+            sqlx::query_scalar("SELECT parent_id FROM saved_query_folder WHERE id = $1")
+                .bind(tree.x)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            parent, None,
+            "the folder stays at the root (trash: {trashed})"
+        );
+    }
+    Ok(())
+}
+
+/// The rule reaches every depth: a sub-folder of somebody else's, and a
+/// query of somebody else's three levels down, each stop the move even
+/// when the folders in between are the mover's own.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_folder_move_is_refused_for_what_is_deep_inside_it(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+    let tree = carried_tree(&pool, tenant_id, "case").await;
+    // `X` and `Y` are Sari's: a folder of Rina's sits one level lower.
+    let y = create_folder(&pool, tenant_id, Some(person(SARI)), "Y", Some(tree.x))
+        .await
+        .unwrap();
+    let z = create_folder(&pool, tenant_id, Some(person(RINA)), "Z", Some(y.id))
+        .await
+        .unwrap();
+
+    let refused = move_folder_for_viewer(&pool, &sari, tree.x, Some(tree.target)).await;
+    assert!(
+        matches!(refused, Err(FolderError::MoveNeedsManage)),
+        "a sub-folder of somebody else's, two levels down, stops the move: {refused:?}"
+    );
+
+    // Hand `Z` to Sari: what stops the move now is a query of Rina's in it.
+    sqlx::query("UPDATE saved_query_folder SET owner_id = $2 WHERE id = $1")
+        .bind(z.id)
+        .bind(person(SARI))
+        .execute(&pool)
+        .await?;
+    let deep = create_saved_query(
+        &pool,
+        &rina,
+        "Rina's, deep",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        Some(z.id),
+    )
+    .await
+    .unwrap();
+    let refused = move_folder_for_viewer(&pool, &sari, tree.x, Some(tree.target)).await;
+    assert!(
+        matches!(refused, Err(FolderError::MoveNeedsManage)),
+        "a query of somebody else's, three levels down, stops the move: {refused:?}"
+    );
+
+    // Rina trashes it: it is still carried.
+    trash_saved_query(&pool, &rina, &deep.id).await.unwrap();
+    let refused = move_folder_for_viewer(&pool, &sari, tree.x, Some(tree.target)).await;
+    assert!(
+        matches!(refused, Err(FolderError::MoveNeedsManage)),
+        "a trashed query of somebody else's still stops the move: {refused:?}"
+    );
+    let parent: Option<Uuid> =
+        sqlx::query_scalar("SELECT parent_id FROM saved_query_folder WHERE id = $1")
+            .bind(tree.x)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(parent, None, "nothing moved");
+    Ok(())
+}
+
+/// A folder move succeeds when the mover manages the folder, every
+/// sub-folder and every query under it, the ones in the trash included.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_folder_move_succeeds_when_the_mover_manages_everything_in_it(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+    let tree = carried_tree(&pool, tenant_id, "case").await;
+    let y = create_folder(&pool, tenant_id, Some(person(SARI)), "Y", Some(tree.x))
+        .await
+        .unwrap();
+    create_saved_query(&pool, &sari, "Sari's", "SELECT 1", "Sari", &[], Some(y.id))
+        .await
+        .unwrap();
+    let trashed = create_saved_query(
+        &pool,
+        &sari,
+        "Sari's, trashed",
+        "SELECT 2",
+        "Sari",
+        &[],
+        Some(y.id),
+    )
+    .await
+    .unwrap();
+    trash_saved_query(&pool, &sari, &trashed.id).await.unwrap();
+    // A query of Rina's inside, with a rule that gives Sari manage on it:
+    // a rule is as good as authorship.
+    let shared = create_saved_query(
+        &pool,
+        &rina,
+        "Rina's, shared",
+        "SELECT 3",
+        "Rina Wijaya",
+        &[],
+        Some(tree.x),
+    )
+    .await
+    .unwrap();
+    replace_grants(
+        &pool,
+        Some(Uuid::parse_str(&shared.id).expect("the saved query id")),
+        None,
+        &[NewGrant {
+            user_id: Some(person(SARI)),
+            role_id: None,
+            level: Level::Manage,
+        }],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let moved = move_folder_for_viewer(&pool, &sari, tree.x, Some(tree.target)).await;
+    assert!(moved.is_ok(), "the mover manages all of it: {moved:?}");
+    assert_eq!(moved.unwrap().parent_id, Some(tree.target));
+    Ok(())
+}
+
+/// Sharing a folder is held to the bar of a move (`QS-3` review of #393):
+/// the viewer manages the folder, every sub-folder and every query under
+/// it, the ones in the trash included. An own tree answers `true`; a live
+/// query, a trashed query and an empty sub-folder of somebody else's each
+/// answer `false`, and a folder that is not there answers `false`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_folder_and_its_contents_are_managed_only_when_every_part_is(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+
+    // Own tree: a sub-folder, a live query and a trashed query, all Sari's.
+    let own = carried_tree(&pool, tenant_id, "own").await;
+    let inner = create_folder(&pool, tenant_id, Some(person(SARI)), "Inner", Some(own.x))
+        .await
+        .unwrap();
+    create_saved_query(
+        &pool,
+        &sari,
+        "Live",
+        "SELECT 1",
+        "Sari",
+        &[],
+        Some(inner.id),
+    )
+    .await
+    .unwrap();
+    let trashed = create_saved_query(&pool, &sari, "Gone", "SELECT 2", "Sari", &[], Some(own.x))
+        .await
+        .unwrap();
+    trash_saved_query(&pool, &sari, &trashed.id).await.unwrap();
+    assert!(
+        manages_folder_and_contents(&pool, &sari, own.x)
+            .await
+            .unwrap(),
+        "Sari manages every part of her own tree"
+    );
+
+    // A live query of Rina's.
+    let live = carried_tree(&pool, tenant_id, "live").await;
+    create_saved_query(
+        &pool,
+        &rina,
+        "Rina's",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        Some(live.x),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !manages_folder_and_contents(&pool, &sari, live.x)
+            .await
+            .unwrap(),
+        "a live query of somebody else's is not managed"
+    );
+
+    // A trashed query of Rina's.
+    let gone = carried_tree(&pool, tenant_id, "gone").await;
+    let rinas = create_saved_query(
+        &pool,
+        &rina,
+        "Rina's, trashed",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        Some(gone.x),
+    )
+    .await
+    .unwrap();
+    trash_saved_query(&pool, &rina, &rinas.id).await.unwrap();
+    assert!(
+        !manages_folder_and_contents(&pool, &sari, gone.x)
+            .await
+            .unwrap(),
+        "a trashed query of somebody else's is not managed"
+    );
+
+    // An empty sub-folder of Rina's.
+    let sub = carried_tree(&pool, tenant_id, "sub").await;
+    create_folder(&pool, tenant_id, Some(person(RINA)), "Hers", Some(sub.x))
+        .await
+        .unwrap();
+    assert!(
+        !manages_folder_and_contents(&pool, &sari, sub.x)
+            .await
+            .unwrap(),
+        "an empty sub-folder of somebody else's is not managed"
+    );
+
+    assert!(
+        !manages_folder_and_contents(&pool, &sari, Uuid::new_v4())
+            .await
+            .unwrap(),
+        "a folder that is not there is not managed"
     );
     Ok(())
 }
@@ -2233,7 +3880,8 @@ async fn the_grantee_search_finds_a_person_by_name_and_by_email(pool: PgPool) ->
         .unwrap();
     assert!(
         by_name.people.iter().any(|grantee| {
-            grantee.name == "Rina Wijaya" && grantee.email == "rina@meridian.example"
+            grantee.name == "Rina Wijaya"
+                && grantee.email.as_deref() == Some("rina@meridian.example")
         }),
         "the person is found by their name"
     );
@@ -2277,11 +3925,14 @@ async fn the_grantee_search_finds_a_role_by_name(pool: PgPool) -> sqlx::Result<(
 async fn the_grantee_search_treats_the_wildcards_literally(pool: PgPool) -> sqlx::Result<()> {
     let group = tenant(GROUP_TENANT);
     let person_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email) VALUES ($1, 'Fifty % Off', $2)")
-        .bind(person_id)
-        .bind("fifty@meridian.example")
-        .execute(&pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO app_user (id, name, username, email) VALUES ($1, 'Fifty % Off', $2, $3)",
+    )
+    .bind(person_id)
+    .bind("fifty")
+    .bind("fifty@meridian.example")
+    .execute(&pool)
+    .await?;
     sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
         .bind(person_id)
         .bind(group)
@@ -2317,9 +3968,11 @@ async fn the_grantee_search_answers_with_the_tenants_people_only(pool: PgPool) -
     let group = tenant(GROUP_TENANT);
     let inactive = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Sleepy Person', $2, 'inactive')",
+        "INSERT INTO app_user (id, name, username, email, status) \
+         VALUES ($1, 'Sleepy Person', $2, $3, 'inactive')",
     )
     .bind(inactive)
+    .bind(format!("sleepy-{inactive}"))
     .bind("sleepy@meridian.example")
     .execute(&pool)
     .await?;
@@ -2360,5 +4013,121 @@ async fn the_grantee_search_answers_with_the_tenants_people_only(pool: PgPool) -
 
     let none = search_grantees(&pool, Some(group), "", 0).await.unwrap();
     assert!(none.people.is_empty(), "a limit of zero asks for no rows");
+    Ok(())
+}
+
+/// A rule's grantee is named the way the share panel shows it: a person of
+/// the viewer's tenant by name and email, a role by name.
+#[sqlx::test(migrations = "../../migrations")]
+async fn grantee_labels_name_a_person_of_the_tenant_and_a_role(pool: PgPool) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+
+    let labels = grantee_labels(&pool, Some(group), &[person(RINA)], &[person(ANALYST_ROLE)])
+        .await
+        .unwrap();
+
+    assert_eq!(labels.people.len(), 1, "{labels:?}");
+    assert_eq!(labels.people[0].id, person(RINA));
+    assert_eq!(labels.people[0].name, "Rina Wijaya");
+    assert_eq!(
+        labels.people[0].email.as_deref(),
+        Some("rina@meridian.example")
+    );
+    assert_eq!(labels.roles.len(), 1, "{labels:?}");
+    assert_eq!(labels.roles[0].id, person(ANALYST_ROLE));
+    assert_eq!(labels.roles[0].name, "Analyst");
+    Ok(())
+}
+
+/// A person who is not a member of the viewer's tenant gets no label: the
+/// name and email of another organisation's person never reach the list.
+#[sqlx::test(migrations = "../../migrations")]
+async fn grantee_labels_leave_out_a_person_of_another_tenant(pool: PgPool) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+
+    let labels = grantee_labels(&pool, Some(group), &[person(RINA), person(SARI)], &[])
+        .await
+        .unwrap();
+
+    assert!(
+        labels.people.iter().any(|found| found.id == person(RINA)),
+        "CONTROL: the member of the tenant is named"
+    );
+    assert!(
+        !labels.people.iter().any(|found| found.id == person(SARI)),
+        "Sari belongs to the Retail tenant only: {labels:?}"
+    );
+    Ok(())
+}
+
+/// A rule still applies to a person who has been deactivated, so the list
+/// keeps naming them, unlike the grantee search.
+#[sqlx::test(migrations = "../../migrations")]
+async fn grantee_labels_keep_the_name_of_an_inactive_person(pool: PgPool) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+    let inactive = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO app_user (id, name, username, email, status) \
+         VALUES ($1, 'Sleepy Person', $2, $3, 'inactive')",
+    )
+    .bind(inactive)
+    .bind(format!("sleepy-{inactive}"))
+    .bind("sleepy@meridian.example")
+    .execute(&pool)
+    .await?;
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(inactive)
+        .bind(group)
+        .execute(&pool)
+        .await?;
+
+    let labels = grantee_labels(&pool, Some(group), &[inactive], &[])
+        .await
+        .unwrap();
+
+    assert_eq!(labels.people.len(), 1, "{labels:?}");
+    assert_eq!(labels.people[0].name, "Sleepy Person");
+    assert_eq!(
+        labels.people[0].email.as_deref(),
+        Some("sleepy@meridian.example")
+    );
+    Ok(())
+}
+
+/// An id the database does not hold is absent from the answer, and an
+/// empty input is an empty answer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn grantee_labels_leave_out_an_unknown_id_and_answer_nothing_for_no_ids(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+
+    let unknown = grantee_labels(
+        &pool,
+        Some(group),
+        &[Uuid::new_v4(), person(RINA)],
+        &[Uuid::new_v4()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(unknown.people.len(), 1, "{unknown:?}");
+    assert_eq!(unknown.people[0].id, person(RINA));
+    assert!(unknown.roles.is_empty(), "{unknown:?}");
+
+    let none = grantee_labels(&pool, Some(group), &[], &[]).await.unwrap();
+    assert!(none.people.is_empty() && none.roles.is_empty(), "{none:?}");
+    Ok(())
+}
+
+/// With no tenant every person of the deployment is named, the same
+/// reading of "no tenant" as the grantee search and the tenant check.
+#[sqlx::test(migrations = "../../migrations")]
+async fn grantee_labels_with_no_tenant_name_every_person(pool: PgPool) -> sqlx::Result<()> {
+    let labels = grantee_labels(&pool, None, &[person(RINA), person(SARI)], &[])
+        .await
+        .unwrap();
+
+    assert_eq!(labels.people.len(), 2, "{labels:?}");
+    assert!(labels.people.iter().any(|found| found.id == person(SARI)));
     Ok(())
 }

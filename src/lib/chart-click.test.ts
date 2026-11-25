@@ -181,3 +181,14 @@ test("a click on a bin names the bin's lower edge, the width and the label the p
   assert.equal(drillTarget(spec("bar"), { name: "9 – 10" }, { rows, labelledRows: labelled, bin }), null)
   assert.equal(drillTarget(spec("bar"), { name: "x" }, { rows: [{ region: null }], labelledRows: [{ region: "x" }], bin }), null)
 })
+
+// QA LH-BI-6-38 (plan D5): the labels "(No value)" and "(Empty)" are display only, and a click on
+// such a mark goes on naming no value, as it did when the label was blank.
+test("a click on the (No value) or (Empty) mark drills nothing, and a stored value with that text still does", () => {
+  assert.equal(drillTarget(spec("bar"), { name: "(No value)" }, { rows: [{ region: null }, { region: "Bali" }] }), null)
+  assert.equal(drillTarget(spec("bar"), { name: "(Empty)" }, { rows: [{ region: "" }] }), null)
+  assert.deepEqual(
+    drillTarget(spec("bar"), { name: "(No value)" }, { rows: [{ region: "(No value)" }] }),
+    { column: "region", value: "(No value)" },
+  )
+})

@@ -54,7 +54,8 @@
 //!
 //! `?ifChanged=true` skips export when the `ClickHouse` content fingerprint
 //! (row count, wrapping 64-bit sum of `cityHash64(*)`, and schema hash)
-//! matches the last successful export. A full scan over a 5,000,000-row mart
+//! matches the last successful export — and never when the mart's newest run
+//! failed (`DATA-49`, QA `LH-DATA-1-01`). A full scan over a 5,000,000-row mart
 //! (`GOLD_EXPORT_MAX_ROWS`) with 4 realistic columns (`UInt64`, `String`, `Float64`,
 //! `DateTime`) measured 187 ms (0.187s) on `ClickHouse` 26.8 running on Linux
 //! `x86_64` (7.9 GB RAM, 6 vCPUs).
@@ -70,31 +71,50 @@ use lakehouse_core::secret::SecretValue;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::gold_export::{self, GoldExportError};
 use crate::gold_export_history;
 use crate::json::ApiJson;
 use crate::state::AppState;
 use crate::upstream_error;
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
 
 impl From<GoldExportError> for ApiError {
     fn from(err: GoldExportError) -> Self {
         match err {
             GoldExportError::ClickHouse(e) => upstream_error::ch_error(&upstream_error::DATABASE, &e),
+            // QA LH-DATA-1-01 (DATA-49): the batch text can hold a cell value
+            // and the Arrow or Iceberg library's words, so it is classified
+            // like an upstream failure — fixed sentence plus a reference —
+            // instead of being stored or answered verbatim.
+            GoldExportError::Batch(detail) => upstream_error::report(
+                &upstream_error::PUBLISH_BATCH,
+                upstream_error::Class::Failed,
+                &detail,
+            )
+            .into_api_error(upstream_error::FailedAs::Unprocessable),
             GoldExportError::UnsupportedColumn { .. }
-            | GoldExportError::Batch(_)
             // The mart is over `GOLD_EXPORT_MAX_ROWS` — a well-formed
             // request against real (too-large) data, same "caller's input,
             // not our outage" shape as the other `Unprocessable` variants,
             // not a 500: the fix is retrying with a smaller mart or a
             // deliberately raised cap, not anything server-side.
             | GoldExportError::RowCapExceeded { .. }
+            // DATA-6 D7: the target table is another mart's latest-copy
+            // table. It joins the same 422 group for the same reason: its
+            // `Display` is this repo's own fixed sentence (naming the
+            // mart, no upstream words), so the fix is renaming the mart,
+            // not anything server-side.
+            | GoldExportError::TargetIsLatestCopy { .. }
             // WS7 item D2: `err.to_string()` is safe here — the inner
             // string is already `policy_engine::enforcement_error_message`'s
             // own fixed, non-leaking text (`export_batch_sql` never wraps
             // the raw Postgres/sqlparser error), matching AGENTS.md rule 4.
             | GoldExportError::PolicyRefused(_) => Self::Unprocessable(err.to_string()),
+            // GOV-7 D5: a table the owner may not read travels as the answer
+            // itself — the tenant gate's own 404 and sentence (D2).
+            GoldExportError::PolicyTableRefused(refusal) => refusal,
             // SEC-50: the tenant gate's own error travels as it is, so
             // the caller sees the status the gate would have answered
             // (its fixed sentence, never an upstream text).
@@ -131,11 +151,22 @@ pub struct ExportQuery {
 /// stored fingerprint from a pre-DATA-10 run, no active mart fingerprint)
 /// exports: a stale open-format copy is the worse outcome, so uncertainty fails
 /// toward publishing.
+///
+/// `DATA-49` (QA `LH-DATA-1-01`): `newest_run_failed` is a fourth such doubt and
+/// wins over a matching fingerprint. The comparison is against the last
+/// *successful* run, so after a failure on an unchanged mart every scheduled run
+/// would be skipped and the card would say "Last publish failed" until someone
+/// pressed Publish now — and a run that failed between batches also leaves a
+/// partial newest copy. A failed newest run therefore always publishes.
 fn if_changed_skip_reason(
     current_fp: Option<&str>,
     last_fp: Option<&str>,
     last_exported_ms: Option<i64>,
+    newest_run_failed: bool,
 ) -> Option<String> {
+    if newest_run_failed {
+        return None;
+    }
     let current = current_fp?;
     let last = last_fp?;
     if current.is_empty() || last.is_empty() || current != last {
@@ -159,11 +190,22 @@ fn skipped_body(reason: &str) -> Value {
 /// The freshness reads behind `?ifChanged=true`: `Some(reason)` to skip with,
 /// `None` to export. A failed read is a classified [`ApiError`], not a silent
 /// skip — a scheduler that cannot MEASURE must not treat the mart as quiet.
+///
+/// `DATA-49` (QA `LH-DATA-1-01`): the newest run of any status is read first. A
+/// failed newest run answers `None` without the successful-run read, because a
+/// failure is reason enough to publish (see [`if_changed_skip_reason`]).
 async fn unchanged_since_last_export_reason(
     state: &AppState,
     mart: &str,
     current_fingerprint: Option<&str>,
 ) -> Result<Option<String>, ApiError> {
+    let newest = gold_export_history::last_export_run(&state.clickhouse, mart)
+        .await
+        .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
+    let newest_failed = newest.as_ref().is_some_and(|run| run.status == "failed");
+    if newest_failed {
+        return Ok(None);
+    }
     let last_export = gold_export_history::last_success_export(&state.clickhouse, mart)
         .await
         .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
@@ -173,6 +215,7 @@ async fn unchanged_since_last_export_reason(
         current_fingerprint,
         last_fp,
         last_started_ms,
+        newest_failed,
     ))
 }
 
@@ -197,6 +240,14 @@ async fn unchanged_since_last_export_reason(
 ///    missing token here is always `401`, whether or not the caller holds
 ///    any permission at all.
 ///
+/// 3. **QA LH-DATA-1-02 (plan D6): a signed-in person who presented no
+///    token is `403`, not `401`.** In the configured-token branch, a
+///    `PrincipalId::User` without `gold:export` that sent no token (header
+///    and query both absent) is forbidden: they are signed in, and the
+///    console reads every `401` as an expired session, which sent an Analyst
+///    opening a Gold table page into a `/login` loop. A token that is
+///    presented and wrong stays `401`. Nobody gets in who did not before.
+///
 /// With neither set, only a `PrincipalId::Service` principal is let
 /// through (`503` otherwise) — unchanged from before this task.
 fn check_export_token(
@@ -211,8 +262,16 @@ fn check_export_token(
         return Ok(());
     }
     if let Some(need) = configured {
-        return if header_token.or(query_token) == Some(need) {
+        let presented = header_token.or(query_token);
+        return if presented == Some(need) {
             Ok(())
+        } else if presented.is_none()
+            && matches!(principal, Some(p) if matches!(p.id, PrincipalId::User(_)))
+        {
+            // QA LH-DATA-1-02 (plan D6): signed in, no token, no gold:export.
+            // `PermissionDenied`, not `Forbidden`: the latter's fixed body is
+            // `embedding_disabled`, which would mislabel this 403.
+            Err(ApiError::PermissionDenied("gold:export".to_owned()))
         } else {
             Err(ApiError::unauthorized())
         };
@@ -228,6 +287,24 @@ fn check_export_token(
                 .to_owned(),
         )),
     }
+}
+
+/// `SEC-66`: the read-only Gold routes accept `gold:read` where
+/// [`check_export_token`] used to demand `gold:export`. The shared-token
+/// match and the service-identity fallback are delegated to that guard
+/// unchanged, so the scheduler's `x-run-token` path and the no-token
+/// service path behave exactly as before. The WRITE route still calls
+/// [`check_export_token`] directly: `gold:read` must never open an export.
+fn check_gold_read_token(
+    configured: Option<&str>,
+    header_token: Option<&str>,
+    query_token: Option<&str>,
+    principal: Option<&Principal>,
+) -> Result<(), ApiError> {
+    if principal.is_some_and(|p| p.has("gold:read")) {
+        return Ok(());
+    }
+    check_export_token(configured, header_token, query_token, principal)
 }
 
 /// Reads the `gold-export` principal's Lakekeeper bearer token from
@@ -345,7 +422,11 @@ async fn gated_source_table(
 /// This is what the scheduler sends so a quiet mart costs reading the
 /// last export history and one fingerprint query. Unknown facts never
 /// skip (see [`if_changed_skip_reason`]); the console's manual trigger
-/// does not send the parameter at all.
+/// does not send the parameter at all. A mart whose newest run FAILED is
+/// never skipped, even when its fingerprint matches the last success: the
+/// card would otherwise say "Last publish failed" until someone pressed
+/// Publish now, and a run that failed between batches leaves a partial
+/// newest copy (`DATA-49`, QA `LH-DATA-1-01`).
 ///
 /// # Single-flight: only one export of a given mart runs at a time
 ///
@@ -358,6 +439,29 @@ async fn gated_source_table(
 /// current rows, duplicating them in the target table (`GoldTable::append`
 /// has no dedup). A DIFFERENT mart is unaffected — the lock is keyed by
 /// mart name.
+///
+/// # What is recorded (`DATA-56`, #484 review R4)
+///
+/// The history table is the card's source of truth, so a publish that fails
+/// has to leave a run there — otherwise a mart whose every publish fails before
+/// the copy starts stays "Up to date" or "Out of date" for ever (#484 review R4,
+/// `DATA-56`). After the caller is authenticated and allowed and the mart
+/// is shown to be theirs, every failure is recorded: the content fingerprint
+/// read, the `?ifChanged=true` history read, the catalog token file, and the
+/// export itself. A failure of the content fingerprint or the history read, both
+/// of which happen BEFORE the per-mart lock, is recorded only when no publish of
+/// that mart is in flight (review round 1, R3): otherwise its row, newer than the
+/// running publish's, would hide that publish's result — the rule the `409`
+/// follows. A refusal records nothing: `401`/`403`/`503` from
+/// [`check_export_token`], `400` for a mart name that is not an identifier, the
+/// tenant gate's `404`/`422`/`503`, and the `409` of a publish already in
+/// flight (that publish records its own run, and a row for the turned-away call
+/// would be newer and hide its result). A name that is not a table is not
+/// refused — it goes on and fails where it fails today (D23). The row's
+/// sentence is the sentence the response carries ([`stored_error`]), never
+/// upstream text. When the database that keeps the history is the thing that
+/// failed, nothing can be recorded: the write is best-effort and the caller
+/// gets the failure it already had.
 ///
 /// # Errors
 ///
@@ -398,15 +502,17 @@ pub async fn export(
     let actor = gold_export_gate_actor(principal.as_ref().map(|Extension(p)| p), &headers);
     let source_table = gated_source_table(&state, mart_ident.as_str(), actor).await?;
 
+    let triggered_by = triggered_by(principal.as_ref().map(|Extension(p)| p));
+
+    // #484 review R4 (DATA-56): from here on the caller is
+    // authenticated and allowed and the mart is shown to be theirs, so every
+    // failure below is a failed publish and is recorded as one.
+    let attempt = Attempt::open(&state, mart_ident.as_str(), &triggered_by).await?;
+
     // DATA-10 review SHOULD-FIX 1 / DATA-10 D2: The fingerprint is computed before
     // the export reads rows, and written on the history row of that export.
-    let current_fingerprint = gold_export_history::mart_content_fingerprint(
-        &state.clickhouse,
-        &state.config.gold_source_schema,
-        mart_ident.as_str(),
-    )
-    .await
-    .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
+    let current_fingerprint =
+        read_content_fingerprint(&attempt, &state.config.gold_source_schema).await?;
 
     // DATA-10 / DATA-1 task 4 — `?ifChanged=true`: a proven-unchanged mart is
     // skipped BEFORE the single-flight lock is taken (a skip holds
@@ -414,21 +520,19 @@ pub async fn export(
     // snapshot — the response is the only trace). Unknown facts export, per
     // [`if_changed_skip_reason`].
     if query.if_changed.as_deref() == Some("true")
-        && let Some(reason) = unchanged_since_last_export_reason(
-            &state,
-            mart_ident.as_str(),
-            current_fingerprint.as_deref(),
-        )
-        .await?
+        && let Some(body) = attempt.skip_body(current_fingerprint.as_deref()).await?
     {
-        return Ok(ApiJson(skipped_body(&reason)));
+        return Ok(ApiJson(body));
     }
 
-    // Held for the rest of this handler (dropped at function return,
-    // success or error alike) — see this function's "Single-flight" doc
+    // Held for the rest of this handler (dropped explicitly below, before
+    // the latest-copy launch — see this function's "Single-flight" doc
     // section above for why acquiring it is the very first thing done
-    // after validating the mart name.
-    let _export_guard = state
+    // after validating the mart name. A `409` here records NO run
+    // (DATA-56): the publish that holds the lock records its own row, and
+    // a row written by the call it turned away would be newer and hide
+    // that result.
+    let export_guard = state
         .gold_export_locks
         .try_acquire(mart_ident.as_str())
         .await
@@ -439,7 +543,9 @@ pub async fn export(
             ))
         })?;
 
-    let token = read_catalog_token(&state.config.lakekeeper_gold_export_token_file).await?;
+    let token = attempt
+        .catalog_token(current_fingerprint.as_deref())
+        .await?;
     let iceberg_config = gold_export::iceberg_config(
         state.config.lakekeeper_catalog_uri.clone(),
         state.config.lakekeeper_warehouse.clone(),
@@ -487,14 +593,11 @@ pub async fn export(
     )
     .await;
     let finished_at = time::OffsetDateTime::now_utc();
+    // QA LH-DATA-1-01 (DATA-49): one conversion, before the row is stored, so
+    // the history row and the response carry the same classified sentence and
+    // the same reference. `GoldExportError`'s `Display` is the log's only.
+    let export_result = export_result.map_err(ApiError::from);
 
-    let triggered_by = principal.as_ref().map_or_else(
-        || "unknown".to_owned(),
-        |Extension(p)| match p.id {
-            PrincipalId::Service(_) => format!("service:{}", p.display_name),
-            PrincipalId::User(_) => format!("user:{}", p.display_name),
-        },
-    );
     record_export_history(
         &state,
         mart_ident.as_str(),
@@ -502,11 +605,18 @@ pub async fn export(
         started_at,
         finished_at,
         current_fingerprint.as_deref().unwrap_or(""),
-        &export_result,
+        export_result.as_ref(),
     )
     .await;
 
-    let result = export_result.map_err(ApiError::from)?;
+    let result = export_result?;
+
+    // DATA-6 D6: a publish that wrote rows is followed by one
+    // `gold_latest_copy_job` run for this mart. The single-flight lock is
+    // released BEFORE the launch (the launch is a best-effort follow-up
+    // to a publish that already succeeded; the next publish must not
+    // queue behind an orchestrator round trip it does not need).
+    drop(export_guard);
 
     Ok(ApiJson(json!({
         "namespace": result.namespace,
@@ -515,14 +625,59 @@ pub async fn export(
         "rowsExported": result.rows_exported,
         "snapshotId": result.snapshot_id,
         "exportedAt": result.exported_at_ms.and_then(millis_to_rfc3339),
+        // DATA-6 M2: the ONE stamp this publish wrote on every row, so
+        // "the rows of this publish" are addressable; microseconds are
+        // kept because two publishes can fall in one second.
+        "copyExportedAt": result
+            .copy_exported_at_micros
+            .and_then(crate::gold_latest_copy::micros_to_rfc3339),
+        "latestCopy": latest_copy_answer(&state, mart_ident.as_str(), &result).await,
     })))
 }
 
-/// Best-effort history write for one finished export attempt: every
-/// `POST` records exactly one row, success or failure (the acceptance
-/// test counts on it), but a failed write is logged, never propagated —
-/// this table is a history view, not a correctness dependency of the
-/// export itself (`gold_export_history::record_export_run`'s doc comment).
+/// The `latestCopy` field of [`export`]'s answer (D6, D13): the launched
+/// job's table name and status, or `null` when this publish wrote no
+/// copy (a zero-row publish — nothing to copy, and the field says so,
+/// rather than pretending a run was queued). The launch is best-effort:
+/// its own failure is recorded and answered as `"not_started"`, never
+/// propagated into the publish's answer.
+async fn latest_copy_answer(
+    state: &AppState,
+    mart: &str,
+    result: &gold_export::GoldExportResult,
+) -> Value {
+    let (true, Some(copy_micros)) = (result.rows_exported > 0, result.copy_exported_at_micros)
+    else {
+        return Value::Null;
+    };
+    let request = crate::gold_latest_copy::LatestCopyRequest {
+        mart,
+        table: &result.table,
+        copy_exported_at_micros: copy_micros,
+        rows: u64::try_from(result.rows_exported).unwrap_or(u64::MAX),
+    };
+    let status = crate::gold_latest_copy::launch(&state.dagster, &state.clickhouse, &request).await;
+    json!({
+        "table": format!("gold.{}", lakehouse_iceberg::gold::latest_table_name(&result.table)),
+        "status": status,
+    })
+}
+
+/// Best-effort history write for one finished export attempt: at most one row
+/// per call — none for a refusal, a skip under `?ifChanged=true`, or a `409`;
+/// one for the export's outcome; one for a failure before the export on a mart
+/// `system.tables` lists (the exact list is this module's "What is recorded"
+/// section on `export`). The acceptance test counts on it. A failed write is
+/// logged, never propagated — this table is a history view, not a correctness
+/// dependency of the export itself (`gold_export_history::record_export_run`'s
+/// doc comment).
+///
+/// `export_result` is the converted result, so the row's `error` is the
+/// sentence the response carries (`DATA-49`, QA `LH-DATA-1-01`) — the
+/// `ApiError`'s own text, never the `Display` of a `GoldExportError`, which
+/// holds upstream text for the log. A failure that happens before the export
+/// starts is recorded from the error alone ([`early_failure`], `DATA-56`,
+/// #484 review R4).
 #[allow(
     clippy::cast_possible_truncation,
     reason = "rows_exported is a usize from an in-memory Vec of one ClickHouse batch, \
@@ -535,9 +690,9 @@ async fn record_export_history(
     started_at: time::OffsetDateTime,
     finished_at: time::OffsetDateTime,
     content_fingerprint: &str,
-    export_result: &Result<gold_export::GoldExportResult, GoldExportError>,
+    export_result: Result<&gold_export::GoldExportResult, &ApiError>,
 ) {
-    let error_message = export_result.as_ref().err().map(ToString::to_string);
+    let error_message = stored_error(export_result);
     let history_row = gold_export_history::NewGoldExportRun {
         mart,
         status: if export_result.is_ok() {
@@ -545,9 +700,9 @@ async fn record_export_history(
         } else {
             "failed"
         },
-        rows_exported: export_result.as_ref().ok().map(|r| r.rows_exported as u64),
-        format_version: export_result.as_ref().ok().map(|r| r.format_version),
-        snapshot_id: export_result.as_ref().ok().and_then(|r| r.snapshot_id),
+        rows_exported: export_result.ok().map(|r| r.rows_exported as u64),
+        format_version: export_result.ok().map(|r| r.format_version),
+        snapshot_id: export_result.ok().and_then(|r| r.snapshot_id),
         error: error_message.as_deref(),
         triggered_by,
         content_fingerprint,
@@ -558,6 +713,213 @@ async fn record_export_history(
     {
         tracing::error!(%err, mart, "failed to record gold export history");
     }
+}
+
+/// Who triggered the publish, for the history row: a service and a person are
+/// told apart, and a call that authenticated only through the shared run token
+/// names no person at all.
+fn triggered_by(principal: Option<&Principal>) -> String {
+    principal.map_or_else(
+        || "unknown".to_owned(),
+        |p| match p.id {
+            PrincipalId::Service(_) => format!("service:{}", p.display_name),
+            PrincipalId::User(_) => format!("user:{}", p.display_name),
+        },
+    )
+}
+
+/// A publish attempt that has passed the token check, the mart name and the
+/// tenant gate — the facts a failure before the export still needs to leave a
+/// run with (`DATA-56`, #484 review R4). It carries the gate's answer instead of
+/// asking again, so a recording helper cannot be reached for a mart the caller
+/// was never shown.
+struct Attempt<'a> {
+    state: &'a AppState,
+    /// Whether `system.tables` lists the mart. The one answer that is never
+    /// recorded with a failed run (see [`early_failure`]).
+    exists: bool,
+    mart: &'a str,
+    triggered_by: &'a str,
+    /// When this attempt's row starts: the moment the mart was found to exist.
+    started_at: time::OffsetDateTime,
+}
+
+impl<'a> Attempt<'a> {
+    /// Opens the attempt on a mart the caller has already reached: asks whether
+    /// `system.tables` lists it, which is the last step that answers without
+    /// recording anything (`DATA-56` D19) — the engine that failed holds the
+    /// history — and starts the clock its row would carry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the classified `ClickHouse` failure of that read; nothing is
+    /// recorded for it.
+    async fn open(
+        state: &'a AppState,
+        mart: &'a str,
+        triggered_by: &'a str,
+    ) -> Result<Self, ApiError> {
+        let exists = mart_exists(&state.clickhouse, &state.config.gold_source_schema, mart)
+            .await
+            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
+        Ok(Self {
+            state,
+            exists,
+            mart,
+            triggered_by,
+            started_at: time::OffsetDateTime::now_utc(),
+        })
+    }
+
+    /// `?ifChanged=true`: the skip body when the mart is proven unchanged since
+    /// its last successful export, `None` when it must be exported (unknown
+    /// facts export, per [`if_changed_skip_reason`]). A read that fails is a
+    /// failed publish, not a skip (`DATA-56`, #484 review R4).
+    ///
+    /// # Errors
+    ///
+    /// Returns the classified history-read failure, after [`early_failure`] has
+    /// recorded it for a mart that exists.
+    async fn skip_body(&self, fingerprint: Option<&str>) -> Result<Option<Value>, ApiError> {
+        match unchanged_since_last_export_reason(self.state, self.mart, fingerprint).await {
+            Ok(Some(reason)) => Ok(Some(skipped_body(&reason))),
+            Ok(None) => Ok(None),
+            Err(err) => Err(early_failure(self, fingerprint.unwrap_or(""), err).await),
+        }
+    }
+
+    /// The catalog token the export publishes with. A token that cannot be read
+    /// is a failed publish, recorded before the error is returned (`DATA-56`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`lakekeeper_token::token_unavailable_message`]'s fixed sentence
+    /// as a `503`, after it is recorded for a mart that exists.
+    async fn catalog_token(
+        &self,
+        fingerprint: Option<&str>,
+    ) -> Result<lakehouse_core::secret::SecretValue, ApiError> {
+        match read_catalog_token(&self.state.config.lakekeeper_gold_export_token_file).await {
+            Ok(token) => Ok(token),
+            Err(err) => Err(early_failure_under_lock(self, fingerprint.unwrap_or(""), err).await),
+        }
+    }
+}
+
+/// The mart's content fingerprint, or `None` for a name that is not a table
+/// (`DATA-10` D2). A read that fails is a failed publish, recorded before the
+/// error is returned (`DATA-56`).
+///
+/// # Errors
+///
+/// Returns the classified `ClickHouse` failure (`422`/`503` with a reference),
+/// after [`early_failure`] has recorded it for a mart that exists.
+async fn read_content_fingerprint(
+    attempt: &Attempt<'_>,
+    schema: &str,
+) -> Result<Option<String>, ApiError> {
+    if !attempt.exists {
+        // DATA-56 D23: a name that is not a table goes on as it did before —
+        // it is not refused here and no early failure is recorded for it.
+        return Ok(None);
+    }
+    match gold_export_history::mart_content_fingerprint(
+        &attempt.state.clickhouse,
+        schema,
+        attempt.mart,
+    )
+    .await
+    {
+        Ok(fingerprint) => Ok(fingerprint),
+        Err(e) => {
+            let err = upstream_error::ch_error(&upstream_error::DATABASE, &e);
+            Err(early_failure(attempt, "", err).await)
+        }
+    }
+}
+
+/// Records a publish that failed before `export_mart` was reached, and returns
+/// the error the caller answers with (`DATA-56`, #484 review R4).
+///
+/// The rule (`DATA-56` D19): once the caller is authenticated and allowed and
+/// the mart is shown to be theirs, a failure is a failed publish and leaves a
+/// run — the fingerprint read, the `?ifChanged=true` history read, and the
+/// catalog token are all inside that boundary. Before it, nothing is recorded:
+/// the token check, the mart name, and the tenant gate all refuse the request
+/// rather than fail it. `attempt.exists` is `false` for a name `system.tables`
+/// does not list (D23): such a name goes on as before and no early failure is
+/// recorded for it. A failed read of `system.tables` never gets here:
+/// `Attempt::open` returns it unrecorded, so it never builds an `Attempt`
+/// (review round 1, R5).
+///
+/// This is the PRE-LOCK helper, used for the content fingerprint and the
+/// `?ifChanged=true` history read (review round 1, R3): the row is written only
+/// when no publish of this mart is in flight. A publish in flight will write its
+/// own row with an older `started_at`, which a fresher row here would hide — the
+/// card would say "Last publish failed" although that publish succeeded, the
+/// exact harm the `409` avoids by recording nothing. The lock is held across the
+/// write, so the two cannot interleave. The catalog token is read with the lock
+/// already held ([`early_failure_under_lock`]).
+///
+/// The write is best-effort, like every other history write here: when
+/// `ClickHouse` is what failed, the row cannot be written and the card's own
+/// read fails with it, so nothing can be said about "Last publish failed"
+/// (`DATA-56` D21). The caller's error is returned unchanged either way.
+async fn early_failure(
+    attempt: &Attempt<'_>,
+    content_fingerprint: &str,
+    err: ApiError,
+) -> ApiError {
+    if let Ok(_guard) = attempt
+        .state
+        .gold_export_locks
+        .try_acquire(attempt.mart)
+        .await
+    {
+        record_early_failure(attempt, content_fingerprint, &err).await;
+    }
+    err
+}
+
+/// [`early_failure`] for the catalog token read, which `export` reaches with the
+/// mart's lock already held: acquiring it again would always fail, so this
+/// records without asking (review round 1, R3). A publish in flight cannot exist
+/// here — this call IS the publish that holds the lock.
+async fn early_failure_under_lock(
+    attempt: &Attempt<'_>,
+    content_fingerprint: &str,
+    err: ApiError,
+) -> ApiError {
+    record_early_failure(attempt, content_fingerprint, &err).await;
+    err
+}
+
+/// The one history write both early-failure helpers share: nothing for a name
+/// `system.tables` does not list (D23), one failed row otherwise.
+async fn record_early_failure(attempt: &Attempt<'_>, content_fingerprint: &str, err: &ApiError) {
+    if attempt.exists {
+        record_export_history(
+            attempt.state,
+            attempt.mart,
+            attempt.triggered_by,
+            attempt.started_at,
+            time::OffsetDateTime::now_utc(),
+            content_fingerprint,
+            Err(err),
+        )
+        .await;
+    }
+}
+
+/// The sentence a failed publish stores, or `None` for a success.
+///
+/// Takes the converted result, not the `GoldExportError`, so this module cannot
+/// store an upstream text by accident (`DATA-49`, QA `LH-DATA-1-01`): the
+/// `ApiError` is what the response carries, and the row and the response are
+/// meant to read the same. Borrowed, not owned, so a failure recorded before
+/// the export starts can be stored and then answered (`DATA-56`).
+fn stored_error(result: Result<&gold_export::GoldExportResult, &ApiError>) -> Option<String> {
+    result.err().map(ToString::to_string)
 }
 
 /// Renders an `Iceberg` snapshot's Unix-millisecond commit time as an RFC
@@ -579,12 +941,26 @@ fn millis_to_rfc3339(ms: i64) -> Option<String> {
 /// whatever the last `POST` claimed. This is the round-trip proof; it
 /// does not touch `ClickHouse` at all.
 ///
+/// A mart the catalog does not have answers `200` with `published: false`
+/// and every other fact `null` ([`read_back_body`]) — never published is a
+/// state, not an error (`DATA-49`, QA `LH-DATA-1-01`).
+///
 /// # Errors
 ///
-/// Returns 401/503 from [`check_export_token`] (same guard as `POST` —
-/// this still reveals row counts, not public data), 503 if the Lakekeeper
-/// token cannot be read, or 500 if the table does not exist yet or the
-/// Iceberg read fails.
+/// Returns 401/503 from [`check_gold_read_token`] (`SEC-66`: the read-side
+/// guard also accepts `gold:read`; this still reveals row counts, not
+/// public data), 422 with the tenant gate's fixed sentence when the
+/// deployment holds several tenants and names no catalog tenant
+/// (`DATA-64`/`SEC-50`), 404 with the gate's own table sentence for a
+/// signed-in person whose tenant does not own the shared catalog
+/// (`DATA-64`/`SEC-50`), 503 with the shared catalog's own sentence when
+/// the deployment cannot count its tenants (`SEC-50` R5), 503 if the
+/// Lakekeeper token cannot be read, or 500 if the catalog refuses or fails
+/// the call for any reason other than "table not found", or the Iceberg
+/// read fails. The `DATA-64` tenant gate runs right after the mart name is
+/// validated and BEFORE the Lakekeeper token file or Iceberg is touched,
+/// so a caller whose reach does not cover the shared catalog learns
+/// nothing about the mart.
 pub async fn read_back(
     State(state): State<AppState>,
     Path(mart): Path<String>,
@@ -593,7 +969,7 @@ pub async fn read_back(
     principal: Option<Extension<Principal>>,
 ) -> ApiResult<ApiJson<Value>> {
     let header_token = headers.get("x-run-token").and_then(|v| v.to_str().ok());
-    check_export_token(
+    check_gold_read_token(
         state.config.gold_export_run_token.as_deref(),
         header_token,
         query.token.as_deref(),
@@ -602,6 +978,15 @@ pub async fn read_back(
 
     let mart_ident =
         Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+
+    // DATA-64 / SEC-50: read-back reads the SHARED catalog, so the gate
+    // asks whose reach covers it — a signed-in person's own tenant, or the
+    // catalog's own tenant for a job with no user (`export`'s own rule,
+    // R4/D3). It runs BEFORE the Lakekeeper token file and the Iceberg read
+    // below, so a caller whose reach does not cover the shared catalog is
+    // refused with the gate's 404/422/503 and learns nothing about the mart.
+    let actor = gold_export_gate_actor(principal.as_ref().map(|Extension(p)| p), &headers);
+    let _ = gated_source_table(&state, mart_ident.as_str(), actor).await?;
 
     let token = read_catalog_token(&state.config.lakekeeper_gold_export_token_file).await?;
     let iceberg_config = gold_export::iceberg_config(
@@ -614,22 +999,49 @@ pub async fn read_back(
         .await
         .map_err(ApiError::from)?;
 
-    Ok(ApiJson(json!({
-        "namespace": lakehouse_iceberg::gold::GOLD_NAMESPACE,
-        "table": mart_ident.as_str(),
-        "formatVersion": readback.format_version,
-        "rowsInIceberg": readback.rows,
-        "snapshotId": readback.snapshot_id,
-        "exportedAt": readback.exported_at_ms.and_then(millis_to_rfc3339),
-    })))
+    Ok(ApiJson(read_back_body(
+        mart_ident.as_str(),
+        readback.as_ref(),
+    )))
+}
+
+/// The body of `GET /api/gold/export/{mart}` and the assistant's
+/// `get_gold_export` tool, in one place so the two cannot drift (`DATA-49`,
+/// QA `LH-DATA-1-01`).
+///
+/// A mart never published answers `200` with `published: false` and every
+/// other fact `null`, never an error and never an invented number: the
+/// console treats "no export" as a normal state, and a 404 would make it a
+/// failed request in the browser for something that is not an error.
+pub(crate) fn read_back_body(mart: &str, readback: Option<&gold_export::GoldReadBack>) -> Value {
+    match readback {
+        None => json!({
+            "namespace": lakehouse_iceberg::gold::GOLD_NAMESPACE,
+            "table": mart,
+            "published": false,
+            "formatVersion": Value::Null,
+            "rowsInIceberg": Value::Null,
+            "snapshotId": Value::Null,
+            "exportedAt": Value::Null,
+        }),
+        Some(readback) => json!({
+            "namespace": lakehouse_iceberg::gold::GOLD_NAMESPACE,
+            "table": mart,
+            "published": true,
+            "formatVersion": readback.format_version,
+            "rowsInIceberg": readback.rows,
+            "snapshotId": readback.snapshot_id,
+            "exportedAt": readback.exported_at_ms.and_then(millis_to_rfc3339),
+        }),
+    }
 }
 
 /// Query parameters for `GET /api/gold/exports`.
 #[derive(Debug, Deserialize)]
 pub struct ExportsQuery {
     mart: String,
-    /// Same shared-token/permission gate as `export`/`read_back` — see
-    /// [`check_export_token`].
+    /// Same shared-token/permission gate as `read_back` — see
+    /// [`check_gold_read_token`].
     token: Option<String>,
 }
 
@@ -641,8 +1053,16 @@ pub struct ExportsQuery {
 /// # Errors
 ///
 /// Returns 400 if `mart` is missing/blank or not a valid identifier,
-/// 401/503 from [`check_export_token`], or 500 if the `ClickHouse` query
-/// fails.
+/// 401/503 from [`check_gold_read_token`] (`SEC-66`: the read-side guard
+/// also accepts `gold:read`), 422 with the tenant gate's fixed sentence
+/// when the deployment holds several tenants and names no catalog tenant
+/// (`DATA-64`/`SEC-50`), 404 with the gate's own table sentence for a
+/// signed-in person whose tenant does not own the shared catalog
+/// (`DATA-64`/`SEC-50`), 503 with the shared catalog's own sentence when
+/// the deployment cannot count its tenants (`SEC-50` R5), or 500 if the
+/// `ClickHouse` query fails. The `DATA-64` tenant gate runs right after
+/// the mart name is validated and BEFORE `ClickHouse` is touched, so
+/// history the caller may not read is never queried.
 pub async fn exports(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -650,7 +1070,7 @@ pub async fn exports(
     principal: Option<Extension<Principal>>,
 ) -> ApiResult<ApiJson<Value>> {
     let header_token = headers.get("x-run-token").and_then(|v| v.to_str().ok());
-    check_export_token(
+    check_gold_read_token(
         state.config.gold_export_run_token.as_deref(),
         header_token,
         query.token.as_deref(),
@@ -659,6 +1079,15 @@ pub async fn exports(
 
     let mart_ident = Ident::new(query.mart.trim())
         .map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+
+    // DATA-64 / SEC-50: the history reveals the shared catalog mart's row
+    // counts and timing, so it is gated exactly as `read_back` is — the
+    // signed-in person as themselves, a job with no user as the catalog's
+    // own tenant (R4, D3). The gate runs BEFORE `ClickHouse` is read, so a
+    // caller whose reach does not cover the shared catalog gets the gate's
+    // 404/422/503 and no history query is issued.
+    let actor = gold_export_gate_actor(principal.as_ref().map(|Extension(p)| p), &headers);
+    let _ = gated_source_table(&state, mart_ident.as_str(), actor).await?;
 
     let runs = gold_export_history::list_export_runs(&state.clickhouse, mart_ident.as_str(), 50)
         .await
@@ -876,10 +1305,26 @@ async fn publication_body(
         last_export.as_ref().map(|e| e.content_fingerprint.as_str()),
     );
     let last_exported_at = last_export.as_ref().and_then(|e| e.started_at_ms);
+    // `DATA-49` (QA `LH-DATA-1-01`): the newest run of any status, so the card
+    // can say the last publish failed instead of reading "Up to date" through
+    // five failed runs. A failed read here is classified like its neighbours.
+    let newest_run = gold_export_history::last_export_run(&state.clickhouse, mart)
+        .await
+        .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     // PR #105 removed From<ChError>; classify, never surface ClickHouse text.
     let last_trim = gold_export_history::last_trim(&state.clickhouse, mart)
         .await
         .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
+    // DATA-6 D4: the latest-copy table's name, what it holds, and the
+    // newest run's outcome — the same classified-ClickHouse-failure shape
+    // as its neighbours (principle 4). `sanitize_mart_name` failing here
+    // is a 400 `invalid mart`, the same mapping `consumers` uses.
+    let sanitized_mart = lakehouse_iceberg::gold::sanitize_mart_name(mart)
+        .map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+    let (latest_holds, latest_run) =
+        crate::gold_latest_copy::latest_copy_state(&state.clickhouse, mart)
+            .await
+            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     Ok(json!({
         "mart": mart,
         "enabled": enabled,
@@ -887,9 +1332,35 @@ async fn publication_body(
         "lastChangedAt": last_changed_at.and_then(millis_to_rfc3339),
         "lastExportedAt": last_exported_at.and_then(millis_to_rfc3339),
         "changedSinceExport": changed_since_export,
+        "lastFailure": last_failure(newest_run.as_ref()),
         "canEdit": can_edit,
         "trim": last_trim,
+        "latestCopy": {
+            "table": format!("gold.{}", lakehouse_iceberg::gold::latest_table_name(&sanitized_mart)),
+            "holds": latest_holds,
+            "lastRun": latest_run,
+        },
     }))
+}
+
+/// The `lastFailure` field of [`publication_body`] (`DATA-49`, QA
+/// `LH-DATA-1-01`): `null` unless the newest run of the mart is `failed`, then
+/// the time it started and the sentence that was stored for it.
+///
+/// `lastExportedAt` and `changedSinceExport` keep describing the last
+/// *successful* publish, so the card can show both facts at once. A row with no
+/// stored reason says so instead of inventing one.
+fn last_failure(newest: Option<&gold_export_history::LastExportRun>) -> Value {
+    let Some(run) = newest.filter(|run| run.status == "failed") else {
+        return Value::Null;
+    };
+    json!({
+        "failedAt": run.started_at_ms.and_then(millis_to_rfc3339),
+        "reason": run
+            .error
+            .clone()
+            .unwrap_or_else(|| "The publish failed. No reason was recorded.".to_owned()),
+    })
 }
 
 /// Borrow the Postgres pool, or fail with a 503. Mirrors
@@ -912,17 +1383,17 @@ fn pool(state: &AppState) -> Result<&sqlx::PgPool, ApiError> {
 /// deployment publishes exactly this list, which is empty until a
 /// `gold:export` principal switches a mart on.
 ///
-/// The floor is `RequiresAuth` (see `POLICY_TABLE`) PLUS
-/// [`check_export_token`] in the handler, same two-layer shape as the
-/// export routes: the scheduler authenticates with its run token or
-/// service identity; a human session needs `gold:export`. A publication
-/// list is not secret the way row data is, but it does reveal what a
-/// deployment considers its "open format" copy — same posture as
-/// `GET /api/gold/exports`.
+/// The floor is the SEC-66 read grant (`gold:read`, or the wider
+/// `gold:export`) in `POLICY_TABLE` PLUS [`check_gold_read_token`] in the
+/// handler, same two-layer shape as the other Gold GETs: the scheduler
+/// authenticates with its run token or service identity; a human session
+/// needs one of the two Gold grants. A publication list is not secret the
+/// way row data is, but it does reveal what a deployment considers its
+/// "open format" copy — same posture as `GET /api/gold/exports`.
 ///
 /// # Errors
 ///
-/// Returns 401/503 from [`check_export_token`], 503 when Postgres is not
+/// Returns 401/503 from [`check_gold_read_token`], 503 when Postgres is not
 /// configured ([`pool`]; this feature is Postgres-backed, unlike the
 /// export routes), or 500 for a store failure (classified, never raw
 /// upstream text).
@@ -933,7 +1404,7 @@ pub async fn publications(
     principal: Option<Extension<Principal>>,
 ) -> ApiResult<ApiJson<Value>> {
     let header_token = headers.get("x-run-token").and_then(|v| v.to_str().ok());
-    check_export_token(
+    check_gold_read_token(
         state.config.gold_export_run_token.as_deref(),
         header_token,
         query.token.as_deref(),
@@ -952,7 +1423,9 @@ pub async fn publications(
 }
 
 /// `GET /api/gold/export/{mart}/publication` — one mart's publication
-/// state: the stored switch plus the two measured freshness facts.
+/// state: the stored switch, the two measured freshness facts, and
+/// `lastFailure` when the mart's newest run failed (`DATA-49`, QA
+/// `LH-DATA-1-01`).
 ///
 /// A mart with no `gold_publication` row is OFF (the default), reported
 /// as `enabled: false, updatedAt: null` — a missing row is a state, not
@@ -1019,9 +1492,6 @@ async fn record_publication_audit(
     mart: &str,
     enabled: bool,
 ) {
-    let Some(pool) = state.pg.as_deref() else {
-        return;
-    };
     let event = NewAuditEvent {
         principal_id: Some(principal.id.uuid().to_string()),
         principal_kind: Some(principal.kind_for_audit().to_owned()),
@@ -1036,9 +1506,7 @@ async fn record_publication_audit(
         approval_id: None,
         session_id: None,
     };
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::error!(%err, mart, "failed to record gold publication audit");
-    }
+    audit_coverage::record_best_effort(state, event).await;
 }
 
 /// `PUT /api/gold/export/{mart}/publication` — switch one mart's
@@ -1159,7 +1627,7 @@ mod tests {
         // RequiresAuth still runs before the handler body, so this proves
         // routing + policy wiring (never 404), matching every other
         // "route is registered" test in this crate's style (see
-        // routes::connectors::tests::debezium_properties_route_is_registered).
+        // routes::connectors::tests, the other "route is registered" tests).
         assert_ne!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -1218,6 +1686,55 @@ mod tests {
         );
     }
 
+    /// `SEC-66`: a person holding the read grant can open the Gold GETs
+    /// whether or not a run token is configured, without presenting one —
+    /// the policy gate admits them and this handler guard must not undo it.
+    #[test]
+    fn gold_read_permission_passes_the_read_guard_with_or_without_a_configured_token() {
+        assert!(
+            check_gold_read_token(None, None, None, Some(&human_principal_with("gold:read")))
+                .is_ok()
+        );
+        assert!(
+            check_gold_read_token(
+                Some("secret"),
+                None,
+                None,
+                Some(&human_principal_with("gold:read")),
+            )
+            .is_ok()
+        );
+    }
+
+    /// `SEC-66`: the read grant stays read-only — the export WRITE still
+    /// calls `check_export_token` directly and must refuse it.
+    #[test]
+    fn gold_read_permission_does_not_pass_the_write_guard() {
+        assert!(
+            check_export_token(None, None, None, Some(&human_principal_with("gold:read"))).is_err()
+        );
+        assert!(
+            check_export_token(
+                Some("secret"),
+                None,
+                None,
+                Some(&human_principal_with("gold:read")),
+            )
+            .is_err()
+        );
+    }
+
+    /// `SEC-66`: the scheduler's two token paths are unchanged by the new
+    /// read guard — the shared token and an unscoped service principal
+    /// still pass exactly as they did through `check_export_token`.
+    #[test]
+    fn read_guard_still_accepts_the_shared_token_and_an_unscoped_service_principal() {
+        assert!(check_gold_read_token(Some("secret"), Some("secret"), None, None).is_ok());
+        let mut service = service_principal();
+        service.permissions = PermissionSet::parse("");
+        assert!(check_gold_read_token(None, None, None, Some(&service)).is_ok());
+    }
+
     #[test]
     fn no_configured_token_still_accepts_a_service_principal_with_no_explicit_scope() {
         // Unchanged behavior from before this task: a service principal
@@ -1261,6 +1778,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn configured_token_forbids_a_signed_in_user_without_the_permission_who_sent_no_token() {
+        // QA LH-DATA-1-02 (plan D6): 403 so the console does not read it as
+        // an expired session.
+        let err = check_export_token(
+            Some("secret"),
+            None,
+            None,
+            Some(&human_principal_with("catalog:read")),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::PermissionDenied(_)));
+        assert_eq!(err.status(), 403);
+    }
+
+    #[test]
+    fn configured_token_still_401s_a_user_without_the_permission_who_sent_a_wrong_token() {
+        let err = check_export_token(
+            Some("secret"),
+            Some("wrong"),
+            None,
+            Some(&human_principal_with("catalog:read")),
+        )
+        .unwrap_err();
+        assert_eq!(err.status(), 401);
+    }
+
+    #[test]
+    fn configured_token_still_401s_when_there_is_no_principal_and_no_token() {
+        let err = check_export_token(Some("secret"), None, None, None).unwrap_err();
+        assert_eq!(err.status(), 401);
+    }
+
     // ── compute_changed_since_export (DATA-10 T3 / D4) ──────────────────
 
     #[test]
@@ -1298,6 +1848,7 @@ mod tests {
             Some("10:11129132029957349367:16812361877011020269"),
             Some("10:11129132029957349367:16812361877011020269"),
             Some(1_700_000_000_000),
+            false,
         )
         .expect("matching fingerprint must skip");
         assert!(skip.starts_with("unchanged since "), "{skip}");
@@ -1310,6 +1861,7 @@ mod tests {
                 Some("10:111:222"),
                 Some("10:333:222"),
                 Some(1_700_000_000_000),
+                false,
             )
             .is_none()
         );
@@ -1317,13 +1869,13 @@ mod tests {
 
     #[test]
     fn no_success_row_exports() {
-        assert!(if_changed_skip_reason(Some("10:111:222"), None, None).is_none());
+        assert!(if_changed_skip_reason(Some("10:111:222"), None, None, false).is_none());
     }
 
     #[test]
     fn empty_stored_fingerprint_exports() {
         assert!(
-            if_changed_skip_reason(Some("10:111:222"), Some(""), Some(1_700_000_000_000),)
+            if_changed_skip_reason(Some("10:111:222"), Some(""), Some(1_700_000_000_000), false,)
                 .is_none()
         );
     }
@@ -1331,13 +1883,175 @@ mod tests {
     #[test]
     fn empty_or_missing_current_fingerprint_exports() {
         assert!(
-            if_changed_skip_reason(Some(""), Some("10:111:222"), Some(1_700_000_000_000),)
+            if_changed_skip_reason(Some(""), Some("10:111:222"), Some(1_700_000_000_000), false,)
                 .is_none()
         );
         assert!(
-            if_changed_skip_reason(None, Some("10:111:222"), Some(1_700_000_000_000),).is_none()
+            if_changed_skip_reason(None, Some("10:111:222"), Some(1_700_000_000_000), false)
+                .is_none()
         );
-        assert!(if_changed_skip_reason(None, None, None).is_none());
+        assert!(if_changed_skip_reason(None, None, None, false).is_none());
+    }
+
+    /// QA `LH-DATA-1-01` (`DATA-49`): a failed newest run publishes even when
+    /// the fingerprint matches the last success — otherwise every scheduled run
+    /// would be skipped and the card would stay "Last publish failed".
+    #[test]
+    fn a_failed_newest_run_is_never_skipped_even_when_the_fingerprint_matches() {
+        assert!(
+            if_changed_skip_reason(
+                Some("10:111:222"),
+                Some("10:111:222"),
+                Some(1_700_000_000_000),
+                true,
+            )
+            .is_none(),
+            "a failed newest run is a doubt, and doubt fails toward publishing"
+        );
+    }
+
+    /// The `lastFailure` field is null unless the newest run failed, whatever the
+    /// last successful publish says.
+    #[test]
+    fn last_failure_is_null_when_the_newest_run_succeeded_or_there_is_none() {
+        assert_eq!(last_failure(None), Value::Null);
+        assert_eq!(
+            last_failure(Some(&gold_export_history::LastExportRun {
+                status: "success".to_owned(),
+                started_at_ms: Some(1_700_000_000_000),
+                error: None,
+            })),
+            Value::Null
+        );
+    }
+
+    /// A failed newest run carries the time it started and the stored sentence.
+    #[test]
+    fn last_failure_carries_the_time_and_the_stored_sentence_when_the_newest_run_failed() {
+        let failure = last_failure(Some(&gold_export_history::LastExportRun {
+            status: "failed".to_owned(),
+            started_at_ms: Some(1_700_000_000_000),
+            error: Some("The catalog request failed. Reference: abc".to_owned()),
+        }));
+        assert_eq!(
+            failure["reason"],
+            "The catalog request failed. Reference: abc"
+        );
+        assert_eq!(failure["failedAt"], "2023-11-14T22:13:20Z");
+    }
+
+    // ── The read-back body (DATA-49, QA LH-DATA-1-01) ─────────────────────
+
+    /// A mart the catalog does not have is "not published": every other fact is
+    /// null, so the card invents neither a row count nor a time.
+    #[test]
+    fn the_read_back_of_a_mart_never_published_says_so_and_invents_no_number() {
+        let body = read_back_body("never_published", None);
+        assert_eq!(body["published"], Value::Bool(false));
+        assert_eq!(body["table"], "never_published");
+        assert_eq!(body["namespace"], lakehouse_iceberg::gold::GOLD_NAMESPACE);
+        for field in ["formatVersion", "rowsInIceberg", "snapshotId", "exportedAt"] {
+            assert!(body[field].is_null(), "{field} must be null: {body}");
+        }
+    }
+
+    /// A published mart keeps today's fields and says it is published.
+    #[test]
+    fn the_read_back_of_a_published_mart_keeps_its_fields_and_says_published() {
+        let readback = gold_export::GoldReadBack {
+            format_version: 2,
+            rows: 5,
+            snapshot_id: Some(42),
+            exported_at_ms: Some(1_700_000_000_000),
+        };
+        let body = read_back_body("orders_rollup", Some(&readback));
+        assert_eq!(body["published"], Value::Bool(true));
+        assert_eq!(body["formatVersion"], 2);
+        assert_eq!(body["rowsInIceberg"], 5);
+        assert_eq!(body["snapshotId"], 42);
+        assert_eq!(body["exportedAt"], "2023-11-14T22:13:20Z");
+    }
+
+    // ── The stored and answered sentence (DATA-49, QA LH-DATA-1-01) ──────
+
+    /// QA `LH-DATA-1-01` (`DATA-49`): the batch text can hold a cell value and
+    /// the Arrow or Iceberg library's words. It is classified — fixed sentence,
+    /// reference id — before it reaches a response or a stored row, and the
+    /// status stays `422` as it was.
+    #[test]
+    fn a_batch_failure_answers_a_fixed_sentence_with_a_reference_and_never_the_value() {
+        let err = ApiError::from(GoldExportError::Batch(
+            "amount: \"12,5\" is not a valid decimal".to_owned(),
+        ));
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let text = err.to_string();
+        assert!(
+            text.starts_with(
+                "A value in this table could not be written in open format. Reference: "
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("12,5"),
+            "the cell value must not travel: {text}"
+        );
+    }
+
+    /// QA `LH-DATA-1-01` (`DATA-49`): the history row stores the sentence the
+    /// response carried, so the card's reason and the answer read the same and
+    /// neither holds the engine's own text or its version.
+    #[test]
+    fn the_stored_error_of_a_failed_publish_is_the_classified_sentence() {
+        let result: Result<gold_export::GoldExportResult, ApiError> = Err(ApiError::from(
+            GoldExportError::ClickHouse(ChError::Server(
+                "Code: 60. DB::Exception: Unknown table (version 26.8.1.1)".to_owned(),
+            )),
+        ));
+        let stored = stored_error(result.as_ref()).expect("a failed publish stores a sentence");
+        assert!(
+            stored.starts_with("The database request failed. Reference: "),
+            "{stored}"
+        );
+        assert!(!stored.contains("Code: 60"), "{stored}");
+        assert!(!stored.contains("26.8"), "{stored}");
+        assert!(
+            stored_error(Ok(&gold_export::GoldExportResult {
+                namespace: "gold".to_owned(),
+                table: "orders_rollup".to_owned(),
+                format_version: 2,
+                rows_exported: 1,
+                snapshot_id: Some(1),
+                exported_at_ms: Some(1_700_000_000_000),
+                copy_exported_at_micros: Some(1_700_000_000_123_456),
+            }))
+            .is_none()
+        );
+    }
+
+    /// `DATA-6` D7: a mart whose Iceberg table is another mart's
+    /// latest-copy table is refused with the fixed sentence, as a 422 —
+    /// the text names the mart and carries no upstream words (no catalog
+    /// address, no HTTP detail), so it is safe to answer as-is.
+    #[test]
+    fn a_latest_copy_target_answers_the_fixed_sentence_as_a_422() {
+        let err = ApiError::from(GoldExportError::TargetIsLatestCopy {
+            mart: "x_latest".to_owned(),
+        });
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let text = err.to_string();
+        assert!(
+            text.contains("x_latest"),
+            "the sentence names the mart: {text}"
+        );
+        assert!(text.contains("latest-copy table"), "{text}");
+        assert!(
+            !text.to_lowercase().contains("iceberg catalog"),
+            "no catalog address travels: {text}"
+        );
+        assert!(
+            !text.to_lowercase().contains("http"),
+            "no HTTP detail travels: {text}"
+        );
     }
 
     /// `SEC-50` slice 2 T8 (M12): the publication body reads the mart (its
@@ -1418,6 +2132,112 @@ mod tests {
             "the refusal precedes the engine: no fingerprint and no parts read"
         );
         Ok(())
+    }
+
+    /// The `AppState` of a `wiremock` `ClickHouse` stand-in, with no live
+    /// Postgres (the history write needs neither).
+    fn state_with_clickhouse(url: &str) -> AppState {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+        env.insert("CH_URL".to_owned(), url.to_owned());
+        AppState::new(Config::from_map(&env).unwrap())
+    }
+
+    /// How many rows the stand-in was asked to insert into the history table —
+    /// the table's own `CREATE`/`ALTER` statements are not counted.
+    async fn history_inserts(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("mock records requests")
+            .iter()
+            .filter(|r| {
+                String::from_utf8_lossy(&r.body).contains("INSERT INTO console.gold_export_run")
+            })
+            .count()
+    }
+
+    /// `DATA-56` D19 (review round 1, R3): with nothing publishing the mart, a
+    /// failure before the per-mart lock leaves one failed run.
+    #[tokio::test]
+    async fn an_early_failure_with_no_publish_in_flight_is_recorded_once() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok.\n"))
+            .mount(&server)
+            .await;
+        let state = state_with_clickhouse(&server.uri());
+        let attempt = Attempt {
+            state: &state,
+            exists: true,
+            mart: "orders_rollup",
+            triggered_by: "user:operator",
+            started_at: time::OffsetDateTime::now_utc(),
+        };
+        let err = early_failure(
+            &attempt,
+            "10:1:2",
+            ApiError::Unavailable("The database is unavailable.".to_owned()),
+        )
+        .await;
+        assert_eq!(
+            err.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the caller's own error is returned unchanged"
+        );
+        assert_eq!(
+            history_inserts(&server).await,
+            1,
+            "a failure before the export, with no publish in flight, is one failed run"
+        );
+    }
+
+    /// `DATA-56` D19 (review round 1, R3): while a publish of the mart is in
+    /// flight, a failure before the per-mart lock writes nothing — its row would
+    /// be newer than the running publish's and hide its result, the harm the
+    /// `409` avoids by recording nothing.
+    #[tokio::test]
+    async fn an_early_failure_while_a_publish_is_in_flight_is_not_recorded() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok.\n"))
+            .mount(&server)
+            .await;
+        let state = state_with_clickhouse(&server.uri());
+        let _in_flight = state
+            .gold_export_locks
+            .try_acquire("orders_rollup")
+            .await
+            .expect("no publish of the mart is running yet");
+        let attempt = Attempt {
+            state: &state,
+            exists: true,
+            mart: "orders_rollup",
+            triggered_by: "user:operator",
+            started_at: time::OffsetDateTime::now_utc(),
+        };
+        let err = early_failure(
+            &attempt,
+            "",
+            ApiError::Unavailable("The database is unavailable.".to_owned()),
+        )
+        .await;
+        assert_eq!(
+            err.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the caller still gets its own error"
+        );
+        assert_eq!(
+            history_inserts(&server).await,
+            0,
+            "the publish in flight records its own run; a row here would hide its result"
+        );
     }
 
     #[tokio::test]

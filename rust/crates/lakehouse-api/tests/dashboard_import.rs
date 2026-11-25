@@ -8,14 +8,17 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use common::{create_principal_with_permissions, session_cookie_for_user, spin_up_with_env};
+use common::{
+    CATALOG_TENANT, create_principal_with_permissions, in_the_catalog_tenant,
+    session_cookie_for_user, spin_up_with_env,
+};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
@@ -187,7 +190,14 @@ async fn app() -> App {
         })
         .mount(&ch)
         .await;
-    let env = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
+    // SEC-58: the import preview's `readableTables` reads the shared `serving`
+    // catalog, so this fixture names the tenant that owns it. Without it a
+    // multi-tenant deployment refuses those names to every caller and the
+    // import behaviour these tests are about would never be reached.
+    let env = HashMap::from([
+        ("CH_URL".to_owned(), ch.uri()),
+        ("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned()),
+    ]);
     let common::TestApp { router, pool } = spin_up_with_env(&env).await;
     App {
         router,
@@ -230,6 +240,7 @@ async fn send(
 
 async fn writer(app: &App, permissions: &str) -> String {
     let user = create_principal_with_permissions(&app.pool, permissions).await;
+    in_the_catalog_tenant(&app.pool, user).await;
     session_cookie_for_user(&app.pool, user).await
 }
 

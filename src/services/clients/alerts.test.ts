@@ -72,3 +72,26 @@ describe("clickhouseAlertRuleService.testRule", () => {
     expect(missing.message).toBe("alert rule not found.")
   })
 })
+
+describe("clickhouseAlertRuleService refusals (WEB-12)", () => {
+  it("listRules rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: alert:read" }, 403))
+
+    await expect(clickhouseAlertRuleService.listRules()).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the alert:read permission.",
+    })
+  })
+})
+
+describe("clickhouseAlertRuleService.listMine", () => {
+  it("reads /api/alerts/mine for one chart, not the permission-gated /api/alerts list (BI-43)", async () => {
+    const calls = stubFetch(() => json({ rules: [{ id: RULE }] }))
+
+    const rules = await clickhouseAlertRuleService.listMine("c 1")
+
+    expect(rules).toEqual([{ id: RULE } as never])
+    expect(calls.map((c) => c.url)).toEqual(["/api/alerts/mine?chart=c%201"])
+  })
+})

@@ -1,5 +1,5 @@
 import type { DeleteMapResult, MapService, MapUser, UploadedMap } from "../contracts/maps"
-import { ServiceError, type ServiceErrorCode } from "../errors"
+import { ServiceError, deniedFor, type ServiceErrorCode } from "../errors"
 import { apiFetch } from "../http"
 
 /**
@@ -8,7 +8,6 @@ import { apiFetch } from "../http"
  * show. The routes are not on the server yet; until they are, a read answers 404.
  */
 function codeFor(status: number): ServiceErrorCode {
-  if (status === 401 || status === 403) return "permission_denied"
   if (status === 404) return "not_found"
   if (status >= 500) return "unavailable"
   return "invalid_request"
@@ -17,7 +16,12 @@ function codeFor(status: number): ServiceErrorCode {
 async function call<T>(url: string, init: RequestInit, fallback: string): Promise<T> {
   const res = await apiFetch(url, init)
   const json = await res.json().catch(() => null)
-  if (!res.ok) throw new ServiceError(codeFor(res.status), json?.error ?? fallback, res.status)
+  if (!res.ok) {
+    // WEB-12: a refusal goes through deniedFor (errors.ts).
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
+    throw new ServiceError(codeFor(res.status), json?.error ?? fallback, res.status)
+  }
   return json as T
 }
 
@@ -44,6 +48,9 @@ export const mapService: MapService = {
     if (res.ok) return { ok: true }
     // A map in use is an answer, not a failure: the charts that use it are listed.
     if (res.status === 409) return { ok: false, message: json?.error ?? "This map is used by charts.", charts: (json?.charts ?? []) as MapUser[] }
+    // WEB-12: a refusal goes through deniedFor (errors.ts).
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
     throw new ServiceError(codeFor(res.status), json?.error ?? "The map could not be deleted", res.status)
   },
 }

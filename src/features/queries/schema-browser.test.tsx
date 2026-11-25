@@ -7,17 +7,57 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { EditorView } from "@codemirror/view"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
-import { assetService, queryService } from "@/services"
+import { NO_READABLE_TABLE } from "@/lib/asset-query"
+import { assetService, lakehouseService, queryService } from "@/services"
 import { ServiceError } from "@/services/errors"
+import type { LakehouseTableDetail } from "@/services/contracts/lakehouse"
 import { SchemaBrowser } from "./schema-browser"
 import { SqlPanel } from "./sql-panel"
+import { queryDraftKey } from "@/lib/query-draft"
 import { useQueryStudio } from "./use-query-studio"
 
 afterEach(() => {
   cleanup()
   mock.restore()
   window.localStorage.clear()
+  visit("/query-studio")
 })
+
+/** Points the browser at a Query Studio address, the way an href does. */
+function visit(path: string) {
+  const url = new URL(path, "http://localhost:3000").href
+  ;(window as unknown as { happyDOM: { setURL: (url: string) => void } }).happyDOM.setURL(url)
+}
+
+/** Opens the studio on a Trino tab, the way an asset's "Open in Query Studio" link does. */
+function visitTrinoTab() {
+  visit("/query-studio?sql=SELECT%20*%20FROM%20&engine=trino")
+}
+
+const BRONZE_NEEDS_TRINO = "Bronze tables are read with Trino: switch this tab to Trino to insert it."
+
+/**
+ * What the browser says about a Bronze table whose Iceberg table read
+ * failed: the read failed, not the table.
+ */
+const TABLE_PROOF_FAILED = "The table could not be read."
+
+/**
+ * A Bronze table's detail as the API sends it: the registry slug `demo_orders`
+ * is its id, `queryTarget` is the ClickHouse `DataLakeCatalog` name (never a
+ * Trino one), and `tableName` is what the Trino name is built from.
+ */
+function bronzeDetail(tableName = "orders") {
+  return {
+    schema: [{ name: "oid", dataType: "String" }],
+    layer: "raw",
+    type: "iceberg-table",
+    tableName,
+    namespace: "bronze",
+    name: "Demo Orders",
+    queryTarget: { engine: "clickhouse", table: `icecat_api.\`bronze.${tableName}\`` },
+  } as never
+}
 
 const ASSETS = [
   { id: "silver.orders", name: "Orders", namespace: "silver", layer: "silver" },
@@ -25,9 +65,27 @@ const ASSETS = [
   { id: "demo_orders", name: "Demo Orders", namespace: "bronze", layer: "raw" },
 ] as never[]
 
+/** The Iceberg table the studio reads to prove a Bronze table is there. */
+const ICEBERG_TABLE = {
+  schema: [],
+  partitionSpec: [],
+  properties: {},
+  snapshots: [],
+  stats: {
+    fileCount: 1,
+    smallFileCount: null,
+    smallFileThresholdBytes: null,
+    recordCount: 1,
+    totalBytes: 1,
+    snapshotCount: 0,
+    metadataLogCount: 0,
+  },
+  compactionAvailable: false,
+} as unknown as LakehouseTableDetail
+
 /** The page's two halves that matter here: the editor with its toolbar, and the browser. */
 function Harness() {
-  const studio = useQueryStudio()
+  const studio = useQueryStudio(queryDraftKey("u1", null))
   return (
     <>
       <SqlPanel studio={studio} onSave={() => {}} />
@@ -47,7 +105,7 @@ function stubServices(options: { assets?: "ok" | "forbidden" } = {}) {
   } else {
     spyOn(assetService, "listAssets").mockResolvedValue(ASSETS)
   }
-  return spyOn(assetService, "getAsset").mockImplementation((async (id: string) => {
+  const getAsset = spyOn(assetService, "getAsset").mockImplementation((async (id: string) => {
     if (id === "silver.orders") {
       return {
         schema: [
@@ -58,6 +116,10 @@ function stubServices(options: { assets?: "ok" | "forbidden" } = {}) {
     }
     return { schema: [] }
   }) as never)
+  // The Iceberg table the studio reads to learn whether a Bronze table is
+  // there at all (QS-4 D3): the same read the catalog page makes.
+  const getTableDetail = spyOn(lakehouseService, "getTableDetail").mockResolvedValue(ICEBERG_TABLE)
+  return { getAsset, getTableDetail }
 }
 
 /** The editor's view, found the way the editor's own DOM exposes it. */
@@ -96,7 +158,7 @@ describe("SchemaBrowser", () => {
   })
 
   it("fetches a table's columns once, however often it is collapsed and expanded", async () => {
-    const getAsset = stubServices()
+    const { getAsset } = stubServices()
     render(<Harness />)
 
     const toggle = await screen.findByRole("button", { name: "Columns of Orders" })
@@ -134,7 +196,7 @@ describe("SchemaBrowser", () => {
   })
 
   it("inserts a table's SQL name at the cursor", async () => {
-    const getAsset = stubServices()
+    const { getAsset } = stubServices()
     const { container } = render(<Harness />)
     const view = editorView(container)
     setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
@@ -148,7 +210,7 @@ describe("SchemaBrowser", () => {
     await act(async () => {})
   })
 
-  it("does not insert a Bronze registry slug as if it were a table name", async () => {
+  it("says a Bronze table is read with Trino, and inserts nothing, on a ClickHouse tab before its detail loads", async () => {
     stubServices()
     const { container } = render(<Harness />)
     const view = editorView(container)
@@ -158,54 +220,255 @@ describe("SchemaBrowser", () => {
     fireEvent.click(row)
 
     expect(view.state.doc.toString()).toBe("SELECT * FROM ")
-    expect(row.getAttribute("title") ?? "").toContain("SQL name")
+    expect(row.getAttribute("title")).toBe(BRONZE_NEEDS_TRINO)
   })
 
-  it("makes a Bronze table insertable once its detail names the table", async () => {
-    const getAsset = stubServices()
-    getAsset.mockResolvedValueOnce({
-      schema: [],
-      queryTarget: { engine: "clickhouse", table: "icecat_api.bronze.orders" },
-    } as never)
+  it("keeps saying so on a ClickHouse tab once the detail has loaded, and offers no ClickHouse name", async () => {
+    const { getAsset } = stubServices()
+    getAsset.mockResolvedValueOnce(bronzeDetail())
     const { container } = render(<Harness />)
     const view = editorView(container)
     setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
 
     fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
 
-    const insert = await screen.findByRole("button", {
-      name: "Insert icecat_api.bronze.orders",
-    })
-    fireEvent.click(insert)
-
-    expect(view.state.doc.toString()).toBe("SELECT * FROM icecat_api.bronze.orders")
+    // The detail landed: its column is listed.
+    expect(await screen.findByText("oid")).toBeTruthy()
+    const row = screen.getByRole("button", { name: "Demo Orders" })
+    fireEvent.click(row)
+    expect(row.getAttribute("title")).toBe(BRONZE_NEEDS_TRINO)
+    expect(screen.queryByRole("button", { name: /^Insert (iceberg|icecat_api)/ })).toBeNull()
+    expect(view.state.doc.toString()).toBe("SELECT * FROM ")
   })
 
-  it("does not offer a Trino-only Bronze name on a ClickHouse tab", async () => {
-    const getAsset = stubServices()
-    getAsset.mockResolvedValueOnce({
-      schema: [{ name: "oid", dataType: "String" }],
-      layer: "bronze",
-      type: "iceberg-table",
-      tableName: "orders",
-      namespace: "bronze",
-      name: "Demo Orders",
-    } as never)
+  it("inserts a Bronze table's Trino name on a Trino tab once its detail names the table", async () => {
+    visitTrinoTab()
+    const { getAsset } = stubServices()
+    getAsset.mockResolvedValueOnce(bronzeDetail())
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
+
+    const insert = await screen.findByRole("button", { name: "Insert iceberg.bronze.orders" })
+    fireEvent.click(insert)
+
+    expect(view.state.doc.toString()).toBe("SELECT * FROM iceberg.bronze.orders")
+    await act(async () => {})
+  })
+
+  it("keeps a Bronze table out of the editor until its Iceberg table is proven", async () => {
+    visitTrinoTab()
+    const { getAsset, getTableDetail } = stubServices()
+    getAsset.mockResolvedValueOnce(bronzeDetail())
+    // The read that proves the table is there never comes back.
+    getTableDetail.mockReturnValue(new Promise<never>(() => {}))
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
+
+    // The detail is there, but the table itself is not proven: the entry
+    // offers nothing.
+    expect(await screen.findByText("oid")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: /^Insert iceberg/ }) === null).toBe(true)
+    const row = screen.getByRole("button", { name: "Demo Orders" })
+    expect(row.getAttribute("aria-disabled")).toBe("true")
+    expect(view.state.doc.toString()).toBe("SELECT * FROM ")
+  })
+
+  it("disables a Bronze table with the sentence when its Iceberg table is not there", async () => {
+    visitTrinoTab()
+    const { getAsset, getTableDetail } = stubServices()
+    getAsset.mockResolvedValueOnce(bronzeDetail())
+    getTableDetail.mockRejectedValue(new ServiceError("not_found", "table not found", 404))
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
+
+    await waitFor(() => {
+      const row = screen.getByRole("button", { name: "Demo Orders" })
+      expect(row.getAttribute("title")).toBe(NO_READABLE_TABLE)
+    })
+    expect(screen.queryByRole("button", { name: /^Insert iceberg/ }) === null).toBe(true)
+    expect(view.state.doc.toString()).toBe("SELECT * FROM ")
+  })
+
+  it("says the table could not be read, with retry, when the proof read fails, and reads it again on the next open", async () => {
+    visitTrinoTab()
+    const { getAsset, getTableDetail } = stubServices()
+    getAsset.mockResolvedValue(bronzeDetail())
+    // A 5xx says nothing about whether the table is there; the read itself
+    // failed (#448 review SHOULD-FIX).
+    getTableDetail.mockRejectedValue(new ServiceError("unavailable", "warehouse down", 503))
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
+
+    // The entry holds the load-failed sentence, never the no-table one,
+    // with a Retry affordance.
+    expect(await screen.findByText(TABLE_PROOF_FAILED)).toBeTruthy()
+    expect(screen.queryByText(NO_READABLE_TABLE)).toBeNull()
+    const row = screen.getByRole("button", { name: "Demo Orders" })
+    expect(row.getAttribute("title")).toBe(TABLE_PROOF_FAILED)
+    const retry = screen.getByRole("button", {
+      name: "Retry reading the table of Demo Orders",
+    })
+
+    // Retry reads the table again.
+    const afterFirstRead = getTableDetail.mock.calls.length
+    fireEvent.click(retry)
+    await waitFor(() => expect(getTableDetail.mock.calls.length).toBeGreaterThan(afterFirstRead))
+
+    // And so does the next open of the entry.
+    const afterRetry = getTableDetail.mock.calls.length
+    fireEvent.click(screen.getByRole("button", { name: "Columns of Demo Orders" }))
+    fireEvent.click(screen.getByRole("button", { name: "Columns of Demo Orders" }))
+    await waitFor(() => expect(getTableDetail.mock.calls.length).toBeGreaterThan(afterRetry))
+  })
+
+  it("inserts a quoted Trino name as it is formed, without quoting its parts again", async () => {
+    visitTrinoTab()
+    const { getAsset } = stubServices()
+    getAsset.mockResolvedValueOnce(bronzeDetail("order lines"))
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
+    fireEvent.click(await screen.findByRole("button", { name: 'Insert iceberg.bronze."order lines"' }))
+
+    expect(view.state.doc.toString()).toBe('SELECT * FROM iceberg.bronze."order lines"')
+    await act(async () => {})
+  })
+
+  it("keeps the table's name unknown on a Trino tab until its detail loads", async () => {
+    visitTrinoTab()
+    const { getAsset } = stubServices()
+    // REL-26: the state under test is the row BEFORE its detail has answered.
+    // `stubServices` answers at once and the studio reads the detail on its
+    // own (a Bronze row is proven when the list loads), so a resolved stub
+    // used to win the race with the click: the studio recorded a target from
+    // the name-less detail, the row stopped being "Trino only", and the same
+    // click inserted `undefined.undefined`. Hold every read open — the state
+    // the assertion means — instead of racing a clock or a fast stub.
+    const releaseDetails: Array<(detail: never) => void> = []
+    getAsset.mockImplementation(
+      (() =>
+        new Promise((resolve) => {
+          releaseDetails.push(resolve as (detail: never) => void)
+        })) as never
+    )
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
+
+    const row = await screen.findByRole("button", { name: "Demo Orders" })
+    // Wait for the state the click is about, not for a tick: the row is still
+    // unnamed while its detail is held. Only then is the click meaningful.
+    await waitFor(() => expect(row.getAttribute("title") ?? "").toContain("SQL name"))
+    fireEvent.click(row)
+
+    expect(view.state.doc.toString()).toBe("SELECT * FROM ")
+    expect(row.getAttribute("title") ?? "").toContain("SQL name")
+
+    // Answer every held read with a valid detail so none stays pending behind
+    // the test and no name-less target is left in the studio's state.
+    await act(async () => {
+      for (const release of releaseDetails) release(bronzeDetail() as never)
+    })
+  })
+
+  // LH-QS-4-08: a Bronze row is proven when the list
+  // loads, and its columns follow the row.
+  it("offers a Bronze table's Trino name on a Trino tab without expanding it", async () => {
+    visitTrinoTab()
+    const { getAsset, getTableDetail } = stubServices()
+    getAsset.mockImplementation((async (id: string) =>
+      id === "demo_orders" ? bronzeDetail() : { schema: [] }) as never)
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Insert iceberg.bronze.orders" }))
+
+    expect(view.state.doc.toString()).toBe("SELECT * FROM iceberg.bronze.orders")
+    expect(getTableDetail).toHaveBeenCalledTimes(1)
+    await act(async () => {})
+  })
+
+  it("disables a Bronze table's column buttons on a Trino tab while its Iceberg table is being proven", async () => {
+    visitTrinoTab()
+    const { getAsset, getTableDetail } = stubServices()
+    getAsset.mockResolvedValue(bronzeDetail())
+    // The read that proves the table is there never comes back.
+    getTableDetail.mockReturnValue(new Promise<never>(() => {}))
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
+
+    const column = await screen.findByRole("button", { name: "Insert column oid" })
+    expect((column as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(column)
+    expect(view.state.doc.toString()).toBe("SELECT * FROM ")
+  })
+
+  it("lets a proven Bronze table's column be inserted on a Trino tab", async () => {
+    visitTrinoTab()
+    const { getAsset } = stubServices()
+    getAsset.mockResolvedValue(bronzeDetail())
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT ", "SELECT ".length)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
+    const column = await screen.findByRole("button", { name: "Insert column oid" })
+    await waitFor(() => expect((column as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(column)
+
+    expect(view.state.doc.toString()).toBe("SELECT oid")
+    await act(async () => {})
+  })
+
+  it("shows the no-table sentence and no columns for a Bronze table whose Iceberg table is not there", async () => {
+    visitTrinoTab()
+    const { getAsset, getTableDetail } = stubServices()
+    getAsset.mockResolvedValue(bronzeDetail())
+    getTableDetail.mockRejectedValue(new ServiceError("not_found", "table not found", 404))
     render(<Harness />)
 
     fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
 
-    // The detail landed: its column is listed.
-    expect(await screen.findByText("oid")).toBeTruthy()
-    // The tab is ClickHouse and this name is Trino's, so it is not offered
-    // here; the row still says its SQL name is not known.
-    expect(screen.queryByRole("button", { name: "Insert iceberg.bronze.orders" })).toBeNull()
-    const row = screen.getByRole("button", { name: "Demo Orders" })
-    expect(row.getAttribute("title") ?? "").toContain("SQL name")
+    expect(await screen.findByText(NO_READABLE_TABLE)).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Insert column oid" })).toBeNull()
+    expect(screen.queryByText("oid")).toBeNull()
+  })
+
+  it("keeps a Bronze table's columns insertable on a ClickHouse tab, and reads no Iceberg table for the list", async () => {
+    const { getAsset, getTableDetail } = stubServices()
+    getAsset.mockResolvedValue(bronzeDetail())
+    render(<Harness />)
+
+    await screen.findByRole("button", { name: "Demo Orders" })
+    await act(async () => {})
+    expect(getTableDetail).toHaveBeenCalledTimes(0)
+    expect(getAsset).toHaveBeenCalledTimes(0)
+
+    fireEvent.click(screen.getByRole("button", { name: "Columns of Demo Orders" }))
+    const column = await screen.findByRole("button", { name: "Insert column oid" })
+    expect((column as HTMLButtonElement).disabled).toBe(false)
   })
 
   it("shows the catalog's reason when a table's columns were refused, and retries on request", async () => {
-    const getAsset = stubServices()
+    const { getAsset } = stubServices()
     getAsset.mockResolvedValueOnce({
       supported: false,
       reason: "This tenant has no catalog configured",
@@ -235,5 +498,48 @@ describe("SchemaBrowser", () => {
       const run = screen.getByRole("button", { name: "Run query" }) as HTMLButtonElement
       expect(run.disabled).toBe(false)
     })
+  })
+})
+
+// QS-11 (LH-QS-1-07), D10: the browser's search narrows by label or reference
+// and says when nothing matches. The filter is local, never stored.
+describe("SchemaBrowser search", () => {
+  it("keeps the tables that match and hides the ones that do not", async () => {
+    stubServices()
+    render(<Harness />)
+    await screen.findByText("Silver")
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Search tables" }), {
+      target: { value: "ord" },
+    })
+
+    expect(screen.getByRole("button", { name: "Columns of Orders" })).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Columns of Mart Wisman" })).toBeNull()
+  })
+
+  it("says when no table matches the text", async () => {
+    stubServices()
+    render(<Harness />)
+    await screen.findByText("Silver")
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Search tables" }), {
+      target: { value: "zzzz" },
+    })
+
+    expect(screen.getByText('No table matches "zzzz".')).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Columns of Orders" })).toBeNull()
+  })
+
+  it("shows every table again when the search is cleared", async () => {
+    stubServices()
+    render(<Harness />)
+    await screen.findByText("Silver")
+    const search = screen.getByRole("textbox", { name: "Search tables" })
+
+    fireEvent.change(search, { target: { value: "ord" } })
+    fireEvent.change(search, { target: { value: "" } })
+
+    expect(screen.getByRole("button", { name: "Columns of Orders" })).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Columns of Mart Wisman" })).toBeTruthy()
   })
 })

@@ -7,8 +7,10 @@
 //! Every organisation has a **shared space** — the root, where a query
 //! with no folder sits — that every member of the organisation sees at
 //! `view`, and a **personal space** — one folder per person — that only
-//! its owner sees, at `manage`. A rule is the only way anybody else sees
-//! a query in a personal space.
+//! its owner sees, at `manage`. A rule on a query or on a folder inside
+//! it is the only way anybody else sees a query in a personal space (a
+//! rule on the personal space itself is ignored), which is why every
+//! move needs `manage`: a move changes which rules cover the item.
 //!
 //! # One resolver
 //!
@@ -40,7 +42,7 @@
 //!
 //! # The writes
 //!
-//! [`create_folder`], [`rename_folder`], [`move_folder`] and
+//! [`create_folder`], [`rename_folder`], [`move_folder_for_viewer`] and
 //! [`delete_folder`] are the four writes the tree needs. They all check
 //! the placement with [`check_placement`] and answer with
 //! [`FolderError`]: a typed answer, so the route layer can tell "the
@@ -91,9 +93,10 @@ pub const MAX_FOLDER_NAME_CHARS: usize = 100;
 pub enum Level {
     /// See it and run it.
     View,
-    /// Change its SQL, its title, its tags and the folder it sits in.
+    /// Change its SQL, its title and its tags (a folder's name), delete
+    /// it and restore it from the trash.
     Edit,
-    /// Share it, delete it, restore it and see its entry in the trash.
+    /// Also move it, share it and delete a folder.
     Manage,
 }
 
@@ -281,7 +284,8 @@ impl FolderMap {
 /// 4. **The author.** The author of an item manages it: the query's
 ///    `owner_id`, or the folder's `owner_id`.
 /// 5. **The rules.** The highest level of the rules that name the item
-///    itself or a folder in its chain.
+///    itself or a folder in its chain. A rule on a personal space is
+///    ignored.
 /// 6. **The personal space.** A chain that holds a personal folder is a
 ///    wall: its owner manages what is inside it, and anybody else sees
 ///    it only through a rule.
@@ -322,9 +326,15 @@ pub fn resolve_level(
         .iter()
         .filter(|grant| {
             grant.query_id == Some(target.id)
-                || grant
-                    .folder_id
-                    .is_some_and(|folder_id| chain.iter().any(|folder| folder.id == folder_id))
+                || grant.folder_id.is_some_and(|folder_id| {
+                    // A rule on a personal space itself is ignored: a
+                    // personal space is shared through a query or a folder
+                    // inside it (`QS-3` review of #382), so a rule stored
+                    // on the space gives nobody anything.
+                    chain
+                        .iter()
+                        .any(|folder| folder.id == folder_id && !folder.is_personal)
+                })
         })
         .map(|grant| grant.level)
         .max();
@@ -337,6 +347,64 @@ pub fn resolve_level(
     }
     // The shared space: every member of the organisation sees the item.
     Some(granted.unwrap_or(Level::View).max(Level::View))
+}
+
+/// The space a location sits in, read the way [`resolve_level`] reads
+/// spaces (its rules 6 and 7): the first personal folder of the
+/// location's chain names the space, and a chain that holds no personal
+/// folder — the root of the tree included — is the shared space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Space {
+    /// The shared space: the root, or a chain with no personal folder.
+    Shared,
+    /// One person's own space, named by its personal folder.
+    Personal(Uuid),
+    /// A folder the map does not hold, or a chain that repeats a folder:
+    /// corrupt data, whose space equals no space — not even another
+    /// unknown one — so a move that names it counts as a move across
+    /// spaces, the fail-closed answer (principle 3 of `AGENTS.md`).
+    Unknown,
+}
+
+/// The space of one location; `None` names the root of the tree, whose
+/// space is the shared one.
+fn space_of(folders: &[FolderNode], location: Option<Uuid>) -> Space {
+    let Some(mut current) = location else {
+        return Space::Shared;
+    };
+    let mut seen: HashSet<Uuid> = HashSet::new();
+    loop {
+        let Some(folder) = folders.iter().find(|folder| folder.id == current) else {
+            return Space::Unknown;
+        };
+        if !seen.insert(folder.id) {
+            return Space::Unknown;
+        }
+        if folder.is_personal {
+            return Space::Personal(folder.id);
+        }
+        match folder.parent_id {
+            Some(parent) => current = parent,
+            None => return Space::Shared,
+        }
+    }
+}
+
+/// Whether a move from `from` to `to` changes the item's space.
+///
+/// The space of a location is the owner of the personal folder in its
+/// folder chain, or the shared space when the chain holds no personal
+/// folder — the same reading as the resolver's rules 6 and 7 — and
+/// `None` names the root, whose space is the shared one. A location the
+/// map cannot place is in no space, so it crosses every space,
+/// another unknown location included.
+///
+/// The store no longer asks this to decide who may move: every move needs
+/// `manage`. It stays as the pure reading of "which space is this in".
+#[must_use]
+pub fn crosses_space(folders: &[FolderNode], from: Option<Uuid>, to: Option<Uuid>) -> bool {
+    let (from, to) = (space_of(folders, from), space_of(folders, to));
+    from == Space::Unknown || to == Space::Unknown || from != to
 }
 
 /// Why a folder cannot be created, renamed or moved as asked. Every
@@ -393,6 +461,12 @@ pub enum FolderError {
     /// A `Personal space` may not be renamed, moved or deleted.
     #[error("a personal space is not renamed, moved or deleted")]
     PersonalSpace,
+    /// The viewer does not manage the folder, or something inside it, so
+    /// the folder is not moved: a move needs manage on the folder and on
+    /// every sub-folder and every query under it, the ones in the trash
+    /// included (`QS-3` review of #382).
+    #[error("moving the folder needs manage on it and on everything inside it")]
+    MoveNeedsManage,
     /// The database refused or failed the write.
     #[error("database error")]
     Database(#[source] StoreError),
@@ -1068,39 +1142,13 @@ pub async fn rename_folder(pool: &PgPool, id: Uuid, name: &str) -> Result<Folder
     Ok(FolderNode::from(row))
 }
 
-/// Move the folder under `new_parent` (`None` for the root).
-///
-/// The whole subtree that moves has to fit in [`MAX_FOLDER_DEPTH`]
-/// levels: the depth of the new parent plus the height of the subtree
-/// may not pass the limit. The folder may not become its own ancestor,
-/// and the new parent must be a folder of the same tenant — a folder of
-/// another tenant is not found at all. The name stays, and it stays
-/// free among the new siblings.
-///
-/// # Errors
-///
-/// Returns [`FolderError::NotFound`] when the folder or the new parent
-/// does not exist, [`FolderError::PersonalSpace`] when the folder is a
-/// `Personal space`, [`FolderError::Cycle`] when the move would make
-/// the folder its own ancestor, [`FolderError::TooDeep`] when the
-/// subtree would grow past the depth limit,
-/// [`FolderError::DuplicateName`] when a new sibling carries the name,
-/// and [`FolderError::Database`] if a query fails.
-pub async fn move_folder(
+/// Write the folder's new parent. Every rule the move must hold to has
+/// run by the time this is called.
+async fn write_moved_folder(
     pool: &PgPool,
     id: Uuid,
     new_parent: Option<Uuid>,
 ) -> Result<FolderNode, FolderError> {
-    let Some(folder) = load_folder(pool, id).await? else {
-        return Err(FolderError::NotFound);
-    };
-    if folder.is_personal {
-        return Err(FolderError::PersonalSpace);
-    }
-    let folders = list_folders(pool, Some(folder.tenant_id)).await?;
-    // The name does not change, but the sibling rule still holds: the
-    // folder may not land beside a sibling that carries the same name.
-    check_placement(&folders, Some(id), &folder.name, new_parent).map_err(FolderError::from)?;
     let row: FolderRow = sqlx::query_as(
         "UPDATE saved_query_folder SET parent_id = $2, updated_at = now() WHERE id = $1 \
          RETURNING id, parent_id, is_personal, owner_id, tenant_id, name",
@@ -1110,6 +1158,167 @@ pub async fn move_folder(
     .fetch_one(pool)
     .await?;
     Ok(FolderNode::from(row))
+}
+
+/// The folder `root` and every folder below it, at any depth. A cycle in
+/// corrupt data ends the walk instead of looping.
+fn subtree_ids(folders: &[FolderNode], root: Uuid) -> Vec<Uuid> {
+    let mut ids = vec![root];
+    let mut next = 0;
+    while let Some(&id) = ids.get(next) {
+        next += 1;
+        for child in folders.iter().filter(|folder| folder.parent_id == Some(id)) {
+            if !ids.contains(&child.id) {
+                ids.push(child.id);
+            }
+        }
+    }
+    ids
+}
+
+/// One saved query, as far as the resolver needs it.
+#[derive(Debug, FromRow)]
+struct QueryRef {
+    id: Uuid,
+    owner_id: Option<Uuid>,
+    folder_id: Option<Uuid>,
+    tenant_id: Option<Uuid>,
+}
+
+/// Whether the viewer manages the folder `root`, every sub-folder under it
+/// and every query under it, each resolved by [`resolve_level`].
+///
+/// The queries are read in one statement for the whole subtree, the ones
+/// in the trash included: a trashed query comes back with a restore, so
+/// the folder that carries it carries it still.
+async fn manages_everything_under(
+    pool: &PgPool,
+    viewer: &SavedQueryViewer,
+    folders: &[FolderNode],
+    root: Uuid,
+) -> Result<bool, FolderError> {
+    let map = FolderMap::new(folders.to_vec());
+    let grants = grants_for_viewer(pool, viewer).await?;
+    let ids = subtree_ids(folders, root);
+    for id in &ids {
+        let Some(folder) = map.get(*id) else {
+            return Ok(false);
+        };
+        // A chain that cannot be built is corrupt data, and corrupt data
+        // is not managed by anybody.
+        let Some(chain) = map.chain(*id) else {
+            return Ok(false);
+        };
+        let chain: Vec<FolderNode> = chain.into_iter().cloned().collect();
+        let target = AccessTarget {
+            id: folder.id,
+            owner_id: folder.owner_id,
+            folder_id: folder.parent_id,
+            tenant_id: Some(folder.tenant_id),
+        };
+        if resolve_level(&target, &chain, &grants, viewer) != Some(Level::Manage) {
+            return Ok(false);
+        }
+    }
+    let queries: Vec<QueryRef> = sqlx::query_as(
+        "SELECT id, owner_id, folder_id, tenant_id FROM saved_query WHERE folder_id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+    for query in queries {
+        let Some(chain) = query.folder_id.and_then(|folder_id| map.chain(folder_id)) else {
+            return Ok(false);
+        };
+        let chain: Vec<FolderNode> = chain.into_iter().cloned().collect();
+        let target = AccessTarget {
+            id: query.id,
+            owner_id: query.owner_id,
+            folder_id: query.folder_id,
+            tenant_id: query.tenant_id,
+        };
+        if resolve_level(&target, &chain, &grants, viewer) != Some(Level::Manage) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether the viewer manages the folder `folder_id`, every sub-folder
+/// under it and every query under it, the ones in the trash included.
+///
+/// A rule on a folder covers everything inside it, so sharing the folder
+/// is held to the same bar as moving it: the viewer who authored the folder
+/// does not hand out what other people put in it (`QS-3` review of #393).
+/// The walk is [`manages_everything_under`], the one [`move_folder_for_viewer`]
+/// uses. A folder that does not exist answers `false`, and the route
+/// has already found it before it asks.
+///
+/// # Errors
+///
+/// Returns [`FolderError::Database`] if a query fails.
+pub async fn manages_folder_and_contents(
+    pool: &PgPool,
+    viewer: &SavedQueryViewer,
+    folder_id: Uuid,
+) -> Result<bool, FolderError> {
+    let Some(folder) = load_folder(pool, folder_id).await? else {
+        return Ok(false);
+    };
+    let folders = list_folders(pool, Some(folder.tenant_id)).await?;
+    manages_everything_under(pool, viewer, &folders, folder_id).await
+}
+
+/// Move the folder under `new_parent` (`None` for the root) for the
+/// viewer the write is made for.
+///
+/// A move needs **manage** on the folder and on every sub-folder and every
+/// query under it, the ones in the trash included, each resolved by the one
+/// resolver ([`resolve_level`]): a move changes which rules cover
+/// everything inside the folder, so somebody who wrote the folder does not
+/// move what others put in it (`QS-3` review of #382, BLOCKER 1). A call
+/// that names the parent the folder already has is not a move and needs
+/// nothing beyond the placement rules.
+///
+/// The placement rules: the whole subtree that moves has to fit in
+/// [`MAX_FOLDER_DEPTH`] levels, the folder may not become its own
+/// ancestor, the new parent must be a folder of the same tenant — a folder
+/// of another tenant is not found at all — and the name stays free among
+/// the new siblings. The edit level on the new parent is the route's to
+/// ask.
+///
+/// # Errors
+///
+/// Returns [`FolderError::NotFound`] when the folder or the new parent
+/// does not exist, [`FolderError::PersonalSpace`] when the folder is a
+/// personal space, [`FolderError::Cycle`] when the move would make the
+/// folder its own ancestor, [`FolderError::TooDeep`] when the subtree would
+/// grow past the depth limit, [`FolderError::DuplicateName`] when a new
+/// sibling carries the name, [`FolderError::MoveNeedsManage`] when the
+/// viewer does not manage everything the move carries, and
+/// [`FolderError::Database`] if a query fails.
+pub async fn move_folder_for_viewer(
+    pool: &PgPool,
+    viewer: &SavedQueryViewer,
+    id: Uuid,
+    new_parent: Option<Uuid>,
+) -> Result<FolderNode, FolderError> {
+    let Some(folder) = load_folder(pool, id).await? else {
+        return Err(FolderError::NotFound);
+    };
+    if folder.is_personal {
+        return Err(FolderError::PersonalSpace);
+    }
+    // Only the tenant's own folders are in the tree, so a parent of
+    // another tenant is not found by the placement rule.
+    let folders = list_folders(pool, Some(folder.tenant_id)).await?;
+    check_placement(&folders, Some(id), &folder.name, new_parent).map_err(FolderError::from)?;
+    if new_parent != folder.parent_id
+        && !manages_everything_under(pool, viewer, &folders, id).await?
+    {
+        return Err(FolderError::MoveNeedsManage);
+    }
+    write_moved_folder(pool, id, new_parent).await
 }
 
 /// Delete the folder.
@@ -1183,8 +1392,9 @@ pub struct GranteePerson {
     pub id: Uuid,
     /// The person's display name.
     pub name: String,
-    /// The person's email address.
-    pub email: String,
+    /// The person's email address; `None` when the account has none
+    /// (ADM-11 D1 made the column nullable).
+    pub email: Option<String>,
 }
 
 /// One role a saved query may be shared with.
@@ -1249,12 +1459,12 @@ pub async fn search_grantees(
     let limit = limit.max(0);
     let pattern = escape_like_pattern(needle.trim());
     let people: Vec<GranteePerson> = sqlx::query_as(
-        "SELECT u.id, u.name, u.email FROM app_user u \
+        "SELECT u.id, u.name, COALESCE(u.email, u.username) AS email FROM app_user u \
          WHERE u.status = 'active' \
            AND ($1::uuid IS NULL OR EXISTS ( \
                 SELECT 1 FROM app_user_tenant t \
                  WHERE t.user_id = u.id AND t.tenant_id = $1)) \
-           AND (u.name ILIKE $2 OR u.email ILIKE $2) \
+           AND (u.name ILIKE $2 OR u.username ILIKE $2 OR u.email ILIKE $2) \
          ORDER BY u.name, u.email LIMIT $3",
     )
     .bind(tenant_id)
@@ -1268,6 +1478,62 @@ pub async fn search_grantees(
             .bind(limit)
             .fetch_all(pool)
             .await?;
+    Ok(GranteeMatches { people, roles })
+}
+
+/// The name (and, for a person, the email) of the grantees a list of rules
+/// names, so the console can say who a rule is for instead of showing an
+/// id.
+///
+/// This is the one lookup behind every access list: at most two queries
+/// whatever the number of rules, and none when both slices are empty.
+///
+/// The tenant boundary is the one of [`search_grantees`] and
+/// [`tenant_user_ids`]: a person is named only when they are a member of
+/// `tenant_id` (through `app_user_tenant`), and with no tenant every person
+/// of the deployment is. A person outside the tenant is left out of the
+/// answer, so the caller shows no name for them: the list never carries
+/// the name or email of another organisation's person, and never makes one
+/// up (`AGENTS.md` principle 2). Unlike the search, an inactive person is
+/// named, because the rule that names them still applies.
+///
+/// A role belongs to the deployment rather than to a tenant — the `role`
+/// table has no tenant column — so every role that exists is named.
+///
+/// An id the database does not hold is absent from the answer.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn grantee_labels(
+    pool: &PgPool,
+    tenant_id: Option<Uuid>,
+    user_ids: &[Uuid],
+    role_ids: &[Uuid],
+) -> Result<GranteeMatches, StoreError> {
+    let people: Vec<GranteePerson> = if user_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "SELECT u.id, u.name, u.email FROM app_user u \
+             WHERE u.id = ANY($1::uuid[]) \
+               AND ($2::uuid IS NULL OR EXISTS ( \
+                    SELECT 1 FROM app_user_tenant t \
+                     WHERE t.user_id = u.id AND t.tenant_id = $2))",
+        )
+        .bind(user_ids.to_vec())
+        .bind(tenant_id)
+        .fetch_all(pool)
+        .await?
+    };
+    let roles: Vec<GranteeRole> = if role_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as("SELECT id, name FROM role WHERE id = ANY($1::uuid[])")
+            .bind(role_ids.to_vec())
+            .fetch_all(pool)
+            .await?
+    };
     Ok(GranteeMatches { people, roles })
 }
 
@@ -1735,6 +2001,139 @@ mod tests {
             Ok(personal.name.clone()),
             "the personal space's name is free for an ordinary folder"
         );
+    }
+
+    /// Moving a query from the shared space into a personal space changes
+    /// its space: the move needs manage.
+    #[test]
+    fn a_move_from_the_shared_space_into_a_personal_space_crosses_spaces() {
+        let personal = folder(Uuid::from_u128(200), None, true, Some(PERSON));
+        assert!(crosses_space(
+            std::slice::from_ref(&personal),
+            None,
+            Some(personal.id)
+        ));
+    }
+
+    /// Moving a query out of a personal space to the shared root changes
+    /// its space: the organisation would gain what was one person's.
+    #[test]
+    fn a_move_from_a_personal_space_to_the_shared_root_crosses_spaces() {
+        let personal = folder(Uuid::from_u128(200), None, true, Some(PERSON));
+        assert!(crosses_space(
+            std::slice::from_ref(&personal),
+            Some(personal.id),
+            None
+        ));
+    }
+
+    /// Moving from one person's personal space into another person's
+    /// changes the space, even though both are personal.
+    #[test]
+    fn a_move_from_one_personal_space_to_another_crosses_spaces() {
+        let rinas = folder(Uuid::from_u128(200), None, true, Some(PERSON));
+        let saris = folder(Uuid::from_u128(201), None, true, Some(OTHER_PERSON));
+        let tree = vec![rinas.clone(), saris.clone()];
+        assert!(crosses_space(&tree, Some(rinas.id), Some(saris.id)));
+    }
+
+    /// A folder and its subfolder are the same personal space: the move
+    /// between them changes nothing about who sees the item.
+    #[test]
+    fn a_move_inside_one_personal_space_crosses_no_space() {
+        let personal = folder(Uuid::from_u128(200), None, true, Some(PERSON));
+        let child = folder(Uuid::from_u128(201), Some(personal.id), false, None);
+        let tree = vec![personal.clone(), child.clone()];
+        assert!(!crosses_space(&tree, Some(personal.id), Some(child.id)));
+        assert!(!crosses_space(&tree, Some(child.id), Some(personal.id)));
+    }
+
+    /// The shared space is the root and every chain below it that holds
+    /// no personal folder: moves inside it change no space.
+    #[test]
+    fn a_move_inside_the_shared_space_crosses_no_space() {
+        let shared = folder(Uuid::from_u128(200), None, false, None);
+        let child = folder(Uuid::from_u128(201), Some(shared.id), false, None);
+        let tree = vec![shared.clone(), child.clone()];
+        assert!(!crosses_space(&tree, None, Some(shared.id)));
+        assert!(!crosses_space(&tree, Some(shared.id), Some(child.id)));
+        assert!(!crosses_space(&tree, Some(child.id), None));
+    }
+
+    /// A chain three deep inside one personal space stays in that space,
+    /// whatever moves inside it, and loses it the moment a move names the
+    /// shared root.
+    #[test]
+    fn a_folder_chain_three_deep_stays_in_its_space_until_a_move_leaves_it() {
+        let personal = folder(Uuid::from_u128(200), None, true, Some(PERSON));
+        let child = folder(Uuid::from_u128(201), Some(personal.id), false, None);
+        let grandchild = folder(Uuid::from_u128(202), Some(child.id), false, None);
+        let (child_id, grandchild_id) = (child.id, grandchild.id);
+        let tree = vec![personal, child, grandchild];
+        assert!(!crosses_space(&tree, Some(grandchild_id), Some(child_id)));
+        assert!(!crosses_space(&tree, Some(child_id), Some(grandchild_id)));
+        assert!(crosses_space(&tree, Some(grandchild_id), None));
+    }
+
+    /// A location that names a folder the map does not hold has no space
+    /// of its own: it counts as across spaces, the fail-closed answer, so
+    /// corrupt data never lets an edit holder move quietly.
+    #[test]
+    fn a_location_outside_the_map_counts_as_across_spaces() {
+        let personal = folder(Uuid::from_u128(200), None, true, Some(PERSON));
+        let unknown = Uuid::from_u128(999);
+        assert!(crosses_space(
+            std::slice::from_ref(&personal),
+            Some(unknown),
+            None
+        ));
+        assert!(crosses_space(
+            std::slice::from_ref(&personal),
+            Some(unknown),
+            Some(personal.id)
+        ));
+    }
+
+    /// A location the map does not hold is crossing every space, another
+    /// unknown one included: two unknown locations are not "the same
+    /// space", so a move between them is not quietly allowed.
+    #[test]
+    fn an_unknown_location_crosses_every_space_another_unknown_one_included() {
+        let personal = folder(Uuid::from_u128(200), None, true, Some(PERSON));
+        let (one, other) = (Uuid::from_u128(998), Uuid::from_u128(999));
+        let tree = std::slice::from_ref(&personal);
+        assert!(crosses_space(tree, Some(one), Some(other)));
+        assert!(crosses_space(tree, Some(one), Some(one)));
+    }
+
+    /// A rule written on a personal space itself gives nobody access: a
+    /// personal space is shared through a query or a folder inside it
+    /// (`QS-3` review of #382), and a rule stored before that rule is ignored.
+    #[test]
+    fn a_rule_on_a_personal_space_gives_another_person_nothing() {
+        let personal = folder(Uuid::from_u128(200), None, true, Some(PERSON));
+        let level = resolve_level(
+            &target(Uuid::from_u128(100), Some(PERSON), Some(personal.id)),
+            std::slice::from_ref(&personal),
+            &[grant(None, Some(personal.id), Level::Manage)],
+            &viewer(Some(OTHER_PERSON), Some(TENANT)),
+        );
+        assert_eq!(level, None);
+    }
+
+    /// A rule on a folder inside a personal space still opens what is in
+    /// that folder: only the rule on the space itself is ignored.
+    #[test]
+    fn a_rule_on_a_folder_inside_a_personal_space_still_opens_it() {
+        let personal = folder(Uuid::from_u128(200), None, true, Some(PERSON));
+        let week = folder(Uuid::from_u128(201), Some(personal.id), false, Some(PERSON));
+        let level = resolve_level(
+            &target(Uuid::from_u128(100), Some(PERSON), Some(week.id)),
+            &[week.clone(), personal],
+            &[grant(None, Some(week.id), Level::Edit)],
+            &viewer(Some(OTHER_PERSON), Some(TENANT)),
+        );
+        assert_eq!(level, Some(Level::Edit));
     }
 
     /// Every rule the placement breaks has its own answer, so the route

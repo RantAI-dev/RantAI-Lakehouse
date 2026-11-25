@@ -41,7 +41,7 @@ use lakehouse_auth::{
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::StoreError;
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
 use lakehouse_store::identity;
 use lakehouse_store::sessions::SessionRow;
 use serde::{Deserialize, Serialize};
@@ -49,6 +49,7 @@ use sha2::Digest as _;
 use time::Duration;
 use uuid::Uuid;
 
+use crate::audit_coverage;
 use crate::auth::{AuthenticatedPrincipal, SESSION_COOKIE_NAME, session_cookie_from_headers};
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
@@ -94,10 +95,100 @@ fn cleared_session_cookie_header(is_dev: bool) -> HeaderValue {
     session_cookie_header(is_dev, "", Duration::ZERO)
 }
 
-/// `{ email, password }` — `POST /api/auth/login` body.
+/// An event caused by a person who is signed in: the principal and its name.
+fn principal_audit_event(principal: &Principal, action: &str, outcome: &str) -> NewAuditEvent {
+    // `GOV-1 review`: the one mapping of a principal to the three actor
+    // columns, shared with the central writer.
+    let (principal_id, principal_kind, actor_label) = audit_coverage::actor(Some(principal));
+    NewAuditEvent {
+        action: action.to_owned(),
+        principal_id,
+        principal_kind,
+        actor_label: Some(actor_label),
+        outcome: outcome.to_owned(),
+        ..Default::default()
+    }
+}
+
+/// The fixed sentence of a refused sign-in. It never says which half was
+/// wrong, the same as the response.
+const SIGN_IN_REFUSED_DETAIL: &str = "The email or the password did not match.";
+
+/// The fixed sentence of the lock row (`plan D5b`). The trail holds no
+/// identifier material on it, so the row says only what happened — never the
+/// identifier, and never any hash of it.
+const SIGN_IN_LOCKED_DETAIL: &str = "Too many failed sign-ins; this sign-in is locked for a while.";
+
+/// The `auth.login` row of a sign-in that worked. Nobody was signed in when
+/// the form was submitted, so the actor is the form; the principal is set
+/// only because the password verified. Nothing the visitor typed is in it:
+/// not the email, not the password.
+fn sign_in_executed_event(user_id: Uuid, principal_kind: &str) -> NewAuditEvent {
+    NewAuditEvent {
+        action: "auth.login".to_owned(),
+        outcome: "executed".to_owned(),
+        principal_id: Some(user_id.to_string()),
+        principal_kind: Some(principal_kind.to_owned()),
+        actor_label: Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM.to_owned()),
+        resource_kind: Some("user".to_owned()),
+        resource_id: Some(user_id.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The `auth.login` row of a refused sign-in: no principal (nobody proved who
+/// they were) and no resource. `GOV-1 review`: the row used to name the first
+/// 48 bits of the unsalted SHA-256 the throttle counts by, which a reader of
+/// the trail could match against guessed emails, and which leaks a prefix of
+/// the hash of a password typed into the identifier box. An unknown email
+/// writes the identical row: the trail is not an account oracle. The lock row
+/// keeps no identifier material either (plan D5b).
+fn sign_in_refused_event() -> NewAuditEvent {
+    NewAuditEvent {
+        action: "auth.login".to_owned(),
+        outcome: "refused".to_owned(),
+        actor_label: Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM.to_owned()),
+        detail: Some(SIGN_IN_REFUSED_DETAIL.to_owned()),
+        ..Default::default()
+    }
+}
+
+/// The fixed sentence of a password change refused for its current password.
+const PASSWORD_CHANGE_WRONG_CURRENT: &str = "The current password did not match.";
+
+/// The fixed sentence of a password change refused for its new password.
+const PASSWORD_CHANGE_BREAKS_RULES: &str = "The new password does not meet the password rules.";
+
+/// The `auth.password_change` row: `executed`, or `refused` with the fixed
+/// sentence that says why. The resource is the caller's own account. Neither
+/// password, nor the text of a rule that the new one broke, is in it.
+fn password_change_event(
+    principal: &Principal,
+    user_id: Uuid,
+    refusal: Option<&str>,
+) -> NewAuditEvent {
+    NewAuditEvent {
+        resource_kind: Some("user".to_owned()),
+        resource_id: Some(user_id.to_string()),
+        detail: refusal.map(str::to_owned),
+        ..principal_audit_event(
+            principal,
+            "auth.password_change",
+            if refusal.is_some() {
+                "refused"
+            } else {
+                "executed"
+            },
+        )
+    }
+}
+
+/// `{ identifier, password }` — `POST /api/auth/login` body.
+/// Accepts `email` as an alias for backwards compatibility (ADM-11 D6).
 #[derive(Debug, Deserialize)]
 struct LoginBody {
-    email: String,
+    #[serde(alias = "email")]
+    identifier: String,
     password: String,
 }
 
@@ -129,6 +220,27 @@ fn locked_response(locked_until: Option<time::OffsetDateTime>) -> ApiError {
     }
 }
 
+/// The longest `User-Agent` a session records, in characters. A browser's
+/// header is short; the cap keeps a caller from storing a kilobyte of text
+/// under the column the Sessions page renders.
+const SESSION_USER_AGENT_MAX_CHARS: usize = 512;
+
+/// The `User-Agent` a sign-in records on its session, or `None`
+/// (`QA LH-SEC-5-01`, `ADM-14` decision D9).
+///
+/// It is what the client says about itself: shown on the Sessions page,
+/// never trusted for anything. Trimmed, cut to
+/// [`SESSION_USER_AGENT_MAX_CHARS`], and nothing when the header is absent,
+/// empty, or carries bytes that are not plain ASCII (`to_str` refuses
+/// those, and a lossy conversion would invent text).
+fn session_user_agent(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(header::USER_AGENT)?.to_str().ok()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(raw.chars().take(SESSION_USER_AGENT_MAX_CHARS).collect())
+}
+
 /// `POST /api/auth/login` — verify `{ email, password }`, and on success,
 /// create a server-side session and set its cookie.
 ///
@@ -153,7 +265,11 @@ fn locked_response(locked_until: Option<time::OffsetDateTime>) -> ApiError {
 /// 400 on an unparseable body; 401 on bad credentials (same status for
 /// "no such email" and "wrong password" — see the module doc comment);
 /// 429 when the key is locked; 503 if no Postgres pool is configured.
-pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Response> {
+pub async fn login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Response> {
     let pool = pool(&state)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         ApiError::Unavailable(
@@ -161,10 +277,13 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
                 .to_owned(),
         )
     })?;
-    let LoginBody { email, password } = serde_json::from_slice(&body)
+    let LoginBody {
+        identifier,
+        password,
+    } = serde_json::from_slice(&body)
         .map_err(|err| ApiError::BadRequest(format!("invalid JSON body: {err}")))?;
 
-    let key = throttle::key_for(&email);
+    let key = throttle::key_for(&identifier);
 
     if let Some(locked_until) = throttle::locked_until(pool, &key).await? {
         return Err(locked_response(Some(locked_until)).into());
@@ -177,14 +296,18 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
     // count within the limit and reach Argon2; the rest answer exactly as
     // a locked key does, without a hash. A missing user still hashes
     // (`DUMMY_HASH`) while within the limit, so timing is unchanged.
-    let (attempt, attempt_lock) =
-        throttle::record_attempt(pool, &key, &state.throttle_policy).await?;
-    if attempt > state.throttle_policy.max_failures {
+    //
+    // `ADM-8`: the policy is resolved once per try, so every number this
+    // try uses — the count, the limit and the refund — comes from the same
+    // answer, even if a save lands in the console while the try runs.
+    let policy = state.throttle_policy().await;
+    let (attempt, attempt_lock) = throttle::record_attempt(pool, &key, &policy).await?;
+    if attempt > policy.max_failures {
         return Err(locked_response(attempt_lock).into());
     }
 
     let credential = Credential::Password {
-        identifier: email,
+        identifier,
         password: Secret::new(password),
     };
     match auth.local.authenticate(&credential).await {
@@ -192,8 +315,12 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
             throttle::clear(pool, &key).await?;
             let PrincipalId::User(user_id) = principal.id else {
                 tracing::warn!("login failed");
-                return Err(ApiError::invalid_or_expired().into());
+                return Err(ApiError::Unauthorized(
+                    "Invalid username/email or password.".to_owned(),
+                )
+                .into());
             };
+            let principal_kind = principal.kind_for_audit();
             let must_change_password = password::must_change_password(pool, user_id)
                 .await
                 .unwrap_or(false);
@@ -201,8 +328,10 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
                 pool,
                 user_id,
                 session::DEFAULT_SESSION_TTL,
+                // ADM-14 D10: no address — the API sits behind the console's
+                // own server and has no trusted source for the client's.
                 None,
-                None,
+                session_user_agent(&headers).as_deref(),
                 &[],
             )
             .await?;
@@ -211,6 +340,15 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
                 name: principal.display_name,
                 must_change_password,
             };
+            // `GOV-1`: the sign-in is on the audit trail. Nobody was signed in
+            // when the form was submitted, so the actor is the form, and the
+            // principal is set only because the password verified. Nothing the
+            // visitor typed goes in: not the email, not the password.
+            audit_coverage::record_best_effort(
+                &state,
+                sign_in_executed_event(user_id, principal_kind),
+            )
+            .await;
             let mut response = (StatusCode::OK, ApiJson(body)).into_response();
             response.headers_mut().append(
                 header::SET_COOKIE,
@@ -232,20 +370,33 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
         Err(AuthError::InvalidCredentials) => {
             // SEC-49: the try was already counted before hashing; the try
             // that reached the limit is the one that set the lock.
-            if attempt_lock.is_some() && attempt == state.throttle_policy.max_failures {
+            if attempt_lock.is_some() && attempt == policy.max_failures {
+                // Plan D5b: the row holds no identifier material — the key
+                // prefix it used to carry was the first 12 hex characters of
+                // the unsalted SHA-256 of what was typed into the identifier
+                // box, and a reader of the trail could match it against
+                // guessed emails. Nobody signed in, so there is no principal
+                // and no resource either; the fixed sentence is all the row
+                // says. Rows written before this change keep their prefix:
+                // `audit_event` is append-only, so nothing rewrites them.
                 let event = NewAuditEvent {
                     action: "auth.login_locked".to_owned(),
                     outcome: "refused".to_owned(),
-                    resource_kind: Some("login_key".to_owned()),
-                    resource_id: Some(key[..12].to_owned()),
+                    // QA LH-SEC-2-06 (SEC-70, decision D3): nobody signed in
+                    // yet, so the event names the form that produced it.
+                    actor_label: Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM.to_owned()),
+                    detail: Some(SIGN_IN_LOCKED_DETAIL.to_owned()),
                     ..Default::default()
                 };
-                if let Err(err) = store_audit::insert(pool, event).await {
-                    tracing::warn!(%err, "failed to record auth.login_locked audit event");
-                }
+                audit_coverage::record_best_effort(&state, event).await;
             }
+            // `GOV-1`: every refused sign-in is on the audit trail, with no
+            // principal (nobody proved who they were) and nothing the visitor
+            // typed, not even a hash of it (`GOV-1 review`). An unknown email
+            // writes the identical row: the trail is not an account oracle.
+            audit_coverage::record_best_effort(&state, sign_in_refused_event()).await;
             tracing::warn!("login failed");
-            Err(ApiError::invalid_or_expired().into())
+            Err(ApiError::Unauthorized("Invalid username/email or password.".to_owned()).into())
         }
         Err(err) => {
             // SEC-49: the try was counted before hashing; a storage error is
@@ -254,9 +405,7 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
             // review SHOULD-FIX 1): the try that reaches the limit locks
             // the key, and a storage error after that must not leave a real
             // user locked out over a database hiccup.
-            if let Err(refund_err) =
-                throttle::refund_attempt(pool, &key, &state.throttle_policy).await
-            {
+            if let Err(refund_err) = throttle::refund_attempt(pool, &key, &policy).await {
                 tracing::warn!(%refund_err, "failed to refund a login attempt");
             }
             tracing::warn!(error = %err, "login failed with a non-credential error");
@@ -269,6 +418,14 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
 /// replayed copy of the old cookie value is rejected, not just the
 /// browser's copy cleared) and clear the cookie.
 ///
+/// The answer also carries the provider's own logout address, when the
+/// deployment has one (`OIDC_POST_LOGOUT_REDIRECT_URI`) and the provider
+/// publishes an `end_session_endpoint`: the browser is sent there as well,
+/// so the provider's session ends too. Without that, the provider still
+/// holds the session it created for that browser, and the next sign-in is
+/// answered from it — the person is signed in as whoever used that machine
+/// last, with no choice offered.
+///
 /// # Errors
 ///
 /// Returns a 503 if no Postgres pool is configured, or the underlying
@@ -276,18 +433,83 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
 pub async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
-    AuthenticatedPrincipal(_principal): AuthenticatedPrincipal,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
 ) -> ApiResult<Response> {
     let pool = pool(&state)?;
     if let Some(token) = session_cookie_from_headers(&headers) {
         session::revoke_session(pool, &Secret::new(token)).await?;
+        // `GOV-1`: only a session that was revoked is a sign-out; a bearer
+        // call has nothing to end. The row names the person, never the
+        // cookie. (`auth.session.revoke` is the row of ending another
+        // session by id, `DELETE /api/auth/sessions/{id}`.)
+        audit_coverage::record_best_effort(
+            &state,
+            principal_audit_event(&principal, "auth.logout", "executed"),
+        )
+        .await;
     }
-    let mut response = StatusCode::NO_CONTENT.into_response();
+    let mut response = (
+        StatusCode::OK,
+        ApiJson(LogoutResult {
+            provider_logout_url: provider_logout_url(&state).await,
+        }),
+    )
+        .into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
         cleared_session_cookie_header(state.config.is_dev),
     );
     Ok(response)
+}
+
+/// The answer to `POST /api/auth/logout`: where the browser should also be
+/// sent, so the provider's session ends with this deployment's.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LogoutResult {
+    /// The provider's logout address, or `None` when the deployment has no
+    /// post-logout redirect address or the provider publishes no logout
+    /// endpoint. The browser stays on this deployment's sign-in page when
+    /// it is `None`.
+    provider_logout_url: Option<String>,
+}
+
+/// The provider's RP-initiated logout address, or `None`.
+///
+/// Two things have to be in place, and both are the deployment's own doing:
+/// the provider must publish an `end_session_endpoint` (its discovery
+/// document names it), and this deployment must name an address the
+/// provider accepts back (`OIDC_POST_LOGOUT_REDIRECT_URI`, registered with
+/// the provider). Without either, the provider refuses the logout — and a
+/// logout that fails silently is worse than none, so the address is only
+/// built when both are there.
+async fn provider_logout_url(state: &AppState) -> Option<String> {
+    let post_logout = state.config.oidc_post_logout_redirect_uri.as_deref()?;
+    let settings = crate::runtime_settings::sso(state).await;
+    let client_id = settings.client_id.as_deref()?;
+    // A server-owned connection's build reads no discovery document (the
+    // environment owns its addresses), so the endpoint is read here for it.
+    let end_session = crate::runtime_settings::end_session_endpoint(state, &settings).await?;
+    build_provider_logout_url(&end_session, client_id, post_logout)
+}
+
+/// Build the provider's logout address from its three parts.
+///
+/// `client_id` and `post_logout_redirect_uri` are the two parameters the
+/// provider needs to accept the logout without an `id_token_hint` (this
+/// deployment does not keep the id token). The provider refuses a logout
+/// whose return address it does not know, so the address here is the one
+/// registered with it.
+fn build_provider_logout_url(
+    end_session: &str,
+    client_id: &str,
+    post_logout_redirect_uri: &str,
+) -> Option<String> {
+    let mut url = url::Url::parse(end_session).ok()?;
+    url.query_pairs_mut()
+        .append_pair("client_id", client_id)
+        .append_pair("post_logout_redirect_uri", post_logout_redirect_uri);
+    Some(url.to_string())
 }
 
 /// `GET /api/auth/me` response body.
@@ -344,7 +566,10 @@ pub async fn me(
     let (email, roles) = match principal.id {
         PrincipalId::User(user_id) => match state.pg.as_deref() {
             Some(pool) => match identity::get_user(pool, &user_id.to_string()).await {
-                Ok(user) => (Some(user.email), user.roles),
+                // ADM-11 D6: a user may have no email at all, so the
+                // lookup's success no longer implies an address exists —
+                // `None` means the account has none.
+                Ok(user) => (user.email, user.roles),
                 Err(_) => (None, Vec::new()),
             },
             None => (None, Vec::new()),
@@ -425,14 +650,15 @@ fn sessions_decision_for(principal: &Principal) -> SessionsDecision {
 /// (every authenticated caller may hit it — the admin-vs-own split lives
 /// here in the handler, see [`SessionsDecision`]).
 ///
-/// # A documented gap
+/// # What each row records
 ///
-/// `created_ip` and `user_agent` are returned as `null` for every session
-/// minted today: both [`login`] and [`oidc_callback`] call
-/// `session::create_session(..., None, None)`. The columns themselves are
-/// `TEXT NULL` (`0019_auth.sql`), so the listing reflects that honestly
-/// rather than inventing an IP or UA — see
-/// `lakehouse_store::sessions::SessionRow`'s own doc comment.
+/// `user_agent` is the browser as it named itself at sign-in (`ADM-14`
+/// decision D9), and `null` for a session older than that change.
+/// `created_ip` is always `null`: the API sits behind the console's own
+/// server and has no trusted source for the client's address, so the page
+/// says "Not recorded" rather than showing a wrong address as a fact
+/// (decision D10) — see `lakehouse_store::sessions::SessionRow`'s own doc
+/// comment.
 ///
 /// # Errors
 ///
@@ -522,15 +748,8 @@ pub async fn revoke_session(
     // write is logged and swallowed, never propagated, so the response
     // code on the wire is always the underlying revoke's, not the
     // audit's.
-    let audit_event = session_revoke_audit_event(&principal, session_id);
-    if let Err(err) = store_audit::insert(pool, audit_event).await {
-        tracing::warn!(
-            %err,
-            action = "auth.session.revoke",
-            session_id = %session_id,
-            "failed to record session revoke audit event"
-        );
-    }
+    audit_coverage::record_best_effort(&state, session_revoke_audit_event(&principal, session_id))
+        .await;
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -590,16 +809,37 @@ pub async fn change_password(
         let Some(old_password) = old_password else {
             return Err(ApiError::BadRequest("oldPassword is required".to_owned()).into());
         };
-        let user = identity::get_user(pool, &user_id.to_string()).await?;
-        password::verify(pool, &user.email, &Secret::new(old_password))
-            .await
-            .inspect_err(|_| {
-                tracing::warn!("change-password rejected: old password did not verify");
-            })?;
+        if let Err(err) = password::verify_for_user(pool, user_id, &Secret::new(old_password)).await
+        {
+            tracing::warn!("change-password rejected: old password did not verify");
+            // `GOV-1`: a wrong current password is a refused change. A storage
+            // error is not, and leaves no row for a change nobody refused.
+            if matches!(err, AuthError::InvalidCredentials) {
+                audit_coverage::record_best_effort(
+                    &state,
+                    password_change_event(&principal, user_id, Some(PASSWORD_CHANGE_WRONG_CURRENT)),
+                )
+                .await;
+            }
+            return Err(ApiError::from(err).into());
+        }
     }
+
+    let user = identity::get_user(pool, &user_id.to_string()).await?;
+    let rules = password::check_rules(&new_password, Some(&user.username), user.email.as_deref());
+    if rules.is_err() {
+        audit_coverage::record_best_effort(
+            &state,
+            password_change_event(&principal, user_id, Some(PASSWORD_CHANGE_BREAKS_RULES)),
+        )
+        .await;
+    }
+    rules.map_err(|err| ApiError::BadRequest(err.to_string()))?;
 
     password::change_password(pool, user_id, &Secret::new(new_password)).await?;
     session::revoke_all_sessions_for_user(pool, user_id).await?;
+    audit_coverage::record_best_effort(&state, password_change_event(&principal, user_id, None))
+        .await;
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -654,11 +894,13 @@ fn safe_return_path(raw: Option<&str>) -> String {
 /// stays confined to this one function's validation, not duplicated at
 /// two call sites that could drift.
 #[derive(Debug, Serialize, Deserialize)]
-struct OidcFlow {
-    state: String,
-    nonce: String,
-    code_verifier: String,
-    next: String,
+pub(crate) struct OidcFlow {
+    pub(crate) state: String,
+    pub(crate) nonce: String,
+    pub(crate) code_verifier: String,
+    pub(crate) next: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) test_run_id: Option<Uuid>,
 }
 
 const OIDC_FLOW_COOKIE_NAME: &str = "lh_oidc_flow";
@@ -668,7 +910,7 @@ const OIDC_FLOW_TTL_SECONDS: i64 = 600;
 /// the `lh_oidc_flow` cookie. `Secure` follows the exact same condition
 /// [`session_cookie_header`] uses — see that function's doc comment for
 /// why the default fails closed to `Secure`.
-fn oidc_flow_cookie_header(is_dev: bool, flow: Option<&OidcFlow>) -> HeaderValue {
+pub(crate) fn oidc_flow_cookie_header(is_dev: bool, flow: Option<&OidcFlow>) -> HeaderValue {
     let (value, max_age) = match flow {
         Some(flow) => {
             let json = serde_json::to_string(flow).unwrap_or_default();
@@ -719,28 +961,34 @@ pub async fn oidc_start(
     State(state): State<AppState>,
     Query(query): Query<OidcStartQuery>,
 ) -> ApiResult<Response> {
-    // Presence-checked only: `/callback` (a later task) is what actually
-    // uses the configured `OidcAuthenticator` to verify the id token this
-    // flow eventually produces. This route only needs to know OIDC is
-    // configured at all before it starts a flow for it.
-    state
-        .auth
-        .as_ref()
-        .and_then(|auth| auth.oidc.as_ref())
-        .ok_or_else(|| {
-            ApiError::Unavailable("OIDC is not configured on this deployment".to_owned())
-        })?;
-    let authorize_url =
-        state.config.oidc_authorize_url.as_deref().ok_or_else(|| {
-            ApiError::Unavailable("OIDC_AUTHORIZE_URL is not configured".to_owned())
-        })?;
-    let redirect_uri =
-        state.config.oidc_redirect_uri.as_deref().ok_or_else(|| {
-            ApiError::Unavailable("OIDC_REDIRECT_URI is not configured".to_owned())
-        })?;
-    let client_id = state
-        .config
-        .oidc_client_id
+    // `ADM-12` D10: the runtime, not the bare config. It carries the
+    // addresses the provider's discovery document named, and is ready only
+    // when the connection can sign someone in — so a saved connection with
+    // no return address or an unreachable discovery answers a plain 503
+    // here instead of redirecting somewhere that cannot work. Review round
+    // 2, R2-B1: an authenticator without sign-in addresses (a bearer-only
+    // deployment) is not enough for this route.
+    let runtime = crate::runtime_settings::sso_runtime(&state).await;
+    let Some(_auth) = runtime.sign_in_authenticator() else {
+        return Err(ApiError::Unavailable(
+            runtime
+                .not_ready_reason()
+                .unwrap_or("Single sign-on is not configured on this deployment.")
+                .to_owned(),
+        )
+        .into());
+    };
+    let sso = runtime.settings;
+    let authorize_url = sso
+        .authorize_url
+        .as_deref()
+        .ok_or_else(|| ApiError::Unavailable("OIDC_AUTHORIZE_URL is not configured".to_owned()))?;
+    let redirect_uri = sso
+        .redirect_uri
+        .as_deref()
+        .ok_or_else(|| ApiError::Unavailable("OIDC_REDIRECT_URI is not configured".to_owned()))?;
+    let client_id = sso
+        .client_id
         .as_deref()
         .ok_or_else(|| ApiError::Unavailable("OIDC_CLIENT_ID is not configured".to_owned()))?;
 
@@ -760,6 +1008,7 @@ pub async fn oidc_start(
         nonce: nonce.expose().to_owned(),
         code_verifier: code_verifier.expose().to_owned(),
         next: safe_return_path(query.next.as_deref()),
+        test_run_id: None,
     };
 
     let mut redirect = url::Url::parse(authorize_url)
@@ -782,6 +1031,18 @@ pub async fn oidc_start(
         .append_pair("nonce", &flow.nonce)
         .append_pair("code_challenge", &code_challenge)
         .append_pair("code_challenge_method", "S256");
+
+    // The `prompt` (default `"login"`, `Config::oidc_prompt`): the provider
+    // shows its login form instead of answering from the session it already
+    // holds for this browser. Without it, "sign out" then "sign in" lands on
+    // the account that signed in last on that machine — the provider's
+    // session cookie is still there, and this service never ends it (it
+    // knows nothing about the provider's session). Read from the
+    // deployment's own configuration, never from a request, so a caller
+    // cannot change how the provider is asked to authenticate.
+    if let Some(prompt) = sso.prompt.as_deref() {
+        redirect.query_pairs_mut().append_pair("prompt", prompt);
+    }
 
     let mut response = (StatusCode::FOUND, ()).into_response();
     response.headers_mut().insert(
@@ -826,10 +1087,15 @@ pub struct ProvidersResponse {
 /// in-memory state (`AppState::auth`, `Config::oidc_provider_name`), never
 /// a database or network call.
 pub async fn providers(State(state): State<AppState>) -> ApiResult<ApiJson<ProvidersResponse>> {
-    let oidc = state.auth.as_ref().and_then(|a| a.oidc.as_ref());
+    // `ADM-12` D10: readiness, not mere configuration. A saved connection
+    // that cannot be used (no `CONSOLE_PUBLIC_URL`, an unreachable
+    // discovery, a refused address) reports no OIDC, so the sign-in page
+    // shows no button that would fail; the Settings form says why.
+    let runtime = crate::runtime_settings::sso_runtime(&state).await;
+    let ready = runtime.is_ready();
     Ok(ApiJson(ProvidersResponse {
-        oidc: oidc.is_some(),
-        provider_name: oidc.map(|_| state.config.oidc_provider_name.clone()),
+        oidc: ready,
+        provider_name: ready.then(|| runtime.settings.provider_name.clone()),
     }))
 }
 
@@ -851,6 +1117,12 @@ pub struct OidcCallbackQuery {
 /// the sentence it shows (`src/features/auth/sso-notice.tsx`); this service
 /// never puts prose — or anything from the token — into the URL.
 const OIDC_NOTICE_PARAM: &str = "ssoNotice";
+
+/// Where a callback refused for `SEC-65` D2 sends the person: the sign-in
+/// page with a fixed notice code (`email_not_verified`). The sentence lives
+/// in the console (`src/features/auth/sso-notice.tsx` `NOTICES`); neither
+/// the email nor the subject ever appears in this address.
+const EMAIL_NOT_VERIFIED_LOCATION: &str = "/login?ssoNotice=email_not_verified";
 
 /// `next` with `ssoNotice=<code>` appended, keeping any query `next`
 /// already carried. `next` has already passed `is_safe_relative_path`
@@ -877,6 +1149,41 @@ struct TokenResponse {
     id_token: String,
 }
 
+/// The one member a failed token response is read for, so a refusal is told
+/// apart from an unreachable provider without ever carrying the provider's
+/// text (`ADM-12` review round 1, S1; principle 4).
+#[derive(Debug, Deserialize)]
+struct TokenErrorResponse {
+    error: String,
+}
+
+/// Why a code exchange did not produce an `id_token` (`ADM-12` review round
+/// 1, S1). The provider's status and body are classified here and never
+/// carried further.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeFailure {
+    /// The provider refused the client ID or secret: a 401/403, or its own
+    /// `error` member saying `invalid_client`.
+    Refused,
+    /// The provider could not be reached at all.
+    Unreachable,
+    /// A status this deployment does not classify, or an answer that is not
+    /// the expected shape.
+    Other,
+}
+
+impl ExchangeFailure {
+    /// The fixed sentence the test sign-in stores for this failure. Nothing
+    /// the provider said is appended.
+    const fn sentence(self) -> &'static str {
+        match self {
+            Self::Refused => "The provider refused the client ID or secret.",
+            Self::Unreachable => "The identity provider could not be reached.",
+            Self::Other => "The provider's answer to the sign-in was not usable.",
+        }
+    }
+}
+
 /// `GET /api/auth/oidc/callback?code=&state=` — the second half of the
 /// login flow [`oidc_start`] began: exchange the authorization code for an
 /// id token, verify it (signature, `iss`, `aud`, `exp`/`nbf`, algorithm
@@ -900,6 +1207,14 @@ struct TokenResponse {
 /// [`lakehouse_auth::OidcAuthenticator::authenticate_with_nonce`]. The
 /// console maps the code to its own sentence; this handler adds no prose.
 ///
+/// `SEC-65` D2: when the provider did not confirm the token's email and an
+/// account already holds it, the answer is a redirect to the sign-in page
+/// with `ssoNotice=email_not_verified`, not the generic 401 body — this is
+/// the one refusal a person can act on. Nothing is created, no session is
+/// minted, and the refusal was audited where it was decided
+/// (`lakehouse_auth::oidc`'s `provision_user`). The code, like every other
+/// notice, is fixed; the email and the subject never appear in the address.
+///
 /// # Errors
 ///
 /// Returns 401 on a missing/undecodable/unparseable flow cookie, a
@@ -907,8 +1222,10 @@ struct TokenResponse {
 /// via [`lakehouse_auth::Secret::constant_time_eq`] — never `==`, which
 /// would leak how many leading bytes matched through response timing), a
 /// token-exchange HTTP failure, or a verification failure from
-/// [`lakehouse_auth::OidcAuthenticator::authenticate_with_nonce`]. Every
-/// one of those renders the same generic 401 body: per AGENTS.md
+/// [`lakehouse_auth::OidcAuthenticator::authenticate_with_nonce`]. The one
+/// exception is `AuthError::EmailNotVerified` (`SEC-65` D2), which redirects
+/// to the sign-in page with a notice rather than answering 401 (see above).
+/// Every other one of those renders the same generic 401 body: per AGENTS.md
 /// principle 4 ("upstream error text never reaches a response"), this
 /// handler never puts the `IdP`'s own error body, or which specific check
 /// failed, into anything sent back to the browser — only a `tracing::warn!`
@@ -943,8 +1260,18 @@ pub async fn oidc_callback(
         |msg: &str| ApiRejection(ApiError::Unavailable(msg.to_owned())).into_response();
     let unavailable_and_clear = |msg: &str| unauthorized_and_clear(unavailable(msg));
 
-    // Deployment-configuration presence is checked BEFORE the flow cookie
-    // is ever read — same order [`oidc_start`] already uses for the same
+    // `ADM-12` plan D8: if this request carries an SSO test flow cookie,
+    // route directly to the draft verification handler BEFORE checking whether
+    // live OIDC is configured on this deployment — the whole purpose of the
+    // test flow is to test a draft configuration before saving it.
+    if let Some(flow) = decode_flow_cookie(&headers)
+        && let Some(test_run_id) = flow.test_run_id
+    {
+        return handle_oidc_test_callback(state, query, flow, test_run_id).await;
+    }
+
+    // Deployment-configuration presence is checked BEFORE the regular flow cookie
+    // is processed — same order [`oidc_start`] already uses for the same
     // three settings (`auth.oidc`/token URL/redirect URI/client ID) plus
     // this handler's own `OIDC_TOKEN_URL`. This is a "is OIDC configured
     // on this deployment at all" question, independent of any particular
@@ -953,23 +1280,26 @@ pub async fn oidc_callback(
     // a "no credentials presented" 401/403 for [`crate::policy::POLICY_TABLE`]'s
     // `Policy::Public` purposes, and nothing has been read from `headers`
     // yet, so there is no cookie to clear on this path.
-    let Some(auth) = state.auth.as_ref().and_then(|a| a.oidc.as_ref()) else {
-        return Ok(unavailable("OIDC is not configured on this deployment"));
+    let runtime = crate::runtime_settings::sso_runtime(&state).await;
+    // R2-B1: a bearer-only deployment has an authenticator but cannot sign
+    // anyone in; this route is a sign-in's second half, so it needs the
+    // ready fact, not merely "an authenticator exists".
+    let Some(auth) = runtime.sign_in_authenticator() else {
+        return Ok(unavailable(
+            runtime
+                .not_ready_reason()
+                .unwrap_or("OIDC is not configured on this deployment"),
+        ));
     };
-    let (Some(token_url), Some(redirect_uri)) = (
-        state.config.oidc_token_url.as_deref(),
-        state.config.oidc_redirect_uri.as_deref(),
-    ) else {
+    let sso = runtime.settings.clone();
+    let (Some(token_url), Some(redirect_uri)) =
+        (sso.token_url.as_deref(), sso.redirect_uri.as_deref())
+    else {
         return Ok(unavailable(
             "OIDC_TOKEN_URL/OIDC_REDIRECT_URI are not configured",
         ));
     };
-    // `AuthState::oidc` is `Some` only when `OIDC_ISSUER`/`OIDC_CLIENT_ID`
-    // are both set (`state::oidc_config`), the same invariant `oidc_start`
-    // relies on for `client_id` — reading it the
-    // same fail-closed way here, rather than sending an empty
-    // `client_id` to the token endpoint.
-    let Some(client_id) = state.config.oidc_client_id.as_deref() else {
+    let Some(client_id) = sso.client_id.as_deref() else {
         return Ok(unavailable("OIDC_CLIENT_ID is not configured"));
     };
 
@@ -996,11 +1326,17 @@ pub async fn oidc_callback(
         return Ok(unauthorized());
     }
 
-    let Some(id_token) = exchange_code_for_id_token(
-        &state,
+    let client_secret = if sso.client_secret_set {
+        Some(sso.client_secret.expose_secret())
+    } else {
+        state.config.oidc_client_secret.as_deref()
+    };
+    let Ok(id_token) = exchange_code_for_id_token(
+        &runtime.http,
         token_url,
         redirect_uri,
         client_id,
+        client_secret,
         &code,
         &flow.code_verifier,
     )
@@ -1009,12 +1345,34 @@ pub async fn oidc_callback(
         return Ok(unauthorized());
     };
 
-    let Ok(login) = auth
+    let login = match auth
         .authenticate_with_nonce(&Secret::new(id_token), &flow.nonce)
         .await
-    else {
-        tracing::warn!("oidc callback: id token verification failed");
-        return Ok(unauthorized());
+    {
+        Ok(login) => login,
+        // `SEC-65` D2: the provider did not confirm the email and an
+        // account holds it, so the sign-in is refused. The person is sent
+        // back to the sign-in page with a fixed code instead of the
+        // generic 401 body, because this refusal is something they can
+        // act on ("ask an administrator"); nothing is created, no session
+        // cookie is set, and the refusal itself was already audited where
+        // it was decided (`provision_user`). The flow cookie is cleared
+        // like every other answer from this handler.
+        Err(AuthError::EmailNotVerified) => {
+            let mut response = (StatusCode::FOUND, ()).into_response();
+            response.headers_mut().insert(
+                header::LOCATION,
+                HeaderValue::from_static(EMAIL_NOT_VERIFIED_LOCATION),
+            );
+            response
+                .headers_mut()
+                .append(header::SET_COOKIE, clear_cookie());
+            return Ok(response);
+        }
+        Err(_) => {
+            tracing::warn!("oidc callback: id token verification failed");
+            return Ok(unauthorized());
+        }
     };
     let PrincipalId::User(user_id) = login.principal.id else {
         // `authenticate_with_nonce` only ever resolves a
@@ -1044,8 +1402,10 @@ pub async fn oidc_callback(
         pool,
         user_id,
         session::DEFAULT_SESSION_TTL,
+        // ADM-14 D10: no address — the API sits behind the console's own
+        // server and has no trusted source for the client's.
         None,
-        None,
+        session_user_agent(&headers).as_deref(),
         &login.mapped_role_names,
     )
     .await?;
@@ -1058,15 +1418,8 @@ pub async fn oidc_callback(
     // carries `principal_id`. Best-effort: a failed audit write is
     // logged and swallowed, never propagated, so the response on the
     // wire is always the underlying login's, not the audit's.
-    let audit_event = oidc_login_audit_event(&login.principal, user_id);
-    if let Err(err) = store_audit::insert(pool, audit_event).await {
-        tracing::warn!(
-            %err,
-            action = "auth.oidc.login",
-            user_id = %user_id,
-            "failed to record oidc login audit event"
-        );
-    }
+    audit_coverage::record_best_effort(&state, oidc_login_audit_event(&login.principal, user_id))
+        .await;
 
     let mut response = (StatusCode::FOUND, ()).into_response();
     // `flow.next` was already validated by `is_safe_relative_path` inside
@@ -1120,20 +1473,27 @@ fn decode_flow_cookie(headers: &HeaderMap) -> Option<OidcFlow> {
 }
 
 /// POST the authorization code (and PKCE `code_verifier`) to `token_url`
-/// and return the `id_token` from a successful response, or `None` on any
-/// failure — a non-2xx status, a network error, or a response body that
-/// isn't `{"id_token": "..."}`. Never surfaces the `IdP`'s own status/body
-/// to the caller or into anything but a `tracing::warn!` line (AGENTS.md
-/// principle 4; see [`oidc_callback`]'s `# Errors` doc comment).
+/// through `http` — the client the connection was built with, so the
+/// address that passed the allowlist check is the one dialled (`ADM-12`
+/// D10) — and return the `id_token` from a successful response.
+///
+/// # Errors
+///
+/// Returns a classified [`ExchangeFailure`] (`ADM-12` review round 1, S1):
+/// [`ExchangeFailure::Refused`] for a client-ID/secret refusal,
+/// [`ExchangeFailure::Unreachable`] for a request that never completed, and
+/// [`ExchangeFailure::Other`] otherwise. Never surfaces the `IdP`'s own
+/// status/body to the caller or into anything but a `tracing::warn!` line
+/// (AGENTS.md principle 4).
 async fn exchange_code_for_id_token(
-    state: &AppState,
+    http: &reqwest::Client,
     token_url: &str,
     redirect_uri: &str,
     client_id: &str,
+    client_secret: Option<&str>,
     code: &str,
     code_verifier: &str,
-) -> Option<String> {
-    let http = reqwest::Client::new();
+) -> Result<String, ExchangeFailure> {
     let mut form = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -1141,24 +1501,42 @@ async fn exchange_code_for_id_token(
         ("code_verifier", code_verifier),
         ("client_id", client_id),
     ];
-    if let Some(secret) = state.config.oidc_client_secret.as_deref() {
+    if let Some(secret) = client_secret {
         form.push(("client_secret", secret));
     }
-    let token_response = http
-        .post(token_url)
-        .form(&form)
-        .send()
+    let response = http.post(token_url).form(&form).send().await.map_err(|_| {
+        tracing::warn!("oidc: token exchange request failed");
+        ExchangeFailure::Unreachable
+    })?;
+    if !response.status().is_success() {
+        let status = response.status();
+        // Only the `error` member is read, and only to tell a refusal from a
+        // status this deployment does not classify. The member's value is
+        // compared, never logged or returned.
+        let invalid_client = response
+            .json::<TokenErrorResponse>()
+            .await
+            .is_ok_and(|body| body.error == "invalid_client");
+        tracing::warn!("oidc: the token endpoint did not accept the code exchange");
+        return Err(
+            if invalid_client
+                || status == StatusCode::UNAUTHORIZED
+                || status == StatusCode::FORBIDDEN
+            {
+                ExchangeFailure::Refused
+            } else {
+                ExchangeFailure::Other
+            },
+        );
+    }
+    response
+        .json::<TokenResponse>()
         .await
-        .and_then(reqwest::Response::error_for_status);
-    let Ok(token_response) = token_response else {
-        tracing::warn!("oidc callback: token exchange request failed");
-        return None;
-    };
-    let Ok(TokenResponse { id_token }) = token_response.json::<TokenResponse>().await else {
-        tracing::warn!("oidc callback: token endpoint response was not the expected shape");
-        return None;
-    };
-    Some(id_token)
+        .map(|response| response.id_token)
+        .map_err(|_| {
+            tracing::warn!("oidc: token endpoint response was not the expected shape");
+            ExchangeFailure::Other
+        })
 }
 
 /// Read the `lh_oidc_flow` cookie's raw (still base64url-encoded) value
@@ -1197,6 +1575,291 @@ fn oidc_login_audit_event(principal: &Principal, user_id: Uuid) -> NewAuditEvent
     }
 }
 
+/// Store a test run's result and record the audit row (`ADM-12` D8): one
+/// place, so every failure path stores the same shape and none can forget
+/// the audit. The sentence in `result.error` is fixed by the caller; nothing
+/// the provider said is in it.
+async fn store_sso_test_result(
+    state: &AppState,
+    pool: &PgPool,
+    test_run_id: Uuid,
+    created_by: Uuid,
+    result: serde_json::Value,
+) {
+    let _ = lakehouse_store::sso_settings::update_test_run_result(pool, test_run_id, &result).await;
+    let outcome = if result.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        "executed"
+    } else {
+        "failed"
+    };
+    audit_sso_test(state, created_by, outcome, &result).await;
+}
+
+/// The second half of a test sign-in (`ADM-12` D8): exchange the code and
+/// verify the ID token against the **draft's own** settings, store what the
+/// provider sent, and create no user, no identity and no session.
+///
+/// `ADM-12` review round 1, B2: every address and every setting comes from
+/// the run's stored draft, through the same builder the live path uses — the
+/// token endpoint, the key set and the authenticate address never come from
+/// the live connection, so a draft's secret is never sent to a provider the
+/// draft did not name. S4: the client secret is the one sealed into the run,
+/// never `OIDC_CLIENT_SECRET`.
+///
+/// # Errors
+///
+/// Returns 401 for a missing/expired run, a missing `code`/`state`, or a
+/// `state` mismatch, and 503 without a Postgres pool. Every provider-side
+/// failure is stored as a fixed sentence and answered with the redirect back
+/// to the Settings page (D8).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear test-sign-in flow: every failure stores one fixed sentence and returns the same redirect (ADM-12 D8)"
+)]
+async fn handle_oidc_test_callback(
+    state: AppState,
+    query: OidcCallbackQuery,
+    flow: OidcFlow,
+    test_run_id: Uuid,
+) -> ApiResult<Response> {
+    let clear_cookie = || oidc_flow_cookie_header(state.config.is_dev, None);
+    let unauthorized_and_clear = |mut resp: Response| {
+        resp.headers_mut()
+            .append(header::SET_COOKIE, clear_cookie());
+        resp
+    };
+    let unauthorized = || {
+        unauthorized_and_clear(crate::error::ApiRejection(ApiError::unauthorized()).into_response())
+    };
+    let unavailable_and_clear = |msg: &str| {
+        unauthorized_and_clear(
+            crate::error::ApiRejection(ApiError::Unavailable(msg.to_owned())).into_response(),
+        )
+    };
+
+    let Some(pool) = state.pg.as_deref() else {
+        return Ok(unavailable_and_clear(
+            "authentication unavailable: no Postgres pool is configured (set DATABASE_URL)",
+        ));
+    };
+
+    let run = match lakehouse_store::sso_settings::get_test_run(pool, test_run_id).await {
+        Ok(Some(r)) if r.expires_at > time::OffsetDateTime::now_utc() => r,
+        _ => return Ok(unauthorized()),
+    };
+    let created_by = run.created_by;
+    let draft = run.draft;
+    let sealed_secret = run.draft_secret;
+
+    let landing_target = format!("/admin/settings?section=sign-in&ssoTest={test_run_id}");
+    let mut redirect_resp = (StatusCode::FOUND, ()).into_response();
+    if let Ok(loc) = HeaderValue::from_str(&landing_target) {
+        redirect_resp.headers_mut().insert(header::LOCATION, loc);
+    }
+    redirect_resp
+        .headers_mut()
+        .append(header::SET_COOKIE, clear_cookie());
+
+    let (Some(code), Some(returned_state)) = (query.code, query.state) else {
+        tracing::warn!("oidc test callback: missing code or state");
+        store_sso_test_result(
+            &state,
+            pool,
+            test_run_id,
+            created_by,
+            serde_json::json!({
+                "ok": false,
+                "error": "The provider returned no authorization code or state.",
+            }),
+        )
+        .await;
+        return Ok(redirect_resp);
+    };
+
+    let state_matches =
+        Secret::new(returned_state).constant_time_eq(&Secret::new(flow.state.clone()));
+    if !state_matches {
+        tracing::warn!("oidc test callback: state mismatch");
+        store_sso_test_result(
+            &state,
+            pool,
+            test_run_id,
+            created_by,
+            serde_json::json!({
+                "ok": false,
+                "error": "The sign-in answer did not match the request this deployment started.",
+            }),
+        )
+        .await;
+        return Ok(redirect_resp);
+    }
+
+    // B2: the draft's own settings, and the draft's own discovery document.
+    // R2-B1: the draft must be able to sign someone in, so this takes the
+    // ready fact — a draft whose discovery worked but which has no return
+    // address cannot test a sign-in.
+    let runtime = crate::runtime_settings::sso_runtime_for_settings(
+        &state,
+        crate::runtime_settings::draft_sso_settings(&state.config, &draft),
+    )
+    .await;
+    let Some(authenticator) = runtime.sign_in_authenticator() else {
+        let reason = runtime
+            .not_ready_reason()
+            .unwrap_or("The draft connection cannot be used to test a sign-in.");
+        store_sso_test_result(
+            &state,
+            pool,
+            test_run_id,
+            created_by,
+            serde_json::json!({ "ok": false, "error": reason }),
+        )
+        .await;
+        return Ok(redirect_resp);
+    };
+    let (Some(token_url), Some(redirect_uri), Some(client_id)) = (
+        runtime.settings.token_url.as_deref(),
+        runtime.settings.redirect_uri.as_deref(),
+        runtime.settings.client_id.as_deref(),
+    ) else {
+        store_sso_test_result(
+            &state,
+            pool,
+            test_run_id,
+            created_by,
+            serde_json::json!({
+                "ok": false,
+                "error": "The draft is missing an address a sign-in needs.",
+            }),
+        )
+        .await;
+        return Ok(redirect_resp);
+    };
+
+    // S4: this run uses ONLY the secret sealed into it when it was created.
+    // No `OIDC_CLIENT_SECRET`, and no live connection's secret.
+    let client_secret = match sealed_secret.as_deref() {
+        None => None,
+        Some(sealed) => {
+            let opened = state
+                .connector_secret_store
+                .keyring()
+                .ok()
+                .and_then(|ring| {
+                    ring.open(crate::runtime_settings::SSO_CLIENT_SECRET_SEAL_NAME, sealed)
+                        .ok()
+                })
+                .and_then(|opened| String::from_utf8(opened.plaintext).ok());
+            let Some(opened) = opened else {
+                tracing::warn!("oidc test callback: the run's sealed secret could not be opened");
+                store_sso_test_result(
+                    &state,
+                    pool,
+                    test_run_id,
+                    created_by,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "The secret saved with this test sign-in could not be opened.",
+                    }),
+                )
+                .await;
+                return Ok(redirect_resp);
+            };
+            Some(opened)
+        }
+    };
+
+    let id_token = match exchange_code_for_id_token(
+        &runtime.http,
+        token_url,
+        redirect_uri,
+        client_id,
+        client_secret.as_deref(),
+        &code,
+        &flow.code_verifier,
+    )
+    .await
+    {
+        Ok(id_token) => id_token,
+        Err(failure) => {
+            store_sso_test_result(
+                &state,
+                pool,
+                test_run_id,
+                created_by,
+                serde_json::json!({ "ok": false, "error": failure.sentence() }),
+            )
+            .await;
+            return Ok(redirect_resp);
+        }
+    };
+
+    match authenticator
+        .validate_for_test(&Secret::new(id_token), &flow.nonce)
+        .await
+    {
+        Ok(claims) => {
+            // S2: `emailVerified` and `overage` are part of what an
+            // administrator sees (`SEC-65` will need the former).
+            store_sso_test_result(
+                &state,
+                pool,
+                test_run_id,
+                created_by,
+                serde_json::json!({
+                    "ok": true,
+                    "subject": claims.subject,
+                    "email": claims.email,
+                    "emailVerified": claims.email_verified,
+                    "groups": claims.groups,
+                    "mappedRoles": claims.mapped_roles,
+                    "overage": claims.overage,
+                }),
+            )
+            .await;
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "oidc test callback: id token validation failed");
+            store_sso_test_result(
+                &state,
+                pool,
+                test_run_id,
+                created_by,
+                serde_json::json!({
+                    "ok": false,
+                    "error": "The ID token could not be verified.",
+                }),
+            )
+            .await;
+        }
+    }
+
+    Ok(redirect_resp)
+}
+
+pub(crate) async fn audit_sso_test(
+    state: &AppState,
+    created_by: Uuid,
+    outcome: &str,
+    result: &serde_json::Value,
+) {
+    let event = NewAuditEvent {
+        principal_id: Some(created_by.to_string()),
+        principal_kind: Some("user".to_owned()),
+        actor_label: None,
+        action: "settings.sso.test".to_owned(),
+        resource_kind: Some("settings".to_owned()),
+        resource_id: Some("sso".to_owned()),
+        args: Some(result.clone()),
+        outcome: outcome.to_owned(),
+        detail: None,
+        run_id: None,
+        approval_id: None,
+        session_id: None,
+    };
+    audit_coverage::record_best_effort(state, event).await;
+}
+
 /// Build the `NewAuditEvent` for a successful session revoke — same
 /// pattern as [`oidc_login_audit_event`]: pure, unit-testable, mirrors
 /// `routes::identity::rotate_service_identity_audit_event`. `resource_id`
@@ -1213,6 +1876,30 @@ fn session_revoke_audit_event(principal: &Principal, session_id: Uuid) -> NewAud
         outcome: "executed".to_owned(),
         ..Default::default()
     }
+}
+
+/// Response body for `GET /api/auth/password-rules` (ADM-11 D4, moved above tests for ADM-11 review 1 B4).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasswordRulesResponse {
+    /// Minimum password length.
+    pub min_length: usize,
+    /// Maximum password length.
+    pub max_length: usize,
+}
+
+/// `GET /api/auth/password-rules` — public endpoint returning password length constraints (ADM-11 D4).
+///
+/// ADM-11 review 1 B4: placed above `#[cfg(test)]` so the SEC-11 scan does not skip it.
+///
+/// # Errors
+///
+/// This handler never fails and returns `Ok`.
+pub async fn password_rules() -> ApiResult<ApiJson<PasswordRulesResponse>> {
+    Ok(ApiJson(PasswordRulesResponse {
+        min_length: password::MIN_PASSWORD_LENGTH,
+        max_length: password::MAX_PASSWORD_LENGTH,
+    }))
 }
 
 #[cfg(test)]
@@ -1235,6 +1922,13 @@ mod tests {
     /// `oidc_start` needs, so `AppState::new` boots with `auth.oidc` populated
     /// without a real Postgres instance or network call.
     fn state_with_oidc_flow_config() -> AppState {
+        state_with_oidc_flow_config_and(&[])
+    }
+
+    /// The same deployment as [`state_with_oidc_flow_config`], with extra
+    /// environment variables — for the settings that change what the
+    /// authorize request carries.
+    fn state_with_oidc_flow_config_and(extra: &[(&str, &str)]) -> AppState {
         let mut env = HashMap::new();
         env.insert(
             "DATABASE_URL".to_owned(),
@@ -1254,6 +1948,9 @@ mod tests {
             "OIDC_REDIRECT_URI".to_owned(),
             "https://lake.invalid/api/auth/oidc/callback".to_owned(),
         );
+        for (key, value) in extra {
+            env.insert((*key).to_owned(), (*value).to_owned());
+        }
         let config = Config::from_map(&env).expect("a valid test Config");
         AppState::new(config)
     }
@@ -1272,6 +1969,68 @@ mod tests {
             .decode(value)
             .expect("valid base64url");
         serde_json::from_slice(&json).expect("valid OidcFlow JSON")
+    }
+
+    /// `QA LH-SEC-5-01` (`ADM-14` D9): the browser is recorded as it named
+    /// itself — trimmed, and cut to a length the column and the page can
+    /// carry.
+    #[test]
+    fn the_session_user_agent_is_the_header_trimmed_and_cut_to_512_characters() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("QA-Browser/1.0"),
+        );
+        assert_eq!(
+            session_user_agent(&headers).as_deref(),
+            Some("QA-Browser/1.0")
+        );
+
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("   QA-Browser/1.0   "),
+        );
+        assert_eq!(
+            session_user_agent(&headers).as_deref(),
+            Some("QA-Browser/1.0"),
+            "surrounding whitespace is trimmed"
+        );
+
+        let long = "A".repeat(700);
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_str(&long).expect("a 700-character header value"),
+        );
+        let recorded = session_user_agent(&headers).expect("a long header is recorded, cut short");
+        assert_eq!(recorded.chars().count(), 512);
+        assert!(recorded.chars().all(|c| c == 'A'));
+    }
+
+    /// `QA LH-SEC-5-01` (`ADM-14` D9): nothing is recorded for a header that
+    /// is absent, empty, or not plain ASCII — a value the page would show as
+    /// fact has to be the client's own text, not a lossy conversion.
+    #[test]
+    fn the_session_user_agent_is_nothing_for_an_absent_empty_or_non_ascii_header() {
+        assert_eq!(session_user_agent(&HeaderMap::new()), None);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("   "));
+        assert_eq!(
+            session_user_agent(&headers),
+            None,
+            "whitespace only is empty"
+        );
+
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_bytes("QA-Browser/1.0 é".as_bytes())
+                .expect("obs-text is a legal header value"),
+        );
+        assert_eq!(
+            session_user_agent(&headers),
+            None,
+            "not plain ASCII is not recorded"
+        );
     }
 
     #[tokio::test]
@@ -1297,6 +2056,9 @@ mod tests {
         assert!(location.starts_with("http://idp.invalid/authorize?"));
         assert!(location.contains("code_challenge_method=S256"));
         assert!(location.contains("response_type=code"));
+        // The default `prompt` is `login`: the provider shows its login form
+        // instead of answering from the session it holds for this browser.
+        assert!(location.contains("prompt=login"));
         let set_cookie = response
             .headers()
             .get(header::SET_COOKIE)
@@ -1306,6 +2068,195 @@ mod tests {
         assert!(set_cookie.starts_with("lh_oidc_flow="));
         assert!(set_cookie.contains("HttpOnly"));
         assert!(set_cookie.contains("SameSite=Lax"));
+    }
+
+    #[tokio::test]
+    async fn oidc_start_sends_the_prompt_the_deployment_asks_for() {
+        // `OIDC_PROMPT` set to another value: that value is sent.
+        let state = state_with_oidc_flow_config_and(&[("OIDC_PROMPT", "consent")]);
+        let app = crate::routes::router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/oidc/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let query = url::Url::parse(location)
+            .expect("the authorize redirect is a URL")
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query.get("prompt").map(String::as_str), Some("consent"));
+        assert_ne!(query.get("prompt").map(String::as_str), Some("login"));
+
+        // `OIDC_PROMPT=off`: the deployment's own spelling for "send no
+        // prompt at all", so the provider reuses the session it holds for
+        // this browser. (An empty value is the default, not an opt-out:
+        // compose always passes the variable.)
+        let state = state_with_oidc_flow_config_and(&[("OIDC_PROMPT", "off")]);
+        let app = crate::routes::router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/oidc/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let query = url::Url::parse(location)
+            .expect("the authorize redirect is a URL")
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query.get("prompt"), None, "{location}");
+    }
+
+    #[test]
+    fn the_provider_logout_address_names_the_client_and_the_return_address() {
+        let url = build_provider_logout_url(
+            "http://idp.invalid/realms/lakehouse/protocol/openid-connect/logout",
+            "lakehouse",
+            "http://lake.invalid/login",
+        )
+        .expect("a logout address");
+        assert!(
+            url.starts_with("http://idp.invalid/realms/lakehouse/protocol/openid-connect/logout?")
+        );
+        let query = url::Url::parse(&url)
+            .expect("a URL")
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            query.get("client_id").map(String::as_str),
+            Some("lakehouse")
+        );
+        assert_eq!(
+            query.get("post_logout_redirect_uri").map(String::as_str),
+            Some("http://lake.invalid/login")
+        );
+
+        // An address the provider does not publish is not turned into a
+        // logout the provider will refuse: no address, no logout.
+        assert_eq!(
+            build_provider_logout_url("not a url", "lakehouse", "http://lake.invalid/login"),
+            None
+        );
+    }
+
+    /// A discovery document naming every address a sign-in needs, plus the
+    /// provider's logout endpoint.
+    async fn mount_discovery_with_logout(server: &wiremock::MockServer, issuer: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/openid-configuration",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issuer": issuer,
+                    "authorization_endpoint": format!("{issuer}/authorize"),
+                    "token_endpoint": format!("{issuer}/token"),
+                    "jwks_uri": format!("{issuer}/.well-known/jwks.json"),
+                    "end_session_endpoint": format!("{issuer}/logout"),
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_connection_the_environment_owns_still_names_the_providers_logout_address() {
+        // The staging shape: the whole connection is in `.env`, so building
+        // the runtime reads no discovery document (D3). The sign-out must
+        // still find the provider's logout endpoint, or "sign out, then
+        // sign in" lands on the account that signed in last.
+        let server = wiremock::MockServer::start().await;
+        let issuer = server.uri();
+        mount_discovery_with_logout(&server, &issuer).await;
+        let state = state_with_oidc_flow_config_and(&[
+            ("OIDC_ISSUER", &issuer),
+            ("OIDC_POST_LOGOUT_REDIRECT_URI", "http://lake.invalid/login"),
+        ]);
+
+        let url = provider_logout_url(&state)
+            .await
+            .expect("the provider's logout address");
+        let parsed = url::Url::parse(&url).expect("a URL");
+        assert_eq!(
+            parsed.path(),
+            "/logout",
+            "the provider's own endpoint: {url}"
+        );
+        let query = parsed
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            query.get("client_id").map(String::as_str),
+            Some("lakehouse-console")
+        );
+        assert_eq!(
+            query.get("post_logout_redirect_uri").map(String::as_str),
+            Some("http://lake.invalid/login")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_does_not_answer_leaves_only_this_deployments_sign_out() {
+        // The read is best-effort: a provider that fails its discovery
+        // document gives no logout address, and the sign-out still ends this
+        // deployment's session (the caller sends the browser to /login).
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/openid-configuration",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let issuer = server.uri();
+        let state = state_with_oidc_flow_config_and(&[
+            ("OIDC_ISSUER", &issuer),
+            ("OIDC_POST_LOGOUT_REDIRECT_URI", "http://lake.invalid/login"),
+        ]);
+
+        assert_eq!(provider_logout_url(&state).await, None);
+    }
+
+    #[tokio::test]
+    async fn without_a_return_address_the_sign_out_asks_the_provider_nothing() {
+        // No `OIDC_POST_LOGOUT_REDIRECT_URI`: the provider would refuse the
+        // logout, so none is built — and its discovery document is not read
+        // for one either.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/openid-configuration",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let issuer = server.uri();
+        let state = state_with_oidc_flow_config_and(&[("OIDC_ISSUER", &issuer)]);
+
+        assert_eq!(provider_logout_url(&state).await, None);
     }
 
     #[tokio::test]
@@ -1435,6 +2386,7 @@ mod tests {
                 nonce: "nonce-1".to_owned(),
                 code_verifier: "verifier-1".to_owned(),
                 next: "/dashboards".to_owned(),
+                test_run_id: None,
             }),
         );
         let response = app
@@ -1540,11 +2492,803 @@ mod tests {
         aud: &'a str,
         exp: i64,
         nonce: &'a str,
+        /// The email claim, when the test sign-in result is about it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        email: Option<&'a str>,
+        /// The provider's `email_verified` claim (`ADM-12` D8/S2).
+        #[serde(rename = "email_verified", skip_serializing_if = "Option::is_none")]
+        email_verified: Option<bool>,
+        /// The groups claim the configured `groupsClaim` names.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        groups: Option<Vec<&'a str>>,
         /// Entra ID's overage marker (`SEC-39`): names each claim whose
         /// values did not fit in the token, so the claim itself is absent.
         /// `None` for every ordinary test token.
         #[serde(rename = "_claim_names", skip_serializing_if = "Option::is_none")]
         claim_names: Option<serde_json::Value>,
+    }
+
+    // ── `ADM-12` review round 1, B1 + D10: a connection saved in Settings,
+    // with no `OIDC_*` variable at all, signs someone in end to end ────────
+    //
+    // The provider is reached over `https` (`wiremock` through
+    // `tls_proxy::HttpsFront`): a console-set issuer must be `https://` (D6)
+    // and a test must not weaken that check to reach a plaintext mock. The
+    // test supplies the client that trusts the CA the front minted
+    // (`AppState::sso_http_override`, compiled only for this crate's tests);
+    // every address check still runs, and only the pins are replaced.
+
+    /// A reachable `https` mock OIDC provider (`ADM-12` review round 1, B1):
+    /// `wiremock` behind [`crate::tls_proxy::HttpsFront`], with a discovery
+    /// document naming the authorize, token and key-set addresses at the
+    /// same `https` origin, and a client that trusts the CA the front
+    /// minted. Every address check still runs against the real
+    /// `validate`/`resolve_checked` path.
+    async fn https_mock_provider() -> (
+        wiremock::MockServer,
+        crate::tls_proxy::HttpsFront,
+        String,
+        reqwest::Client,
+    ) {
+        let server = wiremock::MockServer::start().await;
+        let plain_port: u16 = url::Url::parse(&server.uri())
+            .expect("the mock's URI parses")
+            .port()
+            .expect("the mock listens on a port");
+        let front = crate::tls_proxy::HttpsFront::start("127.0.0.1", plain_port, "127.0.0.1").await;
+        let issuer = format!("https://127.0.0.1:{}", front.port());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/openid-configuration",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issuer": issuer,
+                    "authorization_endpoint": format!("{issuer}/authorize"),
+                    "token_endpoint": format!("{issuer}/token"),
+                    "jwks_uri": format!("{issuer}/.well-known/jwks.json"),
+                })),
+            )
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder()
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(front.ca_pem().as_bytes())
+                    .expect("the front's CA as a certificate"),
+            )
+            .build()
+            .expect("a client trusting the test CA");
+        (server, front, issuer, client)
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_connection_saved_in_settings_signs_in_with_no_oidc_env(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let (server, _front, issuer, http) = https_mock_provider().await;
+        let key = TestKey::generate("kid-1");
+        mount_jwks(&server, &key).await;
+
+        // No `OIDC_*` variable at all: the connection comes from `PUT`, the
+        // return address from `CONSOLE_PUBLIC_URL` (D10).
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert(
+            "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+            "true".to_owned(),
+        );
+        env.insert(
+            "CONSOLE_PUBLIC_URL".to_owned(),
+            "https://lakehouse.test".to_owned(),
+        );
+        // A throwaway installation key, so the console may seal a client
+        // secret (base64 of 32 bytes of 0x2a — not a secret).
+        env.insert("CONNECTOR_SECRETS_KEY".to_owned(), {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x2a_u8; 32])
+        });
+        let mut state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        state.sso_http_override = Some(http);
+        let app = crate::routes::router(state.clone());
+
+        // The seeded Platform Admin holds `*:*`, so it may save SSO (D5).
+        let (admin_id,): (Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+            .bind("fajar@meridian.example")
+            .fetch_one(&pool)
+            .await?;
+        let session_token = lakehouse_auth::session::create_session(
+            &pool,
+            admin_id,
+            lakehouse_auth::session::DEFAULT_SESSION_TTL,
+            None,
+            None,
+            &[] as &[String],
+        )
+        .await
+        .expect("a session for the seeded admin");
+        let cookie = format!("{}={}", SESSION_COOKIE_NAME, session_token.expose());
+
+        let saved = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/settings/sso")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "issuer": issuer,
+                            "clientId": "lakehouse-console",
+                            "clientSecret": "test-secret",
+                            "providerName": "mock",
+                            "jitProvisioning": true,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+        let saved_body = body_json(saved).await;
+        assert_eq!(saved_body["ready"], true, "{saved_body}");
+
+        // The sign-in page is told there is a provider.
+        let providers = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let providers_body = body_json(providers).await;
+        assert_eq!(providers_body["oidc"], true, "{providers_body}");
+
+        // 1. The sign-in starts at the discovery document's authorization
+        // endpoint, and returns to `CONSOLE_PUBLIC_URL`'s callback.
+        let started = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/oidc/start?next=/dashboards")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::FOUND);
+        let location = started
+            .headers()
+            .get(header::LOCATION)
+            .expect("a redirect target")
+            .to_str()
+            .expect("an ASCII location")
+            .to_owned();
+        assert!(
+            location.starts_with(&format!("{issuer}/authorize?")),
+            "the authorize address comes from discovery: {location}"
+        );
+        assert!(
+            location.contains(
+                "redirect_uri=https%3A%2F%2Flakehouse.test%2Fapi%2Fauth%2Foidc%2Fcallback"
+            ),
+            "the return address comes from CONSOLE_PUBLIC_URL: {location}"
+        );
+        let flow_cookie = started
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("the flow cookie")
+            .to_str()
+            .expect("an ASCII cookie")
+            .to_owned();
+        let flow = decode_flow_cookie(&flow_cookie);
+
+        // 2. The provider answers the code exchange at the discovery
+        // document's token endpoint.
+        let id_token = sign_id_token(
+            &IdTokenClaims {
+                sub: "user-saved-in-settings",
+                iss: &issuer,
+                aud: "lakehouse-console",
+                exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                nonce: &flow.nonce,
+                email: None,
+                email_verified: None,
+                groups: None,
+                claim_names: None,
+            },
+            &key,
+        );
+        mount_token_endpoint(&server, &id_token).await;
+
+        let callback = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/auth/oidc/callback?code=code-1&state={}",
+                        flow.state
+                    ))
+                    .header(
+                        header::COOKIE,
+                        flow_cookie.split(';').next().unwrap_or_default(),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(callback.status(), StatusCode::FOUND);
+        assert_eq!(
+            callback
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/dashboards")
+        );
+        assert!(
+            callback
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .any(|value| value.to_str().is_ok_and(
+                    |text| text.starts_with("lh_session=") && !text.contains("Max-Age=0")
+                )),
+            "a session is created"
+        );
+
+        // 3. JIT provisioning created the account for the new subject.
+        let (identities,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM auth_identity \
+             WHERE provider = 'oidc:mock' AND external_subject = 'user-saved-in-settings'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(identities, 1, "the sign-in provisions the new subject");
+        Ok(())
+    }
+
+    // ── `ADM-12` review round 1, B2/S1/S2/S4: the test sign-in uses the
+    // draft's own provider, says what failed, and creates nothing ─────────
+
+    /// A test sign-in against a draft is verified with the draft's own
+    /// provider, reports `emailVerified` and `overage`, and creates no user,
+    /// identity or session (D8; review round 1, S2).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_test_sign_in_reports_the_draft_providers_claims_and_creates_nothing(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let (server, _front, issuer, http) = https_mock_provider().await;
+        let key = TestKey::generate("kid-1");
+        mount_jwks(&server, &key).await;
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert(
+            "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+            "true".to_owned(),
+        );
+        env.insert(
+            "CONSOLE_PUBLIC_URL".to_owned(),
+            "https://lakehouse.test".to_owned(),
+        );
+        env.insert("CONNECTOR_SECRETS_KEY".to_owned(), {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x2a_u8; 32])
+        });
+        let mut state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        state.sso_http_override = Some(http);
+        let admin = seeded_admin_id(&pool).await?;
+
+        let users_before: i64 = sqlx::query_scalar("SELECT count(*) FROM app_user")
+            .fetch_one(&pool)
+            .await?;
+        let identities_before: i64 = sqlx::query_scalar("SELECT count(*) FROM auth_identity")
+            .fetch_one(&pool)
+            .await?;
+        let sessions_before: i64 = sqlx::query_scalar("SELECT count(*) FROM session")
+            .fetch_one(&pool)
+            .await?;
+
+        let (flow_cookie, run_id) = start_sso_test(
+            &state,
+            admin,
+            serde_json::json!({
+                "issuer": issuer,
+                "clientId": "draft-client",
+                "clientSecret": "draft-secret",
+                "providerName": "draft-provider",
+                "groupsClaim": "groups",
+                "roleMap": [{"group": "admins", "role": "Platform Admin"}],
+                "jitProvisioning": true,
+            }),
+        )
+        .await;
+        let flow = decode_flow_cookie(&flow_cookie);
+
+        let id_token = sign_id_token(
+            &IdTokenClaims {
+                sub: "draft-subject-1",
+                iss: &issuer,
+                aud: "draft-client",
+                exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                nonce: &flow.nonce,
+                email: Some("draft@example.com"),
+                email_verified: Some(true),
+                groups: Some(vec!["admins"]),
+                claim_names: None,
+            },
+            &key,
+        );
+        mount_token_endpoint(&server, &id_token).await;
+
+        let response = finish_sso_test(&state, &flow_cookie, &flow, "code-1").await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+
+        let run = lakehouse_store::sso_settings::get_test_run(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("the run exists");
+        let result = run.result.expect("the callback stored a result");
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["subject"], "draft-subject-1");
+        assert_eq!(result["email"], "draft@example.com");
+        assert_eq!(result["emailVerified"], true);
+        assert_eq!(result["groups"], serde_json::json!(["admins"]));
+        assert_eq!(result["mappedRoles"], serde_json::json!(["Platform Admin"]));
+        assert_eq!(result["overage"], false);
+
+        let users_after: i64 = sqlx::query_scalar("SELECT count(*) FROM app_user")
+            .fetch_one(&pool)
+            .await?;
+        let identities_after: i64 = sqlx::query_scalar("SELECT count(*) FROM auth_identity")
+            .fetch_one(&pool)
+            .await?;
+        let sessions_after: i64 = sqlx::query_scalar("SELECT count(*) FROM session")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(users_before, users_after, "no app_user created");
+        assert_eq!(
+            identities_before, identities_after,
+            "no auth_identity created"
+        );
+        assert_eq!(sessions_before, sessions_after, "no session created");
+        Ok(())
+    }
+
+    /// `ADM-12` review round 1, B2: a draft whose provider differs from the
+    /// saved one never sends anything to the saved provider — the token
+    /// exchange goes to the draft's own discovery document.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_draft_whose_provider_differs_sends_nothing_to_the_saved_one(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        // The saved connection's provider, reachable but never used here.
+        let (saved_server, _saved_front, saved_issuer, _saved_http) = https_mock_provider().await;
+        // The draft's own provider.
+        let (draft_server, _draft_front, draft_issuer, draft_http) = https_mock_provider().await;
+        let key = TestKey::generate("kid-1");
+        mount_jwks(&draft_server, &key).await;
+
+        lakehouse_store::sso_settings::upsert(
+            &pool,
+            &lakehouse_store::sso_settings::SsoSettings {
+                oidc_issuer: Some(saved_issuer),
+                oidc_client_id: Some("saved-client".to_owned()),
+                oidc_client_secret: None,
+                oidc_provider_name: Some("saved-provider".to_owned()),
+                oidc_groups_claim: None,
+                oidc_role_map: None,
+                oidc_jit_provisioning: None,
+                oidc_trust_email: None,
+            },
+            "test-user",
+        )
+        .await
+        .unwrap();
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert(
+            "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+            "true".to_owned(),
+        );
+        env.insert(
+            "CONSOLE_PUBLIC_URL".to_owned(),
+            "https://lakehouse.test".to_owned(),
+        );
+        env.insert("CONNECTOR_SECRETS_KEY".to_owned(), {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x2a_u8; 32])
+        });
+        let mut state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        // One client that trusts both mocks' CAs: the saved provider's CA
+        // is only trusted, never dialled, by this test.
+        state.sso_http_override = Some(draft_http);
+        let admin = seeded_admin_id(&pool).await?;
+
+        let (flow_cookie, _run_id) = start_sso_test(
+            &state,
+            admin,
+            serde_json::json!({
+                "issuer": draft_issuer,
+                "clientId": "draft-client",
+                "clientSecret": "draft-secret",
+            }),
+        )
+        .await;
+        let flow = decode_flow_cookie(&flow_cookie);
+        let id_token = sign_id_token(
+            &IdTokenClaims {
+                sub: "draft-subject-2",
+                iss: &draft_issuer,
+                aud: "draft-client",
+                exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                nonce: &flow.nonce,
+                email: None,
+                email_verified: None,
+                groups: None,
+                claim_names: None,
+            },
+            &key,
+        );
+        mount_token_endpoint(&draft_server, &id_token).await;
+
+        let response = finish_sso_test(&state, &flow_cookie, &flow, "code-2").await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+
+        // The saved provider saw no request at all: not the discovery
+        // document, and above all not its token endpoint.
+        let saved_requests = saved_server.received_requests().await.unwrap();
+        assert!(
+            saved_requests.is_empty(),
+            "the draft's test sign-in must not reach the saved provider: {saved_requests:?}"
+        );
+        // The draft's provider is where the code was exchanged.
+        let draft_requests = draft_server.received_requests().await.unwrap();
+        assert!(
+            draft_requests
+                .iter()
+                .any(|request| request.method.as_str() == "POST" && request.url.path() == "/token"),
+            "the exchange goes to the draft's token endpoint: {draft_requests:?}"
+        );
+        Ok(())
+    }
+
+    /// `ADM-12` review round 1, S1: a provider that cannot be reached is
+    /// told apart from one that refused the client, with a fixed sentence.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_test_sign_in_that_cannot_reach_the_provider_says_so(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        // A port nothing listens on: bound, then released.
+        let closed_port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let server = wiremock::MockServer::start().await;
+        let plain_port: u16 = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+        let front = crate::tls_proxy::HttpsFront::start("127.0.0.1", plain_port, "127.0.0.1").await;
+        let issuer = format!("https://127.0.0.1:{}", front.port());
+        // The discovery document is readable; only the token endpoint is
+        // unreachable.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/openid-configuration",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issuer": issuer,
+                    "authorization_endpoint": format!("{issuer}/authorize"),
+                    "token_endpoint": format!("https://127.0.0.1:{closed_port}/token"),
+                    "jwks_uri": format!("{issuer}/.well-known/jwks.json"),
+                })),
+            )
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::builder()
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(front.ca_pem().as_bytes()).unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert(
+            "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+            "true".to_owned(),
+        );
+        env.insert(
+            "CONSOLE_PUBLIC_URL".to_owned(),
+            "https://lakehouse.test".to_owned(),
+        );
+        env.insert("CONNECTOR_SECRETS_KEY".to_owned(), {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x2a_u8; 32])
+        });
+        let mut state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        state.sso_http_override = Some(http);
+        let admin = seeded_admin_id(&pool).await?;
+
+        let (flow_cookie, run_id) = start_sso_test(
+            &state,
+            admin,
+            serde_json::json!({
+                "issuer": issuer,
+                "clientId": "draft-client",
+                "clientSecret": "draft-secret",
+            }),
+        )
+        .await;
+        let flow = decode_flow_cookie(&flow_cookie);
+        let response = finish_sso_test(&state, &flow_cookie, &flow, "code-3").await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+
+        let run = lakehouse_store::sso_settings::get_test_run(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("the run exists");
+        let result = run.result.expect("the callback stored a result");
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(
+            result["error"],
+            "The identity provider could not be reached."
+        );
+        Ok(())
+    }
+
+    /// `ADM-12` review round 1, S4: a run with no secret of its own sends
+    /// none — never the deployment's `OIDC_CLIENT_SECRET`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_test_run_with_no_secret_sends_no_client_secret(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let (server, _front, issuer, http) = https_mock_provider().await;
+        let key = TestKey::generate("kid-1");
+        mount_jwks(&server, &key).await;
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert(
+            "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+            "true".to_owned(),
+        );
+        env.insert(
+            "CONSOLE_PUBLIC_URL".to_owned(),
+            "https://lakehouse.test".to_owned(),
+        );
+        env.insert("CONNECTOR_SECRETS_KEY".to_owned(), {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x2a_u8; 32])
+        });
+        // The deployment's own secret, which this run must not use.
+        env.insert("OIDC_CLIENT_SECRET".to_owned(), "env-secret".to_owned());
+        let mut state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        state.sso_http_override = Some(http);
+        let admin = seeded_admin_id(&pool).await?;
+
+        let (flow_cookie, run_id) = start_sso_test(
+            &state,
+            admin,
+            serde_json::json!({
+                "issuer": issuer,
+                "clientId": "draft-client",
+                // An explicit null: this run carries no secret at all.
+                "clientSecret": null,
+            }),
+        )
+        .await;
+        let flow = decode_flow_cookie(&flow_cookie);
+        let id_token = sign_id_token(
+            &IdTokenClaims {
+                sub: "draft-subject-4",
+                iss: &issuer,
+                aud: "draft-client",
+                exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                nonce: &flow.nonce,
+                email: None,
+                email_verified: None,
+                groups: None,
+                claim_names: None,
+            },
+            &key,
+        );
+        mount_token_endpoint(&server, &id_token).await;
+
+        let response = finish_sso_test(&state, &flow_cookie, &flow, "code-4").await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+
+        let token_requests: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.method.as_str() == "POST" && request.url.path() == "/token")
+            .collect();
+        assert_eq!(token_requests.len(), 1, "the code was exchanged once");
+        let body = String::from_utf8_lossy(&token_requests[0].body);
+        assert!(
+            !body.contains("client_secret"),
+            "a run with no secret sends none, not OIDC_CLIENT_SECRET: {body}"
+        );
+        let run = lakehouse_store::sso_settings::get_test_run(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("the run exists");
+        assert_eq!(
+            run.result.expect("the callback stored a result")["ok"],
+            true,
+            "the public-client exchange still verifies the token"
+        );
+        Ok(())
+    }
+
+    /// `ADM-12` review round 1, S2: a token carrying an overage marker
+    /// reports `overage: true` and maps no group-based role (`SEC-39`).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_test_sign_in_with_a_group_overage_says_so(pool: sqlx::PgPool) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let (server, _front, issuer, http) = https_mock_provider().await;
+        let key = TestKey::generate("kid-1");
+        mount_jwks(&server, &key).await;
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert(
+            "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+            "true".to_owned(),
+        );
+        env.insert(
+            "CONSOLE_PUBLIC_URL".to_owned(),
+            "https://lakehouse.test".to_owned(),
+        );
+        let mut state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        state.sso_http_override = Some(http);
+        let admin = seeded_admin_id(&pool).await?;
+
+        let (flow_cookie, run_id) = start_sso_test(
+            &state,
+            admin,
+            serde_json::json!({
+                "issuer": issuer,
+                "clientId": "draft-client",
+                "roleMap": [{"group": "lakehouse-admins", "role": "Platform Admin"}],
+            }),
+        )
+        .await;
+        let flow = decode_flow_cookie(&flow_cookie);
+        let id_token = sign_id_token(
+            &IdTokenClaims {
+                sub: "draft-subject-5",
+                iss: &issuer,
+                aud: "draft-client",
+                exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                nonce: &flow.nonce,
+                email: None,
+                email_verified: None,
+                groups: None,
+                claim_names: Some(serde_json::json!({ "groups": "src1" })),
+            },
+            &key,
+        );
+        mount_token_endpoint(&server, &id_token).await;
+
+        let response = finish_sso_test(&state, &flow_cookie, &flow, "code-5").await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+        let run = lakehouse_store::sso_settings::get_test_run(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("the run exists");
+        let result = run.result.expect("the callback stored a result");
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["overage"], true, "{result}");
+        assert_eq!(result["mappedRoles"], serde_json::json!([]), "{result}");
+        Ok(())
+    }
+
+    /// The seeded Platform Admin as the route handlers see it: unrestricted
+    /// (`*:*`), which is what `PUT`/`POST`/`GET` of SSO settings require (D5).
+    fn admin_principal(id: Uuid) -> Principal {
+        Principal {
+            id: PrincipalId::User(id),
+            tenant_ids: Vec::new(),
+            display_name: "fajar".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::parse("*:*"),
+            provider: "local".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    async fn seeded_admin_id(pool: &sqlx::PgPool) -> sqlx::Result<Uuid> {
+        let (admin_id,): (Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+            .bind("fajar@meridian.example")
+            .fetch_one(pool)
+            .await?;
+        Ok(admin_id)
+    }
+
+    /// Start a test sign-in by calling the route handler (`ADM-12` D8): the
+    /// response's flow cookie and the run's id.
+    async fn start_sso_test(
+        state: &AppState,
+        admin: Uuid,
+        draft: serde_json::Value,
+    ) -> (String, Uuid) {
+        let response = crate::routes::settings::post_sso_test(
+            axum::extract::State(state.clone()),
+            axum::Extension(admin_principal(admin)),
+            axum::body::Bytes::from(draft.to_string().into_bytes()),
+        )
+        .await
+        .expect("a usable draft starts a test sign-in");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the draft must be usable: {:?}",
+            response.status()
+        );
+        let flow_cookie = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|value| {
+                let text = value.to_str().ok()?;
+                text.starts_with("lh_oidc_flow=").then(|| text.to_owned())
+            })
+            .expect("the test flow cookie");
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let run_id: Uuid = body["id"]
+            .as_str()
+            .expect("the run id")
+            .parse()
+            .expect("a UUID");
+        (flow_cookie, run_id)
+    }
+
+    /// Finish a test sign-in by calling the callback handler with the flow
+    /// cookie `start_sso_test` returned.
+    async fn finish_sso_test(
+        state: &AppState,
+        flow_cookie: &str,
+        flow: &OidcFlow,
+        code: &str,
+    ) -> Response {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(flow_cookie.split(';').next().unwrap_or_default())
+                .expect("an ASCII cookie"),
+        );
+        oidc_callback(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(OidcCallbackQuery {
+                code: Some(code.to_owned()),
+                state: Some(flow.state.clone()),
+            }),
+            headers,
+        )
+        .await
+        .expect("the callback answers")
     }
 
     fn sign_id_token(claims: &IdTokenClaims<'_>, key: &TestKey) -> String {
@@ -1629,6 +3373,7 @@ mod tests {
             nonce: "nonce-from-start".to_owned(),
             code_verifier: "verifier-1".to_owned(),
             next: "/dashboards".to_owned(),
+            test_run_id: None,
         };
 
         let id_token = sign_id_token(
@@ -1640,6 +3385,9 @@ mod tests {
                 // always well under `i32::MAX` seconds past the epoch.
                 exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
                 nonce: &flow.nonce,
+                email: None,
+                email_verified: None,
+                groups: None,
                 claim_names: None,
             },
             &key,
@@ -1678,6 +3426,7 @@ mod tests {
                         flow.state
                     ))
                     .header(header::COOKIE, cookie.to_str().unwrap())
+                    .header(header::USER_AGENT, "QA-Browser/1.0")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1711,6 +3460,19 @@ mod tests {
                 .any(|c| c.starts_with(&format!("{OIDC_FLOW_COOKIE_NAME}="))
                     && c.contains("Max-Age=0")),
             "expected the flow cookie to be cleared even on success: {set_cookies:?}"
+        );
+
+        // QA LH-SEC-5-01 (ADM-14 D9/D10): the single sign-on callback records
+        // the browser it came from, and records no network address.
+        let (count, user_agent, created_ip): (i64, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT count(*), max(user_agent), max(created_ip) FROM session")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(count, 1, "one callback, one session");
+        assert_eq!(user_agent.as_deref(), Some("QA-Browser/1.0"));
+        assert_eq!(
+            created_ip, None,
+            "the network address is not recorded (ADM-14 D10)"
         );
         Ok(())
     }
@@ -1755,6 +3517,7 @@ mod tests {
             nonce: "nonce-from-start".to_owned(),
             code_verifier: "verifier-1".to_owned(),
             next: "/dashboards".to_owned(),
+            test_run_id: None,
         };
 
         let id_token = sign_id_token(
@@ -1764,6 +3527,9 @@ mod tests {
                 aud: client_id,
                 exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
                 nonce: &flow.nonce,
+                email: None,
+                email_verified: None,
+                groups: None,
                 claim_names: Some(serde_json::json!({ "groups": "src1" })),
             },
             &key,
@@ -1818,6 +3584,134 @@ mod tests {
         Ok(())
     }
 
+    /// `SEC-65` D2/AC2: the provider did not confirm the token's email and
+    /// an existing account holds it, so the callback sends the person back
+    /// to the sign-in page with the fixed notice code — not the generic 401
+    /// body — and mints nothing: no session cookie, no identity row. The
+    /// audit row holds the provider and the subject, never the email.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn oidc_callback_redirects_an_unconfirmed_email_to_the_sign_in_notice(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let server = wiremock::MockServer::start().await;
+        let key = TestKey::generate("kid-1");
+        mount_jwks(&server, &key).await;
+        mount_discovery(&server, &server.uri()).await;
+
+        let issuer = server.uri();
+        let client_id = "lakehouse-console";
+        let flow = OidcFlow {
+            state: "state-from-start".to_owned(),
+            nonce: "nonce-from-start".to_owned(),
+            code_verifier: "verifier-1".to_owned(),
+            next: "/dashboards".to_owned(),
+            test_run_id: None,
+        };
+
+        // Rina Wijaya (seeded, `0002_seed_identity.sql`) is an active
+        // account under this address; the token claims it but does not
+        // confirm it (`email_verified` absent).
+        let id_token = sign_id_token(
+            &IdTokenClaims {
+                sub: "unconfirmed-callback-subject",
+                iss: &issuer,
+                aud: client_id,
+                exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                nonce: &flow.nonce,
+                email: Some("rina@meridian.example"),
+                email_verified: None,
+                groups: None,
+                claim_names: None,
+            },
+            &key,
+        );
+        mount_token_endpoint(&server, &id_token).await;
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("OIDC_ISSUER".to_owned(), issuer.clone());
+        env.insert("OIDC_CLIENT_ID".to_owned(), client_id.to_owned());
+        env.insert(
+            "OIDC_AUTHORIZE_URL".to_owned(),
+            format!("{issuer}/authorize"),
+        );
+        env.insert("OIDC_TOKEN_URL".to_owned(), format!("{issuer}/token"));
+        env.insert(
+            "OIDC_REDIRECT_URI".to_owned(),
+            "https://lake.invalid/api/auth/oidc/callback".to_owned(),
+        );
+        env.insert("OIDC_JIT_PROVISIONING".to_owned(), "true".to_owned());
+        let config = Config::from_map(&env).expect("a valid test Config");
+        let state = AppState::new(config);
+        let app = crate::routes::router(state);
+
+        let cookie = oidc_flow_cookie_header(true, Some(&flow));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/auth/oidc/callback?code=auth-code-1&state={}",
+                        flow.state
+                    ))
+                    .header(header::COOKIE, cookie.to_str().unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/login?ssoNotice=email_not_verified",
+            "the refusal goes to the sign-in page's notice, with a fixed code"
+        );
+        let set_cookies: Vec<&str> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert!(
+            !set_cookies
+                .iter()
+                .any(|c| c.starts_with(&format!("{SESSION_COOKIE_NAME}="))),
+            "a refused sign-in mints no session: {set_cookies:?}"
+        );
+        assert!(
+            set_cookies
+                .iter()
+                .any(|c| c.starts_with(&format!("{OIDC_FLOW_COOKIE_NAME}="))
+                    && c.contains("Max-Age=0")),
+            "the flow cookie is still single-use: {set_cookies:?}"
+        );
+
+        let identities: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM auth_identity WHERE provider = 'oidc:test' \
+             AND external_subject = 'unconfirmed-callback-subject'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(identities, 0, "nothing was linked");
+
+        let audited: (String,) = sqlx::query_as(
+            "SELECT args->>'subject' FROM audit_event \
+             WHERE action = 'auth.oidc.link_refused' AND outcome = 'refused'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(audited.0, "unconfirmed-callback-subject");
+        let with_email: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_event WHERE args::text LIKE '%rina@meridian.example%'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(with_email, 0, "the audit row never carries the email");
+        Ok(())
+    }
+
     // ── `oidc_callback` writes a real `audit_event` row on
     // success. Reuses the wiremock round-trip harness above verbatim —
     // the only addition is the post-response SELECT against
@@ -1851,6 +3745,7 @@ mod tests {
             nonce: "nonce-from-start".to_owned(),
             code_verifier: "verifier-1".to_owned(),
             next: "/dashboards".to_owned(),
+            test_run_id: None,
         };
 
         let id_token = sign_id_token(
@@ -1860,6 +3755,9 @@ mod tests {
                 aud: client_id,
                 exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
                 nonce: &flow.nonce,
+                email: None,
+                email_verified: None,
+                groups: None,
                 claim_names: None,
             },
             &key,
@@ -1964,6 +3862,12 @@ mod tests {
             .to_vec()
     }
 
+    /// The same bytes, decoded as JSON — the shape a route test that must
+    /// read a body (`GET /api/settings/sso`, `/api/auth/providers`) uses.
+    async fn body_json(response: Response) -> serde_json::Value {
+        serde_json::from_slice(&body_bytes(response).await).unwrap()
+    }
+
     #[tokio::test]
     async fn providers_reports_oidc_configured_true_only_when_auth_state_has_it() {
         let with_oidc = state_with_oidc_flow_config();
@@ -1973,6 +3877,222 @@ mod tests {
         let without_oidc = AppState::new(Config::from_map(&HashMap::new()).unwrap());
         let body = get_json(&without_oidc, "/api/auth/providers").await;
         assert_eq!(body["oidc"], serde_json::json!(false));
+    }
+
+    /// `ADM-12` review round 2, R2-B1: with only `OIDC_ISSUER` and
+    /// `OIDC_CLIENT_ID` set — the shape a deployment that accepts bearer
+    /// tokens uses — the authenticator exists (the bearer path's fact), but
+    /// no sign-in can be offered, so `providers` reports no OIDC and the
+    /// sign-in page shows no button that would fail.
+    #[tokio::test]
+    async fn an_issuer_and_a_client_id_alone_report_no_sign_in_but_keep_the_authenticator() {
+        let mut env = HashMap::new();
+        env.insert(
+            "DATABASE_URL".to_owned(),
+            "postgres://user:pass@127.0.0.1:1/nonexistent_db_xyz".to_owned(),
+        );
+        env.insert(
+            "OIDC_ISSUER".to_owned(),
+            "https://idp.example.com".to_owned(),
+        );
+        env.insert("OIDC_CLIENT_ID".to_owned(), "lakehouse-console".to_owned());
+        let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+
+        // The bearer-token fact: an authenticator exists.
+        assert!(
+            crate::runtime_settings::oidc(&state).await.is_some(),
+            "an issuer and a client ID alone must still verify bearer tokens"
+        );
+
+        // The sign-in fact: no authorize, token or redirect address, so no
+        // button.
+        let body = get_json(&state, "/api/auth/providers").await;
+        assert_eq!(body["oidc"], serde_json::json!(false));
+        assert_eq!(body["providerName"], serde_json::Value::Null);
+    }
+
+    /// `ADM-12` review round 2, R2-B1, the end-to-end half: a deployment
+    /// that sets only `OIDC_ISSUER` and `OIDC_CLIENT_ID` (no sign-in
+    /// address) still accepts a bearer token, exactly as on `main`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_bearer_token_is_accepted_with_only_an_issuer_and_a_client_id(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let server = wiremock::MockServer::start().await;
+        let key = TestKey::generate("kid-1");
+        mount_jwks(&server, &key).await;
+        mount_discovery(&server, &server.uri()).await;
+        let issuer = server.uri();
+
+        // A user with an `OIDC` identity already linked, so the bearer path
+        // needs no JIT provisioning. `OIDC_PROVIDER_NAME` is unset, so the
+        // label is `oidc:default`.
+        let user_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO app_user (id, name, username, email, status) \
+             VALUES ($1, 'Bearer Only', 'bearer-only', 'bearer-only@meridian.example', 'active')",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO auth_identity (provider, external_subject, app_user_id, password_hash) \
+             VALUES ('oidc:default', 'bearer-only-subject', $1, NULL)",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await?;
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("OIDC_ISSUER".to_owned(), issuer.clone());
+        env.insert("OIDC_CLIENT_ID".to_owned(), "lakehouse-console".to_owned());
+        let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        let app = crate::routes::router(state);
+
+        let token = sign_id_token(
+            &IdTokenClaims {
+                sub: "bearer-only-subject",
+                iss: &issuer,
+                aud: "lakehouse-console",
+                exp: (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
+                    .unix_timestamp(),
+                nonce: "not-checked-on-the-bearer-path",
+                email: None,
+                email_verified: None,
+                groups: None,
+                claim_names: None,
+            },
+            &key,
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/me")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a bearer token must still be accepted when only the issuer and the client ID are set"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn saving_a_config_makes_the_next_providers_call_report_oidc_with_no_restart(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        // `ADM-12` D10: a saved connection is ready only when it can really
+        // be used, so this needs a provider whose discovery document answers
+        // — the same `https` mock the sign-in test uses.
+        let (server, _front, issuer, http) = https_mock_provider().await;
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert(
+            "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+            "true".to_owned(),
+        );
+        env.insert(
+            "CONSOLE_PUBLIC_URL".to_owned(),
+            "https://lakehouse.test".to_owned(),
+        );
+        let mut state = AppState::new(Config::from_map(&env).expect("valid config"));
+        state.sso_http_override = Some(http);
+
+        // At first, no OIDC is configured
+        let body = get_json(&state, "/api/auth/providers").await;
+        assert_eq!(body["oidc"], serde_json::json!(false));
+
+        // Save SSO configuration to the database
+        lakehouse_store::sso_settings::upsert(
+            &pool,
+            &lakehouse_store::sso_settings::SsoSettings {
+                oidc_issuer: Some(issuer),
+                oidc_client_id: Some("saved-client-id".to_owned()),
+                oidc_client_secret: None,
+                oidc_provider_name: Some("saved-provider".to_owned()),
+                oidc_groups_claim: None,
+                oidc_role_map: None,
+                oidc_jit_provisioning: None,
+                oidc_trust_email: None,
+            },
+            "test-user",
+        )
+        .await
+        .unwrap();
+
+        // Clear cache as a console save does
+        state.settings_caches.sso.clear().await;
+        *state.oidc.write().await = None;
+
+        // Next call reports oidc: true and provider_name without restart!
+        let body = get_json(&state, "/api/auth/providers").await;
+        assert_eq!(body["oidc"], serde_json::json!(true));
+        assert_eq!(body["providerName"], serde_json::json!("saved-provider"));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.url.path() == "/.well-known/openid-configuration"),
+            "the addresses come from the saved issuer's discovery document"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_http_or_internal_issuer_gives_400() {
+        use crate::internal_hosts::InternalHosts;
+        use crate::routes::settings::validate_sso_issuer;
+
+        let internal_hosts = InternalHosts::NONE;
+
+        // http:// is refused
+        let err = validate_sso_issuer("http://idp.example.com", &internal_hosts)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), crate::routes::settings::ISSUER_NOT_HTTPS);
+
+        // internal address (e.g. 127.0.0.1) is refused
+        let err = validate_sso_issuer("https://127.0.0.1:8443", &internal_hosts)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            crate::routes::settings::ISSUER_INTERNAL_REFUSED
+        );
+    }
+
+    #[test]
+    fn an_unknown_role_in_the_map_gives_400() {
+        use crate::routes::settings::validate_role_map_entries;
+
+        let known_roles = vec!["Platform Admin".to_owned(), "Analyst".to_owned()];
+
+        let bad_map = serde_json::json!([
+            {"group": "admins", "role": "Platform Admin"},
+            {"group": "devs", "role": "UnknownRole"}
+        ]);
+        let items = bad_map.as_array().unwrap();
+        let err = validate_role_map_entries(items, &known_roles).unwrap_err();
+        assert_eq!(err.to_string(), "Unknown role: \"UnknownRole\".");
+
+        let good_map = serde_json::json!([
+            {"group": "admins", "role": "Platform Admin"},
+            {"group": "devs", "role": "Analyst"}
+        ]);
+        let items = good_map.as_array().unwrap();
+        assert!(validate_role_map_entries(items, &known_roles).is_ok());
     }
 
     // ── `GET /api/auth/sessions` routing shape ──────
@@ -2200,12 +4320,14 @@ mod tests {
     ) -> sqlx::Result<()> {
         use lakehouse_test_support as _;
 
-        let user_id: Uuid =
-            sqlx::query_scalar("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
-                .bind("caller")
-                .bind("caller@x.invalid")
-                .fetch_one(&pool)
-                .await?;
+        let user_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind("caller")
+        .bind("caller")
+        .bind("caller@x.invalid")
+        .fetch_one(&pool)
+        .await?;
 
         let token = lakehouse_auth::session::create_session(
             &pool,

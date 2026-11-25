@@ -101,13 +101,13 @@ export function JoinsSection({
           </div>
         );
       })}
-      {joins.length < MAX_JOINS ? (
-        <div>
-          <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={disabled || !baseMart} onClick={() => onChange([...joins, emptyJoin()])}>
-            <Plus className="size-3" aria-hidden /> Join a table
-          </Button>
-        </div>
-      ) : null}
+      {/* QA LH-BI-7-06 (BI-54): the button stays at the limit, off, with the reason under it. */}
+      <div className="space-y-1">
+        <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={disabled || !baseMart || joins.length >= MAX_JOINS} onClick={() => onChange([...joins, emptyJoin()])}>
+          <Plus className="size-3" aria-hidden /> Join a table
+        </Button>
+        {joins.length >= MAX_JOINS ? <p className="px-2 text-xs text-muted-foreground">A chart joins at most four tables.</p> : null}
+      </div>
     </div>
   );
 }

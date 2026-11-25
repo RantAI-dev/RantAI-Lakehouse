@@ -15,7 +15,10 @@
 //!   column of every table; the columns of one table are a second call
 //!   ([`SqlOp::Columns`]). Both are bounded by [`LIST_TIMEOUT`] (120 s, not the
 //!   5-second test limit) and a row limit, so a schema of 10,000 tables is one
-//!   query that returns 10,000 short strings.
+//!   query that returns 10,000 short strings. The first answer of an object
+//!   storage listing or preview is bounded tighter, by [`FIRST_ANSWER_TIMEOUT`]
+//!   (30 s), so a silent endpoint is given up on instead of held for the full
+//!   120 s (`SRC-41` D16, QA `TC-1712`).
 //! - **Base tables only (D8).** Every listing query filters
 //!   `table_type = 'BASE TABLE'`, as the loader does.
 //! - **Values are bound (AGENTS.md).** The schema, the table, the search text
@@ -74,8 +77,23 @@ use crate::upload_convert::{self, ConversionError, ConversionRunner, Operation, 
 use crate::upload_parse;
 
 /// The limit of one listing or one preview, connect included (`SRC-13`
-/// decision D9: "the listing call's own limit is 120 s").
+/// decision D9: "the listing call's own limit is 120 s"). One answer's own wait
+/// is bounded tighter, by [`FIRST_ANSWER_TIMEOUT`].
 pub const LIST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long an object store is given to answer the FIRST request of a listing
+/// or a preview (`SRC-41` D16, QA `TC-1712`). The S3 client is built on a
+/// pinned HTTP client with no connect or read timeout
+/// (`connector_probe::s3_client`; `object_store`'s own 5 s and 30 s defaults are
+/// among the options this connector ignores), so a silent endpoint was waited
+/// for until [`LIST_TIMEOUT`], 120 s. Past this bound the answer is the class
+/// `timeout` — the same class and sentence that limit gives today — and the 120
+/// s for the whole listing stays: it covers a bucket of 10,000 files
+/// (`SRC-13` decision 9). 30 s is the number the code already uses for one
+/// request to a source (`adapters/rest.py`; Kafka's `request_timeout_ms`;
+/// `sqlx`'s 30 s `acquire_timeout`, under which a SQL listing's connect already
+/// ends, `connector_listing::sql_connect`).
+pub const FIRST_ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The most characters of a glob.
 pub const MAX_GLOB_CHARS: usize = 256;
@@ -110,7 +128,7 @@ pub struct Request {
 #[derive(Debug)]
 pub enum Dispatch {
     /// The API answered (or refused) itself.
-    Done(Answer),
+    Done(Box<Answer>),
     /// The orchestrator must read the source (D1): launch `discover_job`.
     Orchestrator,
 }
@@ -902,6 +920,9 @@ async fn sql_answer(
             };
             SqlOp::Columns { schema, table }
         }
+        // `SRC-4` T1.1: a connection test is launched by `POST .../test`, never
+        // answered by a listing; `dispatch` refuses it before it gets here.
+        Kind::Test => return Answer::failed(kind, ErrorClass::NotSupported),
     };
     match run_sql(target, &info.secret_ref, &op, resolver, internal_hosts, ca).await {
         Ok(SqlOut::Names { names, truncated }) => {
@@ -980,6 +1001,7 @@ async fn list_s3(
     glob: &Glob,
     search: &str,
     limit: usize,
+    first_answer: Duration,
 ) -> Result<Listing, ErrorClass> {
     let Some(directory) = listing_directory(connector_prefix, glob.literal_prefix()) else {
         return Ok(Listing {
@@ -990,7 +1012,17 @@ async fn list_s3(
     let prefix = (!directory.is_empty())
         .then(|| ObjectPath::parse(&directory).map_err(|_| ErrorClass::Failed))
         .transpose()?;
-    let mut stream = client.list(prefix.as_ref());
+    let mut stream = client.list(prefix.as_ref()).peekable();
+    // QA TC-1712 (SRC-41): a silent endpoint answers no item at all, and the
+    // client under this stream has no timeout of its own, so the first answer
+    // gets `first_answer` before the listing is given up on. The loop below is
+    // unchanged: this only waits for the item it would read next.
+    if tokio::time::timeout(first_answer, std::pin::Pin::new(&mut stream).peek())
+        .await
+        .is_err()
+    {
+        return Err(logged("an S3 listing", ErrorClass::Timeout));
+    }
     let (mut objects, mut scanned, mut truncated) = (Vec::new(), 0_usize, false);
     while let Some(item) = stream.next().await {
         let meta = item.map_err(|err| logged("an S3 listing", class_of_object_store(&err)))?;
@@ -1027,6 +1059,25 @@ async fn list_s3(
     Ok(Listing { objects, truncated })
 }
 
+/// The format a preview reads `key` as: what the object's extension says,
+/// case-insensitively, and the connector's configured format only when the
+/// extension says nothing (QA LH-SRC-13-01 F1, plan D10). A `.parquet` object
+/// on a connector set to CSV used to be read as text, so its binary footer
+/// came back as column names. `.json`, `.jsonl` and `.ndjson` map to
+/// [`FilesFormat::Json`], which the preview answers as not supported. Only
+/// the preview chooses this way; the load path reads the configured format.
+fn format_for(key: &str, configured: FilesFormat) -> FilesFormat {
+    let extension = key
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    match extension.as_deref() {
+        Some("parquet") => FilesFormat::Parquet,
+        Some("csv") => FilesFormat::Csv,
+        Some("json" | "jsonl" | "ndjson") => FilesFormat::Json,
+        _ => configured,
+    }
+}
+
 /// The columns of one file (D6): a CSV from its head, a Parquet from its
 /// footer — and the footer is read by the child, from the file's tail
 /// (`SEC-55` D1, `SEC-22` P1).
@@ -1042,10 +1093,19 @@ async fn preview_s3(
     format: FilesFormat,
     key: &str,
     runner: &ConversionRunner,
+    first_answer: Duration,
 ) -> Result<Preview, ErrorClass> {
     let path = ObjectPath::parse(key).map_err(|_| ErrorClass::Failed)?;
     let fail = |err: object_store::Error| logged("an S3 read", class_of_object_store(&err));
-    let size = client.head(&path).await.map_err(fail)?.size;
+    // QA TC-1712 (SRC-41): the same first-answer bound as a listing — the
+    // `head` is the request that tells a silent endpoint from a slow one.
+    let size = tokio::time::timeout(first_answer, client.head(&path))
+        .await
+        .map_err(|_| logged("an S3 read", ErrorClass::Timeout))?
+        .map_err(fail)?
+        .size;
+    // QA LH-SRC-13-01 F1 (plan D10): the object's own extension wins.
+    let format = format_for(key, format);
     match format {
         FilesFormat::Csv => {
             let end = size.min(CSV_HEAD_BYTES);
@@ -1115,13 +1175,28 @@ async fn files_answer(
         match kind {
             Kind::List => {
                 let prefix = dial.prefix.as_deref().unwrap_or_default();
-                list_s3(&client, prefix, &glob, &request.search, request.limit)
-                    .await
-                    .map(|listing| Answer::listing(&request.glob, listing))
-            }
-            Kind::Preview => preview_s3(&client, dial.format, &request.object, runner)
+                list_s3(
+                    &client,
+                    prefix,
+                    &glob,
+                    &request.search,
+                    request.limit,
+                    FIRST_ANSWER_TIMEOUT,
+                )
                 .await
-                .map(|preview| Answer::preview(&request.object, preview)),
+                .map(|listing| Answer::listing(&request.glob, listing))
+            }
+            Kind::Preview => preview_s3(
+                &client,
+                dial.format,
+                &request.object,
+                runner,
+                FIRST_ANSWER_TIMEOUT,
+            )
+            .await
+            .map(|preview| Answer::preview(&request.object, preview)),
+            // See `sql_answer`: `dispatch` refuses a test before this.
+            Kind::Test => Ok(Answer::failed(kind, ErrorClass::NotSupported)),
         }
     })
     .await;
@@ -1166,12 +1241,17 @@ pub async fn dispatch(
     ca: Option<&Path>,
     runner: &ConversionRunner,
 ) -> Dispatch {
+    if kind == Kind::Test {
+        // `SRC-4` T1.1: a connection test is not a listing; it has its own
+        // route (`POST /api/connectors/{id}/test`).
+        return Dispatch::Done(Box::new(Answer::failed(kind, ErrorClass::NotSupported)));
+    }
     let Some(adapter) = info.adapter.as_deref() else {
         // No ingest spec yet: there is no dial to read.
-        return Dispatch::Done(Answer::failed(kind, ErrorClass::NotSupported));
+        return Dispatch::Done(Box::new(Answer::failed(kind, ErrorClass::NotSupported)));
     };
     let Ok(dial) = Dial::parse(adapter, &info.dial) else {
-        return Dispatch::Done(Answer::failed(kind, ErrorClass::Failed));
+        return Dispatch::Done(Box::new(Answer::failed(kind, ErrorClass::Failed)));
     };
     let answer = match &dial {
         Dial::Sql(sql) if sql.driver != SqlDriver::Oracle => {
@@ -1206,18 +1286,25 @@ pub async fn dispatch(
             Answer::listing("", rest_listing(&paths, request))
         }
         Dial::Sheets(_) => Answer::failed(kind, ErrorClass::NotSupported),
-        // Oracle, MongoDB, Kafka, SFTP, and the column preview of REST.
+        // `SRC-4` slice 6 (S10-c): listing would dial Oracle without the native
+        // encryption the connector requires, so an Oracle change-capture
+        // connector's tables are typed by hand and nothing is listed.
+        Dial::Cdc(cdc) if cdc.driver == SqlDriver::Oracle => {
+            Answer::failed(kind, ErrorClass::NotSupported)
+        }
+        // Oracle (batch), MongoDB, Kafka, SFTP, and the column preview of REST.
         // `SRC-3` T1.6: a `saas` connector's objects and columns are listed
         // by the vendor's own module in the orchestrator, never by the API.
         Dial::Sql(_)
         | Dial::Cdc(_)
+        | Dial::CdcMongo(_)
         | Dial::Rest(_)
         | Dial::Mongo(_)
         | Dial::Kafka(_)
         | Dial::Sftp(_)
         | Dial::Saas(_) => return Dispatch::Orchestrator,
     };
-    Dispatch::Done(answer)
+    Dispatch::Done(Box::new(answer))
 }
 
 #[cfg(test)]
@@ -1231,6 +1318,27 @@ mod tests {
     /// a conversion would start (`SEC-55` D5 passes the runner through).
     fn unused_runner() -> ConversionRunner {
         ConversionRunner::new(std::path::PathBuf::from("unused"), 1, 64)
+    }
+
+    /// QA LH-SRC-13-01 F1 (plan D10): a preview reads an object by its
+    /// extension, in any case, and falls back to the configured format.
+    #[test]
+    fn a_preview_reads_an_object_by_its_extension_and_falls_back_to_the_configured_format() {
+        let cases = [
+            ("sales/a.parquet", FilesFormat::Csv, FilesFormat::Parquet),
+            ("sales/A.PARQUET", FilesFormat::Csv, FilesFormat::Parquet),
+            ("sales/a.csv", FilesFormat::Parquet, FilesFormat::Csv),
+            ("sales/a.CSV", FilesFormat::Json, FilesFormat::Csv),
+            ("sales/a.json", FilesFormat::Csv, FilesFormat::Json),
+            ("sales/a.jsonl", FilesFormat::Csv, FilesFormat::Json),
+            ("sales/a.NDJSON", FilesFormat::Csv, FilesFormat::Json),
+            ("sales/a.txt", FilesFormat::Parquet, FilesFormat::Parquet),
+            ("sales/noextension", FilesFormat::Csv, FilesFormat::Csv),
+            ("sales.parquet/data", FilesFormat::Csv, FilesFormat::Csv),
+        ];
+        for (key, configured, expected) in cases {
+            assert_eq!(format_for(key, configured), expected, "{key}");
+        }
     }
 
     fn globs(pattern: &str) -> Glob {
@@ -1440,8 +1548,46 @@ mod tests {
         else {
             panic!("the API answers a PostgreSQL source itself");
         };
+        let answer = *answer;
         assert_eq!(answer.error_class, Some(ErrorClass::AddressRefused));
         assert_eq!(answer.reason, Some(ErrorClass::AddressRefused.reason()));
+    }
+
+    /// `SRC-4` slice 6 (S10-c): an Oracle change-capture connector lists nothing, in the API,
+    /// without a launch.
+    #[tokio::test]
+    async fn an_oracle_change_capture_listing_is_answered_here_as_not_supported() {
+        let resolver =
+            lakehouse_core::secret::EnvSecretResolver::with_map(std::collections::HashMap::new());
+        let oracle_cdc = ConnectorDialInfo {
+            kind: "x".to_owned(),
+            host: "x".to_owned(),
+            secret_ref: "env:UNUSED".to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some("cdc".to_owned()),
+            dial: serde_json::json!({"driver": "oracle", "host": "o.example", "port": 1521,
+                "database": "FREE", "user": "u"}),
+        };
+        let request = Request {
+            limit: 10,
+            ..Request::default()
+        };
+        for kind in [Kind::List, Kind::Preview] {
+            let Dispatch::Done(answer) = dispatch(
+                kind,
+                &oracle_cdc,
+                &request,
+                &resolver,
+                &InternalHosts::NONE,
+                None,
+                &unused_runner(),
+            )
+            .await
+            else {
+                panic!("an Oracle change-capture listing is answered here");
+            };
+            assert_eq!(answer.error_class, Some(ErrorClass::NotSupported));
+        }
     }
 
     /// `SRC-13` D1: the types the orchestrator reads are handed over, and a
@@ -1540,6 +1686,7 @@ mod tests {
         else {
             panic!("the API lists REST endpoints itself");
         };
+        let answer = *answer;
         let names: Vec<&str> = answer
             .objects
             .as_ref()
@@ -1600,12 +1747,94 @@ mod tests {
             else {
                 panic!("answered by the API");
             };
+            let answer = *answer;
             assert_eq!(answer.error_class, Some(ErrorClass::NotSupported));
             assert!(
                 !answer.reason.unwrap().contains("unknown adapter"),
                 "the wrong text of before SRC-13 is gone"
             );
         }
+    }
+
+    // ── an object store that never answers (`TC-1712`) ─────────────────────
+
+    /// A listener on loopback that accepts every connection and never writes a
+    /// byte: an endpoint that takes the request and does not answer.
+    async fn silent_endpoint() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        port
+    }
+
+    /// The S3 client `list_s3`/`preview_s3` take, pointed at [`silent_endpoint`].
+    fn client_for(port: u16, approved: &Approved) -> AmazonS3 {
+        connector_probe::s3_client(
+            &format!("http://127.0.0.1:{port}"),
+            "bucket",
+            "127.0.0.1",
+            approved,
+            "ak",
+            "sk",
+        )
+        .unwrap()
+    }
+
+    /// `SRC-41` D16 (`TC-1712`): a bucket that never answers a listing ends as
+    /// `timeout` at the first-answer limit, not after the 120 s
+    /// [`LIST_TIMEOUT`]. Fails if the timer is removed: the call then waits for
+    /// the silent server and the test's own ten-second limit ends it.
+    #[tokio::test]
+    async fn a_bucket_that_never_answers_a_listing_ends_as_a_timeout_at_the_first_answer_limit() {
+        let port = silent_endpoint().await;
+        let approved = connector_probe::resolve_checked("127.0.0.1", port, &InternalHosts::ALL)
+            .await
+            .unwrap();
+        let client = client_for(port, &approved);
+
+        let answer = tokio::time::timeout(
+            Duration::from_secs(10),
+            list_s3(
+                &client,
+                "",
+                &globs("**"),
+                "",
+                10,
+                Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("the first-answer limit ends the listing");
+        assert_eq!(answer.unwrap_err(), ErrorClass::Timeout);
+    }
+
+    /// The same bound for a preview: its `head` is the first request.
+    #[tokio::test]
+    async fn a_bucket_that_never_answers_a_preview_ends_as_a_timeout_at_the_first_answer_limit() {
+        let port = silent_endpoint().await;
+        let approved = connector_probe::resolve_checked("127.0.0.1", port, &InternalHosts::ALL)
+            .await
+            .unwrap();
+        let client = client_for(port, &approved);
+
+        let answer = tokio::time::timeout(
+            Duration::from_secs(10),
+            preview_s3(
+                &client,
+                FilesFormat::Csv,
+                "sales/a.csv",
+                &unused_runner(),
+                Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("the first-answer limit ends the preview");
+        assert_eq!(answer.unwrap_err(), ErrorClass::Timeout);
     }
 
     // ── live PostgreSQL ────────────────────────────────────────────────────

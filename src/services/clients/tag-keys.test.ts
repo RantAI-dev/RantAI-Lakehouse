@@ -79,3 +79,14 @@ describe("tagKeysService", () => {
     await expect(tagKeysService.update("k", ["a"])).rejects.toMatchObject({ code: "not_found" })
   })
 })
+
+describe("tag-key refusals (WEB-12)", () => {
+  it("a refused tag key rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: governance:write" }, 403))
+    await expect(tagKeysService.create("k", ["a"])).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the governance:write permission.",
+    })
+  })
+})

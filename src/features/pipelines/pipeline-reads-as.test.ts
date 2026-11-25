@@ -5,6 +5,7 @@ import { authorChoices, readsAs, readsAsLine, NO_AUTHOR_REASON } from "./pipelin
 
 function user(overrides: Partial<User> & Pick<User, "id" | "name">): User {
   return {
+    username: overrides.name.toLowerCase().replace(/\s+/g, "."),
     email: `${overrides.name.toLowerCase()}@meridian.example`,
     status: "active",
     roles: ["Analyst"],
@@ -106,21 +107,66 @@ describe("authorChoices", () => {
         // would be visible rather than hidden among the expected entries.
         { ...rina, id: "u-off", name: "Zoe Offline", status: "inactive" },
       ],
-      "meridian-group"
+      "meridian-group",
+      { kind: "unset" },
+      false
     )
     expect(choices.blocked).toBeNull()
     expect(choices.options.map((candidate) => candidate.name)).toEqual(["Adi Pratama", "Rina Wijaya"])
   })
 
   test("a pipeline with no tenant offers nobody and says why", () => {
-    const choices = authorChoices([rina], undefined)
+    const choices = authorChoices([rina], undefined, { kind: "unset" }, false)
     expect(choices.options).toEqual([])
     expect(choices.blocked).toContain("no tenant")
   })
 
   test("an empty tenant says so rather than looking like a failed load", () => {
-    const choices = authorChoices([], "meridian-group")
+    const choices = authorChoices([], "meridian-group", { kind: "unset" }, false)
     expect(choices.options).toEqual([])
+    expect(choices.blocked).toBe("no active user in this pipeline's tenant can read as it")
+  })
+
+  test("with an author and nobody else to offer, the reason names the author", () => {
+    // BLD-11 F5/D7: the masthead names this author and the pipeline runs, so
+    // "no active user can read as it" would be a contradiction.
+    const choices = authorChoices(
+      [],
+      "meridian-group",
+      { kind: "author", userId: "u-rina", name: "Rina Wijaya", active: null },
+      false
+    )
+    expect(choices.options).toEqual([])
+    expect(choices.blocked).toBe(
+      "it reads as Rina Wijaya; no other active user in this pipeline's tenant can be chosen"
+    )
+  })
+
+  test("an author the list cannot name is 'a user you cannot see' in the reason", () => {
+    const choices = authorChoices(
+      [bayu],
+      "meridian-group",
+      { kind: "author", userId: "u-someone", name: null, active: null },
+      false
+    )
+    expect(choices.blocked).toBe(
+      "it reads as a user you cannot see; no other active user in this pipeline's tenant can be chosen"
+    )
+  })
+
+  test("a user list that failed to load says so, not that nobody can read as it", () => {
+    const choices = authorChoices(
+      [],
+      "meridian-group",
+      { kind: "author", userId: "u-rina", name: "Rina Wijaya", active: null },
+      true
+    )
+    expect(choices.options).toEqual([])
+    expect(choices.blocked).toBe("the user list could not be loaded, so no one can be offered here")
+  })
+
+  test("with no author and nobody to offer, today's sentence stays", () => {
+    const choices = authorChoices([], "meridian-group", { kind: "unset" }, false)
     expect(choices.blocked).toBe("no active user in this pipeline's tenant can read as it")
   })
 })

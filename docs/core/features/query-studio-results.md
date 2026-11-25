@@ -6,12 +6,12 @@
 | Backlog | `QS-2` |
 | Kind | Feature |
 | Spec | `docs/core/specs/qs-2.md` |
-| Status | Building |
+| Status | Released: accepted by the product owner on 2026-11-14 (every row Pass; AC6 with findings, one exception under Exceptions) |
 | Priority | P2 |
 | Owner | Held in the base. |
 | Acceptor | Held in the base. |
 | Started | 2026-10-28; also in `BACKLOG.md` Dates |
-| Shipped | Not yet |
+| Shipped | 2026-10-30; fixes 2026-11-06 (#399, #403) |
 | Evidence | |
 | Plan | Plan files are not kept in the repository. |
 
@@ -61,15 +61,17 @@ No new tool. The chat's `run_sql` keeps its own limit. Downloads are a console a
 | 3 | The time limit stays `BI-5`'s 10 s to 30 min. The spec's 2 hours was a planner's number. A query over 30 minutes belongs in a pipeline, not the editor | 30 min max | Owner, 2026-10-28 |
 | 4 | Filter, statistics and histogram work on the rows shown, not the whole result, and the panel says "of the N rows shown". Exact statistics over the full table stay on the catalog page (`asset-columns.tsx`) | none | Owner, 2026-10-28 |
 | 5 | Download uses the existing route `GET /api/query/run/{id}/download` (the run in History), so there is no new route and no `POLICY_TABLE` change. It re-runs the SQL with the caller's current masks and row filters, as today | none | Owner, 2026-10-28 |
-| 6 | Download formats: CSV, TSV, Excel, Parquet. CSV, TSV and Excel are written by the API from streamed rows, with the formula guard dashboard exports use (`csv_export::neutralise`). Parquet is written by ClickHouse (`FORMAT Parquet`), so no new dependency | none | Owner, 2026-10-28 |
+| 6 | Download formats: CSV, TSV, Excel, Parquet. CSV, TSV and Excel are written by the API from streamed rows, with the formula guard dashboard exports use (`csv_export::neutralise`). In Excel a text cell holds the text as it is, without the apostrophe: a text cell is never run (`BI-55`, *(proposed, not yet signed)*). Parquet is written by ClickHouse (`FORMAT Parquet`), so no new dependency | none | Owner, 2026-10-28 |
 | 7 | A download stops at 5 GB (Databricks). Excel stops at 1,048,575 data rows (1,048,576 with the header), the sheet's limit. Either cut is said in the file name and in a message, never silent | 5 GB, 1,048,575 data rows | Owner, 2026-10-28 |
-| 8 | A download honours the role download switch (`DOWNLOADS_OFF`), as dashboard exports do, and the run's time limit. A download in progress can be stopped with Stop | none | Owner, 2026-10-28 |
+| 8 | A download honours the role download switch (`DOWNLOADS_OFF`), as dashboard exports do, and the run's time limit. A download in progress can be stopped with Stop. The run's answer says whether the person may download (`canDownload`); when they may not, the console turns Download and "Copy as TSV" off and shows "Downloads are switched off for your role." beside them. The route refuses either way. | none | Owner, 2026-10-28; changed 2026-11-12 (`QS-9`), *(proposed, not yet signed)* |
 | 9 | Elapsed time is counted in the browser from the moment Run is pressed | none | Owner, 2026-10-28 |
+| 10 | `QS-10`: the estimate route stays at `query:read`. Catalog facts — sources, their certification marks and freshness lag — need `catalog:read`: without it the estimate still answers its numbers, with `sources: []`, no `sourceMarks`, `freshnessLagSeconds: null` and `catalogHidden: true`, and neither the `system.parts` read nor the marks lookup runs. A plan that names no table lists no source, never an invented one. The rewrite already evaluates every mask and row filter before a run and before an estimate, so both answers carry `policyObligations`: `"Column masks"` then `"Row filters"`, each at most once, `[]` when neither applies — no table or column name *(planner default, owner may change)*. A Trino run carries the list too; the Trino estimate keeps `null`. The summary's Rows counts the rows actually shown, with " shown" when the result was cut, not the engine's pre-cut `rowCount` | none | Planner's choice, 2026-11-20 (QS-10), *(proposed, not yet signed)* |
 
 ## Limits to tell a customer
 
 - Statistics and filters in the grid cover the rows shown, up to 64,000, not the whole result. A numeric column's
-  histogram has ten equal-width buckets, a text column's the ten most frequent values.
+  histogram has ten equal-width buckets, or one bucket per distinct value when the column has fewer than ten distinct
+  values; a text column's has the ten most frequent values.
 - A result is cut at 64,000 rows or at 10 MB of row data; the banner says which limit cut it. The product's "MB"
   is MiB: 10 MB is 10,485,760 bytes.
 - A download re-runs the query. If the data changed since the run, the file shows the new data.
@@ -78,9 +80,14 @@ No new tool. The chat's `run_sql` keeps its own limit. Downloads are a console a
 - A comma or tab file over 5 GB is cut at the last whole row that fits, and the file's name says how many rows it
   holds. A Parquet result over 5 GB is refused whole, never sent half.
 - The grid copies the rows it shows as TSV, and one cell's value from the inspector; a selection of several cells
-  cannot be copied at once.
+  cannot be copied at once. For a role whose downloads are blocked, "Copy as TSV" is off as well; one cell's value
+  can still be copied from the inspector, as it can be selected on the screen.
 - Downloads run on ClickHouse only; the button is off for a Trino result.
 - Stop and the time limit do not reach a Trino query.
+- A person without `catalog:read` still gets estimates and runs: the Execution
+  transparency panel shows no sources and no freshness lag for them, saying
+  catalog access is needed instead. An estimate whose plan names no table
+  lists no source.
 
 ## Acceptance checklist
 
@@ -88,23 +95,26 @@ Run on a running console by the product owner. A step not performed is never a p
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `QS-2-AC1` | Run a query returning 100,000 rows | 64,000 rows shown, a banner says the result was cut at 64,000 rows | Not run |
-| `QS-2-AC2` | Download that run as Parquet | The file holds all 100,000 rows | Not run |
-| `QS-2-AC3` | Run a query with wide text columns that passes 10 MB | The banner says it was cut at 10 MB | Not run |
-| `QS-2-AC4` | Filter a column, open its statistics, inspect a JSON cell, copy the rows as TSV | Each works on the shown rows, and the statistics say "of the N rows shown" | Not run |
-| `QS-2-AC5` | Download as CSV, TSV and Excel a query on a masked column | Every file shows the masked value | Not run |
-| `QS-2-AC6` | As a role with downloads switched off, download | Refused with a plain message | Not run |
-| `QS-2-AC7` | Start a large download, press Stop | The query ends on the engine (`system.processes`) within 5 seconds | Not run |
-| `QS-2-AC8` | A user without `query:read` downloads, and a download fails on the engine | Refused; the failure shows a fixed message, not the engine's text (principles 2 and 4) | Not run |
+| `QS-2-AC1` | Run a query returning 100,000 rows | 64,000 rows shown, a banner says the result was cut at 64,000 rows | Pass (2026-11-04, f3cee927, LH-QS-2-01) |
+| `QS-2-AC2` | Download that run as Parquet | The file holds all 100,000 rows | Pass (2026-11-04, f3cee927, LH-QS-2-02) |
+| `QS-2-AC3` | Run a query with wide text columns that passes 10 MB | The banner says it was cut at 10 MB | Pass (2026-11-04, f3cee927, LH-QS-2-03) |
+| `QS-2-AC4` | Filter a column, open its statistics, inspect a JSON cell, copy the rows as TSV | Each works on the shown rows, and the statistics say "of the N rows shown" | Pass (2026-11-14, 240d2e62, LH-QS-2-04) |
+| `QS-2-AC5` | Download as CSV, TSV and Excel a query on a masked column | Every file shows the masked value | Pass (2026-11-04, f3cee927, LH-QS-2-05) |
+| `QS-2-AC6` | As a role with downloads switched off, run a query, then request the download route directly | Download and "Copy as TSV" are disabled with "Downloads are switched off for your role." beside them; the direct request is refused with the same sentence | Pass with findings (2026-11-14, 240d2e62, LH-QS-2-06). The API body carries the `permission_denied: ` prefix; see Exceptions |
+| `QS-2-AC7` | Start a large download, press Stop | The query ends on the engine (`system.processes`) within 5 seconds | Pass (2026-11-13, 80fb2f68, LH-QS-2-07), as written (owner option a) |
+| `QS-2-AC8` | A user without `query:read` downloads, and a download fails on the engine | Refused; the failure shows a fixed message, not the engine's text (principles 2 and 4) | Pass (2026-11-13, 7e8775fb, LH-QS-2-08) |
+| `QS-2-AC9` | On a Trino tab, write a valid Trino query, look at the Execution transparency panel, then run it | The panel says "No pre-run estimate" and names Trino, with no ClickHouse error and no ClickHouse source; the result summary's Engine says Trino | Pass (2026-11-14, 240d2e62, no case) |
 
-**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): product owner (recorded in the base) **Date:** 2026-11-14 **Build:** 240d2e62
 
 Exceptions, each with an owner and a date:
+
+- `QS-2-AC6`, owner 2026-11-14: the API body of a refused download carries the `permission_denied: ` prefix every 403 has; the console shows the sentence alone. Accepted; does not hold QS-2.
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
-- [ ] `BACKLOG.md` Dates has the Shipped date
-- [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
+- [x] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
+- [x] `BACKLOG.md` Dates has the Shipped date
+- [x] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base (done by the auditor)
 - [ ] `CHANGELOG.md` entry a customer can read

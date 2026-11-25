@@ -13,7 +13,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 
@@ -25,7 +25,8 @@ use wiremock::matchers::{body_string_contains, method};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
+    CATALOG_TENANT, TestApp, create_principal_with_permissions, in_the_catalog_tenant,
+    session_cookie_for_user, spin_up_with_env,
 };
 
 async fn rows(server: &MockServer, needle: &str, data: Vec<Value>) {
@@ -85,7 +86,12 @@ impl Stack {
             vec![json!({ "target": "serving.mart_visits", "read": "silver.visits", "at": "2026-09-22 10:03", "kind": "Insert" })],
         )
         .await;
-        let env = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
+        // `SEC-20`, plan 96: the charts belong to the shared catalog, which the
+        // seeded deployment (several tenants) opens only to the tenant it names.
+        let env = HashMap::from([
+            ("CH_URL".to_owned(), ch.uri()),
+            ("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned()),
+        ]);
         Self {
             app: spin_up_with_env(&env).await,
             ch,
@@ -109,8 +115,36 @@ impl Stack {
         )
     }
 
+    /// The same route with an explicit `X-Tenant`, for a principal who is a
+    /// member of more than one tenant (`SEC-54`).
+    async fn get_as(&self, cookie: &str, uri: &str, tenant: &str) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .uri(uri)
+            .header("cookie", cookie)
+            .header("x-tenant", tenant)
+            .body(Body::empty())
+            .unwrap();
+        let response = self.app.router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
     async fn caller(&self, permissions: &str) -> String {
         let id = create_principal_with_permissions(&self.app.pool, permissions).await;
+        session_cookie_for_user(&self.app.pool, id).await
+    }
+
+    /// A caller of the tenant that owns the shared catalog, which is the caller
+    /// the chart and its lineage are shown to.
+    async fn catalog_member(&self, permissions: &str) -> String {
+        let id = create_principal_with_permissions(&self.app.pool, permissions).await;
+        in_the_catalog_tenant(&self.app.pool, id).await;
         session_cookie_for_user(&self.app.pool, id).await
     }
 }
@@ -188,7 +222,7 @@ async fn a_chart_in_somebody_elses_personal_space_is_not_found() {
     let stack = Stack::start().await;
     // A chart on a board the caller does not own: the store lists it only to its owner, so the
     // stand-in returns nothing to this caller and the answer is the one an unknown id gets.
-    let cookie = stack.caller("lineage:read").await;
+    let cookie = stack.catalog_member("lineage:read").await;
     let (status, body) = stack
         .get(&cookie, "/api/dashboard/charts/c_private/lineage")
         .await;
@@ -257,7 +291,7 @@ async fn a_caller_with_lineage_read_only_is_told_no_chart_names() {
         vec![chart_row("c_1", "Visitors", "b_1", "ui")],
     )
     .await;
-    let cookie = stack.caller("lineage:read").await;
+    let cookie = stack.catalog_member("lineage:read").await;
     let (status, body) = stack
         .get(
             &cookie,
@@ -279,7 +313,7 @@ async fn a_caller_with_lineage_read_only_is_told_no_chart_names() {
     assert_eq!(status, StatusCode::OK);
     assert!(!graph.to_string().contains("Visitors"), "{graph}");
     // With `dashboard:read` as well, the chart is named.
-    let both = stack.caller("lineage:read,dashboard:read").await;
+    let both = stack.catalog_member("lineage:read,dashboard:read").await;
     let (_, named) = stack
         .get(
             &both,
@@ -287,4 +321,49 @@ async fn a_caller_with_lineage_read_only_is_told_no_chart_names() {
         )
         .await;
     assert_eq!(named["charts"][0]["chartTitle"], json!("Visitors"));
+}
+
+/// `SEC-54`: `used_by` resolves the caller's active tenant through the
+/// standard `tenant_scope::resolve` helper. A principal of two tenants must
+/// see the shared catalog's charts when `X-Tenant` selects the catalog's
+/// tenant, be refused when it selects their other tenant, and get the
+/// same 404 for a tenant they do not belong to at all.
+#[tokio::test]
+async fn the_used_by_list_follows_the_tenant_the_header_selects() {
+    let stack = Stack::start().await;
+    rows(
+        &stack.ch,
+        "FROM console.bi_chart",
+        vec![chart_row("c_1", "Visitors", "b_1", "ui")],
+    )
+    .await;
+    let user =
+        create_principal_with_permissions(&stack.app.pool, "lineage:read,dashboard:read").await;
+    in_the_catalog_tenant(&stack.app.pool, user).await;
+    // The same person also belongs to the seeded second tenant.
+    let retail: uuid::Uuid = "11111111-1111-4111-8111-000000000002".parse().unwrap();
+    sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(user)
+    .bind(retail)
+    .execute(&stack.app.pool)
+    .await
+    .unwrap();
+    let cookie = session_cookie_for_user(&stack.app.pool, user).await;
+    let uri = "/api/governance/lineage/used-by?table=serving.mart_visits";
+
+    let (status, body) = stack.get_as(&cookie, uri, CATALOG_TENANT).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["charts"][0]["chartId"], json!("c_1"), "{body}");
+
+    let (status, body) = stack.get_as(&cookie, uri, &retail.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["supported"], json!(false), "{body}");
+    assert!(body.get("charts").is_none(), "{body}");
+
+    let (status, body) = stack
+        .get_as(&cookie, uri, &uuid::Uuid::new_v4().to_string())
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }

@@ -42,10 +42,16 @@ describe("tier 2 dial forms", () => {
   it("KafkaDialForm offers exactly the two Rust KafkaAuth variants, username shown for sasl_plain", () => {
     const { container } = render(<KafkaDialForm value={null} onChange={mock()} />)
     const screen = within(container)
-    const select = screen.getByLabelText("Auth type") as HTMLSelectElement
-    const options = Array.from(select.options).map((o) => o.value)
-    expect(options).toEqual(["sasl_plain", "none"])
-    expect(select.value).toBe("sasl_plain")
+    // WEB-9 D5: the control is a combobox; its shown label and the opened
+    // list's options are what the native select's `.value` and `.options` were.
+    const trigger = screen.getByLabelText("Auth type")
+    expect(trigger.querySelector('[data-slot="select-value"]')?.textContent).toBe("sasl_plain")
+    // The list is portalled onto the body, outside this form's container.
+    fireEvent.click(trigger)
+    expect(within(document.body).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "sasl_plain",
+      "none",
+    ])
     expect(screen.getByLabelText("SASL username")).toHaveProperty("type", "text")
   })
 
@@ -74,7 +80,13 @@ describe("tier 2 dial forms", () => {
     expect(fingerprint).toHaveProperty("required", true)
     expect(screen.getByText(/ssh-keyscan/)).toBeDefined()
     expect(screen.getByText(/ssh-keygen -lf -/)).toBeDefined()
-    const authSelect = screen.getByLabelText("Auth type") as HTMLSelectElement
-    expect(Array.from(authSelect.options).map((o) => o.value)).toEqual(["password", "public_key"])
+    // WEB-9 D5: the two choices are read from the opened list; each option's
+    // text is the API's word the native option's value was.
+    const trigger = screen.getByLabelText("Auth type")
+    fireEvent.click(trigger)
+    expect(within(document.body).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "password",
+      "public_key",
+    ])
   })
 })

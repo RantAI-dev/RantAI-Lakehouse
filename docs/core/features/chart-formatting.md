@@ -69,6 +69,7 @@ Planner defaults, all confirmed by the product owner on 2026-10-17 (phase 3 QA).
 - A logarithmic axis cannot show zero or negative values.
 - The default chart palette is the one every chart used before, and it does not reach the 3:1 contrast on a light background: its sky, amber, lime and orange are below it. The four new palettes do. The default is kept as it is so that no saved chart changes colour (the owner's choice).
 - On a raw table, a colour range is read over the rows of the page (50 at a time), not over every row of the table.
+- A rupiah amount shows "Rp" in both number locales. Any other currency shows what the locale gives it, which is its code where the locale has no symbol for it (SGD in the English locale). *(proposed, not yet signed; `BI-55`)*
 
 ## Asking the assistant
 
@@ -91,6 +92,6 @@ Run by the product owner on a running console. A step not performed is never a p
 - `BI-17-AC6` A user without `dashboard:write` cannot change a chart's format, a user without `settings:write` cannot change the palette, fonts or locale, and a failure shows a plain sentence.
 - `BI-17-AC7` A table colours cells below 1,000 red, and a KPI turns green above its goal.
 - `BI-17-AC8` A dashboard set to the dark theme stays dark in a public link while the console is light.
-- `AI-8-AC1` "Show values in rupiah, make the bars green, add a target line at 1,000." applies all three changes.
+- `AI-8-AC1` "Show values in rupiah, make the bars green, add a target line at 1,000." applies all three changes. Accepted by the AI owner, 2026-11-13 (staging `80fb2f68`)
 
 `BI-17-AC4` and `BI-17-AC5` (forecast and clustering) belong to part B.

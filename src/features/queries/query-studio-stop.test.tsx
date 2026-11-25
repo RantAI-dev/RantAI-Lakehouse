@@ -24,7 +24,7 @@ import { AuthProvider } from "@/features/auth/auth-provider"
 import { CopilotProvider } from "@/features/copilot/use-copilot"
 import { assetService, lakehouseService, queryService } from "@/services"
 import { ServiceError } from "@/services/errors"
-import { QUERY_DRAFT_KEY } from "@/lib/query-draft"
+import { queryDraftKey } from "@/lib/query-draft"
 import { QueryStudioPage } from "./query-studio-page"
 
 afterEach(() => {
@@ -55,7 +55,7 @@ function stubNetwork() {
 
 /** Seeds the editor with a statement and opens the SQL tab, the way a saved draft would. */
 function seedDraft(sql: string) {
-  window.localStorage.setItem(QUERY_DRAFT_KEY, JSON.stringify({ sql, question: "", tab: "sql" }))
+  window.localStorage.setItem(queryDraftKey("u1", null), JSON.stringify({ sql, question: "", tab: "sql" }))
 }
 
 function renderPage() {

@@ -21,11 +21,14 @@
 //! admin permission"), so a hash in the wire shape would be a path to
 //! session takeover.
 //!
-//! `created_ip` / `user_agent` round-trip as honest `null` for every
-//! session minted today: `routes::auth::login` and `routes::auth::oidc_callback`
-//! both mint sessions through `session::create_session(pool, user_id, ttl,
-//! None, None)`, and the response shape reflects that — `Option<String>`
-//! serializing to JSON `null` rather than a fabricated placeholder.
+//! `created_ip` is always `null`: the API sits behind the console's own
+//! server, so it has no trusted source for the client's address, and
+//! recording the peer or a forwarded header would show a wrong address as a
+//! fact (`ADM-14` decision D10). `user_agent` is the browser as it named
+//! itself at sign-in (`routes::auth::login` and `routes::auth::oidc_callback`
+//! pass it to `session::create_session`), and `null` for a session older than
+//! that change — an honest absence either way rather than a fabricated
+//! placeholder.
 
 use serde::Serialize;
 use sqlx::FromRow;
@@ -51,23 +54,23 @@ pub struct SessionRow {
     /// `app_user.name` for the session's owner — display only, never an
     /// authorization input.
     pub user_name: String,
-    /// `session.created_at` as the text Postgres renders it for
-    /// `TIMESTAMPTZ`. Newest-first ordering is what [`list_sessions_for_caller`]
-    /// sorts by; callers that need a parsed timestamp parse this themselves
-    /// rather than relying on a particular wire format.
+    /// `session.created_at` as RFC 3339 in UTC with milliseconds
+    /// (`2026-11-12T09:42:13.123Z`), the shape every browser's `Date`
+    /// parses (`ADM-14` decision D11). Newest-first ordering is what
+    /// [`list_sessions_for_caller`] sorts by.
     pub created_at: String,
-    /// `session.expires_at` as the text Postgres renders it for
-    /// `TIMESTAMPTZ`. Distinct from `revoked_at` (deliberately not exposed
-    /// — a session that appears in this list is by definition live, so the
-    /// column is constant `NULL` for every row and would only add noise).
+    /// `session.expires_at` as RFC 3339 in UTC with milliseconds, like
+    /// [`SessionRow::created_at`]. Distinct from `revoked_at` (deliberately
+    /// not exposed — a session that appears in this list is by definition
+    /// live, so the column is constant `NULL` for every row and would only
+    /// add noise).
     pub expires_at: String,
-    /// `session.created_ip` — the IP address the browser presented at
-    /// login. Every session minted today passes `None` here, so this is
-    /// `null` on the response; see the module doc comment on why the
-    /// absence is preserved rather than fabricated.
+    /// `session.created_ip` — always `null`: the API has no trusted source
+    /// for the client's address, so nothing is recorded rather than a wrong
+    /// address (`ADM-14` decision D10; see the module doc comment).
     pub created_ip: Option<String>,
-    /// `session.user_agent` — the browser's `User-Agent` header at login.
-    /// Same honest-`null` posture as [`SessionRow::created_ip`].
+    /// `session.user_agent` — the browser as it named itself at sign-in
+    /// (`ADM-14` decision D9), `null` for a session older than that change.
     pub user_agent: Option<String>,
 }
 
@@ -95,7 +98,10 @@ pub async fn list_sessions_for_caller(
 ) -> Result<Vec<SessionRow>, StoreError> {
     let rows: Vec<SessionRow> = sqlx::query_as(
         "SELECT s.id::text AS id, s.app_user_id::text AS user_id, u.name AS user_name, \
-                s.created_at::text AS created_at, s.expires_at::text AS expires_at, \
+                to_char(s.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') \
+                    AS created_at, \
+                to_char(s.expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') \
+                    AS expires_at, \
                 s.created_ip, s.user_agent \
          FROM session s JOIN app_user u ON u.id = s.app_user_id \
          WHERE s.revoked_at IS NULL AND s.expires_at > now() \

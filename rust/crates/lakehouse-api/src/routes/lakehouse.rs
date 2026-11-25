@@ -32,6 +32,7 @@ use serde_json::{Map, Value, json};
 
 use crate::bounded;
 use crate::error::ApiResult;
+use crate::health;
 use crate::json::ApiJson;
 use crate::lakehouse_catalog;
 use crate::routes::governance::{latest_maintenance_run, maintenance_history_table_name};
@@ -69,6 +70,68 @@ fn validate_warehouse(state: &AppState, warehouse: Option<&str>) -> Result<(), A
         }
         _ => Ok(()),
     }
+}
+
+/// `SEC-20`: the table a caller names must be one the caller's tenant may
+/// read, asked of the SAME gate Query Studio uses (`routes::query`), never a
+/// second reading of the claim table (`AGENTS.md` rule 4).
+///
+/// A table of another tenant gets Query Studio's own 404 and sentence
+/// ([`crate::routes::query::table_not_available`]), so the refusal does not
+/// say whether the table exists. It runs before the catalog is asked, so a
+/// refused caller costs the catalog nothing and learns nothing from it.
+///
+/// # Errors
+///
+/// 404 with the fixed sentence for a table out of reach, and for an
+/// `X-Tenant` header that names a tenant the caller does not belong to;
+/// 503 when the deployment's tenant count or the table's claim cannot be
+/// read.
+async fn ensure_table_in_reach(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+    ns: &str,
+    table: &str,
+) -> Result<(), ApiError> {
+    let reach = crate::routes::query::resolve_reach(state, principal, headers).await?;
+    crate::routes::query::check_tables_against_reach(state, reach, &[format!("{ns}.{table}")]).await
+}
+
+/// `SEC-20`: the tables of `namespace` the caller's tenant may read, in the
+/// order the catalog listed them.
+///
+/// A listing leaves out what the caller may not read instead of refusing
+/// the page (the console's Data page needs the caller's own tables), and the
+/// rule is Query Studio's own
+/// ([`crate::routes::query::table_is_reachable`]): another tenant's upload
+/// is never reachable, and a table nobody claimed is reachable only by the
+/// tenant that owns the shared catalog.
+///
+/// The claims are read once for the whole namespace
+/// ([`crate::routes::query::claims_on`]), not once per table: `bronze` holds
+/// hundreds of tables, and the namespace count has two seconds.
+///
+/// # Errors
+///
+/// 503 when the claims cannot be read.
+async fn leave_out_tables_out_of_reach(
+    state: &AppState,
+    reach: crate::routes::query::TenantReach,
+    namespace: &str,
+    idents: Vec<TableIdent>,
+) -> Result<Vec<TableIdent>, ApiError> {
+    let names: Vec<String> = idents
+        .iter()
+        .map(|ident| format!("{namespace}.{}", ident.name()))
+        .collect();
+    let reachable = crate::routes::query::reachable_names(state, reach, &names).await?;
+    Ok(idents
+        .into_iter()
+        .zip(names)
+        .filter(|(_, name)| reachable.contains(name))
+        .map(|(ident, _)| ident)
+        .collect())
 }
 
 /// Borrow the Postgres pool, or fail with a 503. Shared by every Postgres-
@@ -266,8 +329,26 @@ fn field_json(f: &lakehouse_iceberg::rest::FieldDetail) -> Value {
     })
 }
 
-fn table_detail_body(detail: &TableDetail) -> Value {
+/// A table with at least this many measured small files needs compaction
+/// (OPS-21). The number is the G3 synthetic load's shape — 20 small files
+/// per day partition measured ~15-20x worse planning time than a one-file
+/// control (`docs/plans/G3-RESULT.md`, ADR 0009) — not a guessed tolerance.
+/// Shared with the console's warning helper (`src/lib/lakehouse-view.ts`).
+pub const NEEDS_COMPACTION_FILE_COUNT: u64 = 20;
+
+/// Upper bound on tables one `/api/lakehouse/compaction-status` call scans.
+/// Trino's cron compacts Bronze only (ADR 0009), and a namespace can hold
+/// hundreds of tables; bounding the list keeps System status from fanning
+/// out an unbounded number of catalog + manifest reads. Tables past the cap
+/// are reported as `unmeasuredTables`, never as `0`.
+const MAX_COMPACTION_SCAN_TABLES: usize = 50;
+
+fn table_detail_body(detail: &TableDetail, compaction_available: bool) -> Value {
     json!({
+        // `checked && ok` on the same probe set Services reports — see
+        // `health::trino_compaction_available`. Config alone cannot answer
+        // this: compose gives `TRINO_URL` a default even with the profile off.
+        "compactionAvailable": compaction_available,
         "schema": detail.schema.iter().map(field_json).collect::<Vec<_>>(),
         // The table's schema history, oldest first. A field keeps its `id`
         // across versions, which is what lets a reader tell a rename from
@@ -287,10 +368,11 @@ fn table_detail_body(detail: &TableDetail) -> Value {
         "snapshots": detail.snapshots.iter().map(snapshot_json).collect::<Vec<_>>(),
         "stats": {
             "fileCount": detail.stats.file_count,
-            // Needs a manifest read this workstream does not do — not
-            // guessed from the snapshot summary.
-            "smallFileCount": Value::Null,
-            "smallFileThresholdBytes": Value::Null,
+            // Measured from the current snapshot's manifests by
+            // `lakehouse_iceberg::rest`. `None` means the manifests could
+            // not be read, which serializes to `null` — never a fabricated 0.
+            "smallFileCount": detail.small_file_count,
+            "smallFileThresholdBytes": rest::SMALL_FILE_THRESHOLD_BYTES,
             "recordCount": detail.stats.record_count,
             "totalBytes": detail.stats.total_bytes,
             "snapshotCount": detail.snapshot_count,
@@ -526,15 +608,40 @@ pub struct NamespacesQuery {
 
 /// `GET /api/lakehouse/namespaces?warehouse=`.
 ///
+/// `SEC-20`: a namespace's `tableCount` is of the tables the caller's tenant
+/// may read (see [`leave_out_tables_out_of_reach`]), so another tenant's
+/// upload table is not counted.
+///
+/// `tableCount: null` means the count is unknown or zero. Four causes give it:
+///
+/// - the namespace's lookup did not finish within the two-second budget;
+/// - the catalog failed to list the namespace's tables, or the namespace name
+///   is not a valid identifier;
+/// - the claims that say which tables the caller's tenant may read could not
+///   be read, so [`leave_out_tables_out_of_reach`] failed;
+/// - no table is left to count after the tables the caller may not read are
+///   left out, for example because the namespace is empty or holds only
+///   other tenants' upload tables.
+///
+/// For a caller whose roles hide no table, the row is kept with `null` in
+/// every case, since it names no table. A caller whose roles do hide tables
+/// loses the row instead.
+///
 /// # Errors
-/// 404 if `warehouse` names anything other than the configured warehouse,
-/// 503 if the catalog cannot be reached, or if the reader token is
-/// unavailable.
+/// 404 if `warehouse` names anything other than the configured warehouse, or
+/// if `X-Tenant` names a tenant the caller does not belong to, 503 if the
+/// catalog cannot be reached, if the reader token is unavailable, or if the
+/// deployment's tenant count cannot be read.
 pub async fn namespaces(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Query(query): Query<NamespacesQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     validate_warehouse(&state, query.warehouse.as_deref())?;
+    // `SEC-20`: the reach is resolved once, before the catalog is asked, as
+    // `tables` does, so every namespace is counted under the same answer.
+    let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
 
     let idents = lakehouse_catalog::call(&state, |client| async move {
         rest::list_namespaces(&client).await
@@ -542,6 +649,8 @@ pub async fn namespaces(
     .await
     .map_err(|err| classify_catalog_access_error(err, "namespace"))?;
     let names: Vec<String> = idents.iter().map(NamespaceIdent::to_url_string).collect();
+    // GOV-7 D6: which tables a role may read is Postgres's answer, asked once.
+    let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
 
     // One client, fetched ONCE, shared by every fan-out item below: each
     // item calls `rest::list_table_idents` directly on it, never through
@@ -552,19 +661,47 @@ pub async fn namespaces(
     let client = lakehouse_catalog::client(&state)
         .await
         .map_err(|err| classify_catalog_access_error(err, "namespace"))?;
+    // `GOV-7` D6: the count is of the tables this caller may read, and a
+    // namespace with none of them is not listed at all — a hidden table does
+    // not appear anywhere. A lookup that failed leaves the caller unable to
+    // prove the namespace holds anything visible, so it goes too.
+    //
+    // `SEC-20`: "may read" also means in the caller's tenant's reach, so a
+    // claim that cannot be read fails the lookup like a catalog error does.
     let table_counts = bounded::run_with_budget(names.clone(), Duration::from_secs(2), 8, {
+        let access = access.clone();
+        let state = state.clone();
         move |name: String| {
+            let access = access.clone();
             let client = client.clone();
+            let state = state.clone();
             async move {
                 let ns = NamespaceIdent::from_strs([name.as_str()]).ok()?;
-                rest::list_table_idents(&client, &ns)
+                let idents = rest::list_table_idents(&client, &ns).await.ok()?;
+                let idents = leave_out_tables_out_of_reach(&state, reach, &name, idents)
                     .await
-                    .ok()
-                    .map(|idents| idents.len())
+                    .ok()?;
+                let visible = idents
+                    .iter()
+                    .filter(|ident| access.allows(&name, ident.name()))
+                    .count();
+                (visible > 0).then_some(visible)
             }
         }
     })
     .await;
+    // A namespace whose tables all failed to load keeps its row with a
+    // `null` count for an unrestricted caller (the honest "could not tell");
+    // for a narrowed one it goes, because nothing proves it holds a visible
+    // table (fail closed).
+    let names: Vec<String> = if access.is_all() {
+        names
+    } else {
+        names
+            .into_iter()
+            .filter(|name| table_counts.contains_key(name))
+            .collect()
+    };
 
     Ok(ApiJson(namespaces_body(&names, &table_counts)))
 }
@@ -579,12 +716,19 @@ pub struct TablesQuery {
 
 /// `GET /api/lakehouse/tables?warehouse=&namespace=`.
 ///
+/// `SEC-20`: the listing leaves out the tables the caller's tenant may not
+/// read (see [`leave_out_tables_out_of_reach`]).
+///
 /// # Errors
 /// 400 if `namespace` is missing or not `[a-z0-9_]+`-shaped, 404 if
-/// `warehouse` names anything other than the configured warehouse or if
-/// `namespace` does not exist, 503 if the catalog cannot be reached.
+/// `warehouse` names anything other than the configured warehouse, if
+/// `namespace` does not exist, or if `X-Tenant` names a tenant the caller
+/// does not belong to, 503 if the catalog cannot be reached or a table's
+/// claim cannot be read.
 pub async fn tables(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Query(query): Query<TablesQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     validate_warehouse(&state, query.warehouse.as_deref())?;
@@ -594,6 +738,10 @@ pub async fn tables(
     validate_ident(&namespace, "namespace")?;
     let ns = NamespaceIdent::from_strs([namespace.as_str()])
         .map_err(|_| ApiError::BadRequest("namespace is invalid".to_owned()))?;
+    // `SEC-20`: the reach is resolved once, before the catalog is asked, so a
+    // header naming a tenant the caller is not in is refused like everywhere
+    // else.
+    let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
 
     let idents = lakehouse_catalog::call(&state, {
         let ns = ns.clone();
@@ -604,7 +752,14 @@ pub async fn tables(
     })
     .await
     .map_err(|err| classify_catalog_access_error(err, "namespace"))?;
+    let idents = leave_out_tables_out_of_reach(&state, reach, &namespace, idents).await?;
 
+    // GOV-7 D6: a table the caller's roles hide is not listed.
+    let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
+    let idents: Vec<_> = idents
+        .into_iter()
+        .filter(|ident| access.allows(&namespace, ident.name()))
+        .collect();
     let names: Vec<String> = idents.iter().map(|ident| ident.name().to_owned()).collect();
     // One client, fetched ONCE, shared by every fan-out item below — see
     // `namespaces`' matching comment for why a per-item call must not go
@@ -629,13 +784,23 @@ pub async fn tables(
 ///
 /// # Errors
 /// 400 if `ns`/`table` are not `[a-z0-9_]+`-shaped, 404 if the table does
-/// not exist, 503 if the catalog cannot be reached.
+/// not exist, is out of the caller's tenant's reach
+/// ([`ensure_table_in_reach`]), or if `X-Tenant` names a tenant the caller
+/// does not belong to, 503 if the catalog cannot be reached.
 pub async fn table_detail(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path((ns, table)): Path<(String, String)>,
 ) -> ApiResult<ApiJson<Value>> {
     validate_ident(&ns, "ns")?;
     validate_ident(&table, "table")?;
+    // `SEC-20`: the same order Query Studio keeps: the tenant's reach first,
+    // then what the caller's roles hide (`GOV-7`).
+    ensure_table_in_reach(&state, &principal, &headers, &ns, &table).await?;
+    // GOV-7 D6: a hidden table answers the same 404 an unknown one answers.
+    let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
+    crate::routes::catalog::ensure_key_readable_with(&access, &format!("{ns}.{table}"))?;
     let namespace = NamespaceIdent::from_strs([ns.as_str()])
         .map_err(|_| ApiError::BadRequest("ns is invalid".to_owned()))?;
     let ident = TableIdent::new(namespace, table);
@@ -644,13 +809,123 @@ pub async fn table_detail(
         let ident = ident.clone();
         move |client| {
             let ident = ident.clone();
-            async move { rest::load_table_detail(&client, &ident).await }
+            async move {
+                rest::load_table_detail_with_small_files(
+                    &client,
+                    &ident,
+                    rest::SMALL_FILE_THRESHOLD_BYTES,
+                )
+                .await
+            }
         }
     })
     .await
     .map_err(|err| classify_catalog_access_error(err, "table"))?;
 
-    Ok(ApiJson(table_detail_body(&detail)))
+    // One cached probe set, the same `/api/ops/services` reads. `Some(0)`
+    // small files and `compactionAvailable: false` are both measured facts,
+    // not an inference from whether `TRINO_URL` happens to be set.
+    let probes = health::cached_probe_all(&state).await;
+    Ok(ApiJson(table_detail_body(
+        &detail,
+        health::trino_compaction_available(&probes),
+    )))
+}
+
+/// Builds `GET /api/lakehouse/compaction-status`'s body from already-read
+/// counts. Pure so the "warn only from measured counts" rule is assertable
+/// without a catalog or an object store.
+///
+/// Only tables whose measured count reaches [`NEEDS_COMPACTION_FILE_COUNT`]
+/// are listed. A name whose count could not be read is absent from `tables`
+/// and counted in `unmeasuredTables` — never loaded as a zero.
+fn compaction_status_body(
+    compaction_available: bool,
+    candidates: &[String],
+    counts: &HashMap<String, u64>,
+) -> Value {
+    let mut needing: Vec<(&String, &u64)> = counts
+        .iter()
+        .filter(|(_, count)| **count >= NEEDS_COMPACTION_FILE_COUNT)
+        .collect();
+    needing.sort_by(|a, b| a.0.cmp(b.0));
+    json!({
+        "compactionAvailable": compaction_available,
+        "smallFileThresholdBytes": rest::SMALL_FILE_THRESHOLD_BYTES,
+        "needsCompactionFileCount": NEEDS_COMPACTION_FILE_COUNT,
+        "tables": needing.into_iter().map(|(name, count)| json!({
+            // Trino's cron compacts Bronze only (ADR 0009), so this is the
+            // namespace every row in `tables` belongs to.
+            "namespace": "bronze",
+            "name": name,
+            "smallFileCount": count,
+        })).collect::<Vec<_>>(),
+        "measuredTables": counts.len(),
+        "unmeasuredTables": candidates.len().saturating_sub(counts.len()),
+    })
+}
+
+/// `GET /api/lakehouse/compaction-status` — the System status warning's one
+/// call. Trino's cron only compacts Bronze (ADR 0009), so only that namespace
+/// is scanned; the tenant/role reach is resolved exactly as [`tables`] does,
+/// and the per-table manifest reads are bounded by [`bounded::run_with_budget`]
+/// and a hard table cap rather than issued as an unbounded N+1 from the
+/// console. Tables that did not answer are reported as unmeasured, never as
+/// small-file count zero.
+///
+/// # Errors
+/// 404 if `X-Tenant` names a tenant the caller does not belong to; 503 if
+/// the catalog or the claims cannot be read (same posture as [`tables`]).
+/// An individual table's manifest read failing is not a route error — it
+/// leaves that table out of `tables` and increments `unmeasuredTables`.
+pub async fn compaction_status(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Value>> {
+    let namespace = "bronze";
+    // Same two gates, same order, as `tables`: a table out of the caller's
+    // reach or hidden by their roles must not appear in a deployment-wide
+    // status list either.
+    let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
+    let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
+    let ns = NamespaceIdent::from_strs([namespace])
+        .map_err(|_| ApiError::BadRequest("namespace is invalid".to_owned()))?;
+    let client = lakehouse_catalog::client(&state)
+        .await
+        .map_err(|err| classify_catalog_access_error(err, "table"))?;
+    let idents = rest::list_table_idents(&client, &ns)
+        .await
+        .map_err(|err| classify_rest_error(&err, "namespace"))?;
+    let idents = leave_out_tables_out_of_reach(&state, reach, namespace, idents).await?;
+    let candidates: Vec<String> = idents
+        .into_iter()
+        .filter(|ident| access.allows(namespace, ident.name()))
+        .map(|ident| ident.name().to_owned())
+        .take(MAX_COMPACTION_SCAN_TABLES)
+        .collect();
+
+    let counts = bounded::run_with_budget(candidates.clone(), Duration::from_secs(5), 8, {
+        let ns = ns.clone();
+        move |name: String| {
+            let client = client.clone();
+            let ns = ns.clone();
+            async move {
+                let ident = TableIdent::new(ns, name);
+                rest::load_small_file_count(&client, &ident, rest::SMALL_FILE_THRESHOLD_BYTES)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        }
+    })
+    .await;
+    let probes = health::cached_probe_all(&state).await;
+    Ok(ApiJson(compaction_status_body(
+        health::trino_compaction_available(&probes),
+        &candidates,
+        &counts,
+    )))
 }
 
 /// `true` only for `bronze`: the P4 maintenance job (and its
@@ -677,12 +952,20 @@ fn last_run_applies(ns: &str) -> bool {
 /// `lastVerbRuns` shares that posture too, except for the one case where
 /// `bronze_meta.maintenance_verb_run` itself does not exist yet — see
 /// [`maintenance_verb_runs_or_empty`].
+///
+/// `SEC-20`: also 404 for a table out of the caller's tenant's reach, or if
+/// `X-Tenant` names a tenant the caller does not belong to
+/// ([`ensure_table_in_reach`]), before the policy store or `ClickHouse` is
+/// asked.
 pub async fn maintenance(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path((ns, table)): Path<(String, String)>,
 ) -> ApiResult<ApiJson<Value>> {
     validate_ident(&ns, "ns")?;
     validate_ident(&table, "table")?;
+    ensure_table_in_reach(&state, &principal, &headers, &ns, &table).await?;
 
     let policy = maintenance_policy::get_policy(pool(&state)?, &ns, &table).await?;
 
@@ -786,9 +1069,14 @@ fn validate_maintenance_policy_body(body: &MaintenancePolicyBody) -> Result<(), 
 /// 400 if `ns`/`table` are not `[a-z0-9_]+`-shaped, the body is not JSON,
 /// or a bound (`snapshotsToKeep`/`orphanAgeHours` below 1, an unrecognized
 /// `schedule`) is out of range; 401/403 from the auth gate
-/// (`governance:write`); 503 if no Postgres pool is configured.
+/// (`governance:write`); 404 for a table out of the caller's tenant's reach,
+/// or if `X-Tenant` names a tenant the caller does not belong to
+/// ([`ensure_table_in_reach`], `SEC-20`); 503 if no Postgres pool is
+/// configured.
 pub async fn set_maintenance_policy(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path((ns, table)): Path<(String, String)>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
@@ -796,6 +1084,11 @@ pub async fn set_maintenance_policy(
     validate_ident(&table, "table")?;
     let parsed = parse_maintenance_policy_body(&body)?;
     validate_maintenance_policy_body(&parsed)?;
+    // `SEC-20`: checked once the body is known to be well formed, and before
+    // anything is written. The body is the caller's own text and says
+    // nothing about the table, so its 400 is no oracle; the write is the
+    // part a table out of reach must never get.
+    ensure_table_in_reach(&state, &principal, &headers, &ns, &table).await?;
 
     let input = maintenance_policy::MaintenancePolicyInput {
         namespace: ns.clone(),
@@ -821,7 +1114,7 @@ pub async fn set_maintenance_policy(
 }
 
 /// `GET /api/lakehouse/maintenance-policies` — every configured table
-/// maintenance policy.
+/// maintenance policy the caller may read.
 ///
 /// Read by `dagster/dispar_orchestrate/maintenance.py` using the
 /// scope-less `lakehouse-maintenance-policy-reader` service identity
@@ -830,11 +1123,45 @@ pub async fn set_maintenance_policy(
 /// secret, only per-table retention/compaction settings, and the
 /// maintenance service identity holds no scopes to check against.
 ///
+/// # Tenant scoping
+///
+/// The list names the upload tables of every tenant, so a person
+/// ([`lakehouse_auth::PrincipalId::User`]) reads only the policies of the
+/// tables in their reach (`SEC-20`, plan 95): the rule Query Studio keeps,
+/// through [`crate::routes::query::reachable_names`].
+///
+/// A service identity ([`lakehouse_auth::PrincipalId::Service`]) reads the
+/// whole list. The maintenance job runs the policy of every table, so a list
+/// narrowed to a tenant would silently leave the other tenants' tables
+/// unmaintained. A service identity belongs to no tenant and its token is
+/// the credential of a job, never of a person, so there is no reach to
+/// narrow it by.
+///
 /// # Errors
 ///
-/// 503 if no Postgres pool is configured.
-pub async fn list_maintenance_policies(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+/// 503 if no Postgres pool is configured, or the claims cannot be read; 404
+/// if `X-Tenant` names a tenant the caller does not belong to.
+pub async fn list_maintenance_policies(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Value>> {
     let rows = maintenance_policy::list_all_policies(pool(&state)?).await?;
+    let rows = if matches!(principal.id, lakehouse_auth::PrincipalId::Service(_)) {
+        rows
+    } else {
+        let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
+        let names: Vec<String> = rows
+            .iter()
+            .map(|r| format!("{}.{}", r.namespace, r.table_name))
+            .collect();
+        let reachable = crate::routes::query::reachable_names(&state, reach, &names).await?;
+        rows.into_iter()
+            .zip(names)
+            .filter(|(_, name)| reachable.contains(name))
+            .map(|(row, _)| row)
+            .collect()
+    };
     Ok(ApiJson(json!({
         "policies": rows.iter().map(|r| json!({
             "namespace": r.namespace,
@@ -1144,9 +1471,10 @@ mod tests {
                 record_count: Some(100),
                 total_bytes: Some(1024),
             },
+            small_file_count: None,
         };
 
-        let body = table_detail_body(&detail);
+        let body = table_detail_body(&detail, false);
 
         assert_eq!(body["schema"][0]["name"], json!("id"));
         assert_eq!(body["schema"][0]["required"], json!(true));
@@ -1167,9 +1495,97 @@ mod tests {
         );
         assert_eq!(body["stats"]["fileCount"], json!(1));
         assert_eq!(body["stats"]["smallFileCount"], Value::Null);
-        assert_eq!(body["stats"]["smallFileThresholdBytes"], Value::Null);
+        assert_eq!(
+            body["stats"]["smallFileThresholdBytes"],
+            json!(rest::SMALL_FILE_THRESHOLD_BYTES),
+            "the threshold is a documented constant, measured or not"
+        );
         assert_eq!(body["stats"]["snapshotCount"], json!(1));
         assert_eq!(body["stats"]["metadataLogCount"], json!(1));
+        assert_eq!(body["compactionAvailable"], json!(false));
+    }
+
+    /// OPS-21: a measured count reaches the response as a number, and the
+    /// Trino flag is whatever the probe set answered — never inferred from
+    /// the count itself.
+    #[test]
+    fn table_detail_body_reports_a_measured_small_file_count_and_trino_flag() {
+        let mut detail = TableDetail {
+            schema: Vec::new(),
+            partition_fields: Vec::new(),
+            properties: HashMap::new(),
+            snapshots: Vec::new(),
+            schema_versions: Vec::new(),
+            snapshot_count: 0,
+            metadata_log_count: 0,
+            stats: TableStats::default(),
+            small_file_count: Some(0),
+        };
+
+        let body = table_detail_body(&detail, true);
+        assert_eq!(body["stats"]["smallFileCount"], json!(0));
+        assert_eq!(body["compactionAvailable"], json!(true));
+
+        detail.small_file_count = Some(37);
+        let body = table_detail_body(&detail, false);
+        assert_eq!(body["stats"]["smallFileCount"], json!(37));
+        assert_eq!(body["compactionAvailable"], json!(false));
+    }
+
+    /// OPS-21: only measured counts at or above the documented threshold
+    /// appear, and unreadable ones are counted as unmeasured rather than
+    /// quietly folded into the warning list as zero.
+    #[test]
+    fn compaction_status_lists_only_measured_tables_needing_compaction() {
+        let candidates = vec![
+            "orders".to_owned(),
+            "events".to_owned(),
+            "clean".to_owned(),
+            "unreadable".to_owned(),
+        ];
+        let counts = HashMap::from([
+            ("orders".to_owned(), 42_u64),
+            ("events".to_owned(), NEEDS_COMPACTION_FILE_COUNT),
+            ("clean".to_owned(), 1_u64),
+        ]);
+
+        let body = compaction_status_body(false, &candidates, &counts);
+
+        assert_eq!(body["compactionAvailable"], json!(false));
+        assert_eq!(
+            body["smallFileThresholdBytes"],
+            json!(rest::SMALL_FILE_THRESHOLD_BYTES)
+        );
+        assert_eq!(body["needsCompactionFileCount"], json!(20));
+        assert_eq!(
+            body["tables"][0]["name"],
+            json!("events"),
+            "the rows are sorted by table name, not by HashMap iteration order"
+        );
+        assert_eq!(body["tables"][0]["namespace"], json!("bronze"));
+        assert_eq!(body["tables"][0]["smallFileCount"], json!(20));
+        assert_eq!(body["tables"][1]["name"], json!("orders"));
+        assert_eq!(body["tables"][1]["smallFileCount"], json!(42));
+        assert_eq!(body["tables"].as_array().map(Vec::len), Some(2));
+        assert_eq!(body["measuredTables"], json!(3));
+        assert_eq!(
+            body["unmeasuredTables"],
+            json!(1),
+            "a manifest that could not be read is not a measured zero"
+        );
+    }
+
+    #[test]
+    fn compaction_status_is_silent_when_trino_is_available() {
+        let body = compaction_status_body(
+            true,
+            &["orders".to_owned()],
+            &HashMap::from([("orders".to_owned(), 99_u64)]),
+        );
+        assert_eq!(body["compactionAvailable"], json!(true));
+        // The data is still returned; the console decides not to warn. This
+        // keeps one endpoint for both states instead of two code paths.
+        assert_eq!(body["tables"][0]["smallFileCount"], json!(99));
     }
 
     /// `id` and `parentId` must both survive as strings past
@@ -1676,10 +2092,27 @@ mod tests {
 
             let state = state_pointed_at(&server).await;
 
-            let body = namespaces(State(state), Query(NamespacesQuery { warehouse: None }))
-                .await
-                .expect("namespaces succeeds even though one item fails")
-                .0;
+            // An unrestricted principal: this test is about the shared
+            // Lookup (a failed item keeps its row with a null count), not about
+            // `GOV-7`'s per-caller filter.
+            let principal = Principal {
+                id: lakehouse_auth::PrincipalId::User(uuid::Uuid::from_u128(7)),
+                tenant_ids: Vec::new(),
+                display_name: "Test Admin".to_owned(),
+                permissions: lakehouse_auth::PermissionSet::parse("*:*"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            };
+            let body = namespaces(
+                State(state),
+                Extension(principal),
+                HeaderMap::new(),
+                Query(NamespacesQuery { warehouse: None }),
+            )
+            .await
+            .expect("namespaces succeeds even though one item fails")
+            .0;
 
             assert_eq!(body["namespaces"][0]["name"], json!("bronze"));
             assert_eq!(body["namespaces"][0]["tableCount"], json!(1));

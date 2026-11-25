@@ -49,7 +49,7 @@ use sqlx::{Connection, PgConnection};
 // Force-links lakehouse-test-support for the shared testcontainer Postgres.
 use lakehouse_test_support as _;
 
-mod common;
+use crate::common;
 
 /// The address a connector dial really uses: the approved IP, never the name.
 const APPROVED_ADDRESS: &str = "127.0.0.1";

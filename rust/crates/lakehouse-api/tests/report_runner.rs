@@ -10,8 +10,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -19,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use common::spin_up_state;
 use lakehouse_api::routes::report_runner::{
-    EMAIL_NOT_SET_UP, PAUSED_AFTER_FAILURES, run_subscription, tick,
+    EMAIL_NOT_SET_UP, PAUSED_AFTER_FAILURES, RUN_TOO_LONG, record_cut_run, run_subscription, tick,
 };
 use lakehouse_api::state::AppState;
 use lakehouse_notify::{Attachment, DeliverResult, MailFuture, ReportMailer};
@@ -238,9 +239,10 @@ struct F {
 
 async fn person(pool: &PgPool, name: &str, role_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, $2, $3, 'active')")
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, $2, $3, $4, 'active')")
         .bind(id)
         .bind(name)
+        .bind(name.to_lowercase())
         .bind(format!("{}@company.example", name.to_lowercase()))
         .execute(pool)
         .await
@@ -893,6 +895,52 @@ async fn ten_left_out_charts_do_not_break_the_delivery_record() {
 /// RPT-1 review fix (SHOULD-FIX) R6: each attached file's audit entry says how
 /// many people it went to, which outside addresses, and whether the schedule or
 /// "Send now" sent it.
+/// `BI-35`: a "Send now" stopped at its time budget is a failed manual
+/// delivery with its reason in the history and an audit row with outcome
+/// `failed`, and it does not count toward the five or move the schedule.
+#[tokio::test]
+async fn a_send_now_stopped_at_its_budget_is_recorded_as_failed_in_history_and_audit() {
+    let f = fixture(ok_pdf(), true).await;
+    let sub = subscription(&f, |s| {
+        s.next_run_at = OffsetDateTime::now_utc() + Duration::days(3);
+    })
+    .await;
+    let owner = lakehouse_auth::repository::load_principal_for_user(
+        &f.pool,
+        f.owner,
+        "test".to_owned(),
+        false,
+    )
+    .await
+    .unwrap();
+    let delivery = record_cut_run(&f.state, &owner, &sub, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    assert_eq!(delivery.status, "failed");
+    assert_eq!(delivery.origin, "manual");
+    assert_eq!(delivery.reason.as_deref(), Some(RUN_TOO_LONG));
+    let history = deliveries(&f, &sub).await;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].reason.as_deref(), Some(RUN_TOO_LONG));
+    let audit: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT action, outcome, detail FROM audit_event WHERE action = 'report.send_now'",
+    )
+    .fetch_all(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        audit,
+        vec![(
+            "report.send_now".to_owned(),
+            "failed".to_owned(),
+            Some(RUN_TOO_LONG.to_owned())
+        )]
+    );
+    let stored = subs::get(&f.pool, sub.id).await.unwrap().unwrap();
+    assert_eq!(stored.consecutive_failures, 0);
+    assert!(stored.next_run_at > OffsetDateTime::now_utc() + Duration::days(2));
+}
+
 #[tokio::test]
 async fn the_audit_entry_of_each_file_says_who_received_it() {
     let f = fixture(ok_pdf(), true).await;
@@ -924,13 +972,34 @@ async fn the_audit_entry_of_each_file_says_who_received_it() {
     assert_eq!(origins.iter().filter(|o| **o == "manual").count(), 2);
 }
 
-/// A tracing writer that keeps what is logged, to read back.
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
+// What the current thread is keeping, `None` when it is not capturing.
+thread_local! {
+    static CAPTURE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
 
-impl std::io::Write for Captured {
+/// A log capture that records only the current thread, and only while a
+/// [`LogCapture`] is running on it (`REL-25`).
+///
+/// `tracing::subscriber::set_default` sets the subscriber of the calling
+/// thread alone. The line the PDF test waits for is logged by
+/// `upstream_error::report`, one call site every upstream failure shares:
+/// `tracing-core` decides once per process, the first time any thread reaches
+/// it, whether anybody is interested, and keeps that answer for the whole
+/// process. Another test of this binary reaching that call site on its own
+/// thread, which has no subscriber, records "never" — and this test's record is
+/// then dropped before its subscriber is asked. A subscriber installed for the
+/// process, once, is the default of every thread, so no thread can record
+/// "never"; the writer keeps a record only on the thread that wrote it, so one
+/// test's "pdf render failed" cannot satisfy another's assertion.
+struct ThreadCapture;
+
+impl std::io::Write for ThreadCapture {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
+        CAPTURE.with(|kept| {
+            if let Some(bytes) = kept.borrow_mut().as_mut() {
+                bytes.extend_from_slice(buf);
+            }
+        });
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -938,23 +1007,104 @@ impl std::io::Write for Captured {
     }
 }
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadCapture {
     type Writer = Self;
     fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
+        Self
     }
+}
+
+/// Runs a capture on this thread; dropping it stops the capture.
+struct LogCapture {
+    started_on: std::thread::ThreadId,
+}
+
+impl LogCapture {
+    /// Installs the process-wide subscriber once, then captures this thread.
+    fn start() -> Self {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(ThreadCapture)
+                .with_ansi(false)
+                .finish();
+            // Nothing else in this binary installs a global subscriber. A
+            // capture that silently records nothing must not pass, so a
+            // second installation is a failure of this test, not a skip.
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("this test binary installs no other global subscriber");
+        });
+        CAPTURE.with(|kept| *kept.borrow_mut() = Some(Vec::new()));
+        Self {
+            started_on: std::thread::current().id(),
+        }
+    }
+
+    /// What this thread logged since [`LogCapture::start`].
+    fn text(&self) -> String {
+        assert_eq!(
+            self.started_on,
+            std::thread::current().id(),
+            "a capture reads only the thread that started it"
+        );
+        CAPTURE.with(|kept| {
+            let kept = kept.borrow();
+            String::from_utf8_lossy(kept.as_deref().unwrap_or_default()).into_owned()
+        })
+    }
+}
+
+impl Drop for LogCapture {
+    fn drop(&mut self) {
+        CAPTURE.with(|kept| *kept.borrow_mut() = None);
+    }
+}
+
+/// `REL-25`: a capture keeps what its own thread logs and nothing another
+/// thread logs, so one test's record cannot stand in for another's.
+#[test]
+fn a_log_capture_keeps_what_its_own_thread_logs_and_nothing_from_another_thread() {
+    let capture = LogCapture::start();
+    std::thread::spawn(|| tracing::error!("logged by another thread"))
+        .join()
+        .unwrap();
+    tracing::error!("logged by this thread");
+    let log = capture.text();
+    assert!(log.contains("logged by this thread"), "{log}");
+    assert!(!log.contains("logged by another thread"), "{log}");
+}
+
+/// The call site this test shares with another thread: `tracing-core` takes a
+/// call site's interest from the DEFAULT of the first thread to reach it and
+/// keeps that answer for the process (`D9`, `REL-25`). With a subscriber only
+/// on one thread, a site another thread reached first is recorded "never" and
+/// this thread's record is dropped.
+fn shared_site() {
+    tracing::error!("from the shared call site");
+}
+
+/// `REL-25` (review round 1, R2): a capture sees a call site another thread
+/// reached first — the case a per-thread `set_default` cannot serve. The other
+/// thread is joined before this one logs, so its registration of the site comes
+/// first on any machine, under `cargo test` and `nextest`.
+#[test]
+fn a_log_capture_sees_a_call_site_another_thread_reached_first() {
+    let capture = LogCapture::start();
+    std::thread::spawn(shared_site).join().unwrap();
+    shared_site();
+    let log = capture.text();
+    assert_eq!(
+        log.matches("from the shared call site").count(),
+        1,
+        "the site registered on the other thread must still reach this capture: {log}"
+    );
 }
 
 /// RPT-1 review fix (SHOULD-FIX) R7: a PDF failure leaves a trace for the
 /// operator (the cause under a reference), while the stored reason stays fixed.
 #[tokio::test]
 async fn a_pdf_failure_is_logged_for_the_operator_and_the_record_stays_fixed() {
-    let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(captured.clone())
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let capture = LogCapture::start();
     let f = fixture(
         ResponseTemplate::new(500).set_body_string("chromium crashed at /srv/internal-path"),
         true,
@@ -967,7 +1117,7 @@ async fn a_pdf_failure_is_logged_for_the_operator_and_the_record_stays_fixed() {
         rows[0].reason.as_deref(),
         Some("The PDF could not be made.")
     );
-    let log = String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned();
+    let log = capture.text();
     assert!(log.contains("pdf render failed"), "{log}");
     assert!(log.contains("reference"), "{log}");
 }

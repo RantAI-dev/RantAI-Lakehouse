@@ -312,7 +312,12 @@ def test_a_history_refusal_is_recorded_as_a_rejected_run_with_its_fixed_message(
     monkeypatch.setattr(f, "_make_gate", lambda *a, **k: None)
     refusal = HistoryRefused('table \'orders\' holds rows that were not loaded in the history mode; use "Refresh, removing rows" on it to load it with history')
 
-    def refuse(cfg: Any, plan: Any, gate: Any = None) -> None:
+    # `DATA-52`, review round 1 R2: `_run_one_object` hands the PostgreSQL branch the
+    # run's author, so this stub takes it like the real `run_bronze_ingest` does. The
+    # refusal is raised before any load, so the value is not asserted here; that the
+    # label reaches the sink is asserted by
+    # `test_run_one_object_routes_a_postgres_driver_sql_connector_through_dlt_pipeline`.
+    def refuse(cfg: Any, plan: Any, gate: Any = None, author: str = "") -> None:
         raise refusal
 
     monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", refuse)

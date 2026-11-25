@@ -1,10 +1,13 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { EditorView } from "@codemirror/view"
-import * as notify from "@/lib/notify"
-import { assetService, queryService } from "@/services"
+import * as React from "react"
+import { LEGACY_QUERY_DRAFT_KEY, queryDraftKey, type QueryTabs } from "@/lib/query-draft"
+import { assetService, lakehouseService, queryService } from "@/services"
 import { ServiceError } from "@/services/errors"
-import { useQueryStudio } from "./use-query-studio"
+import type { LakehouseTableDetail } from "@/services/contracts/lakehouse"
+import type { QueryHistoryItem } from "@/services/contracts/queries"
+import { RUN_LINK_UNAVAILABLE, useQueryStudio } from "./use-query-studio"
 
 // The explain and fix actions of Query Studio: what Accept, Reject and the
 // editor do to each other, and that neither action runs the query. The
@@ -12,11 +15,36 @@ import { useQueryStudio } from "./use-query-studio"
 afterEach(() => {
   cleanup()
   mock.restore()
+  // The draft the studio keeps is in this browser: a test that leaves one
+  // behind would hand it to the next test, which would then open a tab it
+  // never asked for.
+  window.localStorage.clear()
+  visit("/query-studio")
 })
 
 const FAILED = "SELECT amont FROM t"
 const PROPOSED = "SELECT amount FROM t"
 const REASON = "The column is named amount."
+
+/** Points the browser at a Query Studio address, the way an href does. */
+function visit(path: string) {
+  const url = new URL(path, "http://localhost:3000").href
+  ;(window as unknown as { happyDOM: { setURL: (url: string) => void } }).happyDOM.setURL(url)
+}
+
+/** One saved query, as the server sends it. */
+const SAVED = {
+  id: "q1",
+  title: "Orders",
+  sql: "SELECT 1",
+  owner: "Rina Wijaya",
+  updatedAt: "2026-11-04T10:00:00.000Z",
+  tags: ["finance"],
+  folderId: null,
+  ownerId: "u1",
+  level: "edit",
+  parameters: [],
+}
 
 /** One row of a result, as the API sends it. */
 const RESULT = {
@@ -45,10 +73,174 @@ function mountWith(sql: string) {
   spyOn(queryService, "listSaved").mockResolvedValue([])
   spyOn(queryService, "listHistory").mockResolvedValue([])
   spyOn(assetService, "listAssets").mockResolvedValue([])
-  const hook = renderHook(() => useQueryStudio())
+  const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
   act(() => hook.result.current.setSql(sql))
   return hook
 }
+
+// QS-11 (LH-QS-1-01), D7: a new tab's document is empty; the hint is a
+// placeholder in the editor, never starter text someone could run by mistake.
+describe("useQueryStudio starter text", () => {
+  it("starts the first tab and every new tab with an empty document", () => {
+    window.localStorage.clear()
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(assetService, "listAssets").mockResolvedValue([])
+    visit("/query-studio")
+
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
+    expect(hook.result.current.tabs[0]?.sql).toBe("")
+    act(() => {
+      hook.result.current.addTab()
+    })
+    expect(hook.result.current.tabs[1]?.sql).toBe("")
+  })
+})
+
+// QS-12 (LH-QS-4-07), D15: a `/query-studio?run=<id>` handoff asks for that
+// one run and opens its SQL on the engine it ran on; an id outside the
+// caller's last 14 days opens no tab and says why.
+describe("useQueryStudio run link", () => {
+  const RUN = {
+    id: "q-1",
+    sql: "SELECT * FROM iceberg.bronze.t",
+    engine: "trino",
+    user: "Rina Wijaya",
+    at: "2026-11-20T10:00:00.000Z",
+    status: "completed",
+    durationMs: 10,
+    scannedBytes: 1,
+    costUnits: 0.1,
+    workloadClass: "interactive",
+    cacheAssisted: false,
+    tablesRead: [],
+  } as unknown as QueryHistoryItem
+
+  function stubLists() {
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
+    spyOn(assetService, "listAssets").mockResolvedValue([])
+  }
+
+  it("opens the run's SQL on its engine from ?run=", async () => {
+    window.localStorage.clear()
+    stubLists()
+    const list = spyOn(queryService, "listHistoryPage").mockResolvedValue({
+      runs: [RUN],
+      total: 1,
+      page: 1,
+      pageSize: 50,
+    } as never)
+    visit("/query-studio?run=q-1")
+
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
+
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(1))
+    expect(list.mock.calls[0]?.[0]).toMatchObject({ id: "q-1", page: 1 })
+    await waitFor(() =>
+      expect(hook.result.current.tabs.some((tab) => tab.sql === RUN.sql)).toBe(true)
+    )
+    const opened = hook.result.current.tabs.find((tab) => tab.sql === RUN.sql)
+    expect(opened?.engine).toBe("trino")
+    expect(hook.result.current.runLinkError).toBeNull()
+  })
+
+  it("says the run is unavailable and opens no tab when the answer is empty", async () => {
+    window.localStorage.clear()
+    stubLists()
+    spyOn(queryService, "listHistoryPage").mockResolvedValue({
+      runs: [],
+      total: 0,
+      page: 1,
+      pageSize: 50,
+    } as never)
+    visit("/query-studio?run=q-1")
+
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
+
+    await waitFor(() => expect(hook.result.current.runLinkError).toBe(RUN_LINK_UNAVAILABLE))
+    expect(hook.result.current.tabs.length).toBe(1)
+    expect(hook.result.current.tabs[0]?.sql).toBe("")
+  })
+})
+
+describe("useQueryStudio saved-query link", () => {
+  it("opens the saved query the link names, with its id and the caller's level", async () => {
+    window.localStorage.clear()
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
+    spyOn(assetService, "listAssets").mockResolvedValue([])
+    const getSaved = spyOn(queryService, "getSaved").mockResolvedValue(SAVED)
+    visit("/query-studio?saved=q1")
+
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
+
+    await waitFor(() => expect(getSaved).toHaveBeenCalledTimes(1))
+    expect(getSaved.mock.calls[0]?.[0]).toBe("q1")
+    await waitFor(() => expect(hook.result.current.tabs[0]?.savedId).toBe("q1"))
+    expect(hook.result.current.tabs.length).toBe(1)
+    expect(hook.result.current.tabs[0]?.name).toBe("Orders")
+    expect(hook.result.current.tabs[0]?.sql).toBe("SELECT 1")
+    expect(hook.result.current.tabs[0]?.level).toBe("edit")
+  })
+
+  it("says the query is not available and opens no tab when the caller may not see it", async () => {
+    window.localStorage.clear()
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
+    spyOn(assetService, "listAssets").mockResolvedValue([])
+    spyOn(queryService, "getSaved").mockRejectedValue(
+      new ServiceError("not_found", "That saved query could not be found.")
+    )
+    visit("/query-studio?saved=q1")
+
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
+
+    await waitFor(() => expect(hook.result.current.savedLinkError).not.toBeNull())
+    expect(hook.result.current.savedLinkError).toBe("This query is not available to you.")
+    // No tab was opened for it: the tab bar still holds the empty one.
+    expect(hook.result.current.tabs.length).toBe(1)
+    expect(hook.result.current.tabs[0]?.savedId).toBeUndefined()
+  })
+
+  it("does not ask for a saved query when the link names none", async () => {
+    window.localStorage.clear()
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
+    spyOn(assetService, "listAssets").mockResolvedValue([])
+    const getSaved = spyOn(queryService, "getSaved").mockResolvedValue(SAVED)
+
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
+
+    await waitFor(() => expect(hook.result.current.tabs.length).toBe(1))
+    expect(getSaved).not.toHaveBeenCalled()
+  })
+
+  it("opens the saved query once when the page runs in StrictMode", async () => {
+    window.localStorage.clear()
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
+    spyOn(assetService, "listAssets").mockResolvedValue([])
+    const getSaved = spyOn(queryService, "getSaved").mockResolvedValue(SAVED)
+    visit("/query-studio?saved=q1")
+
+    // StrictMode runs every effect twice: the link is read once, and the
+    // query it names opens in one tab, not two.
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)), {
+      wrapper: ({ children }) =>
+        React.createElement(React.StrictMode, null, children),
+    })
+
+    await waitFor(() => expect(hook.result.current.tabs[0]?.savedId).toBe("q1"))
+    expect(getSaved).toHaveBeenCalledTimes(1)
+    expect(hook.result.current.tabs.length).toBe(1)
+  })
+})
 
 describe("useQueryStudio fix", () => {
   it("holds the proposal the assistant made, without touching the editor", async () => {
@@ -160,7 +352,7 @@ describe("useQueryStudio columns", () => {
       schema: [{ name: "amount", dataType: "Int64" }],
     } as never)
 
-    const hook = renderHook(() => useQueryStudio())
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
     await waitFor(() => expect(hook.result.current.tables.length).toBe(1))
     act(() =>
       hook.result.current.setSql("SELECT * FROM silver.orders a JOIN silver.orders b")
@@ -174,6 +366,346 @@ describe("useQueryStudio columns", () => {
         columns: [{ name: "amount", dataType: "Int64" }],
       })
     )
+  })
+})
+
+describe("useQueryStudio Bronze tables", () => {
+  /** A Bronze table's detail as the API sends it: ClickHouse `queryTarget`, plus the registry `tableName`. */
+  const BRONZE_DETAIL = {
+    schema: [{ name: "oid", dataType: "String" }],
+    layer: "raw",
+    type: "iceberg-table",
+    tableName: "orders",
+    namespace: "bronze",
+    name: "Demo Orders",
+    queryTarget: { engine: "clickhouse", table: "icecat_api.`bronze.orders`" },
+  }
+
+  /** The Iceberg table the studio reads to prove a Bronze table is there. */
+  const ICEBERG_TABLE = {
+    schema: [],
+    partitionSpec: [],
+    properties: {},
+    snapshots: [],
+    stats: {
+      fileCount: 1,
+      smallFileCount: null,
+      smallFileThresholdBytes: null,
+      recordCount: 1,
+      totalBytes: 1,
+      snapshotCount: 0,
+      metadataLogCount: 0,
+    },
+    compactionAvailable: false,
+  } as unknown as LakehouseTableDetail
+
+  function mountWithBronze(
+    options: { tableMissing?: boolean; tableError?: ServiceError } = {}
+  ) {
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
+    spyOn(assetService, "listAssets").mockResolvedValue([
+      { id: "demo_orders", name: "Demo Orders", namespace: "bronze", layer: "raw" },
+    ] as never)
+    spyOn(assetService, "getAsset").mockResolvedValue(BRONZE_DETAIL as never)
+    // The studio asks the Iceberg table whether it is there, before it offers
+    // a Bronze table's Trino name (QS-4 D3).
+    const tableAnswer = options.tableMissing
+      ? () => Promise.reject(new ServiceError("not_found", "table not found", 404))
+      : options.tableError
+        ? () => Promise.reject(options.tableError)
+        : () => Promise.resolve(ICEBERG_TABLE)
+    spyOn(lakehouseService, "getTableDetail").mockImplementation(tableAnswer)
+    return renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
+  }
+
+  it("names the table by its Trino name on a Trino tab, and answers to it by any spelling", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const hook = mountWithBronze()
+    await waitFor(() => expect(hook.result.current.tables.length).toBe(1))
+    expect(hook.result.current.engine).toBe("trino")
+
+    act(() => hook.result.current.loadColumns("demo_orders"))
+
+    await waitFor(() =>
+      expect(hook.result.current.tables[0]).toMatchObject({
+        reference: "iceberg.bronze.orders",
+        trinoOnly: true,
+      })
+    )
+    expect(hook.result.current.tables[0]?.names).toContain("iceberg.bronze.orders")
+    expect(hook.result.current.tables[0]?.names).toContain("bronze.orders")
+  })
+
+  it("gives a Bronze table no Trino name when its Iceberg table is not there", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const hook = mountWithBronze({ tableMissing: true })
+    await waitFor(() => expect(hook.result.current.tables.length).toBe(1))
+
+    act(() => hook.result.current.loadColumns("demo_orders"))
+
+    await waitFor(() =>
+      expect(hook.result.current.proofs["demo_orders"]?.status).toBe("missing")
+    )
+    expect(hook.result.current.tables[0]).toMatchObject({ reference: "", trinoOnly: true })
+  })
+
+  it("holds a proof read that failed as failed, not missing", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const hook = mountWithBronze({
+      tableError: new ServiceError("unavailable", "warehouse down", 503),
+    })
+    await waitFor(() => expect(hook.result.current.tables.length).toBe(1))
+
+    act(() => hook.result.current.loadColumns("demo_orders"))
+
+    // A 5xx says nothing about the table: the proof is held as failed so
+    // the entry can offer a retry, never as "missing" (#448 review
+    // SHOULD-FIX).
+    await waitFor(() =>
+      expect(hook.result.current.proofs["demo_orders"]?.status).toBe("failed")
+    )
+    expect(hook.result.current.tables[0]).toMatchObject({ reference: "", trinoOnly: true })
+  })
+
+  it("gives the table no name on a ClickHouse tab, whatever the ClickHouse name the detail carries", async () => {
+    const hook = mountWithBronze()
+    await waitFor(() => expect(hook.result.current.tables.length).toBe(1))
+    expect(hook.result.current.engine).toBe("clickhouse")
+
+    act(() => hook.result.current.loadColumns("demo_orders"))
+    await waitFor(() => expect(hook.result.current.columns["demo_orders"]?.status).toBe("ready"))
+
+    expect(hook.result.current.tables[0]).toMatchObject({ reference: "", trinoOnly: true })
+  })
+})
+
+// LH-QS-4-08: the server's estimate is ClickHouse's `EXPLAIN
+// ESTIMATE` and a Trino statement is not valid there, so a Trino tab never asks.
+describe("useQueryStudio estimate by engine", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+  const ESTIMATE = { estimatedBytes: null } as never
+
+  it("never asks for an estimate on a Trino tab, and says it has none", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const estimate = spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    const { result } = mountWith("SELECT 1")
+
+    await sleep(700)
+    act(() => result.current.setSql("SELECT 2"))
+    await sleep(700)
+
+    expect(result.current.engine).toBe("trino")
+    expect(estimate).toHaveBeenCalledTimes(0)
+    expect(result.current.estimateSupported).toBe(false)
+  })
+
+  it("does not ask for an estimate from the Estimate button on a Trino tab", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const estimate = spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    const { result } = mountWith("SELECT 1")
+
+    act(() => result.current.reEstimate())
+    await sleep(50)
+
+    expect(estimate).toHaveBeenCalledTimes(0)
+  })
+
+  it("still estimates on a ClickHouse tab", async () => {
+    const estimate = spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    const { result } = mountWith("SELECT 1")
+
+    await waitFor(() => expect(estimate).toHaveBeenCalledTimes(1))
+    expect(result.current.estimateSupported).toBe(true)
+  })
+
+  it("leaves no stale estimate behind when the tab goes ClickHouse, Trino, ClickHouse", async () => {
+    const estimate = spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    const { result } = mountWith("SELECT 1")
+    await waitFor(() => expect(result.current.estimateAct.status).toBe("success"))
+
+    act(() => result.current.setEngine("trino"))
+    // The estimate a ClickHouse statement got is gone the moment the engine
+    // changes, not after the debounce.
+    expect(result.current.estimateSupported).toBe(false)
+    expect(result.current.estimateAct.status).toBe("idle")
+    expect(result.current.estimateAct.data).toBeNull()
+    await sleep(700)
+    expect(estimate).toHaveBeenCalledTimes(1)
+
+    act(() => result.current.setEngine("clickhouse"))
+    expect(result.current.estimateSupported).toBe(true)
+    await waitFor(() => expect(estimate).toHaveBeenCalledTimes(2))
+  })
+
+  it("drops an estimate still being asked for when the tab goes to Trino", async () => {
+    // The ClickHouse ask is pending when the engine changes: its answer
+    // must not reach the Trino tab.
+    let answer: (value: never) => void = () => {}
+    const estimate = spyOn(queryService, "estimate").mockImplementation(
+      () => new Promise((resolve) => (answer = resolve as (value: never) => void))
+    )
+    const { result } = mountWith("SELECT 1")
+    await waitFor(() => expect(estimate).toHaveBeenCalledTimes(1))
+
+    act(() => result.current.setEngine("trino"))
+    await act(async () => {
+      answer(ESTIMATE)
+    })
+
+    expect(result.current.estimateAct.status).toBe("idle")
+    expect(result.current.estimateAct.data).toBeNull()
+  })
+})
+
+// LH-QS-4-08: the Bronze rows of the list are proven
+// when it loads on a Trino tab, a bounded number at a time.
+describe("useQueryStudio Bronze proof on list load", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  const ICEBERG_TABLE = { schema: [] } as unknown as LakehouseTableDetail
+
+  /** A Bronze asset as the list sends it: a registry slug id, no SQL name. */
+  const bronze = (n: number) => ({
+    id: `demo_t${n}`,
+    name: `Demo ${n}`,
+    namespace: "bronze",
+    layer: "raw",
+  })
+
+  /** The detail of the Bronze table `demo_t<n>`. */
+  const detailOf = (id: string) => ({
+    schema: [{ name: "oid", dataType: "String" }],
+    layer: "raw",
+    type: "iceberg-table",
+    tableName: id.replace("demo_", ""),
+    namespace: "bronze",
+    name: id,
+    queryTarget: { engine: "clickhouse", table: `icecat_api.\`bronze.${id}\`` },
+  })
+
+  function mountList(assets: unknown[], options: { tableError?: ServiceError } = {}) {
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
+    spyOn(assetService, "listAssets").mockResolvedValue(assets as never)
+    const getAsset = spyOn(assetService, "getAsset").mockImplementation(
+      (async (id: string) => detailOf(id)) as never
+    )
+    const getTableDetail = spyOn(lakehouseService, "getTableDetail").mockImplementation(() =>
+      options.tableError ? Promise.reject(options.tableError) : Promise.resolve(ICEBERG_TABLE)
+    )
+    // The draft key is required on this branch (`QS-8`): without an owner the
+    // hook reads no draft, and so no `?engine=` either.
+    return {
+      hook: renderHook(() => useQueryStudio(queryDraftKey("u1", null))),
+      getAsset,
+      getTableDetail,
+    }
+  }
+
+  it("proves each Bronze row once when the list loads, so it has a reference without being expanded", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const { hook, getAsset, getTableDetail } = mountList([
+      { id: "silver.orders", name: "Orders", namespace: "silver", layer: "silver" },
+      bronze(1),
+      bronze(2),
+    ])
+
+    await waitFor(() => {
+      const refs = hook.result.current.tables.map((table) => table.reference)
+      expect(refs).toEqual(["silver.orders", "iceberg.bronze.t1", "iceberg.bronze.t2"])
+    })
+    expect(getAsset.mock.calls.map((call) => call[0]).sort()).toEqual(["demo_t1", "demo_t2"])
+    expect(getTableDetail).toHaveBeenCalledTimes(2)
+
+    // Whatever happens next to the buffer, the cache answers: no second read.
+    act(() => hook.result.current.setSql("SELECT 2"))
+    act(() => hook.result.current.loadColumns("demo_t1"))
+    await sleep(100)
+    expect(getAsset).toHaveBeenCalledTimes(2)
+    expect(getTableDetail).toHaveBeenCalledTimes(2)
+  })
+
+  it("completes the columns after an alias on a Bronze table written by its Trino name, once the row is proven (QS-4-AC8)", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const { hook } = mountList([bronze(1)])
+    const sql = "SELECT b. FROM iceberg.bronze.t1 b"
+    act(() => hook.result.current.setSql(sql))
+    await waitFor(() => expect(hook.result.current.tables[0]?.reference).toBe("iceberg.bronze.t1"))
+    await waitFor(() => expect(hook.result.current.columns["demo_t1"]?.status).toBe("ready"))
+
+    const context = {
+      state: { doc: { toString: () => sql } },
+      pos: sql.indexOf("b.") + 2,
+    } as unknown as Parameters<typeof hook.result.current.completionSource>[0]
+    const answer = hook.result.current.completionSource(context) as unknown as {
+      options: { label: string }[]
+    }
+    expect(answer.options.map((option) => option.label)).toEqual(["oid"])
+  })
+
+  it("reads no Bronze table for the list on a ClickHouse tab, and reads them when the tab goes to Trino", async () => {
+    const { hook, getAsset, getTableDetail } = mountList([bronze(1)])
+    await waitFor(() => expect(hook.result.current.tables.length).toBe(1))
+    await sleep(100)
+    expect(getAsset).toHaveBeenCalledTimes(0)
+    expect(getTableDetail).toHaveBeenCalledTimes(0)
+
+    act(() => hook.result.current.setEngine("trino"))
+
+    await waitFor(() => expect(hook.result.current.tables[0]?.reference).toBe("iceberg.bronze.t1"))
+    expect(getTableDetail).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not read a Bronze table again on a keystroke after its proof failed", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const { hook, getTableDetail } = mountList([bronze(1)], {
+      tableError: new ServiceError("unavailable", "warehouse down", 503),
+    })
+
+    await waitFor(() => expect(hook.result.current.proofs["demo_t1"]?.status).toBe("failed"))
+    act(() => hook.result.current.setSql("SELECT 2"))
+    act(() => hook.result.current.setSql("SELECT 3"))
+    await sleep(100)
+
+    expect(getTableDetail).toHaveBeenCalledTimes(1)
+  })
+
+  it("keeps the number of reads in flight small for a long list, and proves every row in the end", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const rows = Array.from({ length: 12 }, (_, i) => bronze(i + 1))
+    const { hook, getAsset } = mountList(rows)
+    // Each detail read waits until the test lets it through.
+    const gates: (() => void)[] = []
+    let inFlight = 0
+    let peak = 0
+    getAsset.mockImplementation((async (id: string) => {
+      inFlight += 1
+      peak = Math.max(peak, inFlight)
+      await new Promise<void>((resolve) => gates.push(resolve))
+      inFlight -= 1
+      return detailOf(id)
+    }) as never)
+
+    await waitFor(() => expect(gates.length).toBeGreaterThan(0))
+    await sleep(50)
+    // Nothing is let through yet, so the reads started are all that were allowed to start.
+    expect(gates.length).toBeLessThan(rows.length)
+    expect(gates.length).toBeLessThanOrEqual(4)
+
+    for (let round = 0; round < 40 && getAsset.mock.calls.length < rows.length; round += 1) {
+      while (gates.length) gates.shift()?.()
+      await sleep(10)
+    }
+    while (gates.length) gates.shift()?.()
+
+    await waitFor(() =>
+      expect(hook.result.current.tables.every((table) => table.reference !== "")).toBe(true)
+    )
+    expect(peak).toBeLessThanOrEqual(4)
+    expect(getAsset).toHaveBeenCalledTimes(rows.length)
   })
 })
 
@@ -209,6 +741,8 @@ describe("useQueryStudio statements", () => {
     expect(run).toHaveBeenCalledTimes(2)
     const runs = result.current.runs[result.current.activeTabId] ?? []
     expect(runs.map((entry) => entry.status)).toEqual(["done", "error", "not-run"])
+    // QA LH-QS-4-10: a failure says "failure", so the page keeps its sentence about the failure.
+    expect(runs[2]).toMatchObject({ status: "not-run", reason: "failure" })
   })
 
   it("a permission refusal refuses every statement of the batch", async () => {
@@ -228,9 +762,11 @@ describe("useQueryStudio statements", () => {
     expect(runs[2]?.status === "error" && runs[2].error.code).toBe("permission_denied")
   })
 
-  it("refuses a batch of more than twenty statements before anything runs", async () => {
+  // QS-11 (LH-QS-1-12), D9: the refusal is state the page renders beside Run,
+  // cleared when the SQL changes — not a toast. This replaces the toast-pinning
+  // test because the rule changed, not because the behaviour is now untested.
+  it("refuses a batch of more than twenty statements and clears the notice when the SQL changes", async () => {
     const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
-    const notifyInfo = spyOn(notify, "notifyInfo")
     const many = Array.from({ length: 21 }, (_, index) => `SELECT ${index}`).join("; ")
     const { result } = mountWith(many)
 
@@ -239,8 +775,11 @@ describe("useQueryStudio statements", () => {
     })
 
     expect(run).not.toHaveBeenCalled()
-    expect(notifyInfo).toHaveBeenCalledTimes(1)
-    expect(String(notifyInfo.mock.calls[0]?.[0] ?? "")).toContain("20")
+    expect(result.current.batchRefusal).toBe(
+      "At most 20 statements are run at once. Split the buffer into smaller queries and run them one after another."
+    )
+    act(() => result.current.setSql("SELECT 1"))
+    expect(result.current.batchRefusal).toBeNull()
   })
 
   it("marks the statement in flight and the ones after it as not run when the batch is stopped", async () => {
@@ -260,6 +799,8 @@ describe("useQueryStudio statements", () => {
 
     const runs = result.current.runs[result.current.activeTabId] ?? []
     expect(runs.map((entry) => entry.status)).toEqual(["not-run", "not-run", "not-run"])
+    // QA LH-QS-4-10: Stop says "stopped", not a failure.
+    expect(runs.map((entry) => (entry.status === "not-run" ? entry.reason : null))).toEqual(["stopped", "stopped", "stopped"])
     expect(result.current.running).toBe(false)
   })
 
@@ -281,5 +822,573 @@ describe("useQueryStudio statements", () => {
     expect(run).toHaveBeenCalledTimes(1)
     expect(run.mock.calls[0]?.[0]).toBe("SELECT 2")
     view.destroy()
+  })
+})
+
+describe("useQueryStudio parameters", () => {
+  it("gives a name the SQL gains a text definition, and a range name a dateRange one", () => {
+    const hook = mountWith("SELECT {{region}} WHERE d > {{day.start}} AND d < {{day.end}}")
+    expect(hook.result.current.parameters).toEqual([
+      { name: "region", type: "text" },
+      { name: "day", type: "dateRange" },
+    ])
+    expect(hook.result.current.tabs[0]?.parameters).toEqual([
+      { name: "region", type: "text" },
+      { name: "day", type: "dateRange" },
+    ])
+  })
+
+  it("makes no field of a placeholder in a comment or a string", () => {
+    const hook = mountWith("SELECT '{{a}}' -- {{b}}\n/* {{c}} */")
+    expect(hook.result.current.parameters).toEqual([])
+  })
+
+  it("keeps the value a field was given, and takes it away when the field is emptied", () => {
+    const hook = mountWith("SELECT {{region}}")
+    act(() => hook.result.current.setParameterValue("region", "EU"))
+    expect(hook.result.current.parameterValues).toEqual({ region: "EU" })
+    act(() => hook.result.current.setParameterValue("region", undefined))
+    expect(hook.result.current.parameterValues).toEqual({})
+    expect(Object.hasOwn(hook.result.current.tabs[0]?.values ?? {}, "region")).toBe(false)
+  })
+
+  it("hides the field of a name that left the SQL and brings it back with its definition and value", () => {
+    const hook = mountWith("SELECT {{region}}")
+    act(() =>
+      hook.result.current.setParameterDefinition({
+        name: "region",
+        type: "dropdown",
+        options: [{ value: "eu", label: "Europe" }],
+      })
+    )
+    act(() => hook.result.current.setParameterValue("region", "eu"))
+
+    act(() => hook.result.current.setSql("SELECT 1"))
+    expect(hook.result.current.parameters).toEqual([])
+    expect(hook.result.current.tabs[0]?.parameters.map((def) => def.name)).toEqual(["region"])
+    expect(hook.result.current.parameterValues).toEqual({ region: "eu" })
+
+    act(() => hook.result.current.setSql("SELECT {{region}}"))
+    expect(hook.result.current.parameters).toEqual([
+      { name: "region", type: "dropdown", options: [{ value: "eu", label: "Europe" }] },
+    ])
+    expect(hook.result.current.parameterValues).toEqual({ region: "eu" })
+  })
+
+  it("clears a value that no longer fits when the type changes", () => {
+    const hook = mountWith("SELECT {{region}}")
+    act(() => hook.result.current.setParameterValue("region", "EU"))
+    act(() => hook.result.current.setParameterDefinition({ name: "region", type: "number" }))
+    expect(hook.result.current.parameters).toEqual([{ name: "region", type: "number" }])
+    expect(hook.result.current.parameterValues).toEqual({})
+  })
+
+  it("writes the definitions and values to the draft", async () => {
+    const hook = mountWith("SELECT {{region}}")
+    act(() => hook.result.current.setParameterValue("region", "EU"))
+    await waitFor(() => {
+      const stored = JSON.parse(
+        window.localStorage.getItem(queryDraftKey("u1", null)) ?? "{}"
+      )
+      expect(stored.tabs?.[0]?.values).toEqual({ region: "EU" })
+      expect(stored.tabs?.[0]?.parameters).toEqual([{ name: "region", type: "text" }])
+    })
+  })
+
+  it("completes the tab's defined names after {{, including one the SQL does not use yet", () => {
+    const hook = mountWith("SELECT {{region}}")
+    act(() => hook.result.current.setParameterDefinition({ name: "spare", type: "number" }))
+    const sql = "SELECT {{region}}, {{"
+    act(() => hook.result.current.setSql(sql))
+    const context = {
+      state: { doc: { toString: () => sql } },
+      pos: sql.length,
+    } as unknown as Parameters<typeof hook.result.current.completionSource>[0]
+    const answer = hook.result.current.completionSource(context) as unknown as {
+      options: { label: string }[]
+    }
+    expect(answer.options.map((option) => option.label)).toEqual(["region", "spare"])
+  })
+})
+
+describe("useQueryStudio parameter requests", () => {
+  const ESTIMATE = { estimatedBytes: null } as never
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  /** Mounts the hook over a statement with the estimate and the lists answered. */
+  function mountParams(sql: string) {
+    spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    return mountWith(sql)
+  }
+
+  /** The options the first `run` call got, and the ones of call `at`. */
+  function optionsOf(run: { mock: { calls: unknown[][] } }, at = 0) {
+    return run.mock.calls[at]?.[1] as Record<string, unknown>
+  }
+
+  it("sends the run the options it sent before parameters when the SQL has no placeholder", async () => {
+    const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
+    const { result } = mountParams("SELECT 1")
+    act(() => result.current.setParameterValue("region", "EU"))
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    // A value the tab holds for a name the SQL does not use is not sent.
+    expect(Object.keys(optionsOf(run)).sort()).toEqual(["engine", "runId"])
+  })
+
+  it("posts a body byte for byte the one it posted before parameters when the SQL has no placeholder", async () => {
+    const calls: { url: string; body: unknown }[] = []
+    spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), body: init?.body })
+      return new Response(JSON.stringify(RESULT), { status: 200, headers: { "Content-Type": "application/json" } })
+    }) as unknown as typeof fetch)
+    const { result } = mountParams("SELECT 1")
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    const posted = calls.find((call) => call.url.endsWith("/api/query/run"))
+    expect(posted?.body).toBe('{"sql":"SELECT 1","engine":"clickhouse"}')
+  })
+
+  it("posts the values and the definitions when the SQL has a placeholder", async () => {
+    const calls: { url: string; body: unknown }[] = []
+    spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), body: init?.body })
+      return new Response(JSON.stringify(RESULT), { status: 200, headers: { "Content-Type": "application/json" } })
+    }) as unknown as typeof fetch)
+    const { result } = mountParams("SELECT {{region}}")
+    act(() => result.current.setParameterValue("region", "EU"))
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    const posted = calls.find((call) => call.url.endsWith("/api/query/run"))
+    expect(JSON.parse(String(posted?.body))).toStrictEqual({
+      sql: "SELECT {{region}}",
+      engine: "clickhouse",
+      parameters: { region: "EU" },
+      definitions: [{ name: "region", type: "text" }],
+    })
+  })
+
+  it("sends the definitions with their defaults and the values only for names that have one", async () => {
+    const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
+    const { result } = mountParams("SELECT {{region}}, {{n}}")
+    act(() => result.current.setParameterDefinition({ name: "region", type: "text", default: "EU" }))
+    act(() => result.current.setParameterValue("n", 3))
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    const options = optionsOf(run)
+    // The default lives in the definition; it is not copied into the values.
+    expect(options.parameters).toStrictEqual({ n: 3 })
+    expect(options.definitions).toStrictEqual([
+      { name: "region", type: "text", default: "EU" },
+      { name: "n", type: "text" },
+    ])
+  })
+
+  it("sends the definitions of the names the SQL uses, and not the one of a name that left it", async () => {
+    const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
+    const { result } = mountParams("SELECT {{kept}}, {{left}}")
+    act(() =>
+      result.current.setParameterDefinition({ name: "left", type: "number", default: 1 })
+    )
+    act(() => result.current.setParameterValue("left", 2))
+    act(() => result.current.setParameterValue("kept", "x"))
+    act(() => result.current.setSql("SELECT {{kept}}"))
+    // The tab still holds the definition and the value of the name that left.
+    expect(result.current.tabs[0]?.parameters.map((def) => def.name)).toEqual(["kept", "left"])
+    expect(result.current.tabs[0]?.values).toEqual({ kept: "x", left: 2 })
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    const options = optionsOf(run)
+    expect(options.parameters).toStrictEqual({ kept: "x" })
+    expect(options.definitions).toStrictEqual([{ name: "kept", type: "text" }])
+  })
+
+  it("sends the same values and definitions with each statement of a run all", async () => {
+    const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
+    const { result } = mountParams("SELECT {{a}}; SELECT {{a}} + 1; SELECT 3")
+    act(() => result.current.setParameterValue("a", "x"))
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    expect(run).toHaveBeenCalledTimes(3)
+    for (const at of [0, 1, 2]) {
+      expect(optionsOf(run, at).parameters).toStrictEqual({ a: "x" })
+      expect(optionsOf(run, at).definitions).toStrictEqual([{ name: "a", type: "text" }])
+    }
+  })
+
+  it("shows the server's sentence and marks the field it names, and only that one", async () => {
+    spyOn(queryService, "run").mockRejectedValue(
+      new ServiceError("invalid_request", "Fill in {{region}} to run this query.")
+    )
+    const { result } = mountParams("SELECT {{region}}, {{ab}}")
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    const open = result.current.activeRun
+    expect(open?.status === "error" && open.error.message).toBe("Fill in {{region}} to run this query.")
+    expect([...result.current.invalidParameters]).toEqual(["region"])
+  })
+
+  it("marks no field for a refusal that names none", async () => {
+    spyOn(queryService, "run").mockRejectedValue(
+      new ServiceError("invalid_request", "This query has a {{ that is not a parameter.")
+    )
+    const { result } = mountParams("SELECT {{region}}")
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    expect(result.current.invalidParameters.size).toBe(0)
+  })
+
+  it("marks no field for a failure that is not a refusal of the request", async () => {
+    spyOn(queryService, "run").mockRejectedValue(
+      new ServiceError("unavailable", "Fill in {{region}} to run this query.")
+    )
+    const { result } = mountParams("SELECT {{region}}")
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    expect(result.current.invalidParameters.size).toBe(0)
+  })
+
+  it("takes the mark off a field when its value or its definition changes, and off all when the next run starts", async () => {
+    const run = spyOn(queryService, "run").mockRejectedValue(
+      new ServiceError("invalid_request", "{{a}} and {{b}} are both wrong")
+    )
+    const { result } = mountParams("SELECT {{a}}, {{b}}")
+    await act(async () => {
+      await result.current.runQuery()
+    })
+    expect([...result.current.invalidParameters].sort()).toEqual(["a", "b"])
+
+    act(() => result.current.setParameterValue("a", "x"))
+    expect([...result.current.invalidParameters]).toEqual(["b"])
+
+    act(() => result.current.setParameterDefinition({ name: "b", type: "number" }))
+    expect(result.current.invalidParameters.size).toBe(0)
+
+    // The next run starts clean, then marks again what the new refusal names.
+    run.mockRejectedValue(new ServiceError("invalid_request", "Fill in {{a}} to run this query."))
+    await act(async () => {
+      await result.current.runQuery()
+    })
+    expect([...result.current.invalidParameters]).toEqual(["a"])
+    run.mockImplementation(() => new Promise(() => {}))
+    await act(async () => {
+      void result.current.runQuery()
+    })
+    expect(result.current.invalidParameters.size).toBe(0)
+  })
+
+  it("marks the field in no other tab", async () => {
+    spyOn(queryService, "run").mockRejectedValue(
+      new ServiceError("invalid_request", "Fill in {{region}} to run this query.")
+    )
+    const { result } = mountParams("SELECT {{region}}")
+    await act(async () => {
+      await result.current.runQuery()
+    })
+    expect(result.current.invalidParameters.size).toBe(1)
+
+    act(() => {
+      result.current.addTab({ sql: "SELECT {{region}}" })
+    })
+
+    expect(result.current.invalidParameters.size).toBe(0)
+  })
+
+  it("skips the estimate while a name has no value and no default, and asks once it has one", async () => {
+    const estimate = spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    const { result } = mountWith("SELECT {{region}}")
+
+    await sleep(700)
+    expect(estimate).not.toHaveBeenCalled()
+    // The panel says what it says for an empty editor, and shows no error.
+    expect(result.current.estimatable).toBe(false)
+    expect(result.current.estimateAct.status).toBe("idle")
+
+    act(() => result.current.setParameterValue("region", "EU"))
+    await waitFor(() => expect(estimate).toHaveBeenCalledTimes(1))
+    expect(estimate.mock.calls[0]?.[0]).toBe("SELECT {{region}}")
+    expect(estimate.mock.calls[0]?.[1]).toStrictEqual({
+      parameters: { region: "EU" },
+      definitions: [{ name: "region", type: "text" }],
+    })
+    expect(result.current.estimatable).toBe(true)
+  })
+
+  it("names the first parameter the estimate waits for (QS-5-AC14)", async () => {
+    spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    const { result } = mountWith("SELECT {{region}}, {{since}}")
+    expect(result.current.estimateWaitsFor).toBe("region")
+
+    act(() => result.current.setParameterValue("region", "EU"))
+    expect(result.current.estimateWaitsFor).toBe("since")
+
+    act(() => result.current.setParameterValue("since", "2026-11-01"))
+    expect(result.current.estimateWaitsFor).toBeNull()
+  })
+
+  it("does not skip the estimate for a name that has a default", async () => {
+    const estimate = spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    const { result } = mountWith("SELECT {{region}}")
+    act(() => result.current.setParameterDefinition({ name: "region", type: "text", default: "EU" }))
+
+    await waitFor(() => expect(estimate).toHaveBeenCalledTimes(1))
+    expect(estimate.mock.calls[0]?.[1]).toStrictEqual({
+      parameters: {},
+      definitions: [{ name: "region", type: "text", default: "EU" }],
+    })
+  })
+
+  it("asks again when a value changes", async () => {
+    const estimate = spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    const { result } = mountWith("SELECT {{region}}")
+    act(() => result.current.setParameterValue("region", "EU"))
+    await waitFor(() => expect(estimate).toHaveBeenCalledTimes(1))
+
+    act(() => result.current.setParameterValue("region", "US"))
+
+    await waitFor(() => expect(estimate).toHaveBeenCalledTimes(2))
+    expect(estimate.mock.calls[1]?.[1]).toStrictEqual({
+      parameters: { region: "US" },
+      definitions: [{ name: "region", type: "text" }],
+    })
+  })
+
+  it("estimates SQL without a placeholder as it did before parameters", async () => {
+    const estimate = spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    mountWith("SELECT 1")
+
+    await waitFor(() => expect(estimate).toHaveBeenCalledTimes(1))
+    expect(estimate.mock.calls[0]?.[0]).toBe("SELECT 1")
+    expect(estimate.mock.calls[0]?.[1]).toBeUndefined()
+  })
+
+  it("marks the field an estimate's refusal names", async () => {
+    spyOn(queryService, "estimate").mockRejectedValue(
+      new ServiceError("invalid_request", "{{region}} is inside quotes: write it without them, for example = {{region}}.")
+    )
+    const { result } = mountWith("SELECT {{region}}")
+    act(() => result.current.setParameterValue("region", "EU"))
+
+    await waitFor(() => expect([...result.current.invalidParameters]).toEqual(["region"]))
+  })
+
+  it("hands the save sheet no definitions while the tab holds several statements and none is picked", () => {
+    const { result } = mountParams("SELECT {{a}}; SELECT {{b}}")
+    act(() => result.current.setParameterDefinition({ name: "a", type: "text", default: "EU" }))
+    act(() => result.current.setParameterDefinition({ name: "b", type: "number" }))
+    act(() => result.current.setParameterValue("a", "US"))
+    act(() => result.current.setParameterValue("b", 7))
+    expect(result.current.targetStatement).toBeNull()
+
+    expect(result.current.saveParameters).toEqual([])
+  })
+
+  it("saves the definitions of the one statement the tab holds, with the default and not the value", () => {
+    const { result } = mountParams("SELECT {{a}}")
+    act(() => result.current.setParameterDefinition({ name: "a", type: "text", default: "EU" }))
+    act(() => result.current.setParameterValue("a", "US"))
+
+    expect(result.current.saveParameters).toStrictEqual([{ name: "a", type: "text", default: "EU" }])
+  })
+
+  it("saves nothing for a statement without a placeholder, whatever the tab still holds", () => {
+    const { result } = mountParams("SELECT {{a}}")
+    act(() => result.current.setParameterDefinition({ name: "a", type: "text", default: "EU" }))
+    act(() => result.current.setSql("SELECT 1"))
+
+    expect(result.current.saveParameters).toEqual([])
+  })
+
+  it("opens a saved query with its definitions and no values, so each field starts at its default", async () => {
+    window.localStorage.clear()
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    spyOn(assetService, "listAssets").mockResolvedValue([])
+    const definitions = [
+      { name: "region", type: "text" as const, default: "EU" },
+      {
+        name: "tier",
+        type: "dropdown" as const,
+        default: "gold",
+        options: [{ value: "gold", label: "Gold" }],
+      },
+    ]
+    spyOn(queryService, "getSaved").mockResolvedValue({
+      ...SAVED,
+      sql: "SELECT {{region}}, {{tier}}",
+      parameters: definitions,
+    })
+    visit("/query-studio?saved=q1")
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
+    await waitFor(() => expect(hook.result.current.tabs[0]?.savedId).toBe("q1"))
+
+    expect(hook.result.current.tabs[0]?.parameters).toEqual(definitions)
+    expect(hook.result.current.tabs[0]?.values).toEqual({})
+    expect(hook.result.current.parameters).toEqual(definitions)
+
+    // A run from that tab gives no value and sends the definitions, defaults in them.
+    const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
+    await act(async () => {
+      await hook.result.current.runQuery()
+    })
+    expect(optionsOf(run).parameters).toStrictEqual({})
+    expect(optionsOf(run).definitions).toStrictEqual(definitions)
+  })
+
+  it("puts a saved query's definitions in the open tab when its SQL is loaded from the list", () => {
+    const { result } = mountParams("SELECT {{old}}")
+    act(() => result.current.setParameterValue("old", "x"))
+    const definitions = [{ name: "region", type: "text" as const, default: "EU" }]
+
+    act(() => result.current.loadSql("SELECT {{region}}", definitions))
+
+    expect(result.current.tabs[0]?.parameters).toEqual(definitions)
+    expect(result.current.tabs[0]?.values).toEqual({})
+  })
+
+  it("keeps the tab's definitions when a statement without any is loaded", () => {
+    const { result } = mountParams("SELECT {{old}}")
+    act(() => result.current.setParameterValue("old", "x"))
+
+    act(() => result.current.loadSql("SELECT {{old}} + 1"))
+
+    expect(result.current.tabs[0]?.values).toEqual({ old: "x" })
+  })
+})
+
+// `QS-8` (`LH-QS-1-04` F1): the draft belongs to one person in one tenant.
+// The key is the person and their active tenant (`queryDraftKey`), never one
+// entry for the browser, and one hook instance has one owner for its life.
+describe("useQueryStudio draft owner", () => {
+  /** The key of the person these tests write as, and of somebody else. */
+  const MINE = queryDraftKey("u1", null)
+  const THEIRS = queryDraftKey("u2", null)
+
+  /** Stubs the lists the hook asks for, so nothing reaches the network. */
+  function stubLists() {
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
+    spyOn(assetService, "listAssets").mockResolvedValue([])
+  }
+
+  /** One stored tab, the way the browser keeps it. */
+  function storedTabs(sql: string): QueryTabs {
+    return {
+      tabs: [
+        {
+          id: "tab-1",
+          name: "Query 1",
+          sql,
+          engine: "clickhouse",
+          parameters: [],
+          values: {},
+        },
+      ],
+      activeId: "tab-1",
+      question: "",
+      tab: "sql",
+    }
+  }
+
+  it("does not show a draft stored under another person's key", async () => {
+    stubLists()
+    window.localStorage.setItem(THEIRS, JSON.stringify(storedTabs("SELECT 'theirs'")))
+    const hook = renderHook(() => useQueryStudio(MINE))
+
+    await waitFor(() => expect(hook.result.current.sql).not.toBe("SELECT 'theirs'"))
+    expect(hook.result.current.tabs.length).toBe(1)
+    expect(hook.result.current.tabs[0]?.sql).not.toBe("SELECT 'theirs'")
+  })
+
+  it("writes the draft under its owner's key and nothing under the old shared key", async () => {
+    stubLists()
+    const hook = renderHook(() => useQueryStudio(MINE))
+
+    act(() => hook.result.current.setSql("SELECT 'mine'"))
+
+    await waitFor(
+      () => {
+        const raw = window.localStorage.getItem(MINE)
+        expect(JSON.parse(raw ?? "{}").tabs?.[0]?.sql).toBe("SELECT 'mine'")
+      },
+      { timeout: 2000 }
+    )
+    expect(window.localStorage.getItem(LEGACY_QUERY_DRAFT_KEY)).toBeNull()
+  })
+
+  it("reads and writes nothing while the owner is not known", async () => {
+    stubLists()
+    // Review round 1, R5: an empty storage proves nothing about a read. The
+    // old shared entry is there, and an unknown owner must neither open it
+    // nor remove it.
+    window.localStorage.setItem(
+      LEGACY_QUERY_DRAFT_KEY,
+      JSON.stringify(storedTabs("SELECT 'shared'"))
+    )
+    const hook = renderHook(() => useQueryStudio(null))
+
+    expect(hook.result.current.sql).not.toBe("SELECT 'shared'")
+
+    act(() => hook.result.current.setSql("SELECT 1"))
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 600))
+    })
+    expect(hook.result.current.sql).not.toBe("SELECT 'shared'")
+    expect(window.localStorage.getItem(LEGACY_QUERY_DRAFT_KEY)).not.toBeNull()
+    expect(window.localStorage.length).toBe(1)
+  })
+
+  it("keeps writing under its first owner when the key it is given changes", async () => {
+    stubLists()
+    const hook = renderHook(({ key }: { key: string }) => useQueryStudio(key), {
+      initialProps: { key: MINE },
+    })
+
+    act(() => hook.result.current.setSql("SELECT 'mine'"))
+    await waitFor(() => expect(window.localStorage.getItem(MINE)).not.toBeNull(), {
+      timeout: 2000,
+    })
+
+    hook.rerender({ key: THEIRS })
+    act(() => hook.result.current.setSql("SELECT 'mine', 2"))
+
+    await waitFor(
+      () => {
+        const raw = window.localStorage.getItem(MINE)
+        expect(JSON.parse(raw ?? "{}").tabs?.[0]?.sql).toBe("SELECT 'mine', 2")
+      },
+      { timeout: 2000 }
+    )
+    expect(window.localStorage.getItem(THEIRS)).toBeNull()
   })
 })

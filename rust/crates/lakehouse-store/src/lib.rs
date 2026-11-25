@@ -29,13 +29,16 @@
 //! that was never `Some`.
 
 // `sqlx::test` embeds the migration set at compile time; touching this file
-// (adding `0033_connector_ingest_spec.sql`, WS3 item 1; `0064_connector_schema_changes.sql`, SRC-8; `0083_governed_tags.sql`, DATA-12; `0079_column_lineage.sql`, DATA-13; `0081_quality_incidents.sql`, DATA-14) forces the macro to
+// (adding `0033_connector_ingest_spec.sql`, WS3 item 1; `0064_connector_schema_changes.sql`, SRC-8; `0083_governed_tags.sql`, DATA-12; `0079_column_lineage.sql`, DATA-13; `0081_quality_incidents.sql`, DATA-14; `0122_connector_capture_lag.sql`, SRC-4; `0139_alert_rule_delivery.sql`, SRC-40; `0141_upload_table_drop.sql`, DATA-55; `0142_audit_event_append_only.sql`, GOV-1; `0145_dashboard_reports.sql`, BI-18 D; `0146_dashboard_templates.sql`, BI-18 D; `0148_usage_rate_and_permission.sql`, OPS-8; `0150_dashboard_template_creator.sql`, BI-18 D, PR #528 review SHOULD-FIX 2) forces the macro to
 // re-expand and pick up the new migration for every `#[sqlx::test]` in this
 // crate's `tests/` binaries.
 pub mod agents;
+pub mod alert_delivery;
 pub mod alert_state;
 pub mod annotation;
+pub mod assistant_settings;
 pub mod audit;
+pub mod capture_lag;
 pub mod cdc;
 pub mod chat_term;
 pub mod column_lineage;
@@ -47,6 +50,9 @@ pub mod connector_type;
 pub mod connectors;
 pub mod dashboard_access;
 pub mod dashboard_comments;
+pub mod dashboard_reports;
+pub mod dashboard_templates;
+pub mod email_settings;
 pub mod error;
 pub mod geo_map;
 pub mod gold_publication;
@@ -73,9 +79,15 @@ pub mod schema_change;
 pub mod schema_diff;
 pub mod semantic;
 pub mod sessions;
+pub mod sign_in_settings;
+pub mod sso_settings;
 pub mod storage;
 pub mod upload_folders;
 pub mod uploads;
+pub mod usage;
+pub mod workspace_settings;
+
+use sqlx::ConnectOptions;
 
 pub use error::StoreError;
 
@@ -111,6 +123,30 @@ pub fn connect_lazy(database_url: &str) -> Result<PgPool, StoreError> {
         .map_err(StoreError::from)
 }
 
+/// Construct a [`PgPool`] that never logs a statement.
+///
+/// The same pool as [`connect_lazy`] — the same options, the same lazy
+/// construction — with `sqlx`'s statement logging switched off.
+///
+/// WHY: the `migrate` command runs ONE statement whose TEXT carries the
+/// console role's password (the server builds that statement for it, and
+/// `sqlx` then logs the text it is given), and `sqlx` logs a statement's
+/// text at the DEBUG level by default. A deployment that raises the log
+/// level (`RUST_LOG=debug`) would write that password into the log. The
+/// API's own pool keeps its statement logging: its diagnostics are worth
+/// having, and it never runs that statement.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if `database_url` cannot be parsed as a
+/// Postgres connection string. Never fails due to Postgres being
+/// unreachable.
+pub fn connect_lazy_without_statement_logging(database_url: &str) -> Result<PgPool, StoreError> {
+    let options: sqlx::postgres::PgConnectOptions =
+        database_url.parse().map_err(StoreError::from)?;
+    Ok(sqlx::postgres::PgPoolOptions::new().connect_lazy_with(options.disable_statement_logging()))
+}
+
 /// The migration set this binary carries — the one [`migrate`] applies.
 ///
 /// A `static`, not a call: `sqlx::migrate!` expands to the whole set
@@ -122,9 +158,12 @@ pub fn connect_lazy(database_url: &str) -> Result<PgPool, StoreError> {
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 /// Apply every migration in `rust/migrations/` that hasn't already been
-/// applied to `pool`, in order. Safe to call on every boot: `sqlx::migrate!`
+/// applied to `pool`, in order. Safe to call repeatedly: `sqlx::migrate!`
 /// tracks applied versions in a `_sqlx_migrations` table and is a no-op once
 /// a migration has been recorded.
+///
+/// The caller is the `migrate` command (`lakehouse-api migrate`), which runs
+/// it once per deploy; the server does not apply the migrations at boot.
 ///
 /// # Errors
 ///
@@ -183,6 +222,47 @@ pub async fn applied_schema_version(pool: &PgPool) -> Result<i64, StoreError> {
             .await
             .map_err(StoreError::from)?;
     Ok(version.unwrap_or_default())
+}
+
+/// The migration versions this build EMBEDS that `pool` has not applied.
+///
+/// The counterpart of [`embedded_schema_version`]: this crate owns the
+/// migration set, so it is the only place that can answer "is the database
+/// at this build's schema version?" without changing anything.
+///
+/// Read-only, by design: it reads sqlx's own bookkeeping table
+/// (`_sqlx_migrations`) and the embedded set, and writes nothing. The API's
+/// start path uses it to REFUSE to serve on a database whose schema is
+/// behind this build (`SEC-78` decision 4) — the API never migrates; the
+/// `migrate` subcommand does that, with the owner's role.
+///
+/// Only rows with `success = true` count: sqlx keeps a failed migration's
+/// row as a "dirty" marker, and a dirty database is not at any version.
+///
+/// A database that has never been migrated has no such table at all; the
+/// query then fails and the caller sees [`StoreError::Database`] — the
+/// honest answer (such a database is not at this build's schema version)
+/// rather than an empty list that could be mistaken for "everything is
+/// applied".
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if `pool` cannot be reached or the
+/// bookkeeping table cannot be read.
+pub async fn pending_migration_versions(pool: &PgPool) -> Result<Vec<i64>, StoreError> {
+    let applied: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success = true")
+            .fetch_all(pool)
+            .await
+            .map_err(StoreError::from)?;
+    let applied: std::collections::HashSet<i64> = applied.into_iter().collect();
+    let mut pending: Vec<i64> = MIGRATOR
+        .iter()
+        .map(|migration| migration.version)
+        .filter(|version| !applied.contains(version))
+        .collect();
+    pending.sort_unstable();
+    Ok(pending)
 }
 
 #[cfg(test)]

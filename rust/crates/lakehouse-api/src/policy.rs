@@ -76,6 +76,21 @@
 //! the same act as editing a chart (`dashboard:write`, which is not enough).
 //! Listing, validating and the usage of a metric need `dashboard:read` only.
 //!
+//! # `gold:read` / `agent:read` (SEC-66)
+//!
+//! The read side of Gold exports and of agent runs was `RequiresAuth`, so a
+//! signed-in Dashboard Viewer could open `/gold-exports` and
+//! `/agents/runs/[runId]` by address. These two read-only strings close that
+//! hole; `migrations/0153_sec66_read_permissions.sql` grants them on upgrade
+//! to every built-in role except the two people whose remit is dashboards
+//! and the assistant (Dashboard Viewer, Assistant only). Platform Admin's
+//! `*:*` already satisfies both. Gold's GETs keep `gold:export` as a second
+//! accepted grant so a principal that could publish before the upgrade can
+//! still read, and the shared-token/service-identity path is preserved by
+//! seeding `gold:read` on the `gold-export-scheduler` identity. WEB-4
+//! retired the runs-LIST route (`GET /api/agents/runs`); the only agent-run
+//! read left is `GET /api/agents/runs/{id}`, and it carries `agent:read`.
+//!
 //! # `agent:manage` / `workload:cancel` / `storage:restore` / `alert:write`
 //!
 //! Four more route groups had the identical problem: any authenticated
@@ -86,15 +101,17 @@
 //! alongside these table entries rather than gating them behind a token
 //! nothing can hold:
 //!
-//! * `agent:manage` (`/api/agents/employees/{id}/{suspend,resume,revoke}`)
-//!   — same `agent` resource family as Approver's seeded `agent:approve`,
-//!   but a different action: lifecycle control of the employee identity
-//!   itself (a kill switch), not approving one action it proposed.
-//!   Deliberately gets NO seed grant: Approver's remit is narrow
+//! * `agent:manage` — same `agent` resource family as Approver's seeded
+//!   `agent:approve`, but a different action: lifecycle control of the
+//!   employee identity itself (a kill switch), not approving one action it
+//!   proposed. Deliberately gets NO seed grant: Approver's remit is narrow
 //!   per-decision approval, not blanket administration of the employees
 //!   themselves, and no other seeded role plausibly owns "agent
 //!   operations" — reachable only via Platform Admin's `*:*`, same as
-//!   `identity:write`.
+//!   `identity:write`. WEB-4 retired the policy-gated create/suspend/resume/
+//!   revoke routes; the permission is kept because `routes::agents::
+//!   check_employee_run_auth` still uses it to let a person trigger a
+//!   headless run manually.
 //! * `workload:cancel` (`/api/ops/workloads/{id}/cancel`) — granted to
 //!   Data Engineer (`0020`) alongside its existing `pipeline:*`: Data
 //!   Engineer is the role that operates pipelines end-to-end and is the
@@ -105,10 +122,15 @@
 //!   represents storage/backup operations at all (Data Engineer's
 //!   `pipeline:*`/`catalog:write`/`connector:manage` stop short of
 //!   storage); reachable only via Platform Admin's `*:*`.
-//! * `alert:write` (`/api/alerts` `POST`/`PUT`/`DELETE`) — granted to Data
-//!   Engineer (`0020`): alert rules are operational tooling over the same
-//!   pipelines/connectors Data Engineer already manages, and it is the
-//!   natural owner of "define a threshold alert on a data pipeline".
+//! * `alert:write` (`/api/alerts` `POST`/`PUT`/`DELETE`, and since `SEC-67`
+//!   the three `/api/overview/alerts/{id}/{acknowledge,resolve,silence}`
+//!   state-change routes) — granted to Data Engineer (`0020`): alert rules
+//!   are operational tooling over the same pipelines/connectors Data
+//!   Engineer already manages, and it is the natural owner of "define a
+//!   threshold alert on a data pipeline" and act on the ones that fire.
+//!   `SEC-67` moved the overview state changes off `RequiresAuth` so a
+//!   viewer who may read the list (`alert:read`) cannot silently change it;
+//!   the list itself keeps the ADM-13 any-of.
 //!
 //! See `migrations/0020_extend_role_grants.sql` for the exact `UPDATE`
 //! statements and `agent_workload_storage_alert_permissions_seed_alignment`
@@ -134,6 +156,9 @@ pub enum Policy {
     /// An authenticated [`lakehouse_auth::Principal`] whose
     /// [`lakehouse_auth::Principal::has`] this exact string.
     RequiresPermission(&'static str),
+    /// An authenticated [`lakehouse_auth::Principal`] who holds at least one
+    /// of the listed permissions (`ADM-13` D4).
+    RequiresAnyPermission(&'static [&'static str]),
 }
 
 /// `(HTTP method, axum route pattern, policy)`, one entry per route
@@ -145,7 +170,7 @@ pub enum Policy {
 /// this table never needs to know about path-parameter values.
 #[rustfmt::skip]
 pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
-    // ── Public: the ONLY fourteen routes in the whole service. (Was "six" —
+    // ── Public: the ONLY nineteen routes in the whole service. (Was "six" —
     // corrected when the seventh was added, since Task A5's
     // `/api/auth/oidc/callback` had already made the old count stale; the
     // eighth is `POST /api/embed/frame`, SEC-12; the ninth is
@@ -154,7 +179,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // `POST /api/public/dashboard/{token}/unlock` (BI-19 part A); the twelfth
     // and the thirteenth are the public link's and the embed's map boundary
     // route, `PR #246 review BLOCKER 1`; the fourteenth is the readiness
-    // probe, REL-2 decision D7.) ───────────────────────────────────────────
+    // probe, REL-2 decision D7; the fifteenth is the password rules, ADM-11
+    // D4; the sixteenth and the seventeenth are the workspace's name and
+    // pictures, ADM-2 decision 5; the eighteenth and the nineteenth are the
+    // print view's map and image routes, BI-36 and BI-42.) ────────────────
     ("GET",  "/health",                          Policy::Public),
     // REL-2 (D7): the readiness probe an installer or an updater waits on.
     // Public because it answers only whether this stack is ready — three
@@ -167,6 +195,14 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // authenticated by the signed render token in the body, and reads as the
     // person the token names (never as the embed viewer role).
     ("POST", "/api/render/data",                  Policy::Public),
+    // BI-42 (plan D6b): one image card's picture for the print view, fetched by
+    // the API because the PDF renderer may open only the console. Public
+    // because the render token is the credential; only an address saved on an
+    // image card of the token's board, on a listed site, is ever fetched.
+    ("GET",  "/api/render/image",                 Policy::Public),
+    // BI-36: an uploaded map's boundary for the print view, behind the same
+    // render token; a map no chart on the token's board draws on is a 404.
+    ("POST", "/api/render/maps/{id}/geojson",     Policy::Public),
     // SEC-12: the console's `proxy.ts` asks which sites may frame an embed
     // page, with the token the page was opened with. Public because the
     // token is the credential; it answers only an origin list, and the same
@@ -190,6 +226,19 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/public/dashboard/{token}/maps/{id}/geojson", Policy::Public),
     ("POST", "/api/embed/maps/{id}/geojson",      Policy::Public),
     ("POST", "/api/auth/login",                   Policy::Public),
+    ("GET",  "/api/auth/password-rules",          Policy::Public),
+    // Unauthenticated by necessity — the sign-in page shows the workspace's
+    // name and logo before any session exists. It exposes the name and each
+    // picture's type and version only (`routes::settings::get_branding`),
+    // never who saved them or when, and no other settings row.
+    ("GET",  "/api/branding",                     Policy::Public),
+    // Unauthenticated by necessity — the same page loads the pictures the
+    // answer above points to. It serves one stored picture of a fixed kind
+    // (`logo`, `logo-dark` or `icon`): a kind outside that list is a 400 and
+    // a kind inside it that was never set is a 404 (`routes::settings`).
+    // The picture is an inert file: `nosniff`, a sandboxing CSP and
+    // `inline`. Nothing else is reachable through it.
+    ("GET",  "/api/branding/images/{kind}",       Policy::Public),
     // Redirect-only, grants nothing — it only ever
     // 302s to a fixed, config-sourced IdP URL and sets a single-use flow
     // cookie. Mirrors `/api/auth/login`'s existing `Policy::Public`.
@@ -234,7 +283,16 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // ── Catalog: seeded Analyst permission `catalog:read`. ───────────────
     ("GET", "/api/catalog",       Policy::RequiresPermission("catalog:read")),
     ("GET", "/api/catalog/query", Policy::RequiresPermission("catalog:read")),
-    ("GET", "/api/catalog/{id}",  Policy::RequiresPermission("catalog:read")),
+    // The handler admits `catalog:read`, or a person's `query:read` grant made
+    // from exactly this asset (the grant opens that table and nothing else),
+    // and refuses everyone else with the same 403 the gate used to answer
+    // (`catalog::ensure_may_open_asset`; `GOV-11`, `DEC-20`). The table cannot
+    // express "this permission, or a grant on this id": `RequiresAnyPermission`
+    // with both would be untrue, because `query:read` alone is not enough
+    // (`tests/route_auth.rs` asserts each permission of such a row passes
+    // alone). `RequiresAuth` with the level resolved in the handler is the
+    // pattern the dashboard read routes already use.
+    ("GET", "/api/catalog/{id}",  Policy::RequiresAuth),
     // Column profile: aggregates over the asset's rows (a `max` IS a value),
     // so it needs the same `query:read` as running that SELECT yourself —
     // and goes through the same policy rewrite (`routes::catalog_profile`).
@@ -279,6 +337,16 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET", "/api/catalog/{id}/restore",                 Policy::RequiresPermission("catalog:read")),
     ("POST", "/api/catalog/{id}/restore",                Policy::RequiresPermission("governance:write")),
 
+    // DATA-55 (QA `LH-DATA-15-06`, `TC-1731`): dropping a table a file upload
+    // made. The permission is `governance:write` *(proposed, not yet signed,
+    // D6)*: it is the one the signed decision gives the restore, so whoever is
+    // offered Drop table is also offered Restore on the same page.
+    ("GET", "/api/catalog/{id}/drop",                    Policy::RequiresPermission("governance:write")),
+    ("POST", "/api/catalog/{id}/drop",                   Policy::RequiresPermission("governance:write")),
+    // The list of dropped tables is `catalog:read`, like the restore's status
+    // read: it shows what can be restored, and restoring needs more.
+    ("GET", "/api/catalog/dropped/tables",               Policy::RequiresPermission("catalog:read")),
+
     // ── Lakehouse (WS2 §4): the read-only Iceberg warehouse/namespace/
     //    table surface, gated by the same seeded `catalog:read` permission
     //    as the dataset registry above. ────────────────────────────────────
@@ -289,15 +357,28 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET", "/api/lakehouse/tables/{ns}/{table}/maintenance", Policy::RequiresPermission("catalog:read")),
     ("POST", "/api/lakehouse/tables/{ns}/{table}/maintenance", Policy::RequiresPermission("governance:write")),
     ("GET", "/api/lakehouse/capacity",                        Policy::RequiresPermission("catalog:read")),
+    // OPS-21: measured small-file counts feed a warning on the table page
+    // and on System status. The list is scoped to the caller's tenant/roles
+    // in the handler, so the same `catalog:read` floor as the table listing
+    // applies here too.
+    ("GET", "/api/lakehouse/compaction-status",               Policy::RequiresPermission("catalog:read")),
     ("GET", "/api/lakehouse/maintenance-policies",            Policy::RequiresAuth),
 
-    // ── Overview / alerts: no seeded resource maps to these — auth only. ─
+    // ── Overview / alerts: the Home read surfaces have no single seeded
+    //    resource and stay auth-only / any-of, but the three state-change
+    //    routes below mutate a live alert and take the same `alert:write`
+    //    the rule CRUD routes do (SEC-67). ────────────────────────────────
     ("GET",  "/api/overview",                                Policy::RequiresAuth),
     ("POST", "/api/overview",                                Policy::RequiresAuth),
-    ("GET",  "/api/overview/alerts",                          Policy::RequiresAuth),
-    ("POST", "/api/overview/alerts/{id}/acknowledge",         Policy::RequiresAuth),
-    ("POST", "/api/overview/alerts/{id}/resolve",             Policy::RequiresAuth),
-    ("POST", "/api/overview/alerts/{id}/silence",             Policy::RequiresAuth),
+    // ADM-13 (D10.3), ADM-13 review round 1, B3: Home alerts list takes the same any-of as GET /api/alerts,
+    // so an `alert:read`-only viewer can see alerts without being able to change their state (SEC-67).
+    ("GET",  "/api/overview/alerts",                          Policy::RequiresAnyPermission(&["alert:read", "alert:write"])),
+    // SEC-67: acknowledging, resolving and silencing a live alert are state
+    // changes, not reads. A viewer holding only `alert:read` can see the list
+    // above but must be refused (403) here; same `alert:write` as `/api/alerts`.
+    ("POST", "/api/overview/alerts/{id}/acknowledge",         Policy::RequiresPermission("alert:write")),
+    ("POST", "/api/overview/alerts/{id}/resolve",             Policy::RequiresPermission("alert:write")),
+    ("POST", "/api/overview/alerts/{id}/silence",             Policy::RequiresPermission("alert:write")),
 
     // ── Ops: `{kind}` fans out to several logical resources with no single
     //    seeded permission — auth only (see module doc comment). Cancelling
@@ -305,20 +386,44 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    Data Engineer permission `workload:cancel` (0020). `/api/ops/logs`
     //    (WS5 item G1) is registered ahead of the `{kind}` wildcard, same
     //    literal-before-parameter precedent as `/api/governance/lineage`
-    //    below — router-level floor is `RequiresAuth`; the ClickHouse
-    //    branch's stricter `"ops:logs"` check (only Platform Admin's
+    //    below — router-level floor is `RequiresPermission("ops:read")` (ADM-13 D5);
+    //    the ClickHouse branch's stricter `"ops:logs"` check (only Platform Admin's
     //    `*:*` satisfies it — `system.text_log` carries every query's SQL
     //    text verbatim) lives inside the handler, matching
     //    `routes/alerts.rs::check_run_token`'s "auth-only router gate,
     //    stricter handler guard" pattern for `/api/alerts/run`. ─────────
-    ("GET",  "/api/ops/logs",                      Policy::RequiresAuth),
-    ("GET",  "/api/ops/{kind}",                    Policy::RequiresAuth),
+    ("GET",  "/api/ops/logs",                      Policy::RequiresPermission("ops:read")),
+    ("GET",  "/api/ops/{kind}",                    Policy::RequiresPermission("ops:read")),
     ("POST", "/api/ops/workloads/{id}/cancel",     Policy::RequiresPermission("workload:cancel")),
+
+    // ── Usage (OPS-8 part B): the sums of recorded runs, their CSV file and
+    //    the rates behind the estimate. `usage:read` opens every read;
+    //    entering a rate changes what every estimate says, so it is a
+    //    settings change (`settings:write`), like the reporting settings. ──
+    ("GET",  "/api/usage/queries",                 Policy::RequiresPermission("usage:read")),
+    ("GET",  "/api/usage/queries/export",          Policy::RequiresPermission("usage:read")),
+    ("GET",  "/api/usage/rates",                   Policy::RequiresPermission("usage:read")),
+    ("POST", "/api/usage/rates",                   Policy::RequiresPermission("settings:write")),
+    // OPS-8 part C: the size of every layer. `usage:read` opens the route;
+    // the `*:*` check is in the handler, because the refusal there is about
+    // the data (a layer holds every tenant's tables), not about a
+    // permission the console could ask for.
+    ("GET",  "/api/usage/storage",                 Policy::RequiresPermission("usage:read")),
 
     // ── Governance: seeded `policy:*` / `lineage:read`. `{kind}` (quality,
     //    classification, audit, residency) has the same fan-out problem as
     //    ops — auth only for that one. ────────────────────────────────────
     ("GET",  "/api/governance/lineage",   Policy::RequiresPermission("lineage:read")),
+    // GOV-1 part B: the audit trail's search, one event and export. Each is its
+    // own route with `audit:read` and nothing else, so `governance:read`,
+    // which every role holds, opens none of them (feature page Decision 9).
+    // The actor list beside them is a read of the trail too — the audit
+    // page's person filter offers it — so it needs `audit:read` and no
+    // `identity:read` (`GOV-1` acceptance follow-up, D2).
+    ("GET",  "/api/governance/audit/events", Policy::RequiresPermission("audit:read")),
+    ("GET",  "/api/governance/audit/events/{id}", Policy::RequiresPermission("audit:read")),
+    ("GET",  "/api/governance/audit/export.csv", Policy::RequiresPermission("audit:read")),
+    ("GET",  "/api/governance/audit/actors", Policy::RequiresPermission("audit:read")),
     // DATA-13: column-level lineage reads the same records' lineage, so the
     // same permission; charts and dashboards in the answer are listed only
     // to `dashboard:read` inside the handler.
@@ -331,6 +436,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // WS3 item 17: surfaces per-connector ingest history, the same
     // audience as the base `/api/connectors` routes above.
     ("GET",  "/api/governance/ingest-runs", Policy::RequiresPermission("connector:manage")),
+    // WEB-8 S2 T8 (D8): the row filter grammar (functions and operators) the
+    // console offers as a help line. `policy:read`, the same grant that lists
+    // the policies it authors: it describes authoring, not any stored data.
+    ("GET",  "/api/governance/row-filter-grammar", Policy::RequiresPermission("policy:read")),
     ("GET",  "/api/governance/policies",  Policy::RequiresPermission("policy:read")),
     ("POST", "/api/governance/policies",  Policy::RequiresPermission("policy:write")),
     // WS7 item A5: only someone who could actually save the policy may
@@ -368,24 +477,29 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // incidents and alerts) run, so it is a governance decision.
     ("GET",  "/api/governance/quality/schedules", Policy::RequiresAuth),
     ("PUT",  "/api/governance/quality/schedules/{asset}", Policy::RequiresPermission("governance:write")),
+    // WEB-3 S3a-D3: resetting a schedule is the same governance write as
+    // setting one.
+    ("DELETE", "/api/governance/quality/schedules/{asset}", Policy::RequiresPermission("governance:write")),
     // DATA-14 (F5): a table's learned-or-learning state; open to any login
     // like the quality list it is shown beside.
     ("GET",  "/api/governance/quality/learning/{asset}", Policy::RequiresAuth),
     // DATA-14 (F7): a rule's run history; the rule list it belongs to is open to
     // any login, and the history shows what that list shows (a verdict).
     ("GET",  "/api/governance/quality/{id}/runs", Policy::RequiresAuth),
-    // Running a rule reads the table it names, so it takes what reading
-    // that table takes — the same grant as the column profile.
-    ("POST", "/api/governance/quality/{id}/run", Policy::RequiresPermission("query:read")),
+    // Running a rule by hand is a governance action like editing one
+    // (GOV-10, decision DEC-17; QA LH-DATA-14-04 showed a viewer running a
+    // rule at 200). It took `query:read` before. The scheduled and on-load
+    // checks call `quality::evaluate` without this route, so they are not
+    // affected.
+    ("POST", "/api/governance/quality/{id}/run", Policy::RequiresPermission("governance:write")),
     // Rewriting or removing a rule is a governance decision, like setting an SLA.
     ("PUT", "/api/governance/quality/{id}", Policy::RequiresPermission("governance:write")),
     ("DELETE", "/api/governance/quality/{id}", Policy::RequiresPermission("governance:write")),
-    // SEC-23 (F1): reading rules stays open to any login, but adding one
-    // (quality, classification, residency) takes `governance:write` — the
-    // grant that rewriting or removing the same rule already takes above.
-    // It used to be `RequiresAuth`, so anyone logged in could add a rule
-    // they could not then edit or delete.
-    ("GET",  "/api/governance/{kind}",    Policy::RequiresAuth),
+    // SEC-23 (F1), ADM-13 (D5): reading rules, audit logs and maintenance
+    // requires `governance:read`; adding a rule (quality, classification,
+    // residency) takes `governance:write` — the grant that rewriting or
+    // removing the same rule already takes above.
+    ("GET",  "/api/governance/{kind}",    Policy::RequiresPermission("governance:read")),
     ("POST", "/api/governance/{kind}",    Policy::RequiresPermission("governance:write")),
 
     // ── Storage: no seeded resource — auth only. Restore (destructive)
@@ -406,7 +520,8 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    before; with it unset, only a `PrincipalId::Service` principal is
     //    allowed through, not merely `RequiresAuth`'s "any authenticated
     //    principal" — this table entry is a floor, not the whole guard. ──
-    ("GET",    "/api/alerts",      Policy::RequiresAuth),
+    // ADM-13 (D5): GET /api/alerts and other alert GETs require alert:read or alert:write.
+    ("GET",    "/api/alerts",      Policy::RequiresAnyPermission(&["alert:read", "alert:write"])),
     // `BI-19` part C (C3): signed in is the floor. Anybody who can view a chart
     // may save an alert on it for themselves (and remove their own), so the
     // handler decides: `alert:write` for every other rule or target, the
@@ -416,45 +531,58 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST",   "/api/alerts",      Policy::RequiresAuth),
     ("PUT",    "/api/alerts",      Policy::RequiresAuth),
     ("DELETE", "/api/alerts",      Policy::RequiresAuth),
-    // `SRC-7` D9: whether run reports can arrive; auth only, it reads no rule.
-    ("GET",    "/api/alerts/status", Policy::RequiresAuth),
+    // `SRC-7` D9, ADM-13 D5: whether run reports can arrive; alert:read or alert:write.
+    ("GET",    "/api/alerts/status", Policy::RequiresAnyPermission(&["alert:read", "alert:write"])),
+    // `BI-43` D1: signed in is the floor; the handler lists only rules the
+    // caller owns, so no permission is needed to see (and, through
+    // `DELETE /api/alerts`, remove) one's own chart alerts.
+    ("GET",    "/api/alerts/mine",  Policy::RequiresAuth),
     // `BI-40` D1/D2: a signed-in person tests one rule they may manage. The
     // handler decides (the same shape as `POST /api/alerts`): 404 for a rule
     // they cannot see, 403 without `alert:write` on a rule that is not their
     // own chart alert. `/api/alerts/run` below is the scheduler's door and is
     // unchanged — `check_run_token` still guards it (D4 not weakened).
     ("POST",   "/api/alerts/test",  Policy::RequiresAuth),
-    ("GET",    "/api/alerts/run",  Policy::RequiresAuth),
+    // ADM-13 review round 1, S3: GET /api/alerts/run is the scheduler's door
+    // (the same handler as POST /api/alerts/run, guarded by check_run_token),
+    // not a list; route policy is RequiresAuth as the floor.
+    ("GET",    "/api/alerts/run",   Policy::RequiresAuth),
     ("POST",   "/api/alerts/run",  Policy::RequiresAuth),
 
     // ── Gold export (ADR 0010, Rust/Phase-P6-only — no TypeScript route to
-    //    port): same "floor" shape as `/api/alerts/run` — `RequiresAuth`
-    //    here, PLUS `routes::gold::check_export_token`'s own stricter D4
-    //    guard inside the handler (shared-token match, or a service-
-    //    identity principal when `GOLD_EXPORT_RUN_TOKEN` is unset). ──────
-    ("GET",  "/api/gold/export/{mart}",  Policy::RequiresAuth),
+    //    port): the WRITE still has the "floor" shape of `/api/alerts/run`
+    //    — `RequiresAuth` here, PLUS `routes::gold::check_export_token`'s
+    //    own stricter D4 guard inside the handler (shared-token match, or
+    //    a service-identity principal when `GOLD_EXPORT_RUN_TOKEN` is
+    //    unset). The GETs are SEC-66's dedicated read grant: a signed-in
+    //    user without `gold:read` must not read an export by address.
+    //    `gold:export` also passes them — it is the strictly wider grant
+    //    and its holders (custom roles, service identities) must not lose
+    //    a read they had before the permission existed. The token and
+    //    service-identity paths stay intact: `gold-export-scheduler` is
+    //    seeded with `gold:read` (see `lib.rs`) and the handler's token
+    //    branch is unchanged. ────────────────────────────────────────────
+    ("GET",  "/api/gold/export/{mart}",  Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
     ("POST", "/api/gold/export/{mart}",  Policy::RequiresAuth),
-    // History (WS6 item 3): same RequiresAuth floor as export/read-back —
-    // row counts and run timing, not public data.
-    ("GET",  "/api/gold/exports",        Policy::RequiresAuth),
+    // History (WS6 item 3): the same read grant as read-back — row counts
+    // and run timing, not public data.
+    ("GET",  "/api/gold/exports",        Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
     // Consumers (WS6 item 4): an honest supported:false stub — no
-    // ClickHouse/Iceberg/Trino data is ever returned, but the floor stays
-    // RequiresAuth (not a public route) to match every other route under
-    // /api/gold/export/{mart}.
-    ("GET",  "/api/gold/export/{mart}/consumers", Policy::RequiresAuth),
+    // ClickHouse/Iceberg/Trino data is ever returned, but the route stays
+    // permission-gated (not public) to match every other gold GET.
+    ("GET",  "/api/gold/export/{mart}/consumers", Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
 
     // DATA-1 — per-mart publish-to-Iceberg switches. `publications` is
-    // what the scheduler reads (RequiresAuth floor PLUS
-    // `check_export_token` in the handler, same two-layer shape as the
-    // export routes above); the detail GET is read-only state for the
-    // asset page (RequiresAuth floor, `canEdit` reports — never implies —
-    // the permission); the PUT is the one WRITE, floored at the existing
-    // `gold:export` permission so whoever may trigger an export by hand
-    // is exactly who may switch automatic publishing on. Switching off
-    // flips a flag only; no route under /api/gold ever drops Iceberg
-    // data.
-    ("GET", "/api/gold/publications",              Policy::RequiresAuth),
-    ("GET",  "/api/gold/export/{mart}/publication", Policy::RequiresAuth),
+    // what the scheduler reads (same SEC-66 read grant PLUS
+    // `check_export_token` in the handler); the detail GET is read-only
+    // state for the asset page (`canEdit` reports — never implies — the
+    // `gold:export` permission); the PUT is the one WRITE, floored at the
+    // existing `gold:export` permission so whoever may trigger an export
+    // by hand is exactly who may switch automatic publishing on.
+    // Switching off flips a flag only; no route under /api/gold ever
+    // drops Iceberg data.
+    ("GET", "/api/gold/publications",              Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
+    ("GET",  "/api/gold/export/{mart}/publication", Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
     ("PUT",  "/api/gold/export/{mart}/publication", Policy::RequiresPermission("gold:export")),
 
     // ── Query: seeded Analyst permission `query:read`. ───────────────────
@@ -494,9 +622,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // of the saved-query surface: the level the caller holds on the item
     // (view, edit or manage) is the handler's business, because it is
     // decided by the one resolver in the store and not by the permission
-    // set. The access lists need `manage` — reading the list is part of
-    // sharing — and a grantee that is not of the caller's organisation is
-    // refused before anything is written.
+    // set. The two reads are not the same (`#416`): a query's list is
+    // read at manage, because managing a query includes sharing it,
+    // while a folder's list is read from edit up, because a person who
+    // may save or move a query into a folder is told who that folder is
+    // shared with before they do. Writing either list needs manage, and
+    // a grantee that is not of the caller's organisation is refused
+    // before anything is written.
     ("GET",    "/api/query/saved/{id}/access",             Policy::RequiresPermission("query:read")),
     ("PUT",    "/api/query/saved/{id}/access",             Policy::RequiresPermission("query:read")),
     ("GET",    "/api/query/folders/{id}/access",           Policy::RequiresPermission("query:read")),
@@ -507,6 +639,17 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/pipelines",                        Policy::RequiresPermission("pipeline:read")),
     ("POST", "/api/pipelines",                        Policy::RequiresPermission("pipeline:write")),
     ("POST", "/api/pipelines/generate",               Policy::RequiresPermission("pipeline:write")),
+    // BLD-1 part 1 / D16: the first rows of one input or step of a definition
+    // that is not saved yet. `pipeline:write`, because it is the editor's own
+    // preview and not a read of a stored pipeline; nothing is stored, and the
+    // statement runs as the CALLER (decision 13), never as a pipeline's author.
+    ("POST", "/api/pipelines/preview",                Policy::RequiresPermission("pipeline:write")),
+    // BLD-16 / J6: the SQL of one form step of a definition that is not
+    // saved yet, over names, before the access rewrite. `pipeline:write`
+    // for the same reason as the preview above: it is part of authoring and
+    // not a read of a stored pipeline; nothing is stored, nothing is read
+    // from `ClickHouse`.
+    ("POST", "/api/pipelines/step-sql",              Policy::RequiresPermission("pipeline:write")),
     ("GET",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:read")),
     ("PUT",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:write")),
     ("PUT",  "/api/pipelines/{id}/target-lag",         Policy::RequiresPermission("pipeline:write")),
@@ -531,7 +674,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // this route reveals how a governed table rewrites for any pipeline in
     // any tenant, so it cannot be reachable by someone who merely holds
     // `pipeline:read`.
-    ("POST", "/api/pipelines/runnable/{id}/enforce",   Policy::RequiresPermission("pipeline:read")),
+    ("POST", "/api/pipelines/runnable/{id}/compile",   Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/source",             Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs",              Policy::RequiresPermission("pipeline:read")),
     // Plan 1c (R2, day-1): runs × steps matrix for the recovery UI.
@@ -719,6 +862,26 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // BI-1 (D5): a dashboard as a PDF. `dashboard:read`, narrowed by the roles
     // switched off from downloading (D7), audited before the file is sent.
     ("GET",    "/api/dashboard/export/pdf",   Policy::RequiresAuth),
+    // BI-18 part D (T1, feature R2): reports live in dashboard folders. Reading
+    // is "signed in" at the router and `dashboard:read` or a rule in the handler
+    // (`viewer_for`), like a dashboard; writing needs `dashboard:write` here
+    // (`BI-18D-AC8`) and `edit` on the folder in the handler (`manage` to move
+    // one out or delete it).
+    ("GET",    "/api/dashboard/reports",      Policy::RequiresAuth),
+    ("POST",   "/api/dashboard/reports",      Policy::RequiresPermission("dashboard:write")),
+    ("GET",    "/api/dashboard/reports/{id}", Policy::RequiresAuth),
+    ("PUT",    "/api/dashboard/reports/{id}", Policy::RequiresPermission("dashboard:write")),
+    ("DELETE", "/api/dashboard/reports/{id}", Policy::RequiresPermission("dashboard:write")),
+    // BI-18 part D (T2, R3): a report as a PDF, like `GET /api/dashboard/export/pdf`:
+    // read access and the download switch, checked in the handler, audited.
+    ("GET",    "/api/dashboard/reports/{id}/pdf", Policy::RequiresAuth),
+    // BI-18 part D (T3, feature T4): saving a template, listing them, starting a
+    // dashboard from one and deleting one all need `dashboard:write`; starting
+    // also needs `edit` on the folder, in the handler.
+    ("GET",    "/api/dashboard/templates",          Policy::RequiresPermission("dashboard:write")),
+    ("POST",   "/api/dashboard/templates",          Policy::RequiresPermission("dashboard:write")),
+    ("DELETE", "/api/dashboard/templates/{id}",     Policy::RequiresPermission("dashboard:write")),
+    ("POST",   "/api/dashboard/templates/{id}/use", Policy::RequiresPermission("dashboard:write")),
     // BI-19 B2: the Share dialog's embed state and sample token: `manage` on the
     // dashboard, in the handler.
     ("GET",    "/api/dashboard/embed-info",   Policy::RequiresAuth),
@@ -781,6 +944,50 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    `settings_write_needs_no_seed_change_and_no_seeded_role_has_it`. ────
     ("GET",    "/api/settings/reporting",     Policy::RequiresAuth),
     ("PUT",    "/api/settings/reporting",     Policy::RequiresPermission("settings:write")),
+    // ── Email settings (`ADM-7`, `routes::settings`). Reading needs
+    //    `settings:write` too, unlike the reporting settings above: a mail
+    //    server's name, the account's user name and the console's public
+    //    address are the deployment's own, not everybody's (plan D4). The
+    //    test email goes to the caller's own address and nothing else
+    //    (plan D10), so it is the same permission. ──────────────────────────
+    ("GET",    "/api/settings/email",         Policy::RequiresPermission("settings:write")),
+    ("PUT",    "/api/settings/email",         Policy::RequiresPermission("settings:write")),
+    ("POST",   "/api/settings/email/test",   Policy::RequiresPermission("settings:write")),
+    // ── The deployment's feature list (`ADM-6`, `routes::settings`): which
+    //    features are set up and what is missing for the ones that are not.
+    //    It names the deployment's own settings, so it needs the same
+    //    permission as the email screen (plan D4). ────────────────────────
+    ("GET",    "/api/settings/deployment",    Policy::RequiresPermission("settings:write")),
+    // ── Sign-in limits (`ADM-8`, `routes::settings`): the failed-login
+    //    limit, the window, the lockout, the retention and the longest life
+    //    of a signed embed link. They are the deployment's own, so reading
+    //    them needs the same permission as changing them (plan D4). ──────────
+    ("GET",    "/api/settings/sign-in",      Policy::RequiresPermission("settings:write")),
+    ("PUT",    "/api/settings/sign-in",      Policy::RequiresPermission("settings:write")),
+    // ── The assistant's provider (`ADM-9`, `routes::settings`): the address,
+    //    the model and the key. A provider address and a key are the
+    //    deployment's own, so reading them needs `settings:write` too
+    //    (plan D4); the test request is the same permission. ────────────────
+    ("GET",    "/api/settings/assistant",    Policy::RequiresPermission("settings:write")),
+    ("PUT",    "/api/settings/assistant",    Policy::RequiresPermission("settings:write")),
+    ("POST",   "/api/settings/assistant/test", Policy::RequiresPermission("settings:write")),
+    // ── The workspace's name, logo, dark-mode logo and icon (`ADM-2`,
+    //    `routes::settings`). The public side of them is `GET /api/branding`
+    //    in the Public block above; reading the admin view, saving, removing
+    //    a picture and resetting all need `settings:write`. ─────────────────
+    ("GET",    "/api/settings/general",      Policy::RequiresPermission("settings:write")),
+    ("PUT",    "/api/settings/general",      Policy::RequiresPermission("settings:write")),
+    ("DELETE", "/api/settings/general",      Policy::RequiresPermission("settings:write")),
+    ("PUT",    "/api/settings/general/images/{kind}", Policy::RequiresPermission("settings:write")),
+    ("DELETE", "/api/settings/general/images/{kind}", Policy::RequiresPermission("settings:write")),
+    // ── Single sign-on (`ADM-12`, `routes::settings`): issuer, client ID,
+    //    client secret, provider name, groups claim, role map, and JIT.
+    //    Reading needs `settings:write` (plan D5); saving and testing also
+    //    require unrestricted administrator access (`*:*`). ──────────────
+    ("GET",    "/api/settings/sso",          Policy::RequiresPermission("settings:write")),
+    ("PUT",    "/api/settings/sso",          Policy::RequiresPermission("settings:write")),
+    ("POST",   "/api/settings/sso/test",     Policy::RequiresPermission("settings:write")),
+    ("GET",    "/api/settings/sso/test/{id}", Policy::RequiresPermission("settings:write")),
     // ── Query limits (`BI-5`, `routes::query_limits`): anyone signed in reads
     //    the limits that apply to them; changing them is `settings:write`. ──
     ("GET",    "/api/settings/limits",        Policy::RequiresAuth),
@@ -788,20 +995,22 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST",   "/api/query/cancel",           Policy::RequiresAuth),
     ("PUT",    "/api/settings/limits",        Policy::RequiresPermission("settings:write")),
 
-    // ── Agent / AI: no seeded resource for free-form ask/chat — auth only.
-    ("POST", "/api/ai/chat",             Policy::RequiresAuth),
-    ("POST", "/api/ai/tool",             Policy::RequiresAuth),
-    ("GET",    "/api/ai/sessions",       Policy::RequiresAuth),
-    ("POST",   "/api/ai/sessions",       Policy::RequiresAuth),
-    ("PATCH",  "/api/ai/sessions",       Policy::RequiresAuth),
-    ("DELETE", "/api/ai/sessions",       Policy::RequiresAuth),
-    ("GET",  "/api/ai/build-status",     Policy::RequiresAuth),
+    // ── Agent / AI: assistant access (`ADM-13` D5). Any caller holding
+    //    `assistant:use` (full assistant, as before) or `assistant:ask`
+    //    (Ask-mode read-only assistant) passes the auth gate. Tool permissions
+    //    and mode enforcement are judged inside the handlers. ─────────
+    ("POST", "/api/ai/chat",             Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
+    ("POST", "/api/ai/tool",             Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
+    ("GET",    "/api/ai/sessions",       Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
+    ("POST",   "/api/ai/sessions",       Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
+    ("PATCH",  "/api/ai/sessions",       Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
+    ("DELETE", "/api/ai/sessions",       Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
+    ("GET",  "/api/ai/build-status",     Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
     // The caller's own remembered words for the chat (`routes::ai::terms`):
-    // keyed by the principal like Copilot sessions, so the `RequiresAuth`
-    // floor is the whole policy. A caller can only ever reach their own rows.
-    ("GET",    "/api/ai/terms",          Policy::RequiresAuth),
-    ("PUT",    "/api/ai/terms",          Policy::RequiresAuth),
-    ("DELETE", "/api/ai/terms",          Policy::RequiresAuth),
+    // keyed by the principal like Copilot sessions, gated by assistant permissions.
+    ("GET",    "/api/ai/terms",          Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
+    ("PUT",    "/api/ai/terms",          Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
+    ("DELETE", "/api/ai/terms",          Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
 
     // WS5 item F1: navbar bell — same `RequiresAuth` floor as every other
     // authenticated-but-not-permission-scoped read in this table (e.g.
@@ -825,6 +1034,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    Admin's `*:*` grants either today; see the module doc comment. ───
     ("GET",  "/api/identity/users",                  Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/users",                  Policy::RequiresPermission("identity:write")),
+    ("PATCH", "/api/identity/users/{id}",         Policy::RequiresPermission("identity:write")),
     ("PUT",  "/api/identity/users/{id}/tenants/{tenant_id}", Policy::RequiresPermission("identity:write")),
     // ADM-4 D2: the counterpart of the PUT above — taking a user out of
     // a tenant. Same permission, because it is the same act of
@@ -851,8 +1061,20 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // handler adds the escalation rule on top (D3): only an unrestricted
     // `"*:*"` caller may reset a user who holds `"*:*"`.
     ("POST", "/api/identity/users/{id}/reset-password", Policy::RequiresPermission("identity:write")),
+    ("GET",  "/api/identity/permissions",            Policy::RequiresPermission("identity:read")),
     ("GET",  "/api/identity/roles",                  Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/roles",                  Policy::RequiresPermission("identity:write")),
+    // WEB-3 S3a-D2: editing or removing a role is exactly the privilege
+    // bundle write `POST` above is, so it takes `identity:write`, not a new
+    // token (AGENTS.md rule 4).
+    ("PUT",  "/api/identity/roles/{id}",             Policy::RequiresPermission("identity:write")),
+    ("DELETE", "/api/identity/roles/{id}",           Policy::RequiresPermission("identity:write")),
+    // GOV-7 D7: a role's read access per schema and table. Reading it is the
+    // role form's own read (`identity:read`); changing it takes access away
+    // from everybody who holds the role, so it is the same privilege bundle
+    // write as `PUT` above — no new permission token (rule 4).
+    ("GET",  "/api/identity/roles/{id}/table-access", Policy::RequiresPermission("identity:read")),
+    ("PUT",  "/api/identity/roles/{id}/table-access", Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/tenants",                Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/tenants",                Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/service-identities",     Policy::RequiresPermission("identity:read")),
@@ -922,7 +1144,6 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // The tenant gate is the route layer.
     ("POST", "/api/connectors/{id}/discovery/{kind}", Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}/discovery/{kind}", Policy::RequiresPermission("connector:manage")),
-    ("GET",  "/api/connectors/{id}/debezium-properties", Policy::RequiresPermission("connector:manage")),
     // `ingest-spec` GET/PUT deliberately carry DIFFERENT permissions, unlike
     // every other connector route above: `connector:manage` is a broad
     // write-capable grant, and a read-only caller (Phase G's ingest
@@ -963,6 +1184,17 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/connectors/{id}/runs", Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}/runs/{runId}/log", Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/connectors/{id}/resume", Policy::RequiresPermission("connector:manage")),
+    // `SRC-4` slice 2: a person's pause (resume above lifts it), and a change-capture
+    // connector's state in Kafka Connect; same permission and tenant gate.
+    ("POST", "/api/connectors/{id}/pause", Policy::RequiresPermission("connector:manage")),
+    ("GET",  "/api/connectors/{id}/change-capture", Policy::RequiresPermission("connector:manage")),
+    // `SRC-4` slice 4: a person sets the lag a change-capture connector may have
+    // before it alerts; the orchestrator posts each table's backlog and last
+    // applied change. `ingest:read` is the one permission its service identity
+    // holds and a user can hold it too (Data Engineer), so the handler adds
+    // `schema_changes::require_orchestrator`, as the run reports do.
+    ("PUT",  "/api/connectors/{id}/lag-limit", Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/connectors/{id}/capture/observations", Policy::RequiresPermission("ingest:read")),
     // `SRC-11`: the orchestrator reports a run's start, each attempt, a line of
     // the closed log list, and the run's end. `ingest:read`, the one
     // permission its service identity holds; a user can hold it too (Data
@@ -1052,19 +1284,20 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/knowledge/vector-jobs",   Policy::RequiresAuth),
     ("POST", "/api/knowledge/vector-jobs",   Policy::RequiresAuth),
 
-    // ── Agents (digital employees / workflows / tools / runs): no seeded
-    //    resource for most of this domain — auth only. `approvals` maps to
-    //    the seeded Approver permission `agent:approve`. Employee lifecycle
-    //    control (suspend/resume/revoke) requires `agent:manage`,
-    //    deliberately Platform-Admin-only — see module doc comment. ──────
-    ("GET",  "/api/agents/workflows",                Policy::RequiresAuth),
-    ("POST", "/api/agents/workflows",                Policy::RequiresAuth),
+    // ── Agents (digital employees / tools / runs): no seeded resource for
+    //    most of this domain — auth only. `approvals` maps to the seeded
+    //    Approver permission `agent:approve`. WEB-4 retired the workflows,
+    //    employee-create, employee lifecycle (suspend/resume/revoke) and
+    //    runs-LIST routes: no assistant tool, console page, CLI or script
+    //    calls them, so their entries were removed with the routes and the
+    //    paths now answer 404. `agent:manage` stays a real permission — the
+    //    headless-run handler still uses it for a manual trigger — but no
+    //    route is gated on it at the policy layer any more. ────────────────
+    // `GET /employees` feeds Dagster's code-load schedule factory and
+    // `GET /employees/{id}` names the employee on the retained run-detail
+    // page; both are live consumers (see `routes::agents_router`).
     ("GET",  "/api/agents/employees",                Policy::RequiresAuth),
-    ("POST", "/api/agents/employees",                Policy::RequiresAuth),
     ("GET",  "/api/agents/employees/{id}",           Policy::RequiresAuth),
-    ("POST", "/api/agents/employees/{id}/suspend",   Policy::RequiresPermission("agent:manage")),
-    ("POST", "/api/agents/employees/{id}/resume",    Policy::RequiresPermission("agent:manage")),
-    ("POST", "/api/agents/employees/{id}/revoke",    Policy::RequiresPermission("agent:manage")),
     // `/employees/{id}/run` (T3.2, copilot-operations-handover plan): same
     // "floor" shape as `/api/alerts/run`/`/api/gold/export/{mart}` —
     // `RequiresAuth` here, PLUS `routes::agents::check_employee_run_auth`'s
@@ -1078,8 +1311,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // POST /api/agents/tools removed (WS7 item G4): the real tool
     // registry (ai_registry::TOOLS) has no "register" concept.
     ("GET",  "/api/agents/tools",                    Policy::RequiresAuth),
-    ("GET",  "/api/agents/runs",                     Policy::RequiresAuth),
-    ("GET",  "/api/agents/runs/{id}",                Policy::RequiresAuth),
+    // SEC-66: the retained run-detail read is read-only but was open to any
+    // signed-in user. `agent:read` now gates it; `agent:approve` and
+    // `agent:manage` holders are deliberately NOT widened here — the two
+    // are decision/lifecycle powers, not a licence to read every run.
+    // WEB-4 retired the runs-LIST route (`GET /api/agents/runs`), so only
+    // the detail route remains in this table.
+    ("GET",  "/api/agents/runs/{id}",                Policy::RequiresPermission("agent:read")),
     ("GET",  "/api/agents/approvals",                Policy::RequiresPermission("agent:approve")),
     ("POST", "/api/agents/approvals/{id}/decide",    Policy::RequiresPermission("agent:approve")),
 
@@ -1169,6 +1407,7 @@ const ALLOWED_WHILE_MUST_CHANGE_PASSWORD: &[(&str, &str)] = &[
     ("POST", "/api/auth/change-password"),
     ("POST", "/api/auth/logout"),
     ("GET", "/api/auth/me"),
+    ("GET", "/api/auth/password-rules"),
 ];
 
 /// Whether `(method, path)` stays reachable for a principal that still
@@ -1179,6 +1418,12 @@ fn allowed_while_must_change_password(method: &str, path: &str) -> bool {
         .iter()
         .any(|(m, p)| *m == method && *p == path)
 }
+
+/// What a principal that still has to rotate its password is told by every
+/// route outside [`ALLOWED_WHILE_MUST_CHANGE_PASSWORD`] (and what its audited
+/// refusal row says).
+const PASSWORD_ROTATION_REQUIRED: &str =
+    "password rotation required before this route is reachable";
 
 /// The one middleware layered onto the whole router (`routes::router`).
 /// Looks up [`POLICY_TABLE`] for the request's matched route and either
@@ -1232,22 +1477,42 @@ pub async fn auth_gate(
 
     match policy {
         Policy::Public => Ok(next.run(req).await),
-        Policy::RequiresAuth | Policy::RequiresPermission(_) => {
+        Policy::RequiresAuth | Policy::RequiresPermission(_) | Policy::RequiresAnyPermission(_) => {
             let (mut parts, body) = req.into_parts();
             let AuthenticatedPrincipal(principal) =
                 AuthenticatedPrincipal::from_request_parts(&mut parts, &state).await?;
-            if let Policy::RequiresPermission(permission) = policy
-                && !principal.has(permission)
-            {
-                return Err(ApiError::PermissionDenied(permission.to_owned()).into());
-            }
-            if principal.must_change_password
-                && !allowed_while_must_change_password(&method, matched_path.as_str())
-            {
-                return Err(ApiError::PermissionDenied(
-                    "password rotation required before this route is reachable".to_owned(),
+            // `GOV-1`: a refusal below is audited before it is returned (the
+            // handler never runs, so nothing else would). A 401 above is not:
+            // nobody is signed in.
+            let refusal = match policy {
+                Policy::RequiresPermission(permission) if !principal.has(permission) => {
+                    Some(permission.to_owned())
+                }
+                Policy::RequiresAnyPermission(permissions)
+                    if !permissions.iter().any(|perm| principal.has(perm)) =>
+                {
+                    Some(permissions.join(", "))
+                }
+                _ if principal.must_change_password
+                    && !allowed_while_must_change_password(&method, matched_path.as_str()) =>
+                {
+                    Some(PASSWORD_ROTATION_REQUIRED.to_owned())
+                }
+                _ => None,
+            };
+            if let Some(detail) = refusal {
+                let params = crate::audit_coverage::path_params(&mut parts).await;
+                crate::audit_coverage::record_gate_refusal(
+                    &state,
+                    &principal,
+                    &method,
+                    matched_path.as_str(),
+                    &params,
+                    parts.uri.query(),
+                    &detail,
                 )
-                .into());
+                .await;
+                return Err(ApiError::PermissionDenied(detail).into());
             }
             parts.extensions.insert(principal);
             let req = Request::from_parts(parts, body);
@@ -1291,6 +1556,36 @@ mod tests {
         assert_eq!(
             policy_for("POST", "/api/catalog/{id}/restore"),
             Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-55` D6: whether a table may be dropped is the same authority that
+    /// drops it, `governance:write`.
+    #[test]
+    fn the_drop_status_needs_governance_write() {
+        assert_eq!(
+            policy_for("GET", "/api/catalog/{id}/drop"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-55` D6: dropping a table needs `governance:write` (proposed, not
+    /// yet signed), the permission the restore already takes.
+    #[test]
+    fn dropping_a_table_needs_governance_write() {
+        assert_eq!(
+            policy_for("POST", "/api/catalog/{id}/drop"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-55` D13: the list of dropped tables is `catalog:read`, like the
+    /// restore's status read.
+    #[test]
+    fn the_dropped_list_needs_catalog_read() {
+        assert_eq!(
+            policy_for("GET", "/api/catalog/dropped/tables"),
+            Some(Policy::RequiresPermission("catalog:read"))
         );
     }
 
@@ -1359,6 +1654,11 @@ mod tests {
             policy_for("PUT", "/api/governance/quality/schedules/{asset}"),
             Some(Policy::RequiresPermission("governance:write"))
         );
+        // WEB-3 S3a-D3: resetting takes the permission setting one does.
+        assert_eq!(
+            policy_for("DELETE", "/api/governance/quality/schedules/{asset}"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
     }
 
     /// `DATA-14` (F7): a rule's run history is readable by any login.
@@ -1403,7 +1703,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_fourteen_public_entries_exist() {
+    fn exactly_nineteen_public_entries_exist() {
         // Pre-existing drift found while landing the `/api/auth/providers`
         // route: this assertion was still pinned at 4 even though the two
         // earlier OIDC public routes (`/api/auth/oidc/start`,
@@ -1428,20 +1728,38 @@ mod tests {
         // map boundary route, each authenticated by its own token: 11 -> 13.
         // REL-2 decision D7 added `GET /health/ready`, the readiness probe an
         // installer or an updater waits on: 13 -> 14.
-        assert_eq!(public_count, 14);
+        // ADM-11 (D4) / ADM-11 review 1 B3 added `GET /api/auth/password-rules`: 14 -> 15.
+        // ADM-2 (decision 5) added `GET /api/branding` and
+        // `GET /api/branding/images/{kind}`, the workspace's name and pictures
+        // for the sign-in page: 15 -> 17.
+        // BI-36 and BI-42 added the print view's map and image routes, each
+        // authenticated by the render token: 17 -> 19.
+        assert_eq!(public_count, 19);
     }
 
-    /// SEC-23 (F1): adding a governance rule needs `governance:write`, the
-    /// same grant as changing or removing one; listing rules needs a login.
+    /// SEC-23 (F1), ADM-13 (D5): adding a governance rule needs `governance:write`;
+    /// listing rules needs `governance:read`.
     #[test]
-    fn adding_a_governance_rule_needs_governance_write_but_listing_needs_a_login() {
+    fn adding_a_governance_rule_needs_governance_write_and_listing_needs_governance_read() {
         assert_eq!(
             policy_for("POST", "/api/governance/{kind}"),
             Some(Policy::RequiresPermission("governance:write"))
         );
         assert_eq!(
             policy_for("GET", "/api/governance/{kind}"),
-            Some(Policy::RequiresAuth)
+            Some(Policy::RequiresPermission("governance:read"))
+        );
+    }
+
+    /// `GOV-10` decision `DEC-17`: running an authored rule by hand is a
+    /// governance action, not a read of the table it names — QA
+    /// `LH-DATA-14-04` saw a viewer run one at 200 while it took
+    /// `query:read`.
+    #[test]
+    fn running_a_quality_rule_by_hand_needs_governance_write() {
+        assert_eq!(
+            policy_for("POST", "/api/governance/quality/{id}/run"),
+            Some(Policy::RequiresPermission("governance:write"))
         );
     }
 
@@ -1463,11 +1781,25 @@ mod tests {
     #[test]
     fn identity_routes_require_identity_permissions() {
         assert_eq!(
+            policy_for("GET", "/api/identity/permissions"),
+            Some(Policy::RequiresPermission("identity:read"))
+        );
+        assert_eq!(
             policy_for("GET", "/api/identity/roles"),
             Some(Policy::RequiresPermission("identity:read"))
         );
         assert_eq!(
             policy_for("POST", "/api/identity/roles"),
+            Some(Policy::RequiresPermission("identity:write"))
+        );
+        // WEB-3 S3a-D2: editing or removing a role takes the same
+        // permission as minting one.
+        assert_eq!(
+            policy_for("PUT", "/api/identity/roles/{id}"),
+            Some(Policy::RequiresPermission("identity:write"))
+        );
+        assert_eq!(
+            policy_for("DELETE", "/api/identity/roles/{id}"),
             Some(Policy::RequiresPermission("identity:write"))
         );
         assert_eq!(
@@ -1673,39 +2005,111 @@ mod tests {
         );
     }
 
-    /// #1: digital-employee lifecycle control (`agent:manage`) is
-    /// deliberately Platform-Admin-only — an Analyst (and even Approver,
-    /// whose `agent:approve` is a narrower per-decision grant) must be
-    /// denied; only `*:*` gets through.
+    // WEB-4 removed the `agent:manage`-gated lifecycle routes, so there is
+    // no route left for the both-ways table check this block used to hold.
+    // The permission stays: the seed-alignment test below still pins it, and
+    // `routes::agents::check_employee_run_auth` uses it for a manual run.
+
+    /// `SEC-66`: the Gold GETs are no longer open to any signed-in user.
+    /// A Dashboard Viewer is refused; both the new `gold:read` grant and
+    /// the pre-existing `gold:export` grant still read (no reader loses
+    /// access on upgrade), and the two WRITE routes keep their old gates.
     #[test]
-    fn agent_lifecycle_routes_deny_analyst_and_approver_allow_platform_admin() {
+    fn gold_read_routes_refuse_a_dashboard_viewer_and_accept_both_gold_grants() {
         use lakehouse_auth::PermissionSet;
 
-        for path in [
-            "/api/agents/employees/{id}/suspend",
-            "/api/agents/employees/{id}/resume",
-            "/api/agents/employees/{id}/revoke",
-        ] {
-            assert_denied_then_allowed(
-                "POST",
-                path,
-                &PermissionSet::parse("query:read, catalog:read, lineage:read"),
-                "an Analyst",
-                &PermissionSet::parse("*:*"),
-                "a Platform Admin (*:*)",
+        const GOLD_GETS: [&str; 5] = [
+            "/api/gold/export/{mart}",
+            "/api/gold/exports",
+            "/api/gold/export/{mart}/consumers",
+            "/api/gold/publications",
+            "/api/gold/export/{mart}/publication",
+        ];
+        let viewer = PermissionSet::parse("dashboard:read");
+        let reader = PermissionSet::parse("gold:read");
+        let exporter = PermissionSet::parse("gold:export");
+        let admin = PermissionSet::parse("*:*");
+
+        for path in GOLD_GETS {
+            let Some(Policy::RequiresAnyPermission(perms)) = policy_for("GET", path) else {
+                panic!("GET {path} must require a Gold read permission");
+            };
+            assert_eq!(perms.len(), 2, "GET {path} must name both Gold grants");
+            assert_eq!(perms[0], "gold:read");
+            assert_eq!(perms[1], "gold:export");
+            assert!(
+                !perms.iter().any(|perm| viewer.has(perm)),
+                "a Dashboard Viewer must be denied GET {path}"
             );
-            assert_denied_then_allowed(
-                "POST",
-                path,
-                &PermissionSet::parse("agent:approve, policy:review"),
-                "an Approver (agent:approve only)",
-                &PermissionSet::parse("*:*"),
-                "a Platform Admin (*:*)",
+            assert!(
+                perms.iter().any(|perm| reader.has(perm)),
+                "a gold:read holder must be allowed GET {path}"
+            );
+            assert!(
+                perms.iter().any(|perm| exporter.has(perm)),
+                "a gold:export holder must keep its read of GET {path}"
+            );
+            assert!(
+                perms.iter().any(|perm| admin.has(perm)),
+                "a Platform Admin (*:*) must be allowed GET {path}"
             );
         }
+
+        assert_eq!(
+            policy_for("POST", "/api/gold/export/{mart}"),
+            Some(Policy::RequiresAuth),
+            "the export WRITE keeps its token-guarded auth floor"
+        );
+        assert_eq!(
+            policy_for("PUT", "/api/gold/export/{mart}/publication"),
+            Some(Policy::RequiresPermission("gold:export")),
+            "the publication WRITE stays gold:export-only"
+        );
     }
 
-    /// #2: cancelling a workload (`workload:cancel`) is granted to Data
+    /// `SEC-66`: the retained agent-run detail read requires its own
+    /// `agent:read` grant. A Dashboard Viewer (and a person holding only
+    /// `agent:approve`, a narrower decision power) is refused; `agent:read`
+    /// and `*:*` pass. WEB-4 retired the runs-LIST route (`GET
+    /// /api/agents/runs`), so only the detail route is checked here.
+    #[test]
+    fn agent_run_read_routes_refuse_a_dashboard_viewer_and_accept_agent_read() {
+        use lakehouse_auth::PermissionSet;
+
+        assert_eq!(
+            policy_for("GET", "/api/agents/runs"),
+            None,
+            "WEB-4 retired the runs-LIST route; the table must not classify it"
+        );
+        let path = "/api/agents/runs/{id}";
+        assert_eq!(
+            policy_for("GET", path),
+            Some(Policy::RequiresPermission("agent:read")),
+            "GET {path} must require agent:read"
+        );
+        assert_denied_then_allowed(
+            "GET",
+            path,
+            &PermissionSet::parse("dashboard:read"),
+            "a Dashboard Viewer",
+            &PermissionSet::parse("agent:read"),
+            "an agent:read holder",
+        );
+        assert_denied_then_allowed(
+            "GET",
+            path,
+            &PermissionSet::parse("agent:approve"),
+            "an Approver (agent:approve only)",
+            &PermissionSet::parse("agent:read"),
+            "an agent:read holder",
+        );
+        assert!(
+            PermissionSet::parse("*:*").has("agent:read"),
+            "a Platform Admin (*:*) must satisfy agent:read on {path}"
+        );
+    }
+
+    /// #1: cancelling a workload (`workload:cancel`) is granted to Data
     /// Engineer (0020) — an Analyst must be denied, Data Engineer allowed.
     #[test]
     fn workload_cancel_denies_analyst_allows_data_engineer() {
@@ -1721,7 +2125,7 @@ mod tests {
         );
     }
 
-    /// #3: storage restore (`storage:restore`) is deliberately
+    /// #2: storage restore (`storage:restore`) is deliberately
     /// Platform-Admin-only — Data Engineer, despite operating pipelines and
     /// connectors, must still be denied; only `*:*` gets through.
     #[test]
@@ -1738,7 +2142,7 @@ mod tests {
         );
     }
 
-    /// #4 (changed by `BI-19` part C, C3): alert rule CRUD is "signed in" at the
+    /// #3 (changed by `BI-19` part C, C3): alert rule CRUD is "signed in" at the
     /// router, because a person who can view a chart may alert on it for
     /// themselves. `alert:write` is judged in the handler
     /// (`tests/route_auth.rs`, `the_alert_routes_are_signed_in_at_the_router_and_the_handler_asks_for_the_right`).
@@ -1751,6 +2155,49 @@ mod tests {
                 .map(|(_, _, policy)| *policy);
             assert_eq!(row, Some(Policy::RequiresAuth), "{method} /api/alerts");
         }
+    }
+
+    /// `SEC-67`: acknowledging, resolving and silencing an overview alert
+    /// change its state, so they take `alert:write` — the same permission as
+    /// the `/api/alerts` rule CRUD — rather than merely a login. A viewer
+    /// holding only `alert:read` can list the alerts but must be refused on
+    /// all three; the GET keeps the ADM-13 any-of so that read-only view works.
+    #[test]
+    fn overview_alert_state_changes_need_alert_write_not_just_a_login() {
+        use lakehouse_auth::PermissionSet;
+
+        for path in [
+            "/api/overview/alerts/{id}/acknowledge",
+            "/api/overview/alerts/{id}/resolve",
+            "/api/overview/alerts/{id}/silence",
+        ] {
+            // Pin the table row itself: a regression to `RequiresAuth` fails
+            // here even if the permission-set checks below still happen to
+            // pass for the principals chosen.
+            assert_eq!(
+                policy_for("POST", path),
+                Some(Policy::RequiresPermission("alert:write")),
+                "POST {path}"
+            );
+            assert_denied_then_allowed(
+                "POST",
+                path,
+                &PermissionSet::parse("alert:read"),
+                "an alert:read-only viewer",
+                &PermissionSet::parse("alert:write"),
+                "an alert:write holder",
+            );
+        }
+
+        // The list stays open to either permission (ADM-13 D10.3): the viewer
+        // denied above can still see the alerts it can no longer change.
+        assert_eq!(
+            policy_for("GET", "/api/overview/alerts"),
+            Some(Policy::RequiresAnyPermission(&[
+                "alert:read",
+                "alert:write"
+            ])),
+        );
     }
 
     /// Proves `0020_extend_role_grants.sql`'s intent at the `PermissionSet`

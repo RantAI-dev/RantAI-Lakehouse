@@ -1,6 +1,7 @@
 "use client"
 
 import { RefreshCwIcon } from "lucide-react"
+import * as React from "react"
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
@@ -26,10 +27,10 @@ import type {
   GoldReadBack,
 } from "@/services/contracts/gold"
 
-function MartPublication({ mart }: { mart: { name: string } }) {
+function MartPublication({ mart, reloadKey }: { mart: { name: string }; reloadKey: number }) {
   const state = useService<GoldPublication>(
     (signal) => goldService.getPublication(mart.name, signal),
-    [mart.name]
+    [mart.name, reloadKey]
   )
   if (state.status === "loading") return <span className="text-muted-foreground">…</span>
   if (state.status === "error") return <span className="text-destructive">—</span>
@@ -78,19 +79,18 @@ function ConsumersCell({ data }: { data: GoldConsumers }) {
 /**
  * One mart's row: publish state, last export (read straight back from
  * Iceberg), export history count, the count of outside tools that read
- * it, and an "Export now" trigger. Each sub-fetch is independent —
- * `getLastExport` 404/500s for a mart that has never been exported
- * (`read_back` has no table to read yet), and that is rendered as "Never
- * exported" here, not as a page-level error.
+ * it, and an "Export now" trigger. Each sub-fetch is independent.
+ *
+ * A mart never published answers 200 with `published: false` (`DATA-49`,
+ * D11), so that is read from the answer and shown as "Never exported". A
+ * failed request is a failure: the cell shows a dash like its neighbours,
+ * never "Never exported" (`QA LH-DATA-1-01`).
  */
 function MartRow({ mart }: { mart: GoldMart }) {
-  const lastExport = useService<GoldReadBack | null>(async (signal) => {
-    try {
-      return await goldService.getLastExport(mart.name, signal)
-    } catch {
-      return null
-    }
-  }, [mart.name])
+  const lastExport = useService<GoldReadBack>(
+    (signal) => goldService.getLastExport(mart.name, signal),
+    [mart.name]
+  )
   const runs = useService<GoldExportRun[]>(
     (signal) => goldService.listExportRuns(mart.name, signal),
     [mart.name]
@@ -100,25 +100,30 @@ function MartRow({ mart }: { mart: GoldMart }) {
     [mart.name]
   )
   const exportNow = useServiceAction((signal) => goldService.triggerExport(mart.name, signal))
+  // Bumped after a publish so the label reads again (`DATA-49`, review round 1 R1):
+  // `MartPublication`'s `useService` is keyed on the mart's name alone.
+  const [publicationKey, setPublicationKey] = React.useState(0)
 
   return (
     <TableRow>
       <TableCell className="font-medium">{mart.name}</TableCell>
       <TableCell>{formatCompactNumber(mart.rows)}</TableCell>
       <TableCell>
-        <MartPublication mart={mart} />
+        <MartPublication mart={mart} reloadKey={publicationKey} />
       </TableCell>
       <TableCell>
         {lastExport.status === "loading" ? (
           <span className="text-muted-foreground">…</span>
-        ) : lastExport.data?.exportedAt ? (
-          formatDateTime(lastExport.data.exportedAt)
-        ) : (
+        ) : lastExport.status === "error" ? (
+          <span className="text-destructive">—</span>
+        ) : !lastExport.data.published || !lastExport.data.exportedAt ? (
           <span className="text-muted-foreground">Never exported</span>
+        ) : (
+          formatDateTime(lastExport.data.exportedAt)
         )}
       </TableCell>
       <TableCell className="font-mono text-xs">
-        {lastExport.status === "success" && lastExport.data
+        {lastExport.status === "success" && lastExport.data.published
           ? fmtMeasured(lastExport.data.snapshotId)
           : "—"}
       </TableCell>
@@ -147,11 +152,13 @@ function MartRow({ mart }: { mart: GoldMart }) {
             variant="outline"
             disabled={exportNow.status === "pending"}
             onClick={() => {
+              // QA LH-DATA-1-01 (DATA-49), review round 1 R1: a failed publish answers
+              // `lastFailure` and records a run, so the label and the count are read
+              // again whatever the result. Only a success can change the read-back.
               void exportNow.run().then((result) => {
-                if (result) {
-                  lastExport.reload()
-                  runs.reload()
-                }
+                setPublicationKey((key) => key + 1)
+                runs.reload()
+                if (result) lastExport.reload()
               })
             }}
           >

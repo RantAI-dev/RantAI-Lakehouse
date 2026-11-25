@@ -240,6 +240,40 @@ pub enum Resolution {
     NotFound,
 }
 
+/// The incident `id`, or `None` when no incident has it — including an id
+/// that is not a UUID, which [`resolve`] treats the same way.
+///
+/// The API reads an incident before resolving it, so it can answer "not
+/// found" for one on a table the caller's role does not read (`GOV-15`); the
+/// reason's validation stays [`resolve`]'s.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on a query failure.
+pub async fn get(pool: &PgPool, id: &str) -> Result<Option<QualityIncident>, StoreError> {
+    let Ok(id) = Uuid::parse_str(id) else {
+        return Ok(None);
+    };
+    by_id(pool, id).await
+}
+
+/// The incident `id`, as the list shows it. One copy, so [`get`] and
+/// [`resolve`] cannot drift (`AGENTS.md` rule 4).
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on a query failure.
+async fn by_id(pool: &PgPool, id: Uuid) -> Result<Option<QualityIncident>, StoreError> {
+    let sql = format!("SELECT {} {JOINS} WHERE i.id = $1", columns());
+    // safe: `columns()` and `JOINS` are constant literals; values are bound.
+    Ok(
+        sqlx::query_as::<_, QualityIncident>(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(id)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
 /// Resolves the open incident `id` as `by`, with the reason `resolution`.
 ///
 /// # Errors
@@ -277,12 +311,7 @@ pub async fn resolve(
     .bind(resolution)
     .execute(pool)
     .await?;
-    let sql = format!("SELECT {} {JOINS} WHERE i.id = $1", columns());
-    // safe: `columns()` and `JOINS` are constant literals; values are bound.
-    let row = sqlx::query_as::<_, QualityIncident>(sqlx::AssertSqlSafe(sql.as_str()))
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+    let row = by_id(pool, id).await?;
     Ok(match (row, updated.rows_affected()) {
         (Some(row), 1) => Resolution::Resolved(Box::new(row)),
         (Some(_), _) => Resolution::AlreadyResolved,
@@ -444,8 +473,23 @@ pub async fn put_schedule(
     )
 }
 
-// ── Load history ───────────────────────────────────────────────────────
+/// Removes a table's schedule, so it runs every
+/// [`DEFAULT_INTERVAL_MINUTES`] again. Returns how many rows went (0 or 1): a
+/// table with no schedule row is already on the default, which is the
+/// outcome the caller asked for, so that is not an error.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the delete fails.
+pub async fn delete_schedule(pool: &PgPool, asset: &str) -> Result<u64, StoreError> {
+    let done = sqlx::query("DELETE FROM quality_schedule WHERE asset = $1")
+        .bind(asset.trim().to_lowercase())
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected())
+}
 
+// ── Load history ───────────────────────────────────────────────────────
 /// How long a load is kept, in days (the spec's history for learning).
 pub const LOAD_RETENTION_DAYS: i32 = 90;
 

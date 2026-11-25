@@ -238,6 +238,12 @@ export type UploadListFilter = {
   folderId?: string
   /** Text a file name or a table name contains, case-insensitively. */
   q?: string
+  /**
+   * Exactly this raw table name: the uploads loaded into it, newest first
+   * (`DATA-47`). An exact match, not the contains-match `q` is, and narrowed
+   * before the window is cut — so an upload into an older table is still found.
+   */
+  table?: string
 }
 
 /**

@@ -37,9 +37,12 @@ is never logged, stored or sent, and nothing in this module returns any part
 of an exception's message.
 
 Drivers are recognised by the module their exception class claims (`pymysql`,
-`pyodbc`, `oracledb`, `psycopg2`, `kafka`, `paramiko`, `pymongo`), so this
-file imports none of them (`pyodbc` cannot be imported without a system ODBC
-library).
+`pyodbc`, `oracledb`, `psycopg2`, `kafka`, `paramiko`, `pymongo`,
+`botocore`), so this file imports none of them (`pyodbc` cannot be imported
+without a system ODBC library). `botocore` is what an object-storage read
+raises through `s3fs` (`QA LH-SRC-6-53`, `SRC-38`): `aiobotocore` turns
+every `aiohttp` failure into one of its classes and `s3fs` passes them on
+unchanged. It is still not imported here.
 
 # Retry delays
 
@@ -136,6 +139,14 @@ class UnsupportedKafkaAuth(Exception):
     before any connection is attempted."""
 
 
+class KafkaTargetMissing(Exception):
+    """A Kafka stream spec names no Bronze table to load into (`SRC-45`, QA
+    `LH-SRC-6-41`): no source object carries a non-empty `target`. Raised before
+    the consumer is built, so nothing is read or committed. It is a rejected
+    setting (not retried, not `other`) and the message is fixed text that tells
+    the user what to do; it holds no source text."""
+
+
 class ApiUnreachable(Exception):
     """The product's own API could not be asked for the connector (a
     connection error or a 5xx). Transient. The message is fixed."""
@@ -157,22 +168,28 @@ class Classified:
 
 
 # Bounded walk: SQLAlchemy's `.orig`, `raise ... from`, implicit contexts and
-# `dlt`'s `.exception` are chains of a few links; the bound only guards
-# against a cycle.
-_MAX_CAUSE_DEPTH = 8
+# `dlt`'s `.exception` are chains of a few links; the bound guards against a
+# cycle and against a pathological chain. It counts EXCEPTIONS yielded, not
+# queue pops: every exception pushes four entries (`.orig`, `.exception`,
+# `__cause__`, `__context__`), most of them `None` or a repeat, so counting
+# pops read a `raise ... from` chain only three exceptions deep and the
+# object-storage error of QA `LH-SRC-6-53` (`SRC-38`) sat past the cut.
+# `seen` ends a cycle; each exception adds at most four entries, so the walk
+# ends after at most 64 pops.
+_MAX_CAUSE_DEPTH = 16
 
 
 def _chain(exc: BaseException) -> Iterator[BaseException]:
     """`exc` and what it wraps, outermost first, each once."""
     seen: set[int] = set()
     pending: list[BaseException | None] = [exc]
-    for _ in range(_MAX_CAUSE_DEPTH):
-        if not pending:
-            return
+    yielded = 0
+    while pending and yielded < _MAX_CAUSE_DEPTH:
         current = pending.pop(0)
         if current is None or id(current) in seen:
             continue
         seen.add(id(current))
+        yielded += 1
         yield current
         inner = getattr(current, "exception", None)
         pending.extend(
@@ -411,6 +428,17 @@ def _classify_driver(exc: BaseException, root: str) -> str | None:
             return UNREACHABLE
     if root == "pyiceberg" and names & {"ServiceUnavailableError", "ServerError"}:
         return SOURCE_BUSY
+    if root == "botocore":
+        # QA LH-SRC-6-53 (SRC-38): an object-storage endpoint that is down
+        # arrives through `s3fs` and `dlt` as a `botocore` error. The timeout
+        # names are tested first, because `ConnectTimeoutError` is also a
+        # botocore `ConnectionError`. A certificate problem (`SSLError`), a
+        # proxy error (this adapter sets no proxy) and a `ClientError` (the
+        # storage answered) stay `other`: a retry does not pass them.
+        if names & {"ConnectTimeoutError", "ReadTimeoutError"}:
+            return TIMEOUT
+        if names & {"EndpointConnectionError", "ConnectionClosedError"}:
+            return UNREACHABLE
     return None
 
 
@@ -462,9 +490,11 @@ def _classify_one(exc: BaseException) -> str | None:
             UnknownAdapter,
             SecretRefRejected,
             oracle_adapter.OracleTlsConfigError,
+            oracle_adapter.OracleServiceNameError,
             ssrf_guard_sftp_module.HostKeyMismatch,
             ssrf_guard_mongo_module.MongoConfigRejected,
             saas_adapter.SaasSetupRefused,
+            KafkaTargetMissing,
         ),
     ):
         return SETTING_REJECTED

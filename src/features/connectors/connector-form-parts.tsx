@@ -8,9 +8,12 @@
 
 import * as React from "react"
 import { PencilIcon } from "lucide-react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
+import { RequiredMarker } from "@/components/ui/required"
 import { CdcDialForm } from "@/features/connectors/dial-forms/cdc-dial-form"
+import { CdcMongoDialForm } from "@/features/connectors/dial-forms/cdc-mongo-dial-form"
 import { FilesDialForm } from "@/features/connectors/dial-forms/files-dial-form"
 import { KafkaDialForm } from "@/features/connectors/dial-forms/kafka-dial-form"
 import { MongoDialForm } from "@/features/connectors/dial-forms/mongo-dial-form"
@@ -26,6 +29,7 @@ import { SECRET_MANAGER_LABEL, referenceProblem } from "@/lib/connectors/secret-
 import { saasVendorById } from "@/lib/connectors/saas-vendors"
 import type {
   CdcDial,
+  CdcMongoDial,
   CredentialKind,
   CredentialSettings,
   CredentialSource,
@@ -55,6 +59,10 @@ export function hostFromDial(adapter: string | null, dial: Record<string, unknow
     case "sql":
     case "cdc":
     case "sftp":
+      // A MongoDB change-capture dial names `hosts`, not `host` (`SRC-4` slice 5).
+      if (adapter === "cdc" && Array.isArray(dial.hosts)) {
+        return typeof dial.hosts[0] === "string" ? (dial.hosts[0] as string) : ""
+      }
       return typeof dial.host === "string" ? dial.host : ""
     case "files":
       return typeof dial.bucket === "string" ? dial.bucket : ""
@@ -240,6 +248,8 @@ export function normalizedCredential(slot: CredentialSlot, value: string): strin
  * names no single driver.
  */
 export function driverForType(typeName: string | null): SqlDriver | undefined {
+  // Oracle change capture only: the batch Oracle type has its own form (`DialFormFor`), so "Oracle" alone names no driver here.
+  if (typeName === "Oracle CDC") return "oracle"
   switch (typeName?.replace(/ CDC$/, "")) {
     case "PostgreSQL":
       return "postgres"
@@ -292,6 +302,15 @@ export function DialFormFor({
         />
       )
     case "cdc":
+      // MongoDB change capture has its own dial (hosts and a replica set, no host and port).
+      if (typeName === "MongoDB CDC") {
+        return (
+          <CdcMongoDialForm
+            value={dial as unknown as CdcMongoDial | null}
+            onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          />
+        )
+      }
       return (
         <CdcDialForm
           value={dial as unknown as CdcDial | null}
@@ -451,6 +470,10 @@ export function CredentialFields({
   if (noCredential) {
     return <p className="text-xs text-muted-foreground">This connection authenticates with no credential.</p>
   }
+  // On create a credential must be supplied; on edit a blank one keeps the
+  // stored value, so the two slots are optional unless a sign-in/target
+  // change forces a replacement (see the `optional` caller).
+  const required = !optional
   const manager = settings?.secretManager ?? null
   // With a secret manager set up, the form offers "Reference a secret"; the
   // operator can turn typing a value off, which leaves only the reference.
@@ -461,7 +484,7 @@ export function CredentialFields({
     showReference ? (
       <SecretReferenceField key={`${id}-${credentialSlotsKey(slots)}`} manager={manager} idPrefix={id} onChange={onChange} />
     ) : (
-      <CredentialValueInput id={id} slot={slot} value={value} onChange={onChange} />
+      <CredentialValueInput id={id} slot={slot} value={value} onChange={onChange} required={required} />
     )
   return (
     <div className={cn("grid gap-3", pair && !showReference && "sm:grid-cols-2")}>
@@ -498,6 +521,7 @@ export function CredentialFields({
       <Field
         label={showReference ? `${slots.primary.label} (reference)` : slots.primary.label}
         htmlFor={showReference ? undefined : "credential-primary"}
+        required={required}
         error={primaryValue && problems.primary ? problems.primary : undefined}
       >
         {field("credential-primary", slots.primary, primaryValue, onPrimaryValueChange)}
@@ -506,6 +530,7 @@ export function CredentialFields({
         <Field
           label={showReference ? `${typedSecondary.label} (reference)` : typedSecondary.label}
           htmlFor={showReference ? undefined : "credential-secondary"}
+          required={required}
           error={secondaryValue && problems.secondary ? problems.secondary : undefined}
         >
           {field("credential-secondary", typedSecondary, secondaryValue, onSecondaryValueChange)}
@@ -552,26 +577,27 @@ export function TenantField({
   const tenants = user?.tenants ?? []
   return (
     <Field label="Tenant" htmlFor="connector-tenant">
+      {/* WEB-9 D2/D2a: "Unassigned" is a real choice, so it stays an option
+          with value ""; a stored tenant the person's own list lacks shows the
+          placeholder instead of the first tenant as if it were chosen. */}
       {tenants.length === 0 ? (
         <p className="text-xs text-destructive">
           Your account belongs to no tenant, so a connector you create would not appear in any connector
           list. Ask an administrator to add you to a tenant.
         </p>
       ) : (
-        <select
+        <SelectField
           id="connector-tenant"
-          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+          className="w-full"
           value={value}
+          placeholder="Pick a tenant"
           disabled={disabled}
-          onChange={(e) => onChange(e.target.value)}
-        >
-          {value === "" ? <option value="">Unassigned</option> : null}
-          {tenants.map((t) => (
-            <option key={t.id} value={t.id}>
-              {t.name}
-            </option>
-          ))}
-        </select>
+          options={[
+            ...(value === "" ? [{ value: "", label: "Unassigned" }] : []),
+            ...tenants.map((t) => ({ value: t.id, label: t.name })),
+          ]}
+          onValueChange={(next) => onChange(next)}
+        />
       )}
       {hint ? <p className="text-xs text-muted-foreground">{hint}</p> : null}
     </Field>
@@ -598,10 +624,13 @@ export function StepSectionHeading({
   icon,
   title,
   description,
+  required,
 }: {
   icon: React.ReactNode
   title: string
   description: string
+  /** Marks a section whose control must be supplied (UX-1). */
+  required?: boolean
 }) {
   return (
     <div className="flex items-start gap-2.5">
@@ -609,7 +638,9 @@ export function StepSectionHeading({
         {icon}
       </span>
       <div className="min-w-0">
-        <h3 className="text-sm font-medium">{title}</h3>
+        <h3 className="flex items-center gap-1.5 text-sm font-medium">
+          {title} {required ? <RequiredMarker /> : null}
+        </h3>
         <p className="text-xs text-muted-foreground">{description}</p>
       </div>
     </div>
@@ -622,16 +653,18 @@ export function Field({
   className,
   htmlFor,
   error,
+  required,
 }: {
   label: string
   children: React.ReactNode
   className?: string
   htmlFor?: string
   error?: string
+  required?: boolean
 }) {
   return (
     <div className={cn("space-y-1.5", className)}>
-      <Label htmlFor={htmlFor}>{label}</Label>
+      <Label htmlFor={htmlFor} required={required}>{label}</Label>
       {children}
       {error ? <p className="text-xs text-destructive">{error}</p> : null}
     </div>

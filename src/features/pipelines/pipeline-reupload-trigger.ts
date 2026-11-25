@@ -2,8 +2,8 @@
  * The one `dependsOn` control the console offers (DATA-19 decision 2,
  * plan D3): "Run again after this table is re-uploaded".
  *
- * Pure, so the rules are unit-tested without rendering the five-step
- * form. The form holds two pieces of state this module owns the meaning
+ * Pure, so the rules are unit-tested without rendering the pipeline
+ * editor (`pipeline-editor.tsx`, BLD-1 part 1 D17). The editor holds two pieces of state this module owns the meaning
  * of: the stored chain (`PipelineDetail.dependsOn`, which may hold
  * upstreams this switch knows nothing about) and the one boolean the
  * user sees. Every rule lives here, in one place, rather than inline in

@@ -111,6 +111,36 @@ export function tabOf(tabs: readonly BoardTab[], layout: LayoutMap, id: string):
   return tabs.find((t) => t.id === named)?.id ?? tabs[0].id
 }
 
+/**
+ * `BI-48` (QA `LH-BI-6-40`): the layout with a copy of `originalId` placed
+ * directly below it — its own tab, its width and height — and every other tile
+ * at or below the original's bottom on that tab moved down by the copy's
+ * height. Every one of them moves, not only the tiles under the original's
+ * columns: a uniform shift cannot make two tiles overlap. A tile on another tab
+ * is untouched, and an original with no box (drawn below everything, never
+ * placed) leaves the layout as it is.
+ */
+export function placeCopyBelow(
+  tabs: readonly BoardTab[],
+  layout: LayoutMap,
+  ids: readonly string[],
+  originalId: string,
+  copyId: string,
+): LayoutMap {
+  const original = layout[originalId]
+  if (!original) return layout
+  const tab = tabOf(tabs, layout, originalId)
+  const bottom = original.y + original.h
+  const out: LayoutMap = { ...layout, [copyId]: { ...original, y: bottom } }
+  for (const id of ids) {
+    if (id === originalId || id === copyId) continue
+    const box = out[id]
+    if (!box || tabOf(tabs, layout, id) !== tab) continue
+    if (box.y >= bottom) out[id] = { ...box, y: box.y + original.h }
+  }
+  return out
+}
+
 /** Whether a filter is given to a tile on `tab`. A board with no tabs (`tab` undefined) ignores ties. */
 export function appliesOnTab(f: FilterDef, tab: string | undefined): boolean {
   if (tab === undefined || !f.tabs || f.tabs.length === 0) return true

@@ -22,6 +22,20 @@ function plainSpaces(s: string): string {
   return s.replace(/[  ]/g, " ")
 }
 
+/**
+ * How a currency's symbol is asked of `Intl`.
+ *
+ * QA `LH-BI-1-06` (`BI-55`, D12): the English number locale has no symbol for
+ * IDR, so `symbol` writes "IDR 1,234" there; its narrow symbol is "Rp" in both
+ * locales. Every other currency keeps `symbol`, because the narrow symbol of
+ * SGD, CAD and AUD is "$", which reads as US dollars.
+ */
+function currencyDisplayOf(fmt: ValueFormat): "symbol" | "narrowSymbol" | "code" {
+  const display = fmt.currencyDisplay ?? "symbol"
+  if (display !== "symbol") return display
+  return (fmt.currency ?? "IDR") === "IDR" ? "narrowSymbol" : "symbol"
+}
+
 function fraction(decimals: number | undefined, fallbackMax: number): Intl.NumberFormatOptions {
   return decimals === undefined
     ? { maximumFractionDigits: fallbackMax }
@@ -82,7 +96,7 @@ function body(v: number, fmt: ValueFormat, locale: string, autoDecimals: number)
     }
     case "currency": {
       const code = fmt.currency ?? "IDR"
-      const display = fmt.currencyDisplay ?? "symbol"
+      const display = currencyDisplayOf(fmt)
       return plainSpaces(
         new Intl.NumberFormat(locale, {
           style: "currency",
@@ -106,7 +120,7 @@ function compactCurrency(v: number, fmt: ValueFormat, locale: string): string {
     new Intl.NumberFormat(locale, {
       style: "currency",
       currency: fmt.currency ?? "IDR",
-      currencyDisplay: fmt.currencyDisplay ?? "symbol",
+      currencyDisplay: currencyDisplayOf(fmt),
       useGrouping: fmt.thousands !== false,
       ...(decimals === undefined ? {} : fraction(decimals, decimals)),
     }).format(scaled),

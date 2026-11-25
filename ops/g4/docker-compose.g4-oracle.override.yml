@@ -1,0 +1,87 @@
+# ops/g4/docker-compose.g4-oracle.override.yml -- SRC-4 slice 6 (plan T6.3), GATE-ONLY.
+#
+# The `g4-oracle` gate (ops/g4/g4_oracle_test.py) creates an Oracle change-capture connector through the
+# API against the Oracle Database Free fixture of the `g6-oracle` gate. It is layered ON TOP of
+# ops/g6/docker-compose.g6-oracle.override.yml (the fixture, the `file:` credential store, the gate-only
+# internal-host switches); that file does not combine with ops/g6/docker-compose.g6.override.yml (see its
+# header), and this gate needs nothing of the other fixtures. Used as
+#
+#   docker compose -p g4oraci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml \
+#     -f ops/g4/docker-compose.g4-oracle.override.yml --profile g6-oracle --profile dagster --profile cdc \
+#     --profile g4-oracle up -d --no-build ...
+#
+# What this file adds:
+#
+# 1. `KAFKA_CONNECT_URL` and `CDC_KAFKA_BOOTSTRAP` on the API and the applier, empty in the template (which
+#    keeps change capture off). Oracle keeps its schema history in a Kafka topic, like MySQL and SQL Server.
+# 2. ARCHIVELOG and minimal supplemental logging on the fixture, by an idempotent script in
+#    /container-entrypoint-startdb.d (oracle-startdb.d/01_archivelog.sh): LogMiner needs both and the image
+#    has neither (decision S6-h). Oracle restarts once to enter ARCHIVELOG, so the gate polls for it.
+# 3. The runner, built from the code-location image (it has `oracledb`, `requests` and `kafka-python`), with
+#    `lakehouse_cdc_secrets` mounted READ-ONLY so the gate can prove that the password file exists and is removed
+#    on DELETE; production mounts that volume in `lakehouse-api` and `kafka-connect` only.
+#
+# Credentials are `${X:?}`, set by the CI job for its throwaway stack; no default exists anywhere.
+services:
+  lakehouse-api:
+    environment:
+      KAFKA_CONNECT_URL: http://kafka-connect:8083
+      CDC_KAFKA_BOOTSTRAP: kafka:9092
+
+  dagster-code-location:
+    environment:
+      CDC_KAFKA_BOOTSTRAP: kafka:9092
+
+  oracle-g6:
+    volumes:
+      - ./ops/g4/oracle-startdb.d:/container-entrypoint-startdb.d:ro
+
+  g4-oracle-test-runner:
+    profiles: ["g4-oracle"]
+    image: ${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}
+    working_dir: /work
+    depends_on:
+      oracle-g6:
+        condition: service_healthy
+      lakehouse-api:
+        condition: service_started
+      dagster-webserver:
+        condition: service_healthy
+    volumes:
+      - ./ops/g4:/work
+      # At /opt/gates for the reason `g4-test-runner` gives: a bind mount nested under the
+      # bind-mounted /work would make Docker create the mount point on the host.
+      - ./ops/gates:/opt/gates:ro
+      - type: volume
+        source: g6_secrets
+        target: /gate-secrets
+      - type: volume
+        source: lakehouse_cdc_secrets
+        target: /cdc-secrets
+        read_only: true
+    environment:
+      PYTHONPATH: /opt/gates
+      PYTHONDONTWRITEBYTECODE: "1"
+      # The gate prints a marker line the CI job waits for: no buffering.
+      PYTHONUNBUFFERED: "1"
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      CH_LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      CH_OAUTH_CLIENT_ID: clickhouse-reader
+      CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
+      API_URL: http://lakehouse-api:8080
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      KAFKA_CONNECT_URL: http://kafka-connect:8083
+      CDC_KAFKA_BOOTSTRAP: kafka:9092
+      # SYS of the fixture container (the gate creates the connector's user and the tables as SYS).
+      ORACLE_G6_PASSWORD: ${ORACLE_G6_PASSWORD:?}
+      # The password of the connector's common user c##dbzuser and of the schema owner: a throwaway of
+      # this gate's stack, letters, digits and underscores only (the gate puts it in a quoted DDL).
+      G4_ORACLE_CDC_PASSWORD: ${G4_ORACLE_CDC_PASSWORD:?}
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["python g4_oracle_test.py"]
+    restart: "no"

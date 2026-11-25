@@ -408,10 +408,12 @@ class SinkConfig:
     rustfs_secret_key: str
     warehouse_bucket: str
     lakekeeper_token: str
-    # Who the commits of OUR OWN `pyiceberg` writes (the history mode, emptying a table)
-    # are recorded as: the run's label, e.g. `connector conn-x, run 1a2b`
-    # (`history.snapshot_properties`). Empty when the caller has no run context; `dlt`'s
-    # own commits do not carry it (`DATA-15` F5: that is the loader's owners' change).
+    # Who the commits of this sink's writes are recorded as: the run's label, e.g.
+    # `connector conn-x, run 1a2b`, or `<name> (file upload)` (`history.snapshot_properties`,
+    # `DATA-52`). It reaches our own `pyiceberg` writes (the history mode, emptying a table,
+    # a type-changing replace) and the streamed write of a `replace` or an `append`, which
+    # carries it through `iceberg_stream.snapshot_properties_for`. A merge load is `dlt`'s
+    # own write and records none. Empty when the caller has no run context.
     author: str = ""
 
     @classmethod
@@ -692,6 +694,18 @@ def _bronze_pipeline(bronze_table_name: str, config: SinkConfig) -> Any:
     )
 
 
+def open_bronze_table(bronze_table_name: str, config: SinkConfig) -> Any | None:
+    """The `pyiceberg` table of one Bronze table through Lakekeeper's REST catalog,
+    or `None` when `dlt` does not know it yet. For a writer that commits its own
+    `pyiceberg` transaction (the change-capture applier, `cdc_apply.py`, which must
+    delete and append in one commit: `dlt`'s Iceberg merge cannot delete, plan
+    `SRC-4` amendment 1). Addresses the table the way `load_via_sink` and
+    `clear_table` do, so both see the same one."""
+    _install_catalog_env(config)
+    pipeline = _bronze_pipeline(bronze_table_name, config)
+    return history.open_table(pipeline, bronze_table_name)
+
+
 def empty_table(pipeline: Any, bronze_table_name: str, author: str = "") -> bool:
     """Delete every row of a Bronze table in ONE `pyiceberg` transaction, keeping the
     table: its columns, its day partition on `_ingested_at`, `format-version` 2 and its
@@ -901,7 +915,7 @@ def _fit_batch(batch: pa.Table, target: pa.Schema, load_id: str) -> pa.Table:
 
 
 def _replace_changing_types(
-    table: Any, source: Any, changed: list[str], column_types: Mapping[str, str]
+    table: Any, source: Any, changed: list[str], column_types: Mapping[str, str], author: str = ""
 ) -> int:
     """`DATA-18` decision 9, "replacing a table may change its types": write a `replace` that
     changes column types as ONE `pyiceberg` transaction, the new schema and the new rows
@@ -926,6 +940,9 @@ def _replace_changing_types(
     The table's `dlt` schema (in the bucket) keeps the old types of the changed columns
     until the next `dlt` load of the table, which always declares its column types, and
     those declarations win (section 8 item 5: no variant column).
+
+    `author` is who the commit is recorded as (`DATA-52`), as every other write of this
+    sink's own `pyiceberg` commits is.
 
     Returns the number of rows written. # Errors: whatever the catalog, the cast or
     `source` raises; nothing is committed then."""
@@ -957,7 +974,13 @@ def _replace_changing_types(
         target = transaction.table_metadata.schema().as_arrow()
         # A replace: the table's own rows are deleted and the load's rows are added, in ONE
         # snapshot. A load of no rows at all empties the table, as it did before.
-        iceberg_snapshot.write_one_snapshot(table, transaction, groups(target), replace=True)
+        iceberg_snapshot.write_one_snapshot(
+            table,
+            transaction,
+            groups(target),
+            replace=True,
+            snapshot_properties=history.snapshot_properties(author),
+        )
     return rows
 
 
@@ -1228,7 +1251,9 @@ def load_via_sink(
             changed = _changed_columns(retype_table, column_types) if retype_table is not None else []
         if changed and retype_table is not None and column_types is not None:
             # Phase 3 slice 3 review BLOCKER 1: one transaction, never a drop.
-            written = _replace_changing_types(retype_table, source, changed, column_types)
+            written = _replace_changing_types(
+                retype_table, source, changed, column_types, author=config.author
+            )
             return SinkResult(
                 rows=written,
                 has_failed_jobs=False,
@@ -1236,13 +1261,18 @@ def load_via_sink(
                 columns=(),  # dlt's schema is not updated by this path: nothing to report, nothing guessed
             )
         else:
-            load_info = pipeline.run(
-                source,
-                table_name=bronze_table_name,
-                table_format="iceberg",
-                write_disposition=write_disposition,
-                **run_options,
-            )
+            # `DATA-52`: `dlt` calls the streamed write from its own threads, so the author
+            # is registered for this table for the length of the run and read there.
+            with iceberg_stream.snapshot_properties_for(
+                bronze_table_name, history.snapshot_properties(config.author)
+            ):
+                load_info = pipeline.run(
+                    source,
+                    table_name=bronze_table_name,
+                    table_format="iceberg",
+                    write_disposition=write_disposition,
+                    **run_options,
+                )
         dedup.assert_flushed(dedup_steps, table=bronze_table_name)
     except Exception as exc:
         # SRC-10 measurement 4: a failed load leaves its package pending and the

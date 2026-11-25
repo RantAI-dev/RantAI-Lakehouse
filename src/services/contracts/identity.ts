@@ -1,13 +1,24 @@
 export type User = {
   id: string
   name: string
-  email: string
+  username: string
+  email: string | null
   status: "active" | "inactive"
   roles: string[]
   tenants: string[]
   // Nothing writes app_user.last_activity_at (no login, session, or token
   // use records it), so the server never serves a fabricated value here.
   lastActivity: string | null
+}
+
+/**
+ * One entry of the central permission catalog (`WEB-8` D1). Served by
+ * `GET /api/identity/permissions` in catalog order.
+ */
+export type Permission = {
+  name: string
+  area: string
+  description: string
 }
 
 export type Role = {
@@ -45,11 +56,23 @@ export type ServiceIdentity = {
   lastUsedAt: string | null
 }
 
+export type PasswordInput =
+  | { mode: "generate" }
+  | { mode: "set"; value: string }
+
 export type InviteUserInput = {
   name: string
-  email: string
+  username?: string
+  email?: string | null
   roles: string[]
   tenants: string[]
+  password?: PasswordInput
+  mustChangePassword?: boolean
+}
+
+export type UpdateUserInput = {
+  username?: string
+  email?: string | null
 }
 
 /**
@@ -69,7 +92,7 @@ export type InviteUserResponse = User & {
    * The server-generated temporary password. Shown once and never
    * recoverable: the user must change it at first sign-in.
    */
-  temporaryPassword: string
+  temporaryPassword?: string
 }
 
 /**
@@ -107,6 +130,51 @@ export type CreateRoleInput = {
   description: string
 }
 
+/**
+ * What a role is rewritten with (WEB-3 S3a-D2). The name must not collide
+ * with another role's. A rename is not rewritten into a policy's free-text
+ * `subjects`, so a policy that named the old name stops applying to that
+ * role.
+ */
+export type UpdateRoleInput = {
+  name: string
+  permissions: string
+  description: string
+}
+
+/**
+ * One schema or table a role may read (`GOV-7` D3/D7). `table: "*"` means
+ * the whole schema. A name need not exist in the catalog yet: a grant may
+ * name a table a pipeline creates later.
+ */
+export type RoleTableGrant = {
+  schema: string
+  table: string
+}
+
+/**
+ * A role's read access, as `GET /api/identity/roles/{id}/table-access`
+ * answers it and `PUT` stores it (`GOV-7` D7, `role.read_scope` plus
+ * `role_read_grant`).
+ *
+ * `"all"` is the default for every existing and new role, so an upgrade
+ * changes nobody's access (D1); `"listed"` reads only the granted schemas
+ * and tables. The server sorts `grants` and stores none for `"all"`.
+ */
+export type RoleTableAccess = {
+  scope: "all" | "listed"
+  grants: RoleTableGrant[]
+}
+
+/**
+ * What `PUT …/table-access` takes: the role's COMPLETE access, not a delta
+ * — a grant left out is a grant the role no longer holds.
+ */
+export type SetRoleTableAccessInput = {
+  scope: "all" | "listed"
+  grants: RoleTableGrant[]
+}
+
 export type CreateTenantInput = {
   name: string
   slug: string
@@ -137,6 +205,10 @@ export type RotateServiceIdentityResponse = {
 }
 
 export interface IdentityService {
+  /**
+   * The central list of permission strings the API checks (`WEB-8` D1/D4).
+   */
+  listPermissions(signal?: AbortSignal): Promise<Permission[]>
   listUsers(signal?: AbortSignal): Promise<User[]>
   listRoles(signal?: AbortSignal): Promise<Role[]>
   listTenants(signal?: AbortSignal): Promise<Tenant[]>
@@ -146,6 +218,32 @@ export interface IdentityService {
     signal?: AbortSignal
   ): Promise<InviteUserResponse>
   createRole(input: CreateRoleInput, signal?: AbortSignal): Promise<Role>
+  /**
+   * Rewrite a role's name, permissions and description; needs
+   * `identity:write`. 409 when another role has the name.
+   */
+  updateRole(id: string, input: UpdateRoleInput, signal?: AbortSignal): Promise<Role>
+  /**
+   * Remove a role nobody holds; needs `identity:write`. 409 with the API's
+   * own sentence when people still hold it, or when it is a built-in role.
+   */
+  deleteRole(id: string, signal?: AbortSignal): Promise<void>
+  /**
+   * What a role may read (`GOV-7` D7); needs `identity:read`. A role nobody
+   * narrowed answers `"all"` with no grants.
+   */
+  getRoleTableAccess(id: string, signal?: AbortSignal): Promise<RoleTableAccess>
+  /**
+   * Replace a role's read scope and its grants in one request (`GOV-7` D7);
+   * needs `identity:write`. The API refuses a role holding `*:*` ("A role
+   * with full access cannot be narrowed") and a name that is not a plain
+   * identifier, each with a 400 carrying its own sentence.
+   */
+  setRoleTableAccess(
+    id: string,
+    input: SetRoleTableAccessInput,
+    signal?: AbortSignal
+  ): Promise<RoleTableAccess>
   createTenant(input: CreateTenantInput, signal?: AbortSignal): Promise<Tenant>
   createServiceIdentity(
     input: CreateServiceIdentityInput,
@@ -190,6 +288,7 @@ export interface IdentityService {
    * Switch a user off (ADM-4 D3): they can no longer sign in, and every
    * session they hold ends at once. Their data stays.
    */
+  updateUser(id: string, input: UpdateUserInput, signal?: AbortSignal): Promise<User>
   deactivateUser(id: string, signal?: AbortSignal): Promise<User>
   /**
    * Switch a user back on (ADM-4 D3).

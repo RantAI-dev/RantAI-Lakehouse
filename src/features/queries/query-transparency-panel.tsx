@@ -10,7 +10,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { DeprecationNotice } from "@/features/catalog/asset-certification"
 import type { ActionState } from "@/hooks/use-service"
 import { formatBytes, formatCost } from "@/lib/format"
-import { ENGINE_CATEGORY_LABEL, WORKLOAD_CLASS_LABEL } from "@/lib/status"
+import { queryEngineLabel, WORKLOAD_CLASS_LABEL } from "@/lib/status"
 import type { QueryEstimate, QueryPlanStage } from "@/services/contracts/queries"
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
@@ -126,22 +126,52 @@ export function QueryPlanPanel({ plan }: { plan: QueryPlanStage[] | null }) {
 export function QueryTransparencyPanel({
   state,
   estimatable,
+  estimateSupported = true,
+  waitingFor = null,
   onRetry,
 }: {
   state: ActionState<QueryEstimate>
   /** Whether the editor holds a statement worth estimating. */
   estimatable?: boolean
+  /**
+   * Whether the open tab's engine has an estimate at all. Only ClickHouse
+   * does: the server's `EXPLAIN ESTIMATE` has no Trino counterpart, so a Trino
+   * tab never asks and the panel says so (LH-QS-4-08).
+   */
+  estimateSupported?: boolean
+  /**
+   * The first parameter the estimate waits for, or `null`. The panel names it
+   * in the spelling of the run's refusal (QS-5-AC14).
+   */
+  waitingFor?: string | null
   onRetry: () => void
 }) {
+  if (!estimateSupported) {
+    // Every other state is about an estimate this tab cannot have, so none
+    // of them is shown: a leftover refusal or error would blame the query
+    // for something the engine simply does not do.
+    return (
+      <SectionCard
+        title="Execution transparency"
+        description="Pre-run estimate. Engine categories stay product-neutral."
+      >
+        <p className="text-sm text-muted-foreground">No pre-run estimate for Trino queries.</p>
+      </SectionCard>
+    )
+  }
   return (
     <SectionCard
       title="Execution transparency"
-      description="Pre-run estimate. Engine categories stay product-neutral."
+      description="Pre-run estimate."
     >
       {/* An empty editor gets no estimate and says so, rather than
           reporting a confident "0 B · 1.00 cu · Fresh · 0 s" about
-          nothing. */}
-      {state.status === "idle" || estimatable === false ? (
+          nothing. A statement that waits for a parameter names it. */}
+      {waitingFor !== null ? (
+        <p className="text-sm text-muted-foreground">
+          {`Fill in {{${waitingFor}}} for a pre-run estimate.`}
+        </p>
+      ) : state.status === "idle" || estimatable === false ? (
         <p className="text-sm text-muted-foreground">
           Type SQL for a pre-run estimate.
         </p>
@@ -165,10 +195,24 @@ export function QueryTransparencyPanel({
           <Skeleton className="h-4 w-5/6" />
         </div>
       ) : null}
-      {/* A query ClickHouse cannot even plan has no estimate — and its
-          reason (unknown column, missing table) is the most useful thing
+      {/* QA LH-QS-4-08 (QS-6), decision 7: a Trino statement has no pre-run
+          estimate. The server says so in a fixed sentence; the panel names
+          the engine and shows no source and no error, because nothing was
+          sent and nothing was read. */}
+      {state.data?.supported === false && estimatable !== false ? (
+        <div className="space-y-2 text-sm">
+          <p className="text-sm font-medium">No pre-run estimate</p>
+          <p className="text-muted-foreground">{state.data.reason}</p>
+          <dl className="space-y-2">
+            <Row label="Engine">{queryEngineLabel(state.data.queryEngine ?? "")}</Row>
+          </dl>
+        </div>
+      ) : null}
+      {/* A query ClickHouse cannot even plan has no estimate. Its reason is
+          the server's fixed sentence and reference id (the engine's text is
+          logged under that reference, `SEC-11`). It is the most useful thing
           on this panel, so it is shown instead of a row of zeros. */}
-      {state.data?.error && estimatable !== false ? (
+      {state.data?.error && state.data.supported !== false && estimatable !== false ? (
         <div className="space-y-1">
           <p className="text-sm font-medium">This query cannot be planned</p>
           <p className="font-mono text-xs leading-relaxed text-muted-foreground">
@@ -176,7 +220,7 @@ export function QueryTransparencyPanel({
           </p>
         </div>
       ) : null}
-      {state.data && !state.data.error && estimatable !== false ? (
+      {state.data && !state.data.error && state.data.supported !== false && estimatable !== false ? (
         <dl
           className={
             state.status === "pending"
@@ -192,8 +236,12 @@ export function QueryTransparencyPanel({
               ? `${formatCost(state.data.estimatedCostMin)}–${formatCost(state.data.estimatedCostMax)}`
               : "—"}
           </Row>
-          <Row label="Workload">{WORKLOAD_CLASS_LABEL[state.data.workloadClass]}</Row>
-          <Row label="Engine">{ENGINE_CATEGORY_LABEL[state.data.engine]}</Row>
+          <Row label="Workload">
+            {state.data.workloadClass ? WORKLOAD_CLASS_LABEL[state.data.workloadClass] : "—"}
+          </Row>
+          <Row label="Engine">
+            {queryEngineLabel(state.data.queryEngine ?? "clickhouse")}
+          </Row>
           <Row label="Cache">
             {/* Null means nobody asked the cache, which is not the same as
                 "not eligible" — saying either would be a guess. */}
@@ -206,14 +254,21 @@ export function QueryTransparencyPanel({
             )}
           </Row>
           <Row label="Freshness">
-            <FreshnessIndicator lagSeconds={state.data.freshnessLagSeconds} />
+            {/* QS-10 (LH-QS-1-11), D2: without catalog:read the server sends no
+                freshness at all — say why instead of showing a stale 0. */}
+            {state.data.catalogHidden ? (
+              <span className="text-muted-foreground">Needs catalog access</span>
+            ) : (
+              <FreshnessIndicator lagSeconds={state.data.freshnessLagSeconds} />
+            )}
           </Row>
           <div>
             <dt className="text-muted-foreground">Policy obligations</dt>
             <dd className="mt-1 flex flex-wrap gap-1">
               {state.data.policyObligations == null ? (
-                // No policy engine runs before a query here. "None" would
-                // read as "checked, nothing applies".
+                // QS-10 (LH-QS-2-05), D4: null now only comes from an older
+                // server or a Trino estimate, which is not rewritten. "None"
+                // would read as "checked, nothing applies".
                 <span className="text-xs text-muted-foreground">
                   Not evaluated
                 </span>
@@ -231,7 +286,15 @@ export function QueryTransparencyPanel({
           <div>
             <dt className="text-muted-foreground">Sources</dt>
             <dd className="mt-1">
-              <SourcesList sources={state.data.sources} marks={state.data.sourceMarks} />
+              {/* QS-10 (LH-QS-1-11), D2/D3: withhold the catalog's answer, or
+                  say the plan named no table — never invent a source. */}
+              {state.data.catalogHidden ? (
+                <span className="text-muted-foreground">Needs catalog access</span>
+              ) : state.data.sources.length === 0 ? (
+                <span className="text-muted-foreground">No table found in the plan</span>
+              ) : (
+                <SourcesList sources={state.data.sources} marks={state.data.sourceMarks} />
+              )}
             </dd>
           </div>
           <QueryPlanPanel plan={state.data.plan} />

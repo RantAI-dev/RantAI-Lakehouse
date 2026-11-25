@@ -4,13 +4,27 @@ import { devOrigins } from "./src/lib/dev-origins";
 // `OPS-11`: Next.js 16.4 serves the dev server's own resources (HMR, chunks)
 // only to `localhost` unless the host is listed here, so a dev console opened
 // by a LAN address never finishes loading. `CONSOLE_ALLOWED_DEV_ORIGINS`
-// (comma-separated hostnames, `*.` wildcards allowed, see `.env.example`) adds
+// (comma-separated hostnames, `*.` wildcards allowed, see docs/CONFIGURATION.md) adds
 // hosts; `127.0.0.1` is always allowed (`BI-1 QA fix`, see `src/lib/dev-origins.ts`).
 // It affects `next dev` only: a production build ignores it.
 const allowedDevOrigins = devOrigins(process.env.CONSOLE_ALLOWED_DEV_ORIGINS);
 
 const nextConfig: NextConfig = {
   allowedDevOrigins,
+
+  // `OPS-40`: `next dev` writes a managed agent-rules block into the project
+  // root's `AGENTS.md` whenever it detects an AI coding agent
+  // (`node_modules/next/dist/server/lib/generate-agent-files.js`). That
+  // writer is not new in 16.4.5: it was already active on 16.4.3 and rewrote
+  // this repository's `AGENTS.md` on 2026-11-04
+  // (`docs/superpowers/plans/2026-11-04-web-3-console-cleanup.md:462`), before
+  // the advisories behind Next's own security gate were published. On 16.4.3
+  // that gate stops the dev server, so the console cannot be started locally
+  // at all; on 16.4.5 the dev server starts again, and the writer would run
+  // on every `bun run dev` and rewrite the agent-rules file every session
+  // reads first: this repository's own root `AGENTS.md`. Keep the writer off;
+  // the guard in `src/app/agent-rules.test.ts` fails if it is switched back on.
+  agentRules: false,
 
   // Jejak build mandiri (server + node_modules minimal) supaya image Docker
   // konsol tetap ramping — dipakai stack demo `rantai-lake-demo`.

@@ -10,7 +10,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -120,15 +120,36 @@ fn clause_hides_board(sql: &str) -> bool {
     false
 }
 
-/// The `owner_id` a saved rule's `INSERT` wrote: the rule's last value, a
-/// single-quoted literal (`SqlLiteral` doubles an inner quote; owner ids never
-/// carry one).
+/// The `owner_id` a saved rule's `INSERT` wrote. The column is found by name in
+/// the statement's column list and its value by splitting the `VALUES` list on
+/// the commas outside quotes (`SqlLiteral` doubles an inner quote). It used to
+/// be "the last literal", which stopped being the owner when `BI-65` added
+/// `schedule` and `time_zone` after it: the fake then served an empty owner for
+/// the re-read, the rule looked as if it watched something else, and its state
+/// was dropped (PR #650 CI). This is the stand-in's mistake, not the product's:
+/// a real `ClickHouse` returns the stored owner.
 fn inserted_owner(sql: &str) -> Option<String> {
-    // `save_rule` writes `VALUES ('id','name',...)` with no space after a
-    // comma, and `owner_id` is the last column.
-    let values = sql.split(") VALUES (").nth(1)?;
-    let last = values.rsplit("','").next()?;
-    Some(last.strip_suffix("')")?.to_owned())
+    let (head, values) = sql.split_once(") VALUES (")?;
+    let columns = head.split_once('(')?.1;
+    let at = columns.split(',').position(|c| c == "owner_id")?;
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = values.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if quoted && chars.peek() == Some(&'\'') => {
+                chars.next();
+                current.push('\'');
+            }
+            '\'' => quoted = !quoted,
+            ',' if !quoted => fields.push(std::mem::take(&mut current)),
+            ')' if !quoted => break,
+            _ => current.push(c),
+        }
+    }
+    fields.push(current);
+    fields.get(at).cloned()
 }
 
 impl Respond for FakeCh {
@@ -258,12 +279,15 @@ async fn fixture_in(target: &str, tenant: &str) -> Fixture {
     ]);
     let app = spin_up_with_env(&env).await;
     let role = Uuid::new_v4();
-    sqlx::query("INSERT INTO role (id, name, permissions, description) VALUES ($1, 'Chart Owner', 'dashboard:read', 'test')")
+    // `ADM-13` D5: reading the rule list takes `alert:read` or `alert:write`.
+    // The chart owner holds `alert:read` only, so the tests below still prove
+    // that saving for anybody else needs `alert:write`.
+    sqlx::query("INSERT INTO role (id, name, permissions, description) VALUES ($1, 'Chart Owner', 'dashboard:read, alert:read', 'test')")
         .bind(role)
         .execute(&app.pool)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Owner', 'owner@test.invalid', 'active')")
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Owner', 'owner', 'owner@test.invalid', 'active')")
         .bind(owner)
         .execute(&app.pool)
         .await
@@ -399,7 +423,7 @@ async fn an_owner_who_is_disabled_stops_the_alert_and_says_why() {
     let cookie_owner = f.owner;
     // A second, active person triggers the run; the owner is then disabled.
     let other = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Other', 'other@test.invalid', 'active')")
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Other', 'other', 'other@test.invalid', 'active')")
         .bind(other)
         .execute(&f.app.pool)
         .await
@@ -615,7 +639,7 @@ async fn renaming_a_rule_keeps_its_state() {
 async fn an_owner_who_lost_the_dashboard_stops_the_alert() {
     let f = fixture("owner@test.invalid").await;
     let other = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Other', 'o2@test.invalid', 'active')")
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Other', 'o2', 'o2@test.invalid', 'active')")
         .bind(other)
         .execute(&f.app.pool)
         .await
@@ -692,9 +716,10 @@ async fn writer(pool: &PgPool, name: &str, permissions: &str) -> Uuid {
     .await
     .unwrap();
     let user = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, $2, $3, 'active')")
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, $2, $3, $4, 'active')")
         .bind(user)
         .bind(format!("{name} person"))
+        .bind(user.to_string())
         .bind(format!("{user}@test.invalid"))
         .execute(pool)
         .await
@@ -773,7 +798,7 @@ async fn a_mart_rules_disabled_owner_stops_it_with_the_sentence_and_sends_nothin
     *f.fake.plain.lock().unwrap() = true;
     let owner = f.owner;
     let trigger = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Trigger', 'trigger@test.invalid', 'active')")
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Trigger', 'trigger', 'trigger@test.invalid', 'active')")
         .bind(trigger)
         .execute(&f.app.pool)
         .await
@@ -947,4 +972,79 @@ async fn the_rule_list_names_no_chart_the_caller_cannot_see() {
     for field in ["chartTitle", "dashboardId", "dashboardTitle"] {
         assert!(rule.get(field).is_none(), "{field} is absent: {rule}");
     }
+}
+
+// ---- BI-43 D1: a person lists and removes only their own alerts on a chart ----
+
+/// A `DELETE /api/alerts?id=`, as `who`.
+async fn delete_alert(f: &Fixture, who: Uuid, id: &str) -> u16 {
+    let cookie = session_cookie_for_user(&f.app.pool, who).await;
+    let resp = f
+        .app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/alerts?id={id}"))
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    resp.status().as_u16()
+}
+
+/// The owner holds `dashboard:read` and nothing else (a Dashboard Viewer: no
+/// `alert:read`, so `GET /api/alerts` is closed to them), and still lists their
+/// own alert on the chart, target included.
+#[tokio::test]
+async fn a_person_without_alert_read_lists_their_own_alerts_on_a_chart() {
+    let f = fixture("owner@test.invalid").await;
+    sqlx::query("UPDATE role SET permissions = 'dashboard:read' WHERE name = 'Chart Owner'")
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+
+    let (status, _) = get_json(&f, f.owner, "/api/alerts").await;
+    assert_eq!(status, 403, "the full list stays behind alert:read");
+
+    let (status, body) = get_json(&f, f.owner, "/api/alerts/mine?chart=c_kpi").await;
+    assert_eq!(status, 200, "{body}");
+    let rules = body["rules"].as_array().unwrap();
+    assert_eq!(rules.len(), 1, "{body}");
+    assert_eq!(rules[0]["id"], json!(RULE), "{body}");
+    assert_eq!(rules[0]["target"], json!("owner@test.invalid"), "{body}");
+}
+
+/// Another person sees none of it: the rule is the owner's, so a second viewer
+/// gets an empty list for the same chart, and so does the owner for a chart the
+/// rule does not watch.
+#[tokio::test]
+async fn the_own_alert_list_holds_only_the_callers_rules_on_that_chart() {
+    let f = fixture("owner@test.invalid").await;
+    let other = common::create_principal_with_permissions(&f.app.pool, "dashboard:read").await;
+
+    let (status, body) = get_json(&f, other, "/api/alerts/mine?chart=c_kpi").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rules"], json!([]), "{body}");
+
+    let (status, body) = get_json(&f, f.owner, "/api/alerts/mine?chart=c_other").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rules"], json!([]), "{body}");
+
+    let (status, body) = get_json(&f, f.owner, "/api/alerts/mine").await;
+    assert_eq!(status, 400, "a chart is required: {body}");
+}
+
+/// Remove: the owner removes their own chart alert without `alert:write`;
+/// another person without it is refused, and nothing is written for them.
+#[tokio::test]
+async fn a_person_removes_their_own_chart_alert_and_not_anothers() {
+    let f = fixture("owner@test.invalid").await;
+    let other = common::create_principal_with_permissions(&f.app.pool, "dashboard:read").await;
+
+    assert_eq!(delete_alert(&f, other, RULE).await, 403);
+    assert_eq!(delete_alert(&f, f.owner, RULE).await, 200);
 }

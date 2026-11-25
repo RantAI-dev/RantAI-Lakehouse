@@ -5,10 +5,12 @@
 //! `ClickHouse` aggregates with `Dagster` run history (`POST` is
 //! read-only despite the verb — it only lists recent runs).
 
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use lakehouse_auth::Principal;
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
@@ -366,21 +368,103 @@ async fn count_delayed_schedules(
     Some(delayed)
 }
 
+/// The answer to a feed whose trail could not be read.
+///
+/// The run list of the orchestrator is not theirs to read, and an empty 200
+/// would read as "you have done nothing yet" when the read failed. A fixed
+/// message: the database's own text never reaches a response (`AGENTS.md`
+/// principle 4).
+fn trail_read_failed() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        ApiJson(json!({ "activity": [], "error": "database error" })),
+    )
+        .into_response()
+}
+
 /// `POST /api/overview` — the recent-activity feed, from the audit trail
 /// (every console and Copilot action lands there). Despite the verb this
 /// reads only; there is no request body and nothing is mutated.
 ///
-/// `Dagster` run history is the fallback for deployments whose console
-/// Postgres is not configured.
-pub async fn refresh(State(state): State<AppState>) -> Response {
+/// The route is open to every signed-in person (`Policy::RequiresAuth`), but
+/// the feed is a read of the audit trail, and only `audit:read` reads that
+/// (`GOV-1` Decision 9). A holder gets the newest rows of everyone; anybody
+/// else gets the newest rows of their own. The route is reachable only
+/// signed in and nothing calls this function in-process, so a principal is
+/// always present: there is no unnarrowed no-principal branch, unlike
+/// `governance::read_kind`.
+///
+/// `SEC-20` (plan 100): the trail is read per tenant, so the feed holds the
+/// rows of the caller's own organisation, and the deployment's own rows only
+/// for the tenant that owns the shared catalog. The reach is resolved where
+/// the trail is read, because it narrows that read and nothing else.
+///
+/// `Dagster` run history is the fallback for a deployment whose console
+/// Postgres is not configured at all, and — after a trail read that failed —
+/// for the reach that holds the deployment's own rows. It lists the runs
+/// of every pipeline, not the person's own actions, so it is served to a
+/// holder of `audit:read` only — plan 98's rule, which plan 100's decision 6
+/// keeps ("nothing else changes … gov-dev's plan 98 rule for the feed").
+///
+/// The run list stands in for the rows of the trail that nobody signed in
+/// caused, so it is served inside the reach that holds them (plan D5c): an
+/// unrestricted reader, or the tenant that owns the shared catalog. A reach
+/// that cannot be resolved is answered with its own error, the way the audit
+/// page answers it, and never with the run list — the run list of every
+/// pipeline is wider than any reach.
+pub async fn refresh(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+) -> Response {
+    let reads_everyones = principal.has("audit:read");
+    // The audit writers store `principal.id.uuid().to_string()` in
+    // `audit_event.principal_id`, so that is the value that names "their own".
+    let own_id = principal.id.uuid().to_string();
+    let only_principal = (!reads_everyones).then_some(own_id.as_str());
     if let Some(pool) = state.pg.as_deref() {
-        match overview::recent_activity(pool, 20).await {
+        // The reach narrows the trail read, so it is resolved here, where the
+        // trail is read: a deployment without a console database has no trail
+        // to narrow, and the run list below is not a read of the trail.
+        let scope =
+            match crate::routes::audit_scope::scope_for_principal(&state, &principal, &headers)
+                .await
+            {
+                Ok(scope) => scope,
+                // A reach that cannot be resolved is answered with its own
+                // error, the way the audit page answers it
+                // (`routes/audit_events.rs`): the run list below holds every
+                // pipeline of the deployment, which is wider than any reach,
+                // so it is not the answer to a call whose reach is unknown.
+                Err(err) => {
+                    tracing::warn!(error = %err, "audit scope could not be resolved");
+                    return crate::error::ApiRejection(err).into_response();
+                }
+            };
+        match overview::recent_activity(pool, 20, only_principal, &scope).await {
             Ok(activity) => {
                 return (StatusCode::OK, ApiJson(json!({ "activity": activity }))).into_response();
             }
             // Say so rather than silently falling back to the orchestrator.
-            Err(err) => tracing::warn!(error = %err, "audit activity read failed; trying Dagster"),
+            // The run list stands in for the rows of the trail that nobody
+            // signed in caused, so it is served only inside the reach that
+            // holds them (plan D5c): a holder of `audit:read` of a tenant
+            // that does not own the shared catalog is told the read failed.
+            Err(err) => {
+                tracing::warn!(error = %err, "audit activity read failed");
+                if !reads_everyones || !scope.sees_deployment_rows() {
+                    return trail_read_failed();
+                }
+            }
         }
+    }
+    // Only reached with no console Postgres (the audit read did not run, so
+    // there is no failure to report) or by a holder after a failed read, and
+    // then only inside the reach that holds the deployment's own rows. The
+    // run list below covers every pipeline, not the person's own actions, so
+    // a person without `audit:read` gets an empty feed instead of it.
+    if !reads_everyones {
+        return (StatusCode::OK, ApiJson(json!({ "activity": [] }))).into_response();
     }
     match state.dagster.list_runs(20).await {
         Ok(runs) => {
@@ -1106,5 +1190,424 @@ mod tests {
                 "one dataset in the warm tier: {row:?}"
             );
         }
+    }
+}
+
+/// `GOV-1` Decision 9: the Dagster run list that `POST /api/overview` falls
+/// back on (no console Postgres, or a failed audit read) shows orchestrator
+/// activity of every pipeline, so it is served only to a holder of
+/// `audit:read`, like the audit rows it stands in for.
+///
+/// The handler runs behind a one-route router with the principal as a layer,
+/// the way the real auth middleware hands it over, and a `wiremock` Dagster
+/// records what it was asked. The audit-row half of the rule is in
+/// `tests/overview_feed.rs`; the tests that need a console database of their
+/// own have one, because a deployment without a console database, a reach
+/// that cannot be resolved and a trail read that fails are three different
+/// answers.
+#[cfg(test)]
+mod feed_scope {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::body::{Body, to_bytes};
+    use axum::http::{HeaderValue, Request};
+    use axum::routing::post;
+    use lakehouse_auth::{PermissionSet, PrincipalId};
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::config::Config;
+
+    /// The tenant the seed migration creates that owns the shared catalog in
+    /// the tests below.
+    const OWNER_TENANT: &str = "11111111-1111-4111-8111-000000000001";
+    /// Another tenant of the seed migration, one that owns no shared catalog.
+    const OTHER_TENANT: &str = "11111111-1111-4111-8111-000000000002";
+
+    fn principal(permissions: &str) -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::new_v4()),
+            tenant_ids: Vec::new(),
+            display_name: "Test".to_owned(),
+            permissions: PermissionSet::parse(permissions),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// A principal who acts as `tenant`.
+    fn principal_of(tenant: Uuid, permissions: &str) -> Principal {
+        Principal {
+            tenant_ids: vec![tenant],
+            ..principal(permissions)
+        }
+    }
+
+    /// The id of a seeded tenant.
+    fn tenant_id(raw: &str) -> Uuid {
+        raw.parse().expect("a seeded tenant id")
+    }
+
+    /// The configuration of a deployment that names no owner of a shared
+    /// catalog.
+    fn plain_config() -> Config {
+        Config::from_map(&HashMap::new()).expect("a test Config")
+    }
+
+    /// The configuration of a deployment whose shared catalog is owned by
+    /// `owner`.
+    fn config_with_catalog_tenant(owner: Uuid) -> Config {
+        let mut env = HashMap::new();
+        env.insert("CATALOG_TENANT_ID".to_owned(), owner.to_string());
+        Config::from_map(&env).expect("a test Config")
+    }
+
+    /// A Dagster that answers one run, and the state that points at it.
+    /// `pg` is `None` unless `unreachable_pg` is set, which gives the state a
+    /// pool whose every read fails.
+    async fn state_with_dagster(unreachable_pg: bool) -> (AppState, wiremock::MockServer) {
+        state_with_config(plain_config(), unreachable_pg).await
+    }
+
+    /// The state of a deployment configured with `config`, and a Dagster that
+    /// answers one run. `unreachable_pg` gives the state a pool whose every
+    /// read fails.
+    async fn state_with_config(
+        config: Config,
+        unreachable_pg: bool,
+    ) -> (AppState, wiremock::MockServer) {
+        let server = wiremock::MockServer::start().await;
+        let body = json!({
+            "data": { "runsOrError": { "__typename": "Runs", "results": [{
+                "runId": "run-1",
+                "jobName": "orders_job",
+                "status": "SUCCESS",
+                "startTime": 1_700_000_000,
+                "endTime": Value::Null,
+            }] } }
+        });
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let mut state = AppState::new(config);
+        state.dagster = Arc::new(DgClient::new(server.uri()));
+        if unreachable_pg {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .acquire_timeout(Duration::from_secs(2))
+                .connect_lazy("postgres://nobody:nothing@127.0.0.1:1/none")
+                .expect("a parseable URL");
+            state.pg = Some(Arc::new(pool));
+        }
+        (state, server)
+    }
+
+    /// The state of a deployment whose console database is `pool`, and a
+    /// Dagster that answers one run.
+    async fn state_with_pool(
+        config: Config,
+        pool: sqlx::PgPool,
+    ) -> (AppState, wiremock::MockServer) {
+        let (mut state, server) = state_with_config(config, false).await;
+        state.pg = Some(Arc::new(pool));
+        (state, server)
+    }
+
+    /// `POST /` through the handler as `who`: the status and the JSON body.
+    async fn post_as(state: AppState, who: Principal) -> (StatusCode, Value) {
+        post_as_with_headers(state, who, HeaderMap::new()).await
+    }
+
+    /// `POST /` through the handler as `who`, with `headers`: the status and
+    /// the JSON body.
+    async fn post_as_with_headers(
+        state: AppState,
+        who: Principal,
+        headers: HeaderMap,
+    ) -> (StatusCode, Value) {
+        let router = axum::Router::new()
+            .route("/", post(refresh))
+            .layer(Extension(who))
+            .with_state(state);
+        let mut request = Request::builder().method("POST").uri("/");
+        for (name, value) in &headers {
+            request = request.header(name.clone(), value.clone());
+        }
+        let resp = router
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// The tenants of the seed migration are gone, so the deployment holds no
+    /// other tenant and the reach of every caller is the whole deployment.
+    async fn remove_the_seeded_tenants(pool: &sqlx::PgPool) -> sqlx::Result<()> {
+        for raw in [
+            OWNER_TENANT,
+            OTHER_TENANT,
+            "11111111-1111-4111-8111-000000000003",
+            "11111111-1111-4111-8111-000000000004",
+        ] {
+            let id = tenant_id(raw);
+            sqlx::query("DELETE FROM app_user_tenant WHERE tenant_id = $1")
+                .bind(id)
+                .execute(pool)
+                .await?;
+            sqlx::query("DELETE FROM tenant WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// The trail cannot be read: the table it lives in is gone. The rest of
+    /// the console database is untouched, so the reach of the caller is
+    /// still resolved.
+    async fn break_the_trail_read(pool: &sqlx::PgPool) -> sqlx::Result<()> {
+        sqlx::query("ALTER TABLE audit_event RENAME TO audit_event_hidden")
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn without_a_console_database_a_person_without_audit_read_gets_an_empty_feed_and_dagster_is_not_asked()
+     {
+        let (state, dagster) = state_with_dagster(false).await;
+
+        let (status, body) = post_as(state, principal("governance:read")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "activity": [] }));
+        assert!(
+            dagster.received_requests().await.unwrap().is_empty(),
+            "the run list of every pipeline was fetched for a person who may not read it"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_console_database_a_holder_of_audit_read_gets_the_dagster_run_list() {
+        let (state, _dagster) = state_with_dagster(false).await;
+
+        let (status, body) = post_as(state, principal("audit:read")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["activity"][0]["target"], "orders_job");
+        assert_eq!(body["activity"][0]["actor"], "Dagster");
+    }
+
+    /// A console database that cannot be reached is a reach that cannot be
+    /// resolved, so it is answered with its own error and the run list of
+    /// the deployment is not served to it either: the run list holds every
+    /// pipeline of the deployment, which is wider than any reach.
+    #[tokio::test]
+    async fn a_console_database_that_cannot_be_reached_is_answered_with_its_own_error() {
+        let (state, dagster) = state_with_dagster(true).await;
+
+        let (status, body) = post_as(state, principal("audit:read")).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body, json!({ "error": "could not verify tenant count" }));
+        assert!(
+            dagster.received_requests().await.unwrap().is_empty(),
+            "the run list of the deployment was served to a caller whose reach could not be resolved"
+        );
+    }
+
+    /// A trail read that failed is said, not replaced by the run list: a
+    /// person without `audit:read` is told the read failed, with a fixed
+    /// message.
+    ///
+    /// The console database is there and readable — only the trail read
+    /// fails — because a database that cannot be reached at all is a reach
+    /// that cannot be resolved, and that is a different answer (plan D5c).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_failed_audit_read_gives_a_person_without_audit_read_a_503_not_the_dagster_run_list(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let (state, dagster) = state_with_pool(plain_config(), pool.clone()).await;
+        break_the_trail_read(&pool).await?;
+
+        let (status, body) = post_as(state, principal("governance:read")).await;
+
+        // An empty 200 would read as "you have done nothing yet"; the failure
+        // is said, with a fixed message (never the database's own text).
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, json!({ "activity": [], "error": "database error" }));
+        assert!(
+            dagster.received_requests().await.unwrap().is_empty(),
+            "a failed audit read fell through to the run list for a person who may not read it"
+        );
+        Ok(())
+    }
+
+    /// A trail read that failed leaves a holder of `audit:read` the run
+    /// list of the deployment: the run list stands in for the rows nobody
+    /// signed in caused, and the reach of this caller holds them.
+    ///
+    /// The console database is there and readable — only the trail read
+    /// fails — because a database that cannot be reached at all is a reach
+    /// that cannot be resolved, and that is a different answer (plan D5c).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_failed_audit_read_still_falls_back_to_dagster_for_a_holder_of_audit_read(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        // A deployment with no tenant of its own, so the reach of the
+        // caller holds the deployment's own rows.
+        remove_the_seeded_tenants(&pool).await?;
+        let (state, _dagster) = state_with_pool(plain_config(), pool.clone()).await;
+        break_the_trail_read(&pool).await?;
+
+        let (status, body) = post_as(state, principal("audit:read")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["activity"][0]["target"], "orders_job");
+        Ok(())
+    }
+
+    /// `SEC-20` (plan 100): a reach that cannot be resolved is answered
+    /// with its own error, never with the run list of the deployment.
+    ///
+    /// The trail here is readable and holds a row, so the row is not served
+    /// because the reach is unknown — not because the read failed. The
+    /// tests above cannot tell the two apart: their console database
+    /// answers nothing at all, so the reach and the read fail together.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_reach_that_cannot_be_resolved_is_answered_with_its_own_error(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        // A deployment with no tenant of its own, so the reach of the
+        // caller would be "everything" and the row of the trail below
+        // would be served.
+        remove_the_seeded_tenants(&pool).await?;
+        let auditor = principal("audit:read");
+        sqlx::query(
+            "INSERT INTO audit_event (id, at, principal_id, principal_kind, actor_label, action, \
+             resource_kind, resource_id, args, outcome) \
+             VALUES ('row-of-the-trail', '2099-01-01T10:00:00Z', $1, 'user', 'someone', \
+             'dashboard.update', 'dashboard', 'b-1', '{}'::jsonb, 'executed')",
+        )
+        .bind(auditor.id.uuid().to_string())
+        .execute(&pool)
+        .await?;
+
+        let (state, dagster) = state_with_pool(plain_config(), pool.clone()).await;
+        // The count of the deployment's tenants cannot be read, so the
+        // reach of the caller cannot be resolved.
+        sqlx::query("ALTER TABLE tenant RENAME TO tenant_hidden")
+            .execute(&pool)
+            .await?;
+
+        // The holder of `audit:read` is told that the reach could not be
+        // resolved, and the run list of the deployment is not served to it:
+        // the run list holds every pipeline of the deployment, which is
+        // wider than any reach.
+        let (status, body) = post_as(state.clone(), auditor).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body, json!({ "error": "could not verify tenant count" }));
+        assert!(
+            dagster.received_requests().await.unwrap().is_empty(),
+            "the run list of the deployment was served to a caller whose reach could not be resolved"
+        );
+
+        // Anybody else is told the same: the reach is unknown, so no row of
+        // the trail is read and nothing is served.
+        let (status, body) = post_as(state, principal("governance:read")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body, json!({ "error": "could not verify tenant count" }));
+        Ok(())
+    }
+
+    /// A forged `X-Tenant` is answered with the error the reach failed
+    /// with — the 404 every route answers — and the run list of the
+    /// deployment is not served to it: the run list holds every pipeline of
+    /// the deployment, and the reach of a forged header is unknown.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_forged_tenant_header_is_answered_with_the_scope_error_and_dagster_is_not_asked(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let (state, dagster) = state_with_pool(plain_config(), pool).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-tenant",
+            HeaderValue::from_static("22222222-2222-4222-8222-000000000222"),
+        );
+
+        let (status, body) = post_as_with_headers(state, principal("audit:read"), headers).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body, json!({ "error": "tenant not found" }));
+        assert!(
+            dagster.received_requests().await.unwrap().is_empty(),
+            "the run list of the deployment was served to a caller whose reach could not be resolved"
+        );
+        Ok(())
+    }
+
+    /// A holder of `audit:read` whose tenant does not own the shared
+    /// catalog reads no row of the deployment, so a failed trail read is
+    /// said rather than replaced by the run list of the deployment: that
+    /// list holds every pipeline, which is wider than that reach.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_holder_whose_tenant_does_not_own_the_shared_catalog_is_told_the_read_failed(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let owner = tenant_id(OWNER_TENANT);
+        let other = tenant_id(OTHER_TENANT);
+        let (state, dagster) =
+            state_with_pool(config_with_catalog_tenant(owner), pool.clone()).await;
+        break_the_trail_read(&pool).await?;
+
+        let (status, body) = post_as(state, principal_of(other, "audit:read")).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body, json!({ "activity": [], "error": "database error" }));
+        assert!(
+            dagster.received_requests().await.unwrap().is_empty(),
+            "the run list of the deployment was served to a tenant that owns no row of the deployment"
+        );
+        Ok(())
+    }
+
+    /// The tenant that owns the shared catalog reads the deployment's own
+    /// rows, so a failed trail read still leaves it the run list of the
+    /// deployment.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_owner_tenant_still_gets_the_run_list_after_a_failed_trail_read(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let owner = tenant_id(OWNER_TENANT);
+        let (state, _dagster) =
+            state_with_pool(config_with_catalog_tenant(owner), pool.clone()).await;
+        break_the_trail_read(&pool).await?;
+
+        let (status, body) = post_as(state, principal_of(owner, "audit:read")).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["activity"][0]["target"], "orders_job");
+        assert_eq!(body["activity"][0]["actor"], "Dagster");
+        Ok(())
     }
 }

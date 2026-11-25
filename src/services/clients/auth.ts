@@ -1,4 +1,4 @@
-import type { Session } from "../contracts/auth";
+import type { LogoutResult, PasswordRulesResponse, Session } from "../contracts/auth";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
@@ -11,9 +11,10 @@ import { ServiceError } from "../errors";
  *
  * `providers` IS registered — the SSO admin page reads it via
  * `authService.providers`, and the page has no other way to ask "is OIDC
- * configured on this deployment" (`routes/auth.rs:731`). It is the only
- * auth method that fits the read-only, page-shaped pattern the rest of the
- * service registry follows.
+ * configured on this deployment" (`routes/auth.rs:731`). `passwordRules`
+ * is registered too (`WEB-7`): the Invite user page states the lengths the
+ * server enforces. Those two are the read-only, page-shaped auth methods the
+ * rest of the service registry follows.
  */
 
 /** Mirrors `MeResponse` from `rust/crates/lakehouse-api/src/routes/auth.rs`. */
@@ -44,7 +45,7 @@ async function parse<T>(res: Response, fallback: string): Promise<T> {
       // Same message regardless of *why* — non-enumeration mirrors the
       // backend's own guarantee (see `routes/auth.rs`'s module doc
       // comment): never reveal "no such email" vs "wrong password".
-      throw new ServiceError("permission_denied", json?.error ?? "Invalid email or password.");
+      throw new ServiceError("permission_denied", json?.error ?? "Invalid username/email or password.");
     }
     if (res.status === 400 || res.status === 422) {
       throw new ServiceError("invalid_request", json?.error ?? fallback);
@@ -54,11 +55,11 @@ async function parse<T>(res: Response, fallback: string): Promise<T> {
   return json as T;
 }
 
-export async function login(email: string, password: string): Promise<LoginResult> {
+export async function login(identifier: string, password: string): Promise<LoginResult> {
   const res = await apiFetch("/api/auth/login", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ email, password }),
+    body: JSON.stringify({ identifier, password }),
   });
   if (res.status === 429) {
     const json = await res.json().catch(() => null);
@@ -70,10 +71,17 @@ export async function login(email: string, password: string): Promise<LoginResul
   return parse<LoginResult>(res, "Login failed.");
 }
 
-export async function logout(): Promise<void> {
+export async function logout(): Promise<LogoutResult | null> {
   // Best-effort: even if this fails (network blip, already-expired
   // session) the caller clears local state and navigates to /login anyway.
-  await apiFetch("/api/auth/logout", { method: "POST" }).catch(() => {});
+  // The answer names the provider's own logout address, so the provider's
+  // session ends with this deployment's — without it, the provider still
+  // holds the session it created for this browser and the next sign-in is
+  // answered from it.
+  const res = await apiFetch("/api/auth/logout", { method: "POST" }).catch(() => null);
+  if (!res || !res.ok) return null;
+  const body = (await res.json().catch(() => null)) as LogoutResult | null;
+  return body?.providerLogoutUrl ? body : null;
 }
 
 export async function me(signal?: AbortSignal): Promise<AuthUser> {
@@ -151,4 +159,12 @@ export async function deleteSession(id: string, signal?: AbortSignal): Promise<v
     }
     throw new ServiceError("unavailable", json?.error ?? "Failed to revoke session.");
   }
+}
+
+/**
+ * `GET /api/auth/password-rules` (ADM-11 D4).
+ */
+export async function passwordRules(signal?: AbortSignal): Promise<PasswordRulesResponse> {
+  const res = await apiFetch("/api/auth/password-rules", { signal });
+  return parse<PasswordRulesResponse>(res, "Failed to load password rules.");
 }

@@ -1,15 +1,14 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { formatNumber } from "@/lib/format"
-import { COLUMN_TYPES, DATE_FORMATS, columnTypeLabel, columnNameProblem } from "@/lib/uploads"
+import { COLUMN_TYPES, DATE_FORMATS, columnTypeLabel, columnNameProblem, cutsNanosecondDigits } from "@/lib/uploads"
 import type { UploadBadValues, UploadColumnType, UploadDateFormat } from "@/services/contracts/uploads"
 import type { ColumnChoices } from "./use-column-choices"
 import { Refusal, UploadNotice } from "./upload-parts"
-
-const SELECT_CLASS = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
 /** The types a column's select offers: the six, and "Floating point (from the file)" for a column that has it. */
 function typeOptions(type: UploadColumnType, guessed: UploadColumnType) {
@@ -28,10 +27,23 @@ function typeOptions(type: UploadColumnType, guessed: UploadColumnType) {
 export function UploadColumnsEditor({
   choices,
   sampledRows,
+  rows,
+  fileTypes,
 }: {
   readonly choices: ColumnChoices
   /** How many data rows the guess read. */
   readonly sampledRows: number
+  /**
+   * The rows the preview shows: the Check step reads their Timestamp values to say that a
+   * fraction longer than six digits is cut (`DATA-53` decision 17, review round 1 R5).
+   */
+  readonly rows: readonly (readonly string[])[]
+  /**
+   * The file's own type label per column, for a Parquet file only (`DATA-53`): what a
+   * column starts with when the file declares it, so the Check step can say what the
+   * table keeps of it.
+   */
+  readonly fileTypes?: readonly (string | undefined)[]
 }) {
   const { columns, fixed } = choices
   return (
@@ -75,21 +87,34 @@ export function UploadColumnsEditor({
                     />
                   </td>
                   <td className="px-3 py-2">
-                    <select
+                    {/* WEB-9 D3: the console's one dropdown, same types and
+                        order; a disabled row keeps the control disabled. */}
+                    <SelectField
                       aria-label={`Type of ${column.name || `column ${index + 1}`}`}
-                      className={SELECT_CLASS}
+                      className="w-full"
                       value={column.type}
                       disabled={fixed}
-                      onChange={(e) => choices.setType(index, e.target.value as UploadColumnType)}
-                    >
-                      {typeOptions(column.type, column.guessedType).map((t) => (
-                        <option key={t.value} value={t.value}>
-                          {t.label}
-                        </option>
-                      ))}
-                    </select>
+                      options={typeOptions(column.type, column.guessedType).map((t) => ({
+                        value: t.value,
+                        label: t.label,
+                      }))}
+                      onValueChange={(next) => choices.setType(index, next as UploadColumnType)}
+                    />
                     {column.type !== column.guessedType && !fixed ? (
                       <p className="mt-1 text-xs text-muted-foreground">Guessed: {columnTypeLabel(column.guessedType)}</p>
+                    ) : null}
+                    {/* `DATA-53` (QA `LH-DATA-9-32`): what the table keeps of the type, which
+                        a person can only see here. Both notes show with the columns fixed too,
+                        because a table's types are what the load will write. */}
+                    {column.type === "decimal" ? (
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        Stored exactly, with up to 38 digits, 9 of them after the point.
+                      </p>
+                    ) : null}
+                    {column.type === "timestamp" && cutsNanosecondDigits(rows, index, fileTypes?.[index]) ? (
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        The file keeps nanoseconds. The table keeps microseconds, so digits after the sixth are cut.
+                      </p>
                     ) : null}
                   </td>
                   <td className="space-y-1.5 px-3 py-2">
@@ -98,36 +123,31 @@ export function UploadColumnsEditor({
                         <Label className="sr-only" htmlFor={`upload-date-${index}`}>
                           How the dates of {column.name || `column ${index + 1}`} are read
                         </Label>
-                        <select
+                        {/* WEB-9 D2/D3: "Day first or month first?" was a
+                            disabled prompt option, so it is the placeholder;
+                            the three readings stay the options. */}
+                        <SelectField
                           id={`upload-date-${index}`}
-                          className={SELECT_CLASS}
+                          className="w-full"
                           value={column.dateFormat ?? ""}
+                          placeholder="Day first or month first?"
                           disabled={fixed && column.dateFormat !== undefined}
                           aria-invalid={asking}
-                          onChange={(e) => choices.setDateFormat(index, e.target.value as UploadDateFormat)}
-                        >
-                          {column.dateFormat === undefined ? (
-                            <option value="" disabled>
-                              Day first or month first?
-                            </option>
-                          ) : null}
-                          {DATE_FORMATS.map((f) => (
-                            <option key={f.value} value={f.value}>
-                              {f.label}
-                            </option>
-                          ))}
-                        </select>
+                          options={DATE_FORMATS.map((f) => ({ value: f.value, label: f.label }))}
+                          onValueChange={(next) => choices.setDateFormat(index, next as UploadDateFormat)}
+                        />
                         {column.type === "timestamp" ? (
-                          <select
+                          <SelectField
                             aria-label={`Time zone of ${column.name || `column ${index + 1}`}`}
-                            className={SELECT_CLASS}
+                            className="w-full"
                             value={column.timezone ? "zone" : "none"}
                             disabled={fixed}
-                            onChange={(e) => choices.setTimezone(index, e.target.value === "zone")}
-                          >
-                            <option value="none">No time zone in the values</option>
-                            <option value="zone">A time zone in every value (stored in UTC)</option>
-                          </select>
+                            options={[
+                              { value: "none", label: "No time zone in the values" },
+                              { value: "zone", label: "A time zone in every value (stored in UTC)" },
+                            ]}
+                            onValueChange={(next) => choices.setTimezone(index, next === "zone")}
+                          />
                         ) : null}
                       </>
                     ) : null}
@@ -192,6 +212,22 @@ export function BadValuesList({ bad }: { readonly bad: UploadBadValues }) {
 }
 
 /**
+ * The "N values do not fit" heading and the list under it. The Check step and the Review
+ * step show the same one (QA LH-DATA-18-08: the mismatch is listed before loading).
+ */
+export function BadValuesReport({ bad }: { readonly bad: UploadBadValues & { sampledRows?: number } }) {
+  return (
+    <>
+      <h3 className="text-sm font-semibold text-destructive">
+        {formatNumber(bad.count)} {bad.count === 1 ? "value does" : "values do"} not fit
+        {bad.sampledRows ? ` in the first ${formatNumber(bad.sampledRows)} rows` : ""}
+      </h3>
+      <BadValuesList bad={bad} />
+    </>
+  )
+}
+
+/**
  * Before Load: the check of the column list against the sample, and the choice of
  * what to do with a value that does not fit (`DATA-18` decision 6). **Stop** is
  * pre-selected. Nothing is shown while every value fits, except that they do.
@@ -221,15 +257,7 @@ export function UploadBadValuesPanel({ choices, sampledRows }: { readonly choice
           All {formatNumber(check.result.sampledRows || sampledRows)} sampled rows fit these types.
         </p>
       ) : null}
-      {bad ? (
-        <>
-          <h3 className="text-sm font-semibold text-destructive">
-            {formatNumber(bad.count)} {bad.count === 1 ? "value does" : "values do"} not fit
-            {bad.sampledRows ? ` in the first ${formatNumber(bad.sampledRows)} rows` : ""}
-          </h3>
-          <BadValuesList bad={bad} />
-        </>
-      ) : null}
+      {bad ? <BadValuesReport bad={bad} /> : null}
       <fieldset className="space-y-1.5">
         <legend className="text-sm font-medium">What should happen to a value that does not fit?</legend>
         <label className="flex items-center gap-2 text-sm">

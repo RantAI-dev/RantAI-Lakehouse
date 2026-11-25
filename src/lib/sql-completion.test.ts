@@ -1,6 +1,8 @@
 import { strict as assert } from "node:assert"
 import { test } from "node:test"
 import {
+  inCommentOrString,
+  inPlaceholder,
   sqlCompletionOptions,
   tablesInStatement,
   type ColumnState,
@@ -115,6 +117,84 @@ test("sqlCompletionOptions memberi kolom tabel Bronze yang ditulis dengan namesp
     },
   })
   assert.deepEqual(options.map((option) => option.label), ["oid"])
+})
+
+/**
+ * A Bronze table as the studio hands it over on a Trino tab: the registry slug
+ * is not the table's name in Trino, so the Trino name is one of its names.
+ */
+const BRONZE_ON_TRINO: CompletionTable = {
+  id: "demo_orders",
+  label: "Demo Orders",
+  reference: "iceberg.bronze.orders",
+  layer: "raw",
+  names: ["demo_orders", "bronze.Demo Orders", "iceberg.bronze.orders", "bronze.orders"],
+  trinoOnly: true,
+}
+const BRONZE_COLUMNS: Record<string, ColumnState> = {
+  demo_orders: { status: "ready", columns: [{ name: "oid", dataType: "String" }] },
+}
+
+test("sqlCompletionOptions offers the columns after an alias on a Bronze table's Trino name, whatever its id", () => {
+  const sql = "SELECT b. FROM iceberg.bronze.orders b"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "b."),
+    tables: [BRONZE_ON_TRINO],
+    columns: BRONZE_COLUMNS,
+  })
+  assert.deepEqual(options.map((option) => option.label), ["oid"])
+})
+
+test("sqlCompletionOptions finds a Bronze table by its Trino name even when it has no reference of its own", () => {
+  const sql = "SELECT b. FROM iceberg.bronze.orders b"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "b."),
+    tables: [{ ...BRONZE_ON_TRINO, reference: "" }],
+    columns: BRONZE_COLUMNS,
+  })
+  assert.deepEqual(options.map((option) => option.label), ["oid"])
+})
+
+test("sqlCompletionOptions offers the columns after an alias on bronze.<table>", () => {
+  const sql = "SELECT b. FROM bronze.orders AS b"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "b."),
+    tables: [BRONZE_ON_TRINO],
+    columns: BRONZE_COLUMNS,
+  })
+  assert.deepEqual(options.map((option) => option.label), ["oid"])
+})
+
+test("sqlCompletionOptions offers a Bronze table by its Trino name after FROM on a Trino tab", () => {
+  const sql = "SELECT * FROM "
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: [BRONZE_ON_TRINO],
+    columns: {},
+  })
+  assert.deepEqual(options, [
+    {
+      label: "iceberg.bronze.orders",
+      kind: "table",
+      detail: "Demo Orders",
+      apply: "iceberg.bronze.orders",
+    },
+  ])
+})
+
+test("sqlCompletionOptions offers no Bronze table after FROM on a ClickHouse tab", () => {
+  const sql = "SELECT * FROM "
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: [{ ...BRONZE_ON_TRINO, reference: "" }, TABLES[0] as CompletionTable],
+    columns: {},
+  })
+  assert.deepEqual(options.map((option) => option.label), ["silver.orders"])
 })
 
 test("sqlCompletionOptions tidak mencampur kolom dua tabel yang nama kolomnya sama", () => {
@@ -242,4 +322,225 @@ test("sqlCompletionOptions menghitung dari awal kata yang sedang diselesaikan", 
     columns: COLUMNS,
   })
   assert.equal(from, sql.indexOf("am"))
+})
+
+test("sqlCompletionOptions offers the defined parameter names after {{ and nothing else", () => {
+  const sql = "SELECT amount FROM silver.orders WHERE status = {{"
+  const { from, options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: TABLES,
+    columns: COLUMNS,
+    parameters: ["region", "day"],
+  })
+  assert.equal(from, sql.length)
+  assert.deepEqual(
+    options.map((option) => [option.label, option.kind, option.apply]),
+    [
+      ["region", "parameter", "region"],
+      ["day", "parameter", "day"],
+    ]
+  )
+})
+
+test("sqlCompletionOptions completes a parameter name that is half typed, past blanks inside the braces", () => {
+  const sql = "SELECT amount FROM silver.orders WHERE status = {{  re"
+  const { from, options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: TABLES,
+    columns: COLUMNS,
+    parameters: ["region"],
+  })
+  assert.equal(from, sql.indexOf("re"))
+  assert.deepEqual(options.map((option) => option.label), ["region"])
+})
+
+test("sqlCompletionOptions offers no parameter name outside the braces", () => {
+  const sql = "SELECT amount FROM silver.orders WHERE "
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: TABLES,
+    columns: COLUMNS,
+    parameters: ["region"],
+  })
+  assert.equal(options.some((option) => option.kind === "parameter"), false)
+})
+
+test("sqlCompletionOptions offers nothing after {{ when the tab defines no parameter", () => {
+  const sql = "SELECT amount FROM silver.orders WHERE status = {{"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: TABLES,
+    columns: COLUMNS,
+  })
+  assert.deepEqual(options, [])
+})
+
+test("sqlCompletionOptions offers the defined parameter names after a {{ that is half typed", () => {
+  const sql = "SELECT amount FROM silver.orders WHERE status = {{reg"
+  const { from, options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: TABLES,
+    columns: COLUMNS,
+    parameters: ["region", "day"],
+  })
+  // The name is half typed, so the list starts where the name starts; the
+  // list itself holds every defined name, and the editor narrows it down.
+  assert.equal(from, sql.indexOf("reg"))
+  assert.deepEqual(options.map((option) => option.label), ["region", "day"])
+})
+
+test("sqlCompletionOptions offers no parameter name after a {{ inside a line comment", () => {
+  const sql = "-- a note with a {{"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: TABLES,
+    columns: COLUMNS,
+    parameters: ["region", "day"],
+  })
+  // The braces are text in a comment, so no name belongs there.
+  assert.deepEqual(options.filter((option) => option.kind === "parameter"), [])
+})
+
+test("sqlCompletionOptions offers no parameter name after a {{ inside a block comment", () => {
+  const sql = "/* a note with a {{ */"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.indexOf("{{") + 2,
+    tables: TABLES,
+    columns: COLUMNS,
+    parameters: ["region", "day"],
+  })
+  assert.deepEqual(options.filter((option) => option.kind === "parameter"), [])
+})
+
+test("sqlCompletionOptions offers no parameter name after a {{ inside a quoted run", () => {
+  const sql = "SELECT 'a {{ b'"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.indexOf("{{") + 2,
+    tables: TABLES,
+    columns: COLUMNS,
+    parameters: ["region", "day"],
+  })
+  assert.deepEqual(options.filter((option) => option.kind === "parameter"), [])
+})
+
+test("inPlaceholder reads the braces before the name, and inCommentOrString the text around the cursor", () => {
+  // The braces open a placeholder, with or without a half typed name.
+  assert.equal(inPlaceholder("SELECT {{", 9), true)
+  assert.equal(inPlaceholder("SELECT {{a", 10), true)
+  assert.equal(inPlaceholder("SELECT a", 8), false)
+  // A comment and a quoted run hold text, not code.
+  assert.equal(inCommentOrString("-- a {{", 6), true)
+  assert.equal(inCommentOrString("/* a {{ */", 6), true)
+  assert.equal(inCommentOrString("SELECT 'a {{'", 12), true)
+  // The cursor right after a closed quoted run writes code again.
+  assert.equal(inCommentOrString("SELECT 'abc'", 12), false)
+  assert.equal(inCommentOrString("SELECT 1", 8), false)
+})
+
+// QS-4-AC8: after `q.`, an alias the statement declares for a
+// table the list does not hold has no columns to offer, and the table list
+// is no answer to it either.
+test("sqlCompletionOptions offers nothing after an alias declared for a table that is not in the list", () => {
+  const sql = "SELECT q. FROM x q"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "q."),
+    tables: TABLES,
+    columns: COLUMNS,
+  })
+  assert.deepEqual(options, [])
+})
+
+test("sqlCompletionOptions offers nothing after an AS alias of an unknown table in a JOIN", () => {
+  const sql = "SELECT q. FROM silver.orders o JOIN nowhere.gone AS q ON q.id = o.id"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "q."),
+    tables: TABLES,
+    columns: COLUMNS,
+  })
+  assert.deepEqual(options, [])
+})
+
+test("sqlCompletionOptions still offers a listed table's columns after its alias, next to an unknown table's alias", () => {
+  const sql = "SELECT o. FROM silver.orders o JOIN nowhere.gone AS q ON q.id = o.id"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "o."),
+    tables: TABLES,
+    columns: COLUMNS,
+  })
+  assert.deepEqual(options.map((option) => option.label), ["amount", "status"])
+})
+
+test("sqlCompletionOptions still offers the tables after a schema name, whatever aliases the statement declares", () => {
+  const sql = "SELECT * FROM x q JOIN serving."
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: TABLES,
+    columns: COLUMNS,
+  })
+  assert.ok(options.some((option) => option.label === "serving.customers"))
+})
+
+test("sqlCompletionOptions keeps the general answer for a qualifier that is neither an alias nor a table", () => {
+  const sql = "SELECT zz. FROM silver.orders"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "zz."),
+    tables: TABLES,
+    columns: COLUMNS,
+  })
+  assert.ok(options.some((option) => option.label === "amount"))
+})
+
+test("sqlCompletionOptions answers with the listed table when an alias name is declared for a listed and an unknown table", () => {
+  const sql = "SELECT q. FROM silver.orders q JOIN nowhere AS q ON 1 = 1"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "q."),
+    tables: TABLES,
+    columns: COLUMNS,
+  })
+  assert.deepEqual(options.map((option) => option.label), ["amount", "status"])
+})
+
+// QS round review R1 (D8): the answer says which place it answered for, so the
+// source can boost names in a FROM/qualifier position but leave the general
+// list to CodeMirror's own match score against the keywords.
+test("sqlCompletionOptions marks the general branch as general", () => {
+  const sql = "s"
+  const answer = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "s"),
+    tables: TABLES,
+    columns: COLUMNS,
+  })
+  assert.equal(answer.place, "general")
+})
+
+test("sqlCompletionOptions marks the FROM, qualifier and placeholder branches as names", () => {
+  for (const [sql, marker] of [
+    ["SELECT * FROM ", "FROM "],
+    ["SELECT o. FROM silver.orders o", "o."],
+    ["SELECT {{", "{{"],
+  ] as const) {
+    const answer = sqlCompletionOptions({
+      sql,
+      cursor: after(sql, marker),
+      tables: TABLES,
+      columns: COLUMNS,
+      parameters: ["region"],
+    })
+    assert.equal(answer.place, "names", sql)
+  }
 })

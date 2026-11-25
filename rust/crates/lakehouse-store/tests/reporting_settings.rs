@@ -48,15 +48,25 @@ async fn a_deployment_that_never_saved_has_no_row(pool: PgPool) -> sqlx::Result<
 async fn a_save_round_trips_and_a_second_save_replaces_the_one_row(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let first = upsert(&pool, &settings("Europe/Berlin", "sunday"), "user-a")
+    let (replaced, stored) = upsert(&pool, &settings("Europe/Berlin", "sunday"), "user-a")
         .await
         .expect("upsert");
-    assert_eq!(first, settings("Europe/Berlin", "sunday"));
-    assert_eq!(get(&pool).await.expect("get"), Some(first));
+    assert_eq!(
+        replaced, None,
+        "the deployment never saved; nothing was replaced"
+    );
+    assert_eq!(stored, settings("Europe/Berlin", "sunday"));
+    assert_eq!(get(&pool).await.expect("get"), Some(stored));
 
-    upsert(&pool, &settings("Asia/Jakarta", "monday"), "user-b")
+    let (replaced, stored) = upsert(&pool, &settings("Asia/Jakarta", "monday"), "user-b")
         .await
         .expect("upsert again");
+    assert_eq!(
+        replaced,
+        Some(settings("Europe/Berlin", "sunday")),
+        "the row the second save replaced"
+    );
+    assert_eq!(stored, settings("Asia/Jakarta", "monday"));
     let (rows, who): (i64, String) =
         sqlx::query_as("SELECT count(*), max(updated_by) FROM reporting_settings")
             .fetch_one(&pool)
@@ -66,6 +76,73 @@ async fn a_save_round_trips_and_a_second_save_replaces_the_one_row(
         "the second save replaces the row, it does not add one"
     );
     assert_eq!(who, "user-b");
+    Ok(())
+}
+
+/// Plan D3b: a save reports the settings it replaced — `None` when no row
+/// existed — so the route can name what changed from the save's own
+/// transaction, never from a read taken before it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_save_reports_the_settings_it_replaced_and_none_when_the_row_is_new(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let (replaced, stored) = upsert(&pool, &settings("Europe/Berlin", "sunday"), "user-a")
+        .await
+        .expect("first save");
+    assert_eq!(replaced, None);
+    assert_eq!(stored, settings("Europe/Berlin", "sunday"));
+
+    let (replaced, stored) = upsert(&pool, &settings("Asia/Jakarta", "monday"), "user-b")
+        .await
+        .expect("second save");
+    assert_eq!(
+        replaced,
+        Some(settings("Europe/Berlin", "sunday")),
+        "the settings the second save replaced"
+    );
+    assert_eq!(stored, settings("Asia/Jakarta", "monday"));
+    Ok(())
+}
+
+/// Plan D3b: two saves racing each other must serialise, so the second one
+/// reports the settings the first committed as the ones it replaced.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_save_waits_for_an_uncommitted_save_and_reports_the_settings_it_committed(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    upsert(&pool, &settings("UTC", "monday"), "seed")
+        .await
+        .expect("the row exists");
+    // Another request's save, not committed yet: the singleton row is
+    // locked until this transaction ends. The transaction holds one
+    // connection of the pool, and the save below takes another.
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE reporting_settings SET time_zone = 'Europe/Berlin' WHERE singleton")
+        .execute(&mut *tx)
+        .await?;
+
+    let task_pool = pool.clone();
+    let save_task = tokio::spawn(async move {
+        upsert(&task_pool, &settings("Asia/Jakarta", "monday"), "user-b")
+            .await
+            .expect("the save that waits")
+    });
+    // Without the lock the save reads past this uncommitted update at once;
+    // with it, the save is still waiting here.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !save_task.is_finished(),
+        "the save must wait for the uncommitted save before it"
+    );
+
+    tx.commit().await?;
+    let (replaced, stored) = save_task.await.expect("the save task joins");
+    assert_eq!(
+        replaced,
+        Some(settings("Europe/Berlin", "monday")),
+        "the committed update is what the save reports as replaced"
+    );
+    assert_eq!(stored, settings("Asia/Jakarta", "monday"));
     Ok(())
 }
 
@@ -115,7 +192,8 @@ async fn the_formatting_settings_round_trip_and_a_row_saved_before_them_keeps_th
     chosen.download_denied_roles = vec!["Viewer".to_owned(), "Guest".to_owned()];
     chosen.report_allowed_domains = vec!["example.com".to_owned(), "partner.example".to_owned()];
     chosen.public_links_enabled = false;
-    assert_eq!(upsert(&pool, &chosen, "u").await.expect("upsert"), chosen);
+    let (_, stored) = upsert(&pool, &chosen, "u").await.expect("upsert");
+    assert_eq!(stored, chosen);
     assert_eq!(get(&pool).await.expect("get"), Some(chosen));
     Ok(())
 }
@@ -198,7 +276,8 @@ async fn the_table_refuses_content_sites_that_are_not_https_origins_or_are_too_m
     }
     let mut fifty = settings("UTC", "monday");
     fifty.content_sites = (0..50).map(|i| format!("https://s{i}.example")).collect();
-    assert_eq!(upsert(&pool, &fifty, "u").await.expect("fifty"), fifty);
+    let (_, stored) = upsert(&pool, &fifty, "u").await.expect("fifty");
+    assert_eq!(stored, fifty);
     Ok(())
 }
 
@@ -226,7 +305,7 @@ async fn the_table_refuses_an_empty_report_domain_and_more_than_fifty(
 async fn the_result_cache_rule_round_trips_and_the_table_refuses_a_bad_one(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let stored = upsert(&pool, &settings("UTC", "monday"), "u")
+    let (_, stored) = upsert(&pool, &settings("UTC", "monday"), "u")
         .await
         .expect("upsert");
     assert_eq!(stored.result_cache_mode, "default");
@@ -240,7 +319,7 @@ async fn the_result_cache_rule_round_trips_and_the_table_refuses_a_bad_one(
         let mut s = settings("UTC", "monday");
         s.result_cache_mode = mode.to_owned();
         s.result_cache_minutes = minutes;
-        let back = upsert(&pool, &s, "u").await.expect("upsert");
+        let (_, back) = upsert(&pool, &s, "u").await.expect("upsert");
         assert_eq!(back, s);
         assert_eq!(get(&pool).await.expect("get"), Some(s));
     }

@@ -617,6 +617,11 @@ pub async fn discover(
             let target = match &parsed {
                 Dial::Sql(dial) => DialTarget::from(dial),
                 Dial::Cdc(dial) => DialTarget::from(dial),
+                // `SRC-4` slice 5: a `MongoDB` change-capture connector is listed by the
+                // orchestrator (the discovery routes), like a batch `MongoDB` connector.
+                Dial::CdcMongo(_) => {
+                    return Ok(DiscoverResult::unsupported(DISCOVER_MOVED_REASON));
+                }
                 Dial::Files(_)
                 | Dial::Rest(_)
                 | Dial::Sheets(_)

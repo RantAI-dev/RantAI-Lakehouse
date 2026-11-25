@@ -29,8 +29,16 @@
 //! A subscription can be saved without `SMTP_HOST`; the list says
 //! `emailSetUp: false` so the console can say "Email is not set up on this
 //! deployment", and a run records the same sentence (principle 2: no invented
-//! success). A PDF attachment is refused while the deployment has no PDF
+//! success). Such a failed delivery is not counted towards the pause, by
+//! decision (`DEC-18`, QA `LH-RPT-1-06`), so the list also says per row that
+//! the subscription is not being sent ([`not_sent_json`]) rather than leaving
+//! the person to read "Failed" and wonder whether something is wrong with
+//! their report. A PDF attachment is refused while the deployment has no PDF
 //! service.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query, State};
@@ -40,15 +48,18 @@ use lakehouse_bi::store;
 use lakehouse_core::ApiError;
 use lakehouse_store::report_schedule::{MonthDay, Schedule, zone_is_known};
 use lakehouse_store::report_subscriptions::{
-    self as subscriptions, Delivery, NewSubscription, Recipient, RecipientRow, Subscription,
+    self as subscriptions, Delivery, DeliveryStatus, NewSubscription, Recipient, RecipientRow,
+    Subscription,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use super::report_runner::{
-    AttachmentSpec, MAX_RECIPIENTS, domain_allowed, normalise_address, run_subscription,
+    AttachmentSpec, EMAIL_NOT_SET_UP, MAX_RECIPIENTS, domain_allowed, normalise_address,
+    record_cut_run, run_subscription,
 };
 use crate::error::ApiResult;
 use crate::json::ApiJson;
@@ -149,7 +160,7 @@ pub(crate) struct SubscriptionInput {
     pub paused: Option<bool>,
 }
 
-fn schedule_of(input: &ScheduleInput) -> Result<Schedule, ApiError> {
+pub(crate) fn schedule_of(input: &ScheduleInput) -> Result<Schedule, ApiError> {
     let bad = || ApiError::BadRequest("That schedule is not valid.".to_owned());
     let minute = input.minute.unwrap_or(0);
     let hour = || input.hour.ok_or_else(bad);
@@ -234,14 +245,11 @@ pub(crate) async fn validate_input(
         .ok_or_else(|| ApiError::Unavailable("the database is unavailable".to_owned()))?;
     crate::routes::settings::require_download(state, owner).await?;
 
-    // The board is one the owner can see (a trashed board and another person's
-    // personal board read as missing); the built-in board has no row.
-    // BI-19 B1 review R12: the owner's resolved viewer, not the baseline.
-    let viewer = crate::routes::dashboard_access::viewer_for(state, owner).await?;
-    let found = store::get_board(&state.clickhouse, board, &viewer)
-        .await
-        .map_err(|err| crate::routes::dashboard::classify_dashboard_ch_error(&err))?;
-    if found.is_none() && board != store::DEFAULT_BOARD_ID {
+    // The board is one the owner can see NOW, under their current table grants
+    // (GOV-17 review R4). BI-19 B1 review R12: the owner's resolved viewer, not
+    // the baseline. A trashed board, another person's personal board and one
+    // hidden by a denied dependency all read as missing.
+    if !board_still_visible(state, owner, board).await? {
         return Err(ApiError::NotFound(NO_SUCH_DASHBOARD.to_owned()));
     }
 
@@ -468,10 +476,40 @@ async fn subscription_json(
     }))
 }
 
-fn settings_flags(state: &AppState) -> Value {
+/// What the console shows above the subscription list: whether email is set
+/// up (the resolver's answer, not the environment's alone — `ADM-7` D3) and
+/// whether PDF export is supported.
+async fn settings_flags(state: &AppState) -> Value {
     json!({
-        "emailSetUp": state.config.smtp_host.is_some(),
+        "emailSetUp": crate::runtime_settings::email(state).await.host.is_some(),
         "pdfSupported": crate::routes::dashboard::pdf_supported(&state.config),
+    })
+}
+
+/// `notSent`: why a subscription is not being sent right now, or `null`
+/// (`RPT-2`, QA `LH-RPT-1-06`, `DEC-18`).
+///
+/// While the installation has no e-mail set up, every delivery fails for that
+/// one reason and nothing is paused for it (`DEC-18`), so the list says so on
+/// each row instead. `lastAttemptAt` is the start of the subscription's newest
+/// delivery **if** that delivery failed for this reason, `null` otherwise —
+/// nothing has been attempted since e-mail went away, or nothing ever.
+///
+/// Nothing here counts a failure or pauses a subscription: the counting is the
+/// runner's and stays exactly as `DEC-18` decided.
+fn not_sent_json(email_set_up: bool, last: Option<&Delivery>) -> Value {
+    if email_set_up {
+        return Value::Null;
+    }
+    let last_attempt_at = last
+        .filter(|d| {
+            d.status == DeliveryStatus::Failed.as_str()
+                && d.reason.as_deref() == Some(EMAIL_NOT_SET_UP)
+        })
+        .and_then(|d| d.started_at.format(&Rfc3339).ok());
+    json!({
+        "cause": "email_not_set_up",
+        "lastAttemptAt": last_attempt_at,
     })
 }
 
@@ -488,8 +526,38 @@ fn pool_of(state: &AppState) -> Result<&lakehouse_store::PgPool, ApiError> {
         .ok_or_else(|| ApiError::Unavailable("the database is unavailable".to_owned()))
 }
 
-/// The subscription, if it exists and `principal` is its owner or an
-/// administrator.
+/// GOV-17 review R4: whether `principal`'s CURRENT table grants still let them
+/// see the board a report is about. Subscription ownership or the
+/// `settings:write` admin right is NOT enough: a role narrowed after the
+/// subscription was created must not keep the dashboard's configuration
+/// (board, filters, params, grain, attachments, recipients, history) readable
+/// by known subscription id. This resolves the CALLER's own narrowed viewer —
+/// never the report owner's broader grants — so an admin whose grants were
+/// narrowed is refused just like any other caller. A genuine *:* / role-union
+/// All caller keeps access (the resolver leaves its viewer unnarrowed).
+///
+/// # Errors
+///
+/// The classified store / entitlement error; `false` (never an error) is the
+/// refusal for a board the caller cannot currently see.
+pub(crate) async fn board_still_visible(
+    state: &AppState,
+    principal: &Principal,
+    board: &str,
+) -> Result<bool, ApiError> {
+    let viewer = crate::routes::dashboard_access::viewer_for(state, principal).await?;
+    let board = board.trim();
+    if board.is_empty() || board == store::DEFAULT_BOARD_ID {
+        return Ok(viewer.sees_builtin_board());
+    }
+    let found = store::get_board(&state.clickhouse, board, &viewer)
+        .await
+        .map_err(|err| crate::routes::dashboard::classify_dashboard_ch_error(&err))?;
+    Ok(found.is_some())
+}
+
+/// The subscription, if it exists, `principal` is its owner or an administrator,
+/// AND the caller can still see the dashboard it is about (GOV-17 review R4).
 async fn own_or_admin(
     state: &AppState,
     principal: &Principal,
@@ -502,11 +570,18 @@ async fn own_or_admin(
         .await
         .map_err(|e| store_failed(&e))?
         .ok_or_else(|| ApiError::NotFound(NO_SUCH_SUBSCRIPTION.to_owned()))?;
-    if sub.owner_id == principal.id.uuid() || is_admin(principal) {
-        Ok(sub)
-    } else {
-        Err(ApiError::PermissionDenied(NOT_YOURS.to_owned()))
+    // GOV-17 review R4: the by-id metadata and history readers all go through
+    // here. An unknown-equivalent 404 keeps a guessed id from confirming that a
+    // hidden dashboard has a report.
+    if !board_still_visible(state, principal, &sub.board).await? {
+        return Err(ApiError::NotFound(NO_SUCH_SUBSCRIPTION.to_owned()));
     }
+    // GOV-17 review R8: only a visible dashboard may reveal that a report is
+    // owned by someone else. Hidden reports have the unknown-id response.
+    if sub.owner_id != principal.id.uuid() && !is_admin(principal) {
+        return Err(ApiError::PermissionDenied(NOT_YOURS.to_owned()));
+    }
+    Ok(sub)
 }
 
 /// The person a report is made as: the caller when they own it, else the owner
@@ -546,7 +621,13 @@ pub struct ListQuery {
 
 /// `GET /api/reports/subscriptions?board=` — the subscriptions of one
 /// dashboard that the caller owns (an administrator sees all), each with its
-/// last delivery, and whether email and the PDF service are set up.
+/// last delivery, whether email and the PDF service are set up, and — while
+/// e-mail is not set up — `notSent`, which says the subscription is not being
+/// sent and when it was last tried (`RPT-2`, `DEC-18`).
+///
+/// `notSent` and `canEdit` are the LIST's fields, like the ones that describe
+/// what the caller may do: [`subscription_json`] and the single-subscription
+/// routes do not carry them.
 ///
 /// # Errors
 ///
@@ -564,12 +645,10 @@ pub async fn list(
         .filter(|b| !b.is_empty())
         .ok_or_else(|| ApiError::BadRequest("board is required".to_owned()))?;
     let pool = pool_of(&state)?;
-    // BI-19 B1 review R12: the resolved viewer, not the baseline.
-    let viewer = crate::routes::dashboard_access::viewer_for(&state, &principal).await?;
-    let found = store::get_board(&state.clickhouse, board, &viewer)
-        .await
-        .map_err(|err| crate::routes::dashboard::classify_dashboard_ch_error(&err))?;
-    if found.is_none() && board != store::DEFAULT_BOARD_ID {
+    // BI-19 B1 review R12 / GOV-17 review R4: the caller's resolved viewer and
+    // CURRENT table grants, not the baseline. A dashboard hidden by a denied
+    // dependency (including built-in Main) leaves no report list behind.
+    if !board_still_visible(&state, &principal, board).await? {
         return Err(ApiError::NotFound(NO_SUCH_DASHBOARD.to_owned()).into());
     }
     let admin = is_admin(&principal);
@@ -583,14 +662,18 @@ pub async fn list(
     let last = subscriptions::last_deliveries(pool, &ids)
         .await
         .map_err(|e| store_failed(&e))?;
+    // One read of the setting per request, one owner of "is e-mail set up":
+    // the same answer that fills `emailSetUp` decides `notSent` (`RPT-2`).
+    let mut body = settings_flags(&state).await;
+    let email_set_up = body["emailSetUp"] == json!(true);
     let mut items = Vec::with_capacity(rows.len());
     for sub in &rows {
         let last = last.iter().find(|d| d.subscription_id == sub.id);
         let mut item = subscription_json(pool, sub, last).await?;
         item["canEdit"] = json!(admin || sub.owner_id == principal.id.uuid());
+        item["notSent"] = not_sent_json(email_set_up, last);
         items.push(item);
     }
-    let mut body = settings_flags(&state);
     body["items"] = Value::Array(items);
     Ok(ApiJson(body))
 }
@@ -806,12 +889,76 @@ pub async fn send_now(
     if sub.owner_id != principal.id.uuid() {
         return Err(ApiError::PermissionDenied(NOT_THE_OWNER.to_owned()).into());
     }
+    // BI-35: one press per subscription per interval, claimed before any work
+    // starts so two presses at once cannot both pass.
+    let interval = Duration::from_secs(state.config.report_send_now_interval_secs);
+    if let Err(retry_after_secs) = SEND_NOW_CLAIMS.claim(sub.id, Instant::now(), interval) {
+        return Err(ApiError::TooManyRequests {
+            message: SEND_NOW_TOO_SOON.to_owned(),
+            retry_after_secs,
+        }
+        .into());
+    }
     let mailer =
-        lakehouse_notify::EmailSender::new(crate::routes::alerts::smtp_config(&state.config));
-    let delivery = run_subscription(&state, &mailer, &sub, true)
-        .await
-        .map_err(|e| store_failed(&e))?;
+        lakehouse_notify::EmailSender::new(crate::runtime_settings::email(&state).await.smtp());
+    let started_at = OffsetDateTime::now_utc();
+    // BI-35: the run is stopped here, a little before the route's own deadline
+    // ([`super::EXPORT_REQUEST_TIMEOUT`]), so the stop is recorded. At the route
+    // deadline the request is dropped and nothing is written.
+    let delivery = match tokio::time::timeout(
+        SEND_NOW_BUDGET,
+        run_subscription(&state, &mailer, &sub, true),
+    )
+    .await
+    {
+        Ok(done) => done.map_err(|e| store_failed(&e))?,
+        Err(_elapsed) => record_cut_run(&state, &principal, &sub, started_at)
+            .await
+            .map_err(|e| store_failed(&e))?,
+    };
     Ok(ApiJson(delivery_json(&delivery)))
+}
+
+/// How long a "Send now" may run before it is stopped and recorded as failed
+/// (`BI-35`): the route's deadline less ten seconds for the record and the answer.
+const SEND_NOW_BUDGET: Duration = Duration::from_secs(300);
+const _: () = assert!(SEND_NOW_BUDGET.as_secs() < super::EXPORT_REQUEST_TIMEOUT.as_secs());
+
+/// The 429 sentence of a "Send now" pressed again too soon (`BI-35`).
+const SEND_NOW_TOO_SOON: &str = "This report was just sent. Wait a little before sending it again.";
+
+/// When each subscription's "Send now" was last claimed, in this process.
+static SEND_NOW_CLAIMS: SendNowClaims = SendNowClaims::new();
+
+/// The rate limit of "Send now" (`BI-35`): a map from subscription to the
+/// moment of its last claim. In memory on purpose: it protects the mail server
+/// and the PDF service from a double click or a loop, which a restart does not
+/// make worse, and it needs no migration. Entries older than the interval are
+/// dropped on each claim, so the map holds only the subscriptions pressed
+/// within the last interval.
+struct SendNowClaims(Mutex<Option<HashMap<Uuid, Instant>>>);
+
+impl SendNowClaims {
+    const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// Claim a send for `id` at `now`. `Err` is the whole seconds to wait,
+    /// at least one. An `interval` of zero never refuses.
+    fn claim(&self, id: Uuid, now: Instant, interval: Duration) -> Result<(), u64> {
+        if interval.is_zero() {
+            return Ok(());
+        }
+        let mut guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let map = guard.get_or_insert_with(HashMap::new);
+        map.retain(|_, last| now.saturating_duration_since(*last) < interval);
+        if let Some(last) = map.get(&id) {
+            let wait = interval.saturating_sub(now.saturating_duration_since(*last));
+            return Err(wait.as_secs() + 1);
+        }
+        map.insert(id, now);
+        Ok(())
+    }
 }
 
 /// `GET /api/reports/subscriptions/{id}/deliveries` — the last 50 sends.
@@ -836,14 +983,16 @@ pub async fn deliveries(
 /// Query of `GET /api/reports/recipients`.
 #[derive(Debug, Deserialize)]
 pub struct PickerQuery {
+    // `AI-30` (`find_report_recipients`): the assistant calls this same
+    // handler with a `q`; keep the fields constructible from that tool.
     #[serde(default)]
-    q: Option<String>,
+    pub(crate) q: Option<String>,
     /// `1`: the permissions picker (`BI-19` part B): also list roles whose
     /// name matches. Roles are shown only to somebody who manages a dashboard
     /// (`dashboard:write` or a `manage` rule); the report picker stays as
     /// narrow as it was.
     #[serde(default)]
-    roles: Option<String>,
+    pub(crate) roles: Option<String>,
 }
 
 /// `GET /api/reports/recipients?q=` — active users' names and addresses for the
@@ -977,6 +1126,88 @@ mod tests {
         ] {
             assert_eq!(schedule(&schedule_json(s)).unwrap(), s);
         }
+    }
+
+    /// A recorded delivery of `status` with `reason`, started at `started`.
+    fn delivery(status: &str, reason: Option<&str>) -> Delivery {
+        let started = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        Delivery {
+            id: Uuid::new_v4(),
+            subscription_id: Uuid::new_v4(),
+            started_at: started,
+            finished_at: started,
+            status: status.to_owned(),
+            origin: "schedule".to_owned(),
+            recipient_count: 1,
+            reason: reason.map(str::to_owned),
+        }
+    }
+
+    /// `RPT-2` (`DEC-18`): with e-mail set up the list says nothing of the
+    /// kind, whatever the last delivery did.
+    #[test]
+    fn not_sent_is_null_while_email_is_set_up() {
+        let failed = delivery("failed", Some(EMAIL_NOT_SET_UP));
+        assert_eq!(not_sent_json(true, Some(&failed)), Value::Null);
+        assert_eq!(not_sent_json(true, None), Value::Null);
+    }
+
+    /// `RPT-2` (`DEC-18`): the cause, and the time of the attempt that failed
+    /// for it — read back as the delivery's own `started_at`.
+    #[test]
+    fn not_sent_names_the_cause_and_the_time_of_a_last_attempt_that_failed_for_it() {
+        let failed = delivery("failed", Some(EMAIL_NOT_SET_UP));
+        let said = not_sent_json(false, Some(&failed));
+        assert_eq!(said["cause"], json!("email_not_set_up"));
+        let at = said["lastAttemptAt"].as_str().expect("a time");
+        let read_back = OffsetDateTime::parse(at, &Rfc3339).expect("RFC 3339 as written");
+        assert_eq!(read_back, failed.started_at);
+    }
+
+    /// `RPT-2` (`DEC-18`): no time when the newest delivery was sent, was
+    /// skipped, failed for another reason, or there is none at all.
+    #[test]
+    fn not_sent_has_no_time_when_the_last_delivery_was_sent_or_failed_for_another_reason() {
+        for last in [
+            delivery("sent", None),
+            delivery("skipped", None),
+            delivery("failed", Some("The PDF could not be made.")),
+            delivery("failed", None),
+        ] {
+            let said = not_sent_json(false, Some(&last));
+            assert_eq!(said["cause"], json!("email_not_set_up"), "{said}");
+            assert_eq!(said["lastAttemptAt"], Value::Null, "{said}");
+        }
+        let said = not_sent_json(false, None);
+        assert_eq!(
+            said,
+            json!({ "cause": "email_not_set_up", "lastAttemptAt": null })
+        );
+    }
+
+    /// `BI-35`: one claim per subscription per interval, the wait is whole
+    /// seconds and at least one, other subscriptions are not held back, an
+    /// interval of zero never refuses, and the claim frees itself.
+    #[test]
+    fn send_now_claims_are_one_per_subscription_per_interval() {
+        let claims = SendNowClaims::new();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let t0 = Instant::now();
+        let sixty = Duration::from_secs(60);
+        assert_eq!(claims.claim(a, t0, sixty), Ok(()));
+        assert_eq!(
+            claims.claim(a, t0 + Duration::from_secs(10), sixty),
+            Err(51)
+        );
+        assert_eq!(
+            claims.claim(a, t0 + Duration::from_millis(59_500), sixty),
+            Err(1)
+        );
+        assert_eq!(claims.claim(b, t0 + Duration::from_secs(10), sixty), Ok(()));
+        assert_eq!(claims.claim(a, t0 + sixty, sixty), Ok(()));
+        let off = SendNowClaims::new();
+        assert_eq!(off.claim(a, t0, Duration::ZERO), Ok(()));
+        assert_eq!(off.claim(a, t0, Duration::ZERO), Ok(()));
     }
 
     #[test]

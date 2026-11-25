@@ -1,4 +1,4 @@
-import type { Board } from "../contracts/dashboards"
+import type { Board, FilterValues } from "../contracts/dashboards"
 import type {
   ChartLineage,
   CreateBoardInput,
@@ -20,7 +20,7 @@ import type {
   CommentPerson, DashboardComment, EmbedInfo, GranteeMatches, ItemAccess, MoveEffect, PublicLink, PublicLinkState,
 } from "../contracts/dashboards"
 import { apiFetch } from "../http"
-import { ServiceError, type ServiceErrorCode } from "../errors"
+import { ServiceError, deniedFor, type ServiceErrorCode } from "../errors"
 
 /**
  * DashboardService NYATA — board disimpan di ClickHouse
@@ -41,12 +41,12 @@ import { ServiceError, type ServiceErrorCode } from "../errors"
  */
 
 /**
- * The service error code for a status: 401 and 403 are a permission, 404 is
- * "not found", a 5xx is the service being unavailable, the rest is a request
- * the server refused. One rule for every call here.
+ * The service error code for a status: a 401 or 403 goes through `deniedFor`
+ * (`errors.ts`, WEB-12), so it never reaches here; 404 is "not found", a 5xx
+ * is the service being unavailable, the rest is a request the server refused.
+ * One rule for every call here.
  */
 function codeFor(status: number): ServiceErrorCode {
-  if (status === 401 || status === 403) return "permission_denied"
   if (status === 404) return "not_found"
   if (status >= 500) return "unavailable"
   return "invalid_request"
@@ -55,6 +55,9 @@ function codeFor(status: number): ServiceErrorCode {
 async function readJson<T>(res: Response): Promise<T> {
   const json = await res.json().catch(() => null)
   if (!res.ok) {
+    // WEB-12: a refusal goes through deniedFor (errors.ts).
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
     throw new ServiceError(codeFor(res.status), json?.error ?? `Gagal (${res.status})`)
   }
   return json as T
@@ -70,6 +73,9 @@ async function readJson<T>(res: Response): Promise<T> {
 async function checkedWrite<T>(res: Response): Promise<T> {
   const json = await res.json().catch(() => null)
   if (!res.ok) {
+    // WEB-12: a refusal goes through deniedFor (errors.ts).
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
     throw new ServiceError(
       codeFor(res.status),
       json?.error ?? `The change was refused (${res.status}).`
@@ -86,6 +92,9 @@ async function request<T>(
   const res = await apiFetch(url, init)
   const json = await res.json().catch(() => null)
   if (!res.ok) {
+    // WEB-12: a refusal goes through deniedFor (errors.ts).
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
     throw new ServiceError(codeFor(res.status), json?.error ?? fallbackMessage)
   }
   return json as T
@@ -110,6 +119,22 @@ async function writeBoard(
 const JSON_HEADERS = { "Content-Type": "application/json" }
 
 export const clickhouseDashboardService: DashboardService = {
+  async filterValues({ column, scope, others, search }, signal) {
+    const q = new URLSearchParams({ column })
+    if ("mart" in scope) {
+      q.set("mart", scope.mart)
+      if (scope.joins?.length) q.set("joins", JSON.stringify(scope.joins))
+    } else if ("sqlSource" in scope) {
+      q.set("source", scope.sqlSource)
+    } else {
+      q.set("board", scope.board)
+    }
+    if (search.trim()) q.set("q", search.trim())
+    if (others.length) q.set("filters", JSON.stringify(others))
+    const res = await apiFetch(`/api/dashboard/values?${q.toString()}`, { cache: "no-store", signal })
+    const json = await readJson<{ values?: unknown[]; truncated?: boolean }>(res)
+    return { values: (json.values ?? []).map(String), truncated: json.truncated === true } satisfies FilterValues
+  },
   async listBoards(signal) {
     const res = await apiFetch("/api/dashboard/boards", { signal })
     const json = await readJson<{ boards?: Board[] }>(res)
@@ -158,6 +183,79 @@ export const clickhouseDashboardService: DashboardService = {
       signal,
     })
     await checkedWrite<unknown>(res)
+  },
+  /**
+   * Save a chart from the builder's high-level input (`WEB-7` D6). The
+   * server answers `{ chart }` on success and its own `{ error }` otherwise;
+   * the error is thrown as the service error whose message the builder
+   * shows, which is what the direct call it replaces did.
+   */
+  async saveChart(input, edit, signal) {
+    const res = await apiFetch("/api/dashboard/specs", {
+      method: edit ? "PUT" : "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(input),
+      signal,
+    })
+    if (!res.ok) {
+      const json = (await res.json().catch(() => null)) as { error?: string } | null
+      // WEB-12: a refusal goes through deniedFor (errors.ts).
+      const denied = deniedFor(res.status, json)
+      if (denied) throw denied
+      throw new ServiceError(codeFor(res.status), json?.error ?? "Failed to save chart", res.status)
+    }
+    // `BI-48`: the route answers `{ ok, chart }`; a tile's Duplicate places the
+    // new tile below the original by this id. An answer without one is `""`:
+    // the chart exists, and the caller saves no layout for it.
+    const json = (await res.json().catch(() => null)) as { chart?: { id?: unknown } } | null
+    return { id: typeof json?.chart?.id === "string" ? json.chart.id : "" }
+  },
+  /**
+   * The marts, by name (`WEB-7` D7). The route answers rows with them; the
+   * picker only needs what to call each one.
+   */
+  async listMarts(signal) {
+    const json = await request<{ marts?: { name?: string; rows?: number }[] }>(
+      "/api/dashboard/fields",
+      { cache: "no-store", signal },
+      "The marts could not be loaded"
+    )
+    return (json.marts ?? [])
+      .filter((mart): mart is { name: string; rows?: number } =>
+        typeof mart.name === "string" && mart.name.length > 0
+      )
+      .map((mart) => ({ name: mart.name }))
+  },
+  /**
+   * The measures of one mart (`WEB-7` D7). The route also answers its
+   * dimensions and kinds; a rule watches measures, so those are what it
+   * returns.
+   */
+  async listMartMeasures(mart, signal) {
+    const json = await request<{ measures?: string[] }>(
+      `/api/dashboard/fields?mart=${encodeURIComponent(mart)}`,
+      { cache: "no-store", signal },
+      "The fields could not be loaded"
+    )
+    return json.measures ?? []
+  },
+  /**
+   * One stored chart, read from the list the console already calls. The list
+   * is what the server has: there is no by-id route, and adding one is not
+   * this change's business (`WEB-7` D6).
+   */
+  async getChart(id, signal) {
+    const json = await request<{
+      charts?: { id: string; title?: string; board?: string; def?: Record<string, unknown> }[]
+    }>("/api/dashboard/specs", { cache: "no-store", signal }, "The chart could not be loaded")
+    const found = (json.charts ?? []).find((chart) => chart.id === id)
+    if (!found) return null
+    return {
+      id: found.id,
+      title: found.title ?? found.id,
+      board: found.board ?? "default",
+      def: found.def ?? {},
+    }
   },
 
   async listSqlSources(signal) {
@@ -280,14 +378,25 @@ export const clickhouseDashboardService: DashboardService = {
     await checkedWrite<{ ok: boolean }>(res)
   },
   async listBoardCharts(board, signal) {
-    const json = await request<{ charts?: { id: string; title?: string; board?: string }[] }>(
+    const json = await request<{ charts?: { id: string; title?: string; board?: string; kind?: string }[] }>(
       "/api/dashboard/specs",
       { cache: "no-store", signal },
       "The charts could not be loaded"
     )
     return (json.charts ?? [])
       .filter((c) => c.board === board)
-      .map((c) => ({ id: c.id, title: c.title ?? c.id }))
+      .map((c) => ({ id: c.id, title: c.title ?? c.id, kind: c.kind }))
+  },
+  async listChartOutlines(signal) {
+    const json = await request<{
+      charts?: { id: string; board?: string; kind?: string; span?: number; def?: { kind?: string } }[]
+    }>("/api/dashboard/specs", { cache: "no-store", signal }, "The charts could not be loaded")
+    return (json.charts ?? []).map((c) => ({
+      id: c.id,
+      board: c.board || "default",
+      kind: c.kind ?? c.def?.kind ?? "",
+      ...(c.span === 2 ? { span: 2 as const } : {}),
+    }))
   },
   // BI-19 part A. The server's sentences are ours, so they are shown as they come.
   async getPublicLink(board, signal) {

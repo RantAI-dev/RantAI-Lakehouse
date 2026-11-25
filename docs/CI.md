@@ -18,13 +18,26 @@ This repo's CI is split into workflows under `.github/workflows/`:
   throwaway registry and a throwaway key. See "Release pipeline" below.
 - **`coverage.yml`** — `cargo llvm-cov` (lcov, uploaded as a workflow
   artifact) and a CycloneDX SBOM per crate (also uploaded as an artifact,
-  for Phase 6's release attachment). Runs on `push` to `main` and manual dispatch
-  only to avoid spending ~30 runner minutes per PR run when no PR checks consume
-  the artifact.
+  for Phase 6's release attachment). Runs on a `push` to `main` that changes a file
+  the Rust tests read, and on manual dispatch; never on a pull request, which would
+  spend ~30 runner minutes per PR run when no PR check consumes the artifact.
 - **`security-all-branches.yml`** — daily scheduled (`cron: '17 3 * * *'`) and manual
   dispatch scan of all git branches using `gitleaks` (`--log-opts="--all"`).
   Deliberately separate from pull-request checks so findings on one branch do
   not block unrelated PRs (SEC-36, D2).
+- **`staging-cache-prune.yml`** — daily scheduled (`cron: '23 6 * * *'`) and manual
+  dispatch cleanup of the staging VM's disk. It prunes the BuildKit build cache
+  (cache only: no container, no log, no volume) and the dangling images the
+  earlier deploys left behind, and nothing else. It runs on the staging runner
+  (`self-hosted`, `staging`), like the deploy, and has its own concurrency group
+  so that a scheduled run can never cancel a deploy that is still queued. See
+  "Staging disk (cache prune)" below.
+- **`deploy-staging.yml`** — the staging deployment, on a push to `main` or on
+  manual dispatch. Two jobs: `build-api-image` builds `lakehouse-api`'s image
+  (the `cargo build --release`) on a GitHub-hosted runner, and `deploy` runs on
+  the staging VM, loads that image and starts the stack with it. The Rust
+  compile therefore does NOT happen on the VM, next to the running stack. See
+  "The staging deploy" below.
 
 ## Change Scopes and the Single Gate (`ci-required`)
 
@@ -33,7 +46,7 @@ To reduce CI feedback latency on targeted changes (such as docs-only or frontend
 
 | Scope | Triggered By |
 |---|---|
-| `rust` | `rust/**`, `src/lib/dashboard-specs.ts`, `docker-compose.yml` |
+| `rust` | `rust/**`, `src/lib/dashboard-specs.ts`, `docker-compose.yml`, `.env.example`, `ops/release/release.pub`, `ops/release/fixtures/**`, `public/geo/**` (the last three are compiled in by `include_bytes!`/`include_str!`, `OPS-24` R5) |
 | `frontend` | `src/**`, `public/**`, `package.json`, `bun.lock`, `bunfig.toml`, `tsconfig.json`, `next.config.ts`, `eslint.config.mjs`, `postcss.config.mjs`, `components.json`, `Dockerfile.frontend` |
 | `dagster` | `dagster/**` |
 | `site` | `site/**`, the Lakehouse site, its own package (`WEB-5` D12) |
@@ -41,10 +54,208 @@ To reduce CI feedback latency on targeted changes (such as docs-only or frontend
 | `docs_only` | True when every changed file is under `docs/**`, `GTM/**`, or is a root `*.md`, `LICENSE` or `NOTICE` |
 | `all` | `.github/**`, `ops/fixtures/**`, `scripts/ci/**`, an unreadable base SHA, or any file unclassified by the rules above (fails safe) |
 
-On a `push` to `main`, all jobs run unconditionally.
+The same script also writes the gate groups the run selected: `gates_storage`,
+`gates_pipelines`, `gates_cdc`, `gates_ingest`, `gates_saas`, `gates_secrets`,
+`gates_alerts`, `gates_upload`, `gates_governance` and `gate_groups` (`OPS-25`;
+see "Gates by path" below).
+
+A `push` to `main` follows the same scopes as a pull request (`OPS-24` D1): the diff
+is the push's own (`github.event.before` to the pushed commit). Every push has its own
+run and none waits for another (D2). One full run starts every night at 19:23 UTC and
+can be started by hand (`workflow_dispatch`): it has no base commit, and `ci-required`
+requires every job on both events whatever the scope says (D3, `OPS-24` R3). Setting the
+repository variable `CI_PUSH_FULL` to **exactly `true`, lower case** makes every push run
+everything again; any other value (`TRUE`, `1`, `yes`) is a `::warning::` in the log and
+does nothing, because the comparison happens in `detect_change_scope.sh` and nowhere else
+(`OPS-24` R4). The same push's run then also turns the push proof off, from that script's
+`push_full` output.
+
+### A push that repeats a passed pull request
+
+A push whose diff was already tested by a pull request does not run that test again
+(`OPS-24` D4–D6). `scripts/ci/detect_push_proof.sh`, run by `changes`, calls a push
+**proven** when all of the following hold for the pushed commit `H`:
+
+1. the event is `push`, and the push's scope needs the Rust tests or the acceptance
+   jobs (otherwise there is nothing to skip);
+2. a pull-request head `P` is found: `H`'s second parent when `H` is a merge commit;
+   otherwise the head of the one merged pull request whose `merge_commit_sha` is `H`
+   and whose base is `main`, read from the API, fetched as `refs/pull/<n>/head` and
+   checked to be that exact commit (most merges here are squash merges, so the
+   merge-commit rule alone would miss most pushes);
+3. `H`'s first parent is an ancestor of `P`: the branch held `main`'s tip when it was
+   merged, so the run that tested `P` tested `H`'s tree;
+4. `H`'s tree equals `P`'s tree;
+5. the most recently completed `ci-required` check run on `P`, made by GitHub Actions,
+   is a success, and none is still running;
+6. in that same check suite, the job that stands for each group the push needs
+   succeeded: `Rust · fmt` for the Rust group, `Images · build lakehouse-api + dagster
+   once` for the acceptance group. The gate script makes a group all-or-nothing, so
+   one job of the group plus a green `ci-required` proves the group, which closes the
+   case where the pull-request run had a narrower scope than the push.
+
+Anything else is **not proven** — an error, an empty answer, a failed API call, an
+unexpected value — and then every job in scope runs, as before. A proven push still
+runs `changes`, `repo-lints`, the console and Dagster unit jobs when in scope, `fmt`,
+`clippy`, `build`, `msrv`, `images` and one leg of `test` in its cheapest form: it
+restores the cache and compiles (`cargo nextest run --no-run`) only when the restore
+was not an exact hit. It skips the nextest runs, the doctest step, the test-count
+check, the 25 gate jobs and `image-smoke`. `images` keeps running because it is the
+only writer of the image layer cache the pull requests read.
+
+**The accepted limit of this proof (`OPS-24` D4, R6c).** Condition 5 reads the
+`ci-required` check run of the head commit `P`, and a head's checks are reported for
+whatever base that run was made against. So a head whose green `ci-required` came from a
+run against another base — a pull request retargeted after it passed, or a stack branch
+whose checks were made against its parent branch rather than `main` — satisfies condition
+5 without its run having tested the tree against `main`'s tip. Conditions 3 and 4 still
+prove that the *code* is the code that was tested; what they cannot prove is that the
+run's merge base was `main`. The nightly run (D3) runs every job on `main` every night, so
+a gap of that kind is closed within a day. Retargeting a pull request does not by itself
+start a new run (the `pull_request` trigger names no `edited` type), so the fresh run
+against the new base comes with the next push to the branch. A future fix could compare
+the run's base SHA, which the check-run payload does not carry.
+
+`ci-required` treats the skipped jobs as follows (`OPS-24` D6):
+
+| Jobs | "skipped" is accepted when |
+|---|---|
+| `changes`, `repo-lints` | never |
+| `verify` | neither `frontend` nor `all` |
+| `fmt`, `clippy`, `build`, `msrv`, `test` | neither `rust` nor `all` (a proven push does not excuse them) |
+| `dagster-unit-tests`, `dagster-loader-tests` | neither `dagster` nor `all` |
+| `images` | none of `rust`, `dagster`, `stack`, `all` (a proven push does not excuse it) |
+| the 25 gate jobs and `image-smoke` | none of `rust`, `dagster`, `stack`, `all` (a gate job's own group narrows this further, see "Gates by path" below); **or** the event is `push` and the push is proven |
+
+| Result | Required | Not required |
+|---|---|---|
+| `success` | pass | pass |
+| `skipped` (or empty) | **fail** | pass |
+| `failure`, `cancelled` | **fail** | **fail** |
+| anything else | **fail** | **fail** |
+
+The proof is read on the event `push` only: on a pull request, a scheduled run or a
+manual run it is ignored, and `ci-required` gates exactly as it does without it. The
+nightly run of D3 and `CI_PUSH_FULL=true` are the backstops that still run every
+gate.
+
+### Draft PRs (`OPS-38`)
+
+On a `pull_request` event whose PR is a draft, only the fast checks run so
+in-progress and stacked PRs do not fill the hosted runner queue: `changes`,
+`repo-lints`, `verify` (when in scope), `Rust · fmt` (when in scope),
+`ci-required`, and the separate `security.yml` workflow. Every heavy job (`clippy`,
+`build`, `msrv`, `test`, Dagster unit/loader tests, `images`, `image-smoke`, and
+all 25 acceptance gates) and the two `REL-20` nextest steps in `ci-required` are
+skipped. `scripts/ci/detect_change_scope.sh` compares
+`github.event.pull_request.draft` to **exactly `true`, lower case** and fails
+closed on any other or missing value (non-draft / full run); `changes` exports
+`draft` and `heavy` (`draft != 'true'`), and `ci-required` accepts the skipped
+heavy jobs on a draft while still failing if any job failed or was cancelled and
+printing the draft state in its log. `ci.yml` subscribes to `pull_request` types
+`opened`, `synchronize`, `reopened`, and `ready_for_review`, so marking a draft
+ready starts a full run automatically.
+
+### Gates by path (`OPS-25`)
+
+A pull request runs only the acceptance gates its changed files can affect. The 25 gate
+jobs are arranged in nine groups, and a group runs only when a file that can change what
+it exercises changes:
+
+| Group | Jobs | What they exercise |
+|---|---|---|
+| `storage` | `g1-rustfs`, `g2-seaweedfs` | `g1_lakekeeper`, tenant provisioning on SeaweedFS |
+| `pipelines` | `g3a-dagster`, `g3-maintenance`, `gold-export` | Dagster + dlt Bronze ingest, the authored pipelines, maintenance, Gold export |
+| `cdc` | `g4-cdc`, `g4-mysql`, `g4-mongo`, `g4-oracle`, `g4-mssql` | change capture through Kafka Connect |
+| `ingest` | `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g6-ops`, `g6-discovery-scale` | batch connectors, connector operations, discovery at scale |
+| `saas` | `g6-saas-a`, `g6-saas-b` | business-app connectors against the vendor stubs |
+| `secrets` | `g6-credentials`, `g6-secret-managers`, `g6-oauth`, `g10-sso` | credentials at rest, Vault/AWS, OAuth sign-in, Keycloak SSO |
+| `alerts` | `g6-alerts` | alert delivery |
+| `upload` | `g9-upload` | file upload |
+| `governance` | `g8-governance`, `g8-time-travel` | masking and time travel on Trino and ClickHouse |
+
+`images` and `image-smoke` are not in a group: their condition is unchanged, so a
+console-only pull request still builds both images and proves `/health` starts.
+
+`scripts/ci/gate_paths.txt` is the one place this is written. A `group` line lists a
+group's jobs; a `path <pattern> <groups>` line names the files that select it, with
+`<groups>` a comma list, `all` (every group) or `none` (no gate). Patterns are bash
+globs, where `*` also matches `/`, and **the first matching line wins**, so the specific
+lines come before the catch-alls. `scripts/ci/detect_change_scope.sh` reads the map
+once, writes `gates_<group>` for each group and `gate_groups` (`none`, or the selected
+groups between commas, `,cdc,`), and each gate's `if:` keeps today's scope condition and
+appends its own `gates_<group>`. An unmapped file, a missing or unreadable map, and the
+label below select every group: unknown means everything, and a map that names a group
+that does not exist turns `changes` red.
+
+**Shared paths select every group.** One binary (`cargo build -p lakehouse-api`) serves
+every gate, and 21 of the 25 gates create connectors, run pipelines and read back
+through the router and the shared routes, so `docker-compose.yml`, `.env.example`,
+`.github/*`, `scripts/*`, `rust/migrations/*`, `rust/Cargo.toml`, `rust/Cargo.lock`,
+every crate's `Cargo.toml` and every `src/` module not named in the map, `rust/Dockerfile`,
+`rust/entrypoint.api.sh`, `rust/rust-toolchain.toml`, `dagster/Dockerfile`,
+`dagster/pyproject.toml`, `dagster/dagster.yaml`, `definitions.py` and every Dagster
+module not named in the map, `ops/fixtures/*`, `ops/gates/*`, `ops/oidc-mock/*`,
+`ops/smtp-ca/*`, `ops/backups/*`, `ops/init-env.sh`, and any other `ops/*` or `rust/*`
+path select all nine groups. Inside the API that includes `lib.rs`, `main.rs`,
+`state.rs`, `config.rs`, `policy.rs` (`POLICY_TABLE`), `policy_engine.rs`,
+`sql_rewrite.rs`, `routes/mod.rs` (the router), `routes/support.rs`, `routes/auth.rs`,
+`routes/identity.rs`, `routes/connectors.rs`, `routes/pipelines.rs`, `routes/query.rs`,
+`routes/governance.rs` and `upstream_error.rs`.
+
+**`none` is explicit and narrow.** A path selects no group only when no gate can load
+it: integration tests and benches (except G1's own `g1_lakekeeper` test, which is the
+`storage` gate), the parity corpus, `lakehouse-test-support` (a dev-dependency),
+`lakehousectl` (not in any image), the assistant (`routes/ai/*`, `lakehouse-llm`, the
+store's `chat_term.rs`, `assistant_settings.rs` and `knowledge.rs`), Dagster's unit
+tests, `ops/lint`, `ops/release`, `ops/ai_eval`, `ops/bench`, `ops/geo`, `ops/demo`,
+`ops/forecast`, and the console (`src/*`, `public/*`, its config files,
+`Dockerfile.frontend`; `images` builds the API and Dagster only). Two console paths are
+the exception: `src/lib/dashboard-specs.ts` and `public/geo/*` are compiled into
+`lakehouse-bi`, so they select `governance,alerts`.
+
+**Adding a `path` line requires evidence (`OPS-38` D2).** Add a `path` rule to
+`scripts/ci/gate_paths.txt` for a module under `rust/crates/lakehouse-api/src/`
+or `rust/crates/lakehouse-store/src/` only where its gate reach is proven: grep
+the gate scripts (`ops/g*`, `ops/gold_export*`, `dagster/`) and the gate jobs
+in `.github/workflows/ci.yml` for every route path defined in the file, trace
+every Rust caller and importer across the workspace, and record that evidence in
+a `#` comment line immediately above the new `path` rule. Map a file to `none`
+only when no gate calls any of its routes and no gate-exercised module imports
+it; any file whose reach is unclear keeps the `all` default.
+
+**The label `ci:all-gates`.** Adding that label to a pull request selects every group
+and sets `stack=true`, so `images` runs too. Only a boolean crosses into the script
+(`ALL_GATES_LABEL`), never any label text, and the script compares it to exactly `true`;
+labels are in the event payload, so no new permission is needed. It takes effect on the
+next push to the pull request (or a close and reopen): no `labeled` trigger is added,
+because any label event would start a run and cancel the one in progress. Whether
+"Re-run jobs" sees a label added after the original event is *not verified*: push.
+
+**What a skipped gate means (`ci-required`, `OPS-25` D7).** `required_gate.sh` reads
+`gate_groups` and the map's `group` lines:
+
+| Scope | The job's group | Required |
+|---|---|---|
+| no acceptance scope (§`ci-required` above) | any | no |
+| acceptance scope, `all=true`, or the nightly/manual run | any | yes |
+| acceptance scope, a pull request or an unproven push | in `gate_groups` | yes |
+| acceptance scope, a pull request or an unproven push | not in it, and `gate_groups` is `none` or well formed | no |
+| acceptance scope | `gate_groups` unset, empty or malformed, or the job has no `group` line | **yes** (fail closed) |
+
+`images` stays required by the acceptance scope and `image-smoke` by the unproven scope
+(the two lines are unchanged). A gate that failed or was cancelled is red whatever the
+selection says.
+
+**Pushes** follow the same map: a proven push skips every gate as before, and an
+unproven push runs the gates of the groups its own diff selects.
+
+The owner accepted on 2026-11-13 that `main` may occasionally be red until the nightly
+run catches a gate that a pull request did not run.
+
 
 Downstream jobs execute according to scope:
-- **`repo-lints`**: Runs unconditionally on all pushes and PRs. Folds the static lints (parity corpus secrets, R11 bare iceberg count, compose init readiness, Dagster intra-package imports, connector gate coverage (`SRC-9`: every supported connector type has a gate in `ops/gates/coverage.json`, or an explicit waiver that the output lists)) and the unit tests of the connector gate tooling into one fast job.
+- **`repo-lints`**: Runs unconditionally on all pushes and PRs. Folds the static lints (parity corpus secrets, R11 bare iceberg count, compose init readiness, Dagster intra-package imports, every file compiled into Rust from outside `rust/` setting the `rust` scope (`OPS-24` R5), every Rust test file being declared in a test binary (`OPS-32`, `scripts/ci/check_test_modules.sh`), connector gate coverage (`SRC-9`: every supported connector type has a gate in `ops/gates/coverage.json`, or an explicit waiver that the output lists)) and the unit tests of the connector gate tooling into one fast job.
 - **`verify`**: Runs if `frontend` or `all` is true.
 - **`site`** (`WEB-5` D12, "Site · lint, typecheck, test, build, size"): Runs if `site` or `all` is true, in `site/`: `bun install --frozen-lockfile`, lint, typecheck, unit tests, the static export built with `NEXT_PUBLIC_SITE_URL=https://example.invalid`, and a check that `out/index.html` is `lang="en"`, `out/id/index.html` is `lang="id"` and `out/en` does not exist. Required by `ci-required` (`SITE_RESULT`) exactly as `verify` is, on its own scope.
 - **`dagster-unit-tests`**: Runs if `dagster` or `all` is true. Runs the tests not marked `loader` (`-m "not loader"`).
@@ -54,15 +265,17 @@ Downstream jobs execute according to scope:
 - **`g6-oauth`** (`SRC-12` part C, `ops/g6/src12_oauth_test.py`): starts the same stack as `g6-ops` with `ops/g6/docker-compose.src12.override.yml` (the writable credentials volume and the runner's read-only view of it), and the CI-only `.env` sets the gate-only `CONNECTOR_OAUTH_ALLOW_HTTP=true` and `CONNECTOR_OAUTH_REDIRECT_URI=http://lakehouse-api:8080/api/connectors/oauth/callback`. The provider is a thread of the gate's runner: an authorize endpoint that approves at once and redirects with a code, a token endpoint that checks the PKCE verifier, issues 5-second access tokens and rotates the refresh token (honouring only the latest), a revocation endpoint, and a REST API whose pages answer 2 seconds late and require the bearer token. Steps: the client secret is saved before any sign-in (unverified, sealed); the gate signs in as a browser would (S256, random state, redirect to the product's callback with its own session); a load of 5 rows outlives one access token (at least two refresh grants are counted at the provider); the rotated refresh token is sealed in place (the file changed, still no clear text) and a second load after the first access token expired succeeds (the run record says so, the provider counted a refresh-token grant for it, the sealed token changed again; the table is loaded by `replace`, so rows are not the proof); the connection test refreshes and passes twice; a wrong and a replayed `state` are refused with the fixed page and never reach the provider; a refresh token the provider no longer honours fails one attempt as `sign_in_refused` with none of the provider's words in the log, and signing in again restores loading; signing out and deleting the connector each call the revocation address with the stored token and remove the files. Its own job, 25 minutes; the first CI runs are its measurement. Not run against a real stack before it reached CI.
 - **`g6-saas-a`** and **`g6-saas-b`** (`SRC-3` AD9 amended before slice 6, `ops/g6/g6_saas_test.py`): the gate of the business-app (`saas`) connectors is two jobs that run in parallel on the same scripts, each given the vendors it owns by `SAAS_GATE_VENDORS` (comma separated vendor ids, or `--vendors=`; empty means every vendor, as in a local run). `g6-saas-a` owns HubSpot, Zendesk, Salesforce, Google Analytics 4 and ServiceNow; `g6-saas-b` owns Confluence, SharePoint, Dynamics 365, Workday and NetSuite. One job with eight vendors took 16m17s of the signed 20 minutes (`7a8af090`), so ten would not fit; no step was removed to make them fit, and each job has its own compose project (`saasagci`, `saasbgci`). Both are in `ci-required` and `scripts/ci/required_gate.sh` (`G6_SAAS_A_RESULT`, `G6_SAAS_B_RESULT`), and `coverage.json` (slice 7) names the job each type is proven in. The rest of this entry describes what either job runs for its vendors. It is a gate in jobs of their own so that no existing connector gate grows (`g6-ingest-other` measured 14m53s to 18m36s of its 20 minutes, `docs/plans/SRC-9-RESULT.md`). One mock vendor server (`ops/g6/saas_stub.py`, stdlib only, service `saas-stub-g6`, profile `g6-saas`) answers for every vendor on the vendor's own port (the vendor's real paths, `VENDOR_PORTS` in the stub; `GET /health` and the `/__admin/<vendor>` state controls on 8080). **Through the product (slice 2 review BLOCKER 4):** the job runs the Dagster stack as `g6-ingest-other` does (`--profile dagster`: API, `dagster-code-location`, `dagster-webserver`, `dagster-daemon`, ClickHouse and the catalog as dependencies) with `ops/g6/docker-compose.g6-saas.override.yml` layered on `docker-compose.g6.override.yml`; that file turns on, for the API and the code location only, the gate-only `CONNECTOR_OAUTH_ALLOW_HTTP` and `SAAS_GATE_ORIGINS` (vendor id to the mock's origin; a no-op without the switch, in Rust and in Python, both tested) so that the product dials the mock. For every vendor in `PRODUCT_VENDORS` the gate: creates the connector through the API (a type that is `supported = false` is not refused) and saves its ingest spec; runs the API's connection test (passes, names the account, repeats none of the mock's words); lists the objects through the orchestrator (the object says it loads incrementally) and previews it (HubSpot's properties API, Zendesk honestly `not_supported`); loads with `ingest_job` into Bronze Iceberg and reads the rows back through ClickHouse; changes the vendor, reloads, and reads back the merged table (no key twice; Zendesk's deleted ticket says `status = deleted`; HubSpot's archived deal stays because HubSpot reports no deletes); revokes the sign-in and checks the API's test and a run fail without the vendor's words. The browser sign-in has no browser here, so it stays a vendor-level step, and the vendor-level steps (the vendor module and `SaasSession` run in the runner against the mock) stay as well: HubSpot connect with the private-app token and the browser sign-in, discover, load, reload through search, a new property in describe, a 429 with `Retry-After` waited out and one that never lifts, a revoked token and refresh token; Zendesk connect with an email and API token and with the browser sign-in (the token request is JSON and the refresh token rotates), the mock's time-based export repeating tickets at page boundaries (upstream #659) and the connector reading each once, a cursor reload with a changed, a new and a deleted ticket, a new field, rate limits, a forbidden and a revoked sign-in. `--vendors-only` runs the vendor-level steps with no API against a local `python ops/g6/saas_stub.py` (set `PORT` if 8080 is taken). The API steps first assert the ten types are `supported: false`. ServiceNow (client credentials; Table API paged by the `Link` header; the dictionary describes the table) and Confluence (email + API token for the product steps; the browser sign-in behind Atlassian's gateway, with its cloud id, at vendor level; a reload that must stop near the cursor, `max_reads`) joined in slice 4. SharePoint (Graph delta feed, its link kept in dlt state; a delete marked; a 410 Gone resync at vendor level and in the dlt-state pytest) and Dynamics 365 (an untracked table filtered by `modifiedon`, a tracked table read by its change-tracking delta link) joined in slice 5; each has a product entry for client credentials and one for the browser sign-in's connection test and load, with Entra's token endpoint in the mock at the customer's tenant. Workday (a report read once and replaced; Basic for the integration user, the refresh grant with the client in the Basic header) and NetSuite (SuiteQL pages by `offset` and `hasMore`; the certificate way, whose PS256 assertion the mock verifies with the public key the gate registers, and the browser sign-in) joined in slice 6, each with a vendor-level run and two product entries in `g6-saas-b`; both are models of documentation that could not be run against a real account. Each later vendor adds an entry to `PRODUCT_VENDORS`, its mock and its vendor-level steps in its own slice, and the types stay `supported = false` until slice 7. Budget: the signed 20 minutes per job (each job's cut-off is 25, as `g6-ingest-other`'s); the first CI runs are its measurement and the job summary has each vendor's product steps time.
 - **`g6-discovery-scale`** (`SRC-13` decisions D9 and D12, `ops/g6/src13_discovery_scale_test.py`): creates a PostgreSQL schema of 10,000 tables in the stack's own database, lists it through `POST /api/connectors/conn-pg-lakehouse/discovery/list`, searches one table by part of its name, previews it, and prints each call's seconds on `[src13]` lines that are copied to the job summary. **Fails if the listing takes more than 120 seconds** (the feature page's "10,000 tables in 2 minutes", D9) or does not return exactly the 10,000 names. The stack is the API and its PostgreSQL only (with ClickHouse and `oidc-mock`, which the API depends on): no Dagster, because the API lists PostgreSQL itself. Its own job, so no existing connector gate grows past its 20 minutes (the type-by-type `discover` steps of `g6-ingest`, `g6-ingest-other`, `g4-cdc` and `g6-oracle` are quick calls, and the ones the orchestrator answers run after the loads). Estimated 8 to 12 minutes; the first CI runs are its measurement. The measured seconds are for a CI runner against a local PostgreSQL, not a customer's database. Not run against a real stack before it reached CI.
-- **Rust fmt / clippy / build / test / msrv**: Runs if `rust` or `all` is true.
-- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g9-upload`, `g6-alerts`, `g6-ops`, `g6-credentials`, `g6-secret-managers`, `g6-oauth`, `g6-discovery-scale`, `g6-saas-a`, `g6-saas-b`, `gold-export`, `g8-governance`, `g8-time-travel`)**: Run if `rust`, `dagster`, `stack`, or `all` is true.
+- **Rust fmt / clippy / build / test / msrv**: Runs if `rust` or `all` is true. The `test` job runs `cargo nextest run --workspace` across three partitions (`--partition count:N/3`, `REL-20`) plus `cargo test --doc` for doctests; local developers may keep `cargo test`. The integration tests are one binary per crate (`tests/it.rs`, `OPS-32`), so the job links 28 test binaries instead of 193; measurements in `docs/plans/OPS-32-RESULT.md`.
+- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g4-mysql`, `g4-mssql`, `g4-mongo`, `g4-oracle`, `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g9-upload`, `g6-alerts`, `g6-ops`, `g6-credentials`, `g6-secret-managers`, `g6-oauth`, `g6-discovery-scale`, `g6-saas-a`, `g6-saas-b`, `gold-export`, `g8-governance`, `g8-time-travel`)**: Run if `rust`, `dagster`, `stack`, or `all` is true **and** the job's gate group was selected ("Gates by path").
 - **`images` and `image-smoke`**: Same condition as the acceptance jobs; see "Images: built once per run" below.
 
 `ci.yml` runs with `permissions: contents: read` for the whole workflow, which is the
-token a fork PR is given. Nothing in it needs more: image artifacts and the layer cache use
-the Actions runtime credentials, which every run gets.
+token a fork PR is given. One job asks for more, and only to read: `changes` adds
+`checks: read` and `pull-requests: read`, which `scripts/ci/detect_push_proof.sh` uses
+on a push to `main` to read the merged pull request's check runs (`OPS-24` D7). On a
+pull request the script returns before any API call.
 
-At the end of the pipeline, **`ci-required`** runs with `if: always()`, checks every job result against the detected scope, and fails if any required job failed, cancelled, or was skipped when the scope indicated it should have run. Both the scope detection script (`scripts/ci/detect_change_scope.sh`) and the gate script (`scripts/ci/required_gate.sh`) have accompanying self-tests that run in CI before the scripts are executed.
+At the end of the pipeline, **`ci-required`** runs with `if: always()`, checks every job result against the detected scope, and fails if any required job failed, cancelled, or was skipped when the scope indicated it should have run, except the acceptance jobs and the test runs of a push proven to repeat a passed pull request (above). Both the scope detection script (`scripts/ci/detect_change_scope.sh`) and the gate script (`scripts/ci/required_gate.sh`) have accompanying self-tests that run in CI before the scripts are executed.
 
 ## Images: built once per run
 
@@ -75,7 +288,7 @@ jobs built the Dagster image as well. Now:
   (`image-lakehouse-api`, `image-lakehouse-dagster`): `docker buildx` with
   `outputs: type=docker`, compressed with `zstd`, one-day retention, no second
   compression by the artifact service. It prints each archive's size in the log.
-- Each consumer (`g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `g6-ingest-other`,
+- Each consumer (`g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g4-mysql`, `g4-mssql`, `g4-mongo`, `g4-oracle`, `g6-ingest`, `g6-ingest-other`,
   `g6-oracle`, `g9-upload`, `g6-alerts`, `g6-ops`, `g6-credentials`, `g6-secret-managers`, `g6-oauth`, `g6-discovery-scale`, `g6-saas-a`, `g6-saas-b`, `gold-export`, `g8-governance`, `g8-time-travel`,
   `image-smoke`) `needs: [changes, images]`, downloads the artifact(s) it
   uses, `docker load`s them, and starts the stack with `up -d --no-build`. `gold-export`,
@@ -136,9 +349,111 @@ The repository's Actions cache is capped at 10 GB and was at 9.9 GB when PR 2 wa
   'refs/heads/main'`. PRs restore `main`'s cache and do not store their own (PR #88 stored a
   980 MB copy of `build`'s). The `fmt` job has no cache step at all: `cargo fmt --check`
   compiles nothing.
+- On a proven push the cache writers still run: `clippy`, `build`, `msrv`, one leg of
+  `test` (it compiles only when its cache is not current) and `images`.
 
 If `images` is cold on `main` more often than on a Cargo.lock change, the cache is being
 evicted: reduce what `rust-cache` stores before anything else (CI-SPEED-PLAN §9).
+
+## Runners
+
+Two repository variables, both unset by default, decide whether work may run on a
+self-hosted CI worker (`OPS-24` D10, D11). With both unset the workflows are exactly as
+they were: every job runs on `ubuntu-latest`.
+
+| Variable | What it moves | Default |
+|---|---|---|
+| `CI_WORKER_COMPILE` | the four small Rust jobs: `fmt`, `clippy`, `build`, `msrv` | unset, hosted |
+| `CI_COVERAGE_ON_WORKER` | the `coverage` job of `coverage.yml` | unset, hosted |
+
+Both are read by `scripts/ci/select_runner.sh` and compared there, **exactly `true`,
+lower case** (`OPS-24` R4). `TRUE`, `1` or `yes` leaves every job hosted, because the
+workflows pass the raw value to the script and never compare it themselves — a GitHub
+expression's `==` on strings ignores case, so two comparisons could disagree.
+
+The labels are fixed in the repository, not read from a variable:
+`scripts/ci/select_runner.sh` holds `["self-hosted","lakehouse-ci"]` as a constant. A job
+is only offered to a runner that carries every label, so no variable value can reach
+another machine — the staging runner carries `self-hosted, Linux, X64, staging` and never
+`lakehouse-ci`.
+
+The first step of every job that can run self-hosted is "Refuse a self-hosted runner that
+is not the CI worker": it fails unless the runner's own environment holds
+`LAKEHOUSE_CI_WORKER=1`. It runs **before** `actions/checkout`, whose `git clean -ffdx`
+would delete the file that marker lives in on another machine. That is the second line of
+defence; the label is the first.
+
+**A fork's pull request always gets `ubuntu-latest`.** `select_runner.sh` decides from the
+event and `github.event.pull_request.head.repo.full_name`, and has a self-test. The honest
+limit: this protects an unmodified workflow. A fork can edit the workflow in its own pull
+request; only the repository setting that requires approval for external contributors
+stops that, and it is the owner's to set.
+
+**The worker's target directory.** `scripts/ci/worker_prepare.sh` (self-hosted steps only)
+prints the machine's facts, then gives cargo `$HOME/.cache/lakehouse-ci/target/<runner>`,
+one directory per runner registration, exported as `CARGO_TARGET_DIR`. Its size is
+bounded: `CI_WORKER_TARGET_MAX_GB` (5 to 500, default 40) is the limit; over it, files not
+read for three days are deleted, and if that is not enough the directory itself is
+recreated empty. That is the only place a file outside the workspace is deleted on a
+self-hosted runner, and it is the runner's own cache — never `cargo clean`, never on every
+run. `CI_WORKER_CARGO_JOBS` (1 to 64) becomes `CARGO_BUILD_JOBS`.
+
+**A machine below this size must not get a job a pull request requires:** 24 hardware
+threads or more, 48 GB of RAM or more (12 GB per runner instance), four runner instances,
+always on. That is what keeps utilisation under 0.7 at the measured peak and finishes a
+burst of five runs within today's eight minutes. A machine that can sleep blocks every
+pull request that waits for it, for up to 24 hours.
+
+**Before either variable is set, the owner checks these, in order** (`OPS-24` §3c, R11):
+
+1. Settings, Actions, General: "Require approval for all external contributors". A
+   contributor with one merged pull request can otherwise run an edited workflow that
+   names the worker's labels; whoever approves a fork's run reads its `.github/` and
+   `scripts/ci/` diff first.
+2. The CI worker's runner `.env` holds `LAKEHOUSE_CI_WORKER=1`. The staging runner's does
+   not, and the staging runner never gets the label `lakehouse-ci`.
+3. The runner's user has no `sudo`. It is in the `docker` group only if Coverage runs
+   there (Docker access is root on that machine): then `CI_WORKER_COMPILE` stays unset, so
+   that no pull request's code runs beside Docker.
+4. Nothing that user can read is a secret (keys, tokens, other checkouts).
+5. Optional: a runner registered at organisation level in a group limited to this
+   repository; not needed for D11.
+
+Then, for the first machine: leave `CI_WORKER_COMPILE` unset. Set
+`CI_COVERAGE_ON_WORKER=true` and `CI_WORKER_CARGO_JOBS=4`, start "Coverage & SBOM" by
+hand, and read the "Prepare the CI worker" step (cores, memory, disk, mount options) and
+the job's time. If the job is killed for memory or passes 90 minutes, unset the variable:
+the next run is on a hosted runner.
+
+**The cost of turning `CI_WORKER_COMPILE` on:** `main` no longer writes the hosted caches
+of `clippy`, `build` and `msrv` (those steps are guarded to a hosted runner), so a fork's
+pull request compiles them cold. That is why the switch is off by default.
+
+**Coverage on the worker (`CI_COVERAGE_ON_WORKER`).** `coverage.yml`'s `coverage` job can
+run on the CI worker when the variable is exactly `true`. It qualifies because nothing
+reads its result — it is not a required check and no workflow names its artifacts — and
+because the workflow has no `pull_request` trigger, so only `main`'s code reaches the
+worker through it. It is chosen only for `refs/heads/main` (`OPS-24` R10): a manual
+dispatch of another branch runs hosted, decided by `select_runner.sh` in the workflow's
+own `choose` job. It needs Docker (testcontainers) and 44 to 55 job-minutes on a hosted
+runner. When the worker is offline the run waits; `coverage.yml`'s concurrency rule allows
+one running and one waiting run and a newer push replaces the waiting one, so nothing
+piles up, and GitHub fails a job no runner took within 24 hours. Nothing waits for it, so
+that is acceptable. The job removes the containers it started — only those carrying
+`org.testcontainers.managed-by=testcontainers` and absent from its note, and nothing at
+all when that note is missing — and keeps the labelled reusable Postgres; the `sbom` job
+of the same workflow stays hosted, because 34 seconds have nothing to gain.
+
+What may run on the worker, and what may not (`OPS-24` D11):
+
+| Candidate | Read by anything? | Needs | Verdict |
+|---|---|---|---|
+| `coverage.yml`, job `coverage` | no (not a required check, no artifact consumer) | Docker (testcontainers), 44 to 55 min on 4 vCPU | **qualifies**, behind `CI_COVERAGE_ON_WORKER`, default hosted |
+| `coverage.yml`, job `sbom` | no | 34 s | stays hosted: nothing to gain |
+| `catalog-search-bench.yml` | its numbers are published as "on a GitHub runner" | a stack, up to 180 min | no: a different machine changes the numbers |
+| `g9-upload-large.yml` | same (`DATA-17-RESULT.md`) | reads container memory, 2 GiB files | no: same reason |
+| `security-all-branches.yml` | people | minutes, 03:17 UTC | no: about 2 job-minutes a day, off peak |
+| the nightly run | people | 42 jobs | no: the gates would collide on one machine, and the night has free hosted runners |
 
 ## MSRV
 
@@ -236,6 +551,35 @@ needs a human to explicitly decide to take it on and coordinate with anyone
 holding a local clone. The baseline makes it unnecessary for keeping the
 scan useful.
 
+## Security tool downloads (OPS-18)
+
+The security jobs install their scanners from pinned GitHub release assets:
+`gitleaks` v8.30.1 (`gitleaks_8.30.1_linux_x64.tar.gz`, in `security.yml`'s
+`gitleaks` and `history-scan` jobs and in `security-all-branches.yml`) and
+`cargo-deny` v0.22.0 (`cargo-deny-0.22.0-x86_64-unknown-linux-musl.tar.gz`,
+in `security.yml`'s `cargo deny check (all)` job — the same binary version
+`EmbarkStudios/cargo-deny-action@v2` used before OPS-18, now installed
+explicitly because that action's `curl | tar` had no retry).
+
+Every one of those downloads goes through `scripts/ci/retry_download.sh`:
+four attempts, `curl --connect-timeout 15 --max-time 120` per attempt, and a
+10/20/30-second backoff with no sleep after the last failure. Each attempt
+writes to a temporary file that is deleted on every exit path, so a truncated
+download can never be extracted and a partial archive is never published at
+the destination; extraction and the scan/run itself happen once, after a
+complete download. This is what the 2026-11-08 release-asset outage
+(16:02–17:35 WIB) showed was missing: `cargo-deny`, `gitleaks` and
+`history-scan` all failed before scanning anything. The job names — including
+the required status checks `cargo deny check (all)` and `gitleaks (working
+tree)` — are unchanged. `scripts/ci/tests/test_retry_download.sh` is run by
+the `Repo lints` job in `ci.yml`.
+
+`cargo audit (advisories)` is unchanged: the `cargo-audit` ref of
+`taiki-e/install-action` already wraps its release download in a `retry()`
+loop (10 attempts with a growing sleep) and passes `curl --retry 10`, so it
+needs no second retry here. OPS-18 covered `gitleaks` and `cargo-deny`; it did
+not report a `cargo-audit` download failure.
+
 ### Scan scope on PRs and `main` vs. the daily all-branch scan (`SEC-36`)
 
 Historically, `history-scan` fetched all remote branches and invoked `gitleaks`
@@ -282,6 +626,104 @@ against the full stack.
 The build that used to live here — `docker.yml`, which built `rust/Dockerfile` on a tag
 push and never published anything — is now the release pipeline below. It builds the same
 image, with the same build arguments, and then does the rest.
+
+## The staging deploy
+
+`deploy-staging.yml` runs on a push to `main` and on manual dispatch, with
+`concurrency: {group: staging, cancel-in-progress: false}` — a deploy is never
+cancelled half-way, and a second push waits for the first.
+
+It has two jobs.
+
+### `build-api-image` (GitHub-hosted runner)
+
+`lakehouse-api`'s image comes from `rust/Dockerfile`, which runs
+`cargo build --release --locked -p lakehouse-api`. That compile used to run ON
+the staging VM, in the middle of `docker compose up --build`, next to the whole
+running stack — the API, Postgres, Trino, ClickHouse, Kafka, the Dagster code
+location, webserver and daemon — on 8 vCPU and 8 GiB.
+
+That is what the deploy's build used to starve on. The bake stopped right
+after its last `exporting attestation manifest` line and sat in `futex_wait`
+until the run was cancelled (runs `44596923569` and `44666444411`, 17 and 28
+minutes of a 120-minute budget). The same bake returns 0 in a second on an idle
+box, so buildkit was never broken — the box was simply full of other work.
+
+The build now runs on `ubuntu-latest` and arrives as an artifact. It is the
+same build `ci.yml`'s `images` job makes, with the same arguments and the same
+GHA layer cache, so it is a cache hit:
+
+- `GIT_SHA` is deliberately **not** passed. `ARG GIT_SHA` sits near the top of
+  `rust/Dockerfile`, so a per-commit value would invalidate every layer below
+  it. The image carries `GIT_SHA=unknown`; the deploy sets the real commit at
+  RUN time (compose's `environment:` overrides the image's `ENV`, and
+  `check_commit` reads the run-time value), so the API and the code location
+  still agree and the console's op-source view still matches.
+- `CARGO_TARGET_DIR` and the `pipeline_src` build context are the same as in
+  `ci.yml` and in `docker-compose.yml`.
+- The cache is read and never written: the repository's Actions cache is capped
+  at 10 GB and `ci.yml`'s `images` job is what keeps it.
+
+### `deploy` (the staging VM)
+
+The deploy job downloads the artifact, `docker load`s it, and starts the stack
+with `up -d --no-build`. The images that are still built on the VM are the
+light ones (`dagster`, `console`, `g7-test-runner`, `oidc-mock`); the list is
+read out of compose's own resolved configuration, one service per image, so it
+cannot go stale.
+
+**The fallback.** If the artifact is missing, cannot be decompressed, or does
+not carry the expected image, the deploy builds the API image on the VM, as it
+did before. A staging deploy must not be blocked by an artifact service — and
+it must not come up with a stale image either, so the fallback builds rather
+than skips.
+
+The build step's budget is 45 minutes (it was 120). The longest build that
+succeeded took 22 minutes (a cold `cargo build --release`); 45 leaves room for
+a cold build and stops a hung one from holding the self-hosted runner for two
+hours, which it cannot afford — the runner serves one job at a time.
+
+## Staging disk (cache prune)
+
+Every staging deploy writes a new BuildKit build cache and a new image layer set.
+The cache reached 50 GB on the 146 GB disk of the staging VM, the disk was at
+94%, and the first manual prune had to free 50.31 GB to bring the box back.
+Nothing else reclaims that space: the build cache is only touched by a build.
+
+`staging-cache-prune.yml` bounds it. It runs on the staging runner
+(`self-hosted`, `staging`), daily at 06:23 UTC — an hour and a half after the
+bronze maintenance schedule (03:00), whose fan-out over 513 bronze tables is
+over by then — and on manual dispatch.
+
+| Command | What it removes | What it never removes |
+|---|---|---|
+| `docker builder prune --all --max-used-space 8GB --reserved-space 4GB --force` | BuildKit build cache beyond its budget, least recently used first | Containers, their logs, images, volumes |
+| `docker image prune --force --filter until=168h` | Dangling images (untagged leftovers of earlier deploys) older than a week | A tagged image; an image any container (running or stopped) uses |
+
+The two commands are deliberately **not** `docker system prune` and **not**
+`docker container prune`: both remove stopped containers, and with them the logs
+QA still has to read. `docker volume prune` is never run: it removes volumes,
+and with them the data.
+
+Two details are measured, not guessed:
+
+- **The size bound works; the age filter does not combine with it.** With
+  `--filter until=...` in place the space bounds stop biting (a filter plus
+  `--min-free-space 60GB` freed 0 B while the disk was 15 GB short of the
+  target), so the budget is the only bound that is used. `--reserved-space
+  4GB` keeps at least 4 GB of cache, so a burst of deploys can never prune the
+  cache away and turn the next deploy into a cold 20-minute `cargo build
+  --release`. Measured on the staging VM: the prune freed 4.37 GB and left
+  11.27 GB (the shared and the in-use records cannot be pruned, so the
+  effective ceiling sits a little above 8 GB).
+- **The prune cannot cancel a deploy.** Its concurrency group is
+  `staging-cache-prune`, not the deploy's `staging`: a new run replaces a
+  pending one in the same group, so a scheduled run sharing the deploy's group
+  could cancel a deploy that was still queued. No overlap with a build is
+  possible anyway — the staging runner runs one job at a time.
+
+The deploy workflow applies the same cache bound right after its build, so the
+cache never grows between the daily runs either.
 
 ## Release pipeline
 

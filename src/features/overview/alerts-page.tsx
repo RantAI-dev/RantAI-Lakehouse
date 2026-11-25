@@ -14,6 +14,7 @@ import {
   SeverityBadge,
 } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
+import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
@@ -56,12 +57,19 @@ function AlertResolutionForm(props: AlertResolutionProps) {
 
   return (
     <div className="flex flex-col gap-2">
+      {/* UX-4: the note is this box's one required input, so no star and no
+          legend; the textarea keeps `aria-required`. */}
+      <Label htmlFor="resolution-note">Resolution note</Label>
       <Textarea
+        id="resolution-note"
+        aria-required
         value={note}
         onChange={(e) => onNoteChange(e.target.value)}
         placeholder="Resolution note..."
-        aria-label="Resolution note"
       />
+      <p className="text-xs text-muted-foreground">
+        Required to Resolve; optional for Acknowledge or Silence.
+      </p>
       <div className="flex flex-wrap items-center gap-2">
         {selected.status === "open" ? (
           <Button

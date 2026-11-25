@@ -10,14 +10,15 @@ import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { SurfaceThemeProvider } from "@/components/ui/surface-theme";
 import { cn } from "@/lib/utils";
 import { dashboardDestination, queryDestination, urlDestination } from "@/lib/click-destination";
 import { binRangeFilter, isLastBin, toggleBinFilter } from "@/lib/chart-bins";
 import { bucketActions, bucketRangeFilter, dashboardRangeDestination, toggleBucketFilter } from "@/lib/bucket-click";
 import { ParamControls } from "./param-controls";
 import { ParamDialog } from "./param-dialog";
-import { PARAMS_PARAM, normalizeDef, paramsDiffer, paramsQuery, readParamsParam, savedParamsBody, withParamsParam, withValue, type BoardParam, type ParamControl, type ParamValue } from "@/lib/params";
-import { GRAIN_PARAM, differsFromSaved, grainQuery, readGrainParam, savedGrainBody, shownGrain, withGrainParam, type GrainChoice } from "@/lib/grain-switch";
+import { PARAMS_PARAM, acceptedParams, normalizeDef, paramsDiffer, paramsQuery, readParamsParam, savedParamsBody, withParamsParam, withValue, type BoardParam, type ParamControl, type ParamValue, type RefusedParam } from "@/lib/params";
+import { GRAIN_PARAM, differsFromSaved, grainNotAppliedSentence, grainQuery, readGrainParam, savedGrainBody, shownGrain, withGrainParam, type GrainChoice } from "@/lib/grain-switch";
 import { PART_NO_CLICK_REASON, isGrain, isTruncation, switchChoices, type ColumnKind, type Grain, type ReportingContext } from "@/lib/time-grain";
 import { effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
 import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
@@ -29,22 +30,23 @@ import { extractViewFiltersFromChat } from "@/lib/dashboard-view-filter-from-cha
 import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import {
-  TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, isSingleValueChart, isStaticKind, moveTab, moveTileToTab, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
+  TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, isSingleValueChart, isStaticKind, moveTab, moveTileToTab, placeCopyBelow, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
 } from "@/lib/dashboard-tabs";
-import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
-import type { ChartClick, FilterDef, FilterField } from "@/services/clients/bi-store";
-import { useAuth } from "@/features/auth/auth-provider";
-import { useCopilot } from "@/features/copilot/use-copilot";
-import { useService } from "@/hooks/use-service";
 import { dashboardService, queryService } from "@/services";
+import type { BoardTab, LayoutMap, PhoneTile, ChartClick, FilterDef, FilterField } from "@/services";
+import { useAuth } from "@/features/auth/auth-provider";
+import { useCopilotSelect } from "@/features/copilot/use-copilot";
+import { useService } from "@/hooks/use-service";
 import { newRunId, RUN_ID_HEADER } from "@/lib/run-id";
 import { STOPPED_SENTENCE } from "@/lib/query-limits";
 import { apiFetch } from "@/services/http";
 import { useAutoRefresh } from "./auto-refresh";
 import { BoardSwitcher } from "./board-switcher";
-import { ChartBuilder, type ChartDef } from "./chart-builder";
+import type { ChartDef } from "./chart-builder";
+import { chartEditHref, chartNewHref } from "./chart-page";
 import { fmtInt } from "./chart-option";
 import { DashboardActionsMenu, EditLayoutButton, NewChartButton, RenameDashboardDialog } from "./dashboard-actions";
+import { SaveTemplateDialog } from "./template-dialogs";
 import { chartWriteItems } from "./tile-write-items";
 import { ThemeFontDialog } from "./theme-font-dialog";
 import { FreshnessDialog } from "./freshness-dialog";
@@ -78,7 +80,7 @@ import { DrillMenu, NoteDialog, RecordsDialog, type DrillTarget } from "./drill"
 import { DrillTrail, useTileDrills } from "./tile-drills";
 import type { RecordsRequest } from "./records";
 import { forgetLastBoard, rememberLastBoard } from "./last-board";
-import { offerFor } from "./access-level";
+import { offerFor } from "@/lib/access-level";
 import { ShareDialog } from "./share-dialog";
 import { CommentsDialog } from "./comments-panel";
 import { TileBody } from "./tile-body";
@@ -128,6 +130,8 @@ type Payload = {
   theme?: string; font?: string;
   /** The parameters the board shows with this response's value, the value each has saved (or by default), and every value in force (BI-11). */
   params?: ParamControl[]; defaultParams?: Record<string, ParamValue>; appliedParams?: Record<string, ParamValue>;
+  /** The parameters whose requested value did not fit, with the reason (`BI-52`): empty when there are none. */
+  refusedParams?: RefusedParam[];
   filterColumns: string[]; filterFields?: FilterField[];
   boards: BoardOpt[]; kpis: KpiMeta[];
   charts: ChartCard[]; results: Record<string, Cell>; storeError?: string | null;
@@ -221,13 +225,21 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const pParam = searchParams.get(PARAMS_PARAM);
   const pValues = React.useMemo(() => readParamsParam(pParam), [pParam]);
   const [paramsOpen, setParamsOpen] = React.useState(false);
+  // BI-52: a parameter value the server refused, by name, with its sentence,
+  // and the answer's own view of what was sent, until the person changes that
+  // parameter again, presses Reset, or opens another dashboard.
+  const [paramRefusals, setParamRefusals] = React.useState<Record<string, string>>({});
+  const [paramAnswer, setParamAnswer] = React.useState<
+    { sent: Record<string, ParamValue> | null; refused: RefusedParam[]; applied?: Record<string, ParamValue> } | null
+  >(null);
   const [savingDefault, setSavingDefault] = React.useState(false);
-  const [editing, setEditing] = React.useState<{ id: string; def: ChartDef } | null>(null);
   // Tile delete is one click away, so it asks first.
   const [removing, setRemoving] = React.useState<{ id: string; title: string } | null>(null);
   const [removeBusy, setRemoveBusy] = React.useState(false);
   const [renameOpen, setRenameOpen] = React.useState(false);
   const [themeOpen, setThemeOpen] = React.useState(false);
+  // BI-18 part D (T6): "Save as template" from the ⋯ menu.
+  const [templateOpen, setTemplateOpen] = React.useState(false);
   // BI-4 part B: the dashboard's own freshness rule, saved through the board write path.
   const [freshOpen, setFreshOpen] = React.useState(false);
   const [savingFresh, setSavingFresh] = React.useState(false);
@@ -267,7 +279,6 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const reloadShortcuts = shortcuts.reload;
   const isFavourite = shortcuts.status === "success" && shortcuts.data.favourites.some((f) => f.kind === "board" && f.id === board);
   React.useEffect(() => { void dashboardService.touchRecent("board", board).catch(() => undefined); }, [board]);
-  const [newChartOpen, setNewChartOpen] = React.useState(false);
   const [fullscreen, setFullscreen] = React.useState(false);
   // Auto-refresh starts from the board's saved interval; a viewer's change is
   // this session's only (null = follow the saved one) and is never written
@@ -326,6 +337,20 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       setData({ ...json, charts: (json.charts ?? []).map((c) => (c.def ? { ...c, def: normalizeDef(c.def) } : c)) });
       setLayout(json.layout ?? {});
       setPhone(json.phoneLayout);
+      // BI-52 (plan D28, D29; QA LH-BI-11-05): a refused value is shown on its
+      // parameter, and this answer also decides which names the address may
+      // keep.
+      const refused = json.refusedParams ?? [];
+      if (refused.length) setParamRefusals((prev) => {
+        const next = { ...prev };
+        for (const r of refused) next[r.name] = r.reason;
+        return next;
+      });
+      // R3: a failed read of the definitions answers `appliedParams: {}` with
+      // `storeError`, which says nothing about the values; passed on as such,
+      // it would strip every one of them from the address. Undefined keeps
+      // them (QA LH-BI-11-05 (BI-52), review R3).
+      setParamAnswer({ sent: pValues, refused, applied: json.storeError ? undefined : json.appliedParams });
       return json;
     } catch (e) {
       // Stop is an answer, not an error: the tiles that were already on screen stay, and the page says "Stopped".
@@ -354,7 +379,12 @@ export function DashboardPage({ boardId }: { boardId: string }) {
 
   // Switching dashboard starts in view mode; the switcher navigates without
   // `f`, so the new board opens on its own default.
-  React.useEffect(() => { setEdit(false); setPhoneEdit(false); }, [board]);
+  React.useEffect(() => {
+    setEdit(false);
+    setPhoneEdit(false);
+    // BI-52: a refusal belongs to the dashboard it was made on.
+    setParamRefusals({});
+  }, [board]);
   React.useEffect(() => { if (!edit) setPhoneEdit(false); }, [edit]);
   // `/dashboards` meneruskan ke board terakhir, jadi membukanya di sinilah
   // yang menentukan "terakhir" — bukan klik di daftar, karena kanvas juga
@@ -474,10 +504,33 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const paramsDirty = pValues !== null && paramsDiffer(paramControls, data?.defaultParams);
   const rowDirty = dirty || grainDirty || paramsDirty;
   const changeParam = React.useCallback((name: string, value: ParamValue) => {
+    // BI-52: changing a parameter clears its refusal; the next answer decides
+    // whether there is a new one.
+    setParamRefusals((prev) => {
+      if (!(name in prev)) return prev;
+      const next = { ...prev };
+      delete next[name];
+      return next;
+    });
     const qs = withParamsParam(window.location.search, withValue(pValues, data?.defaultParams ?? {}, name, value));
     router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
   }, [router, pathname, pValues, data?.defaultParams]);
+
+  // BI-52 (plan D29): a refused value never stays in the address, and neither
+  // does a name the answer does not know. Writing it starts the one more read
+  // that confirms the value in force; nothing here asks the server first.
+  React.useEffect(() => {
+    if (!paramAnswer) return;
+    // The address has moved on since this answer: the next answer decides.
+    if (paramsQuery(paramAnswer.sent) !== paramsQuery(pValues)) return;
+    const kept = acceptedParams(paramAnswer.sent, paramAnswer.refused, paramAnswer.applied);
+    if (paramsQuery(kept) === paramsQuery(pValues)) return;
+    const qs = withParamsParam(window.location.search, kept);
+    router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+  }, [paramAnswer, pValues, router, pathname]);
   const resetRow = React.useCallback(() => {
+    // BI-52: Reset is one of the three ways a refusal goes away.
+    setParamRefusals({});
     const q = new URLSearchParams(window.location.search);
     q.delete(FILTER_PARAM);
     q.delete(GRAIN_PARAM);
@@ -666,6 +719,41 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     }, 600);
   }, [board]);
 
+  // `BI-48` (QA `LH-BI-6-40`): a chart's copy is a new chart on the same
+  // dashboard from the stored definition, titled "<title> (copy)", placed
+  // directly below the original on its tab and the same size. The save is the
+  // console's own create (`POST /api/dashboard/specs`, `D17`), so the server
+  // applies every check of a new chart; the layout save is awaited, not the
+  // debounced `persistLayout`, because the copy must land where the page drew
+  // it before the reload.
+  //
+  // `BI-48` review round 1, R6: the chart and its place are two writes, and a
+  // failure of the second is not a failed duplicate. The armed layout timer is
+  // cleared first — it would fire with the layout of a moment ago and take the
+  // copy's box away — and a layout failure still reloads, because the chart
+  // exists on the server whatever happened to its box.
+  async function duplicateChart(spec: ChartCard) {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    let id = "";
+    try {
+      ({ id } = await dashboardService.saveChart({ ...spec.def, title: `${spec.title} (copy)`, board }, false));
+    } catch (e) {
+      notifyFailure("The chart was not duplicated", writeError(e));
+      return;
+    }
+    if (id) {
+      try {
+        await dashboardService.saveBoardLayout(board, placeCopyBelow(tabs, shownLayout, chartIds, spec.id, id));
+      } catch (e) {
+        // The copy was made; only its box was not. Saying "not duplicated"
+        // here would invite a second copy of a chart that exists.
+        await load();
+        notifyFailure("The copy was made, but its place was not saved", writeError(e));
+        return;
+      }
+    }
+    await load();
+  }
   async function removeChart(id: string) {
     setRemoveBusy(true);
     try {
@@ -853,37 +941,26 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
-  // A chart made while another tab is open lands on that tab, not on the first.
-  const loadAndPlace = async () => {
-    const known = new Set(chartIds);
-    const json = await load();
-    if (!json || !canWrite || tabs.length < 2 || !selTab || selTab === tabs[0].id) return;
-    const added = (json.charts ?? []).filter((c) => !known.has(c.id) && !(c.id in (json.layout ?? {})));
-    if (added.length === 0) return;
-    const onTab = tilesOnTab(tabs, json.layout ?? {}, (json.charts ?? []).map((c) => c.id), selTab);
-    let y = onTab.reduce((m, id) => Math.max(m, (json.layout?.[id]?.y ?? 0) + (json.layout?.[id]?.h ?? 0)), 0);
-    const next: LayoutMap = { ...(json.layout ?? {}) };
-    for (const c of added) { next[c.id] = { x: 0, y, w: c.span === 2 ? 12 : 6, h: 6, tab: selTab }; y += 6; }
-    try { await putBoard({ layout: next }); await load(); } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
-  };
+  // `WEB-7` D6: a chart is built on its own page now, and saving it returns
+  // to `/dashboards/<id>`, which reloads the board. The chart with no stored
+  // box is drawn where the board draws such charts (the tab as shown), so
+  // the old in-place placement on the open tab is gone with the dialog.
 
   // Tell Copilot what is on this dashboard — the built-in one included.
-  const {
-    messages: messagesFromCopilot,
-    setPageContext, setMode: setCopilotMode, setExpanded: setCopilotExpanded,
-  } = useCopilot();
+  // BI-32 review: the page reads only what it needs from the assistant, so an
+  // answer streaming in (or a step landing) does not re-render the board and
+  // every tile. `messages` was read for one thing: the filters the last answer
+  // set for this board, taken here as a JSON string that changes only with them.
+  const setPageContext = useCopilotSelect((c) => c.setPageContext);
+  const setCopilotMode = useCopilotSelect((c) => c.setMode);
+  const setCopilotExpanded = useCopilotSelect((c) => c.setExpanded);
   // AI-2 (plan 20): a `set_board_view_filters` step in the most recent
   // assistant answer applies when its `board` matches the board on screen —
   // mirror what it set into the page address (`?f=`) with the same helper a
   // chip change uses. A step for another board is ignored here; the step
   // card carries the link instead.
-  const chatViewFilters = React.useMemo(
-    () => extractViewFiltersFromChat(messagesFromCopilot, board),
-    [messagesFromCopilot, board],
-  );
-  // Re-applying the same filters (a re-render of the same message) loops back
-  // through `writeAddress` and reloads the page; key on the filter JSON so a
-  // single apply is one navigation.
+  const chatViewFiltersJson = useCopilotSelect((c) => JSON.stringify(extractViewFiltersFromChat(c.messages, board)));
+  const chatViewFilters = React.useMemo<FilterDef[] | null>(() => JSON.parse(chatViewFiltersJson), [chatViewFiltersJson]);
   const chatViewFilterKey = React.useRef<string | null>(null);
   React.useEffect(() => {
     if (chatViewFilters === null) return;
@@ -934,6 +1011,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         tabs: summarizeTabs(tabs, (id) => tabOf(tabs, layout, id), chartIds, selTab),
         tiles,
       }),
+      // AI-30: the server fills a PDF export of this board with these
+      // filters when the model sends no view of its own.
+      view: { board, filters: normalizeFilters(filters) },
     });
     return () => setPageContext(null);
   }, [board, dashName, charts, kpis, results, filters, grainText, filterJson, paramControls, tabs, layout, chartIds, selTab, setPageContext]);
@@ -989,7 +1069,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       followClick(saved, target.value, target.grain);
       return;
     }
-    const bin = target.bin ? { width: target.bin.width, last: isLastBin(Number(target.value), target.bin.width, target.bin.max) } : undefined;
+    const bin = target.bin ? { width: target.bin.width, last: isLastBin(Number(target.value), target.bin.width, target.bin.max, target.bin.whole) } : undefined;
     // BI-13: a mark of one of the chart's other questions lists that question's own rows and
     // filters the dashboard by that question's dimension; the server needs the chart and the question's index.
     const layer = ctx.layer;
@@ -998,6 +1078,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       column: layer ? layer.dimension : target.column,
       mart: layer ? layer.mart : spec.mart, sqlSource: layer ? layer.sqlSource : spec.sqlSource,
       chart: layer ? spec.id : ownFilterChart(spec), layer: layer?.index,
+      question: ctx.question,
       x: pos.x, y: pos.y, builtin: spec.source === "builtin",
     });
   };
@@ -1061,6 +1142,11 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       };
     }
     const cell = data?.results[spec.id];
+    // BI-50 (QA LH-BI-9-05): the mark is shown only while the control is in use
+    // and this answer applied a grain, so a chart the control does not change
+    // says why. Without a grain on screen the mark would answer nobody.
+    const notApplied = hasRows(cell) && data?.appliedGrain && grainedCharts.length > 0
+      ? grainNotAppliedSentence(cell.grainNotApplied) : null;
     const badge = SOURCE_BADGE[spec.source];
     const drilled = tileDrills.drills[spec.id];
     const level = drilled ? tileDrills.currentLevel(spec) : undefined;
@@ -1070,7 +1156,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     const downloadKind = downloadMenuKind({ own, hasRows: hasRows(cell) && cell.rows.length > 0 }, canDownload);
     const write = chartWriteItems({
       canWrite, own, hasDef: Boolean(spec.def),
-      onEdit: () => setEditing({ id: spec.id, def: spec.def as ChartDef }),
+      // `WEB-7` D6: editing a chart is its own page, carrying the parameter
+      // values the dashboard shows so its preview matches this one.
+      onEdit: () => router.push(chartEditHref(board, spec.id, data?.appliedParams)),
+      onDuplicate: () => void duplicateChart(spec),
       onDelete: () => setRemoving({ id: spec.id, title: spec.title }),
     });
     const menu: TileMenuItem[] = [
@@ -1125,8 +1214,14 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           {spec.def?.filters?.length ? <OwnFiltersMarker filters={spec.def.filters} /> : null}
           {hasRows(cell) && cell.filtersSkipped?.length ? <SkippedFiltersMarker skipped={cell.filtersSkipped} /> : null}
           {/* A pivot says its own cut-off in its footer (the cell cap, not the latest buckets). */}
-          {hasRows(cell) && (cell.grainSkipped || (cell.truncated && spec.kind !== "pivot"))
-            ? <GrainMarkers skipped={cell.grainSkipped} truncated={cell.truncated && spec.kind !== "pivot"} limit={typeof spec.def?.limit === "number" ? spec.def.limit : undefined} /> : null}
+          {/* BI-50 (QA LH-BI-9-05): the grain mark is drawn only while the control is in use and applied a grain. */}
+          {hasRows(cell) && (cell.grainSkipped || (cell.truncated && spec.kind !== "pivot") || notApplied)
+            ? <GrainMarkers
+                skipped={cell.grainSkipped}
+                truncated={cell.truncated && spec.kind !== "pivot"}
+                limit={typeof spec.def?.limit === "number" ? spec.def.limit : undefined}
+                notApplied={notApplied ?? undefined}
+              /> : null}
           {drillable ? (
         <Tooltip>
           <TooltipTrigger render={<span className="inline-flex shrink-0 text-muted-foreground/70" />}>
@@ -1191,9 +1286,12 @@ export function DashboardPage({ boardId }: { boardId: string }) {
 
   // `dark` on the container themes the dashboard alone (the tokens and the
   // `dark:` variants key off an ancestor with the class); the rest of the
-  // console, and anything portalled out of this element, keeps its theme.
+  // console keeps its theme. WEB-10: portals still land on <body> (never inside
+  // this scrolling pane), but the surface's theme class travels with them so a
+  // popup opened from a light board is light too.
   return (
     <ReportingProvider reporting={data?.reporting}>
+    <SurfaceThemeProvider themeClass={look.surfaceThemeClass}>
     <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6", look.className || (fullscreen && fsDark && "dark"), look.className && !fullscreen && "rounded-lg p-4")} style={look.style}>
       <PageHeader
         title={
@@ -1252,6 +1350,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               onExportPdf={exportPdf}
               onDownloadPdf={() => setPdfOpen(true)}
               onExportFile={() => void downloadFile()}
+              onSaveTemplate={hasPermission("dashboard:write") ? () => setTemplateOpen(true) : undefined}
               onSubscriptions={() => setSubsOpen(true)}
               pdfSupported={data?.pdfSupported === true}
               canDownload={canDownload}
@@ -1269,7 +1368,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                 <SlidersHorizontal className="size-4" /> Parameters
               </Button>
             ) : null}
-            <NewChartButton canWrite={canWrite} onClick={() => setNewChartOpen(true)} />
+            <NewChartButton canWrite={canWrite} onClick={() => router.push(chartNewHref(board, data?.appliedParams))} />
           </span>
         }
       />
@@ -1277,7 +1376,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       {error ? <div className="rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">{readableErrorMessage(error)}</div> : null}
       {data?.storeError ? <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-2 text-xs text-amber-600 dark:text-amber-400">Could not load saved charts: {data.storeError}</div> : null}
 
-      {showFilterBar || grainedCharts.length > 0 || paramControls.length > 0 ? (
+      {showFilterBar || grainedCharts.length > 0 || paramControls.length > 0 || Object.keys(paramRefusals).length > 0 ? (
         <FilterRow count={filters.filter(isActiveFilter).length + (pValues ? Object.keys(pValues).length : 0)}>
           {grainedCharts.length > 0 ? (
             <GrainSwitch
@@ -1286,7 +1385,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               onChange={(next) => writeGrain(next === "" ? "own" : next)}
             />
           ) : null}
-          <ParamControls controls={paramControls} onChange={changeParam} />
+          <ParamControls controls={paramControls} onChange={changeParam} refusals={paramRefusals} />
           <FilterBar
             board={board}
             fields={filterFields}
@@ -1338,7 +1437,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             </EmptyDescription>
           </EmptyHeader>
           <EmptyContent className="flex-row justify-center gap-2">
-            <NewChartButton canWrite={canWrite} onClick={() => setNewChartOpen(true)} />
+            <NewChartButton canWrite={canWrite} onClick={() => router.push(chartNewHref(board, data?.appliedParams))} />
             <Button
               size="sm"
               variant="outline"
@@ -1434,16 +1533,6 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           onChanged={() => void load()}
         />
       ) : null}
-      {editing ? (
-        <ChartBuilder hideTrigger open={!!editing} onOpenChange={(o) => { if (!o) setEditing(null); }}
-          editId={editing.id} initial={editing.def} board={board} boards={boards} paramValues={data?.appliedParams}
-          onSaved={() => { setEditing(null); void load(); }} />
-      ) : null}
-      {newChartOpen ? (
-        <ChartBuilder hideTrigger open onOpenChange={setNewChartOpen}
-          board={board} boards={boards} paramValues={data?.appliedParams}
-          onSaved={() => { setNewChartOpen(false); void loadAndPlace(); }} />
-      ) : null}
 
       {drill ? (
         <DrillMenu
@@ -1460,7 +1549,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           onAddNote={edit && canWrite && !drill.builtin && drill.tileId && drillChart && NOTE_KINDS.includes(drillChart.kind) && drill.layer === undefined
             ? () => { setNoteError(null); setNoteFor({ tileId: drill.tileId as string, point: drill.label ?? drill.name }); setDrill(null); }
             : undefined}
-          onRecords={() => openRecords({ title: drill.label ?? drill.name, mart: drill.mart, sqlSource: drill.sqlSource, column: drill.column, value: drill.name, grain: drill.grain, binWidth: drill.bin?.width, chart: drill.chart, layer: drill.layer }, drill.builtin, drillChart && drill.layer === undefined ? tileDrills.fixed(drillChart) : NO_FILTERS, drill.tileId)}
+          onRecords={() => openRecords({ title: drill.label ?? drill.name, mart: drill.mart, sqlSource: drill.sqlSource, column: drill.column, value: drill.name, grain: drill.grain, binWidth: drill.bin?.width, chart: drill.chart, layer: drill.layer, question: drill.question }, drill.builtin, drillChart && drill.layer === undefined ? tileDrills.fixed(drillChart) : NO_FILTERS, drill.tileId)}
           drillDown={drillOffer && drill.layer === undefined ? ("reason" in drillOffer ? drillOffer : { label: `Drill down to ${drillOffer.to}`, onSelect: () => { if (drillChart) tileDrills.down(drillChart, drillOffer.hierarchy, drill.name, drill.label); setDrill(null); } }) : undefined}
         />
       ) : null}
@@ -1502,6 +1591,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         <FreshnessDialog open={freshOpen} onOpenChange={setFreshOpen} rule={data?.boardCacheRule} effective={data?.cacheRule}
           saving={savingFresh} error={freshError} onSave={(r) => void saveFreshness(r)} />
       ) : null}
+      {!isDefault && hasPermission("dashboard:write") ? (
+        <SaveTemplateDialog open={templateOpen} onOpenChange={setTemplateOpen} board={board} boardName={dashName} />
+      ) : null}
       {renameOpen ? (
         <RenameDashboardDialog open={renameOpen} onOpenChange={setRenameOpen} currentName={dashName} onSave={(n) => void renameDashboard(n)} />
       ) : null}
@@ -1536,6 +1628,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ) : null}
       <ChartLineagePanel chart={lineageChart} onOpenChange={(next) => { if (!next) setLineageChart(null); }} />
     </div>
+    </SurfaceThemeProvider>
     </ReportingProvider>
   );
 }

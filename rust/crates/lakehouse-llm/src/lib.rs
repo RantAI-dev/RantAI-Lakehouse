@@ -65,6 +65,25 @@ pub enum LlmError {
     Api(String),
 }
 
+impl LlmError {
+    /// The HTTP status the provider answered with, when it answered with a
+    /// non-2xx status.
+    ///
+    /// The status is part of the message this crate formats itself (`LLM
+    /// <status>: …`), so a caller that needs it asks here rather than
+    /// parsing the message a second time.
+    #[must_use]
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Self::Transport(_) => None,
+            Self::Api(message) => message
+                .strip_prefix("LLM ")
+                .and_then(|rest| rest.split(':').next())
+                .and_then(|code| code.trim().parse().ok()),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,

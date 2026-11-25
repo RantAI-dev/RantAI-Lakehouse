@@ -12,7 +12,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -20,39 +20,19 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use testcontainers::ImageExt;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::clickhouse::ClickHouse;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use common::{
-    TestApp, create_zero_permission_principal, session_cookie_for_user, spin_up_with_env,
-};
+use common::{TestApp, create_assistant_principal, session_cookie_for_user, spin_up_with_env};
 
-static CLICKHOUSE: tokio::sync::OnceCell<(String, testcontainers::ContainerAsync<ClickHouse>)> =
+static CLICKHOUSE: tokio::sync::OnceCell<lakehouse_test_support::clickhouse::Started> =
     tokio::sync::OnceCell::const_new();
 
 /// ONE `ClickHouse` for the whole test binary; see `tests/query_result_cap.rs`
 /// for why per-test containers race.
 async fn shared_clickhouse() -> &'static str {
     &CLICKHOUSE
-        .get_or_init(|| async {
-            let container = ClickHouse::default()
-                .with_env_var("CLICKHOUSE_USER", "default")
-                .with_env_var("CLICKHOUSE_PASSWORD", "")
-                .with_env_var("CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT", "1")
-                .with_tag("26.8")
-                .start()
-                .await
-                .expect("start the ClickHouse testcontainer");
-            let host = container.get_host().await.expect("container host");
-            let port = container
-                .get_host_port_ipv4(8123)
-                .await
-                .expect("container HTTP port");
-            (format!("http://{host}:{port}"), container)
-        })
+        .get_or_init(lakehouse_test_support::clickhouse::start)
         .await
         .0
 }
@@ -64,8 +44,10 @@ async fn app_with_two_users() -> (TestApp, String, String, Uuid, Uuid) {
     let mut env = HashMap::new();
     env.insert("CH_URL".to_owned(), ch_url.to_owned());
     let app = spin_up_with_env(&env).await;
-    let owner = create_zero_permission_principal(&app.pool).await;
-    let other = create_zero_permission_principal(&app.pool).await;
+    // `ADM-13` D5: both people may use the assistant and hold nothing else;
+    // the tests are about whose conversation each may read, not permissions.
+    let owner = create_assistant_principal(&app.pool, "").await;
+    let other = create_assistant_principal(&app.pool, "").await;
     let owner_cookie = session_cookie_for_user(&app.pool, owner).await;
     let other_cookie = session_cookie_for_user(&app.pool, other).await;
     (app, owner_cookie, other_cookie, owner, other)
@@ -283,6 +265,48 @@ async fn another_users_conversation_is_not_found_for_get_rename_and_delete() {
         theirs["sessions"],
         json!([]),
         "another user's list holds none of the owner's conversations"
+    );
+}
+
+#[tokio::test]
+async fn a_conversation_with_quotes_backslashes_and_like_wildcards_round_trips() {
+    let (app, owner, _other, _owner_id, _other_id) = app_with_two_users().await;
+    // A quote, a backslash, a newline and both LIKE wildcards in one message.
+    // The write is a JSONEachRow body; the search binds `q` as a ClickHouse
+    // parameter, so `%` and `_` are ordinary characters, not wildcards.
+    let text = "it's C:\\data 100%_wild\nand a quote ' at the end";
+    let id = save(&app.router, &owner, text).await;
+    save(&app.router, &owner, "an ordinary conversation").await;
+
+    let (status, opened) = send(
+        &app.router,
+        "GET",
+        &format!("{SESSIONS}?id={id}"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "open answered {opened}");
+    assert_eq!(opened["session"]["messages"][0]["content"], json!(text));
+
+    let mut search = url::Url::parse("http://localhost/api/ai/sessions").unwrap();
+    search
+        .query_pairs_mut()
+        .append_pair("q", r"it's C:\data 100%_wild");
+    let uri = format!("{}?{}", search.path(), search.query().unwrap());
+
+    let (status, found) = send(&app.router, "GET", &uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "search answered {found}");
+    let ids: Vec<&str> = found["sessions"]
+        .as_array()
+        .expect("sessions is a list")
+        .iter()
+        .map(|s| s["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(
+        ids,
+        [id.as_str()],
+        "the quote, backslash, % and _ were matched literally: {found}"
     );
 }
 

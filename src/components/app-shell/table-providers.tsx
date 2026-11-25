@@ -3,6 +3,16 @@
 import * as React from "react";
 import { NuqsAdapter } from "nuqs/adapters/next/app";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { toServiceError } from "@/services/errors";
+
+/**
+ * Whether a failed table query is asked again. A refusal answers the same
+ * every time, so it is shown at once; any other failure is asked three
+ * more times, as before (QA LH-DATA-12-09 F2, WEB-11).
+ */
+export function retryTableQuery(failureCount: number, error: unknown): boolean {
+  return failureCount < 3 && toServiceError(error).code !== "permission_denied";
+}
 
 /**
  * Providers the Advanced Data Table stack needs, mounted once in the root
@@ -38,7 +48,7 @@ export function TableProviders({ children }: { children: React.ReactNode }) {
             // get fresh rows.
             refetchOnWindowFocus: false,
             refetchOnReconnect: true,
-            retry: 3,
+            retry: retryTableQuery,
           },
         },
       })

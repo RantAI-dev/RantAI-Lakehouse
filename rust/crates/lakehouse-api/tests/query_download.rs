@@ -6,8 +6,7 @@
 //! exercise it end to end — this file drives it through the real router,
 //! a real per-test Postgres database (`common::spin_up_with_env`), and a
 //! `wiremock` stand-in for `ClickHouse` (`CH_URL` override), following
-//! `tests/debezium_properties.rs`'s exact real-database-plus-real-router
-//! shape. Two seeded users (`rina@meridian.example`,
+//! `tests/route_auth.rs`'s real-database-plus-real-router shape. Two seeded users (`rina@meridian.example`,
 //! `sari@meridian.example`, both `Analyst` / `query:read` —
 //! `0002_seed_identity.sql`) stand in for "the owner" and "a different
 //! principal": there is no public `Principal` constructor, so every
@@ -16,7 +15,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -74,6 +73,7 @@ async fn insert_history_row(pool: &PgPool, id: &str, sql: &str, owner: Option<Uu
         cache_assisted: false,
         tables_read: &[],
         message: None,
+        tenant_id: None,
     };
     record_history(pool, &input)
         .await
@@ -483,9 +483,10 @@ async fn a_statement_the_rewrite_refuses_is_refused_with_the_run_routes_status_a
     );
 }
 
-/// `SEC-17`: a cell that would run as a formula in a spreadsheet gets a
-/// leading apostrophe in every text format; a number in a number column is
-/// untouched.
+/// `SEC-17`: a cell that would run as a formula gets a leading apostrophe in
+/// the comma and tab files; in the workbook it is a string cell holding the
+/// text as it is, never a formula (`BI-55`, QA `LH-BI-1-08`); a number in a
+/// number column is untouched.
 #[tokio::test]
 async fn a_cell_that_starts_a_formula_is_guarded_in_every_text_format() {
     let ch = MockServer::start().await;
@@ -522,9 +523,13 @@ async fn a_cell_that_starts_a_formula_is_guarded_in_every_text_format() {
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let text = workbook_text(bytes.to_vec());
+    assert!(text.contains("=1+1"), "the workbook holds the text: {text}");
     assert!(
-        text.contains("'=1+1") || text.contains("&apos;=1+1"),
-        "the formula-looking cell is text in the workbook: {text}"
+        !text.contains("'=1+1")
+            && !text.contains("&apos;=1+1")
+            && !text.contains("<f>")
+            && !text.contains("<f "),
+        "the workbook cell holds the text, not a guarded formula: {text}"
     );
 }
 

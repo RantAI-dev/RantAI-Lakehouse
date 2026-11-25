@@ -108,38 +108,89 @@ fn all_queries(stmt: &sqlparser::ast::Statement) -> Vec<Query> {
 ///
 /// A bare, unqualified table name is excluded here whenever it matches
 /// a CTE alias declared ANYWHERE in `sql` (not lexically scoped to the
-/// exact position) — safe because every table this module's caller
-/// ever governs is authored fully qualified (`policy_engine::
-/// PolicyCondition::table`, e.g. `"serving.mart_x"`), so a bare 1-part
-/// name can never collide with a governed table's canonical key
-/// regardless of CTE scoping precision; excluding it too eagerly only
-/// ever affects this function's own "is this a CTE" cosmetics, never
-/// which tables get substituted.
+/// exact position), compared AS WRITTEN — exact case, never case-folded.
+/// `ClickHouse` matches a `WITH` name by exact case (BLD-1 part 1 D6a /
+/// review R2-B1), so `WITH T AS (SELECT 1) SELECT * FROM t` reads a REAL
+/// table `t` in the connection's database, not the CTE. Folding both
+/// sides (the old behaviour, SEC-73) silently dropped that `t` from this
+/// result — and therefore from the tenant gate, which reads this same
+/// collector through [`gate_targets`]. Governing policy keys are authored
+/// fully qualified (`policy_engine::PolicyCondition::table`, e.g.
+/// `"serving.mart_x"`), so a bare 1-part name is never a governed key
+/// itself; it must nonetheless reach the gate, which is why the
+/// comparison here is exact.
 pub fn referenced_tables(sql: &str, dialect: &dyn Dialect) -> Option<Vec<String>> {
+    let statements = Parser::parse_sql(dialect, sql).ok()?;
+    Some(
+        referenced_tables_of(&statements)
+            .into_iter()
+            .map(|key| key.short)
+            .collect(),
+    )
+}
+
+/// Every real table in `sql` with both its short and its full key — the
+/// three-part-aware counterpart of [`referenced_tables`]. `None` when the
+/// statement does not parse, which the fail-closed rewrite treats as
+/// "cannot prove no governed table is touched".
+#[must_use]
+pub fn referenced_table_keys(sql: &str, dialect: &dyn Dialect) -> Option<Vec<TableKeys>> {
     let statements = Parser::parse_sql(dialect, sql).ok()?;
     Some(referenced_tables_of(&statements).into_iter().collect())
 }
 
-/// Every real table the queries in `statements` reference — the
-/// collection [`referenced_tables`] performs, over an already parsed
-/// statement list, so both share ONE collector (`AGENTS.md` rule 4).
-fn referenced_tables_of(statements: &[Statement]) -> HashSet<String> {
+/// Both keys of one table reference, used to bind policies authored with
+/// three parts (`erp_pg.public.customers`) to that catalog and no other,
+/// while a two-part policy (`public.customers`) still binds to every
+/// catalog's table of that name (`BI-44` slice 2).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableKeys {
+    /// The historical `"schema.table"` key. A three-part name drops its
+    /// leading catalog, exactly as [`canonicalize`] always did.
+    pub short: String,
+    /// The full lowercased dotted name, including the catalog when the
+    /// query wrote one. Equals `short` for one- and two-part names.
+    pub full: String,
+}
+
+impl TableKeys {
+    /// Derives both keys from the already-lowercased parts of an identifier.
+    fn from_parts(parts: &[String]) -> Self {
+        Self {
+            short: canonicalize(parts),
+            full: canonicalize_full(parts),
+        }
+    }
+}
+
+/// Every real table the queries in `statements` reference, with BOTH keys,
+/// so a caller that needs catalog-scoped policy lookup sees the full name
+/// as well as the historical short one. The one collector behind
+/// [`referenced_tables`], [`referenced_table_keys`] and the tenant gate
+/// (`AGENTS.md` rule 4).
+fn referenced_tables_of(statements: &[Statement]) -> HashSet<TableKeys> {
     let mut queries = Vec::new();
     for stmt in statements {
         queries.extend(all_queries(stmt));
     }
+    // SEC-73: keep the names AS WRITTEN. ClickHouse matches a `WITH` name
+    // by exact case, so a bare reference that differs only in case is a
+    // real table in the connection's database, not the CTE — it must not
+    // be dropped from the gate's targets or the rewrite's substitution
+    // set. `object_name_parts` lowercases for canonical table keys and is
+    // deliberately not used here.
     let ctes: HashSet<String> = queries
         .iter()
         .flat_map(|q| q.with.iter())
         .flat_map(|with| with.cte_tables.iter())
-        .map(|cte| cte.alias.name.value.to_ascii_lowercase())
+        .map(|cte| cte.alias.name.value.clone())
         .collect();
     let mut out = HashSet::new();
     for query in &queries {
         for twj in top_level_table_with_joins(query) {
-            collect_table_factor_name(&twj.relation, &ctes, &mut out);
+            collect_table_factor_keys(&twj.relation, &ctes, &mut out);
             for join in &twj.joins {
-                collect_table_factor_name(&join.relation, &ctes, &mut out);
+                collect_table_factor_keys(&join.relation, &ctes, &mut out);
             }
         }
     }
@@ -227,6 +278,7 @@ fn statement_gate_targets(stmt: &Statement) -> GateTargets {
         Statement::Query(_) => GateTargets::Tables(
             referenced_tables_of(std::slice::from_ref(stmt))
                 .into_iter()
+                .map(|key| key.short)
                 .collect(),
         ),
         Statement::Explain { statement, .. } => statement_gate_targets(statement),
@@ -518,38 +570,59 @@ fn top_level_table_with_joins(query: &Query) -> Vec<&sqlparser::ast::TableWithJo
     from_set_expr(&query.body)
 }
 
+/// The lone identifier of a single-part `ObjectName`, AS WRITTEN — exact
+/// case, no quote-style stripping beyond what `sqlparser` already does.
+/// `None` for a qualified name (which is never a CTE reference).
+///
+/// SEC-73: this is deliberately NOT [`object_name_parts`], which lowercases
+/// every part so canonical table keys (`"bronze.orders"`) bind on both
+/// `ClickHouse` and `Trino`. CTE names are different: `ClickHouse` matches
+/// them by exact case, so the CTE-exclusion check must use the raw spelling.
+fn single_part_as_written(name: &ObjectName) -> Option<&str> {
+    let [ObjectNamePart::Identifier(ident)] = name.0.as_slice() else {
+        return None;
+    };
+    Some(&ident.value)
+}
+
 /// Records `factor`'s own canonical table name into `out`, when it is
 /// an ordinary `TableFactor::Table` naming a real table (not a
 /// table-function call — `args.is_some()` — which WS7 item B5 classifies
-/// and refuses separately, and not a bare name matching a CTE alias).
+/// and refuses separately, and not a bare name matching a CTE alias
+/// exactly, case included — SEC-73).
 /// Does NOT recurse into `TableFactor::Derived`'s subquery or
 /// `TableFactor::NestedJoin`'s inner joins beyond one level of
 /// unwrapping — both are reachable through [`all_queries`]/this same
 /// function being called again for the nested/derived query's own
 /// top-level `FROM`, so a second, deeper recursion here would only
 /// duplicate (harmlessly, into the same `HashSet`) work already done.
-fn collect_table_factor_name(
+fn collect_table_factor_keys(
     factor: &TableFactor,
     ctes: &HashSet<String>,
-    out: &mut HashSet<String>,
+    out: &mut HashSet<TableKeys>,
 ) {
     match factor {
         TableFactor::Table { name, args, .. } => {
             if args.is_some() {
                 return;
             }
-            let parts = object_name_parts(name);
-            if parts.len() == 1 && ctes.contains(&parts[0]) {
+            // SEC-73: compare the bare name AS WRITTEN against the CTE
+            // names (also collected as written). `object_name_parts`
+            // lowercases every part for canonical table keys — using it
+            // here used to make `WITH T AS (...) FROM t` look like a CTE
+            // reference when ClickHouse reads a real table `t`.
+            if single_part_as_written(name).is_some_and(|part| ctes.contains(part)) {
                 return; // a CTE reference, not a real table
             }
-            out.insert(canonicalize(&parts));
+            let parts = object_name_parts(name);
+            out.insert(TableKeys::from_parts(&parts));
         }
         TableFactor::NestedJoin {
             table_with_joins, ..
         } => {
-            collect_table_factor_name(&table_with_joins.relation, ctes, out);
+            collect_table_factor_keys(&table_with_joins.relation, ctes, out);
             for join in &table_with_joins.joins {
-                collect_table_factor_name(&join.relation, ctes, out);
+                collect_table_factor_keys(&join.relation, ctes, out);
             }
         }
         // TableFactor::Derived's own subquery is a Query node already
@@ -580,6 +653,33 @@ pub(crate) fn canonicalize(parts: &[String]) -> String {
         1 => parts[0].to_owned(),
         2 => parts.join("."),
         _ => parts[parts.len() - 2..].join("."),
+    }
+}
+
+/// The full lowercased dotted name of a table, including its leading
+/// catalog when the query wrote one (`BI-44` slice 2). For one- and two-part
+/// names this is the same as [`canonicalize`], so an authored two-part policy
+/// still binds to every catalog's table of that name; a three-part policy
+/// binds to its own catalog and no other. A quoted part containing a dot is
+/// split first, matching [`canonicalize`]'s rule.
+pub(crate) fn canonicalize_full(parts: &[String]) -> String {
+    parts
+        .iter()
+        .flat_map(|p| p.split('.'))
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// The historical lookup key of an already-canonical dotted name: the last
+/// two segments. Used when a three-part authored policy needs its table's
+/// real columns resolved, which live under the schema/table pair.
+pub(crate) fn short_key_of(table: &str) -> String {
+    let parts: Vec<&str> = table.split('.').collect();
+    if parts.len() > 2 {
+        parts[parts.len() - 2..].join(".")
+    } else {
+        table.to_owned()
     }
 }
 
@@ -688,6 +788,92 @@ mod table_resolution {
         let sql = "WITH recent AS (SELECT id FROM silver.orders_enriched) SELECT * FROM recent";
         let tables = referenced_tables(sql, &ClickHouseDialect {}).unwrap();
         assert_eq!(tables, vec!["silver.orders_enriched".to_owned()]);
+    }
+
+    /// SEC-73: `ClickHouse` matches a `WITH` name by exact case (BLD-1 part 1
+    /// D6a / review R2-B1), so a bare reference that differs only in case
+    /// is a REAL table in the connection's database. It must be reported,
+    /// gated and rewritten rather than silently dropped as a CTE.
+    #[test]
+    fn a_bare_name_differing_from_a_cte_only_in_case_is_a_real_table() {
+        for dialect in [
+            &sqlparser::dialect::ClickHouseDialect {} as &dyn sqlparser::dialect::Dialect,
+            &sqlparser::dialect::GenericDialect {},
+            &super::TrinoDialect::default(),
+        ] {
+            // `t` is not `T`: a real table, not the CTE.
+            assert_eq!(
+                referenced_tables("WITH T AS (SELECT 1) SELECT * FROM t", dialect),
+                Some(vec!["t".to_owned()]),
+                "a differently-cased bare name must not be dropped"
+            );
+            // Same case in both places: still the CTE, still excluded.
+            assert_eq!(
+                referenced_tables("WITH T AS (SELECT 1) SELECT * FROM T", dialect),
+                Some(Vec::new())
+            );
+            assert_eq!(
+                referenced_tables("WITH t AS (SELECT 1) SELECT * FROM t", dialect),
+                Some(Vec::new())
+            );
+            // The ordinary, lower-case CTE over a real table is unchanged.
+            assert_eq!(
+                referenced_tables(
+                    "WITH recent AS (SELECT id FROM silver.orders_enriched) SELECT * FROM recent",
+                    dialect
+                ),
+                Some(vec!["silver.orders_enriched".to_owned()])
+            );
+        }
+    }
+
+    /// SEC-73: the exact-case check uses the name AS WRITTEN, including
+    /// quoting, and only ever applies to a single-part (unqualified) name.
+    #[test]
+    fn cte_matching_is_exact_case_for_quoted_names_and_not_for_qualified_names() {
+        let dialect = ClickHouseDialect {};
+        // A quoted `T` is still the exact name "T" to ClickHouse, so `t`
+        // is a different, real table.
+        assert_eq!(
+            referenced_tables("WITH `T` AS (SELECT 1) SELECT * FROM t", &dialect),
+            Some(vec!["t".to_owned()])
+        );
+        // `` `T` `` matches the CTE's own exact-case name.
+        assert_eq!(
+            referenced_tables("WITH `T` AS (SELECT 1) SELECT * FROM `T`", &dialect),
+            Some(Vec::new())
+        );
+        // A qualified name is never a CTE reference, whatever its case.
+        assert_eq!(
+            referenced_tables("WITH T AS (SELECT 1) SELECT * FROM x.t", &dialect),
+            Some(vec!["x.t".to_owned()])
+        );
+        // Canonical table keys stay lower-cased; only the CTE-exclusion
+        // comparison uses the raw spelling.
+        assert_eq!(
+            referenced_tables("WITH t AS (SELECT 1) SELECT * FROM x.T", &dialect),
+            Some(vec!["x.t".to_owned()])
+        );
+    }
+
+    /// SEC-73: a differently-cased reference is a real table at any depth —
+    /// a derived table, a CTE body, a nested CTE's body, or a `UNION` branch.
+    #[test]
+    fn a_mixed_case_cte_does_not_hide_a_real_table_at_any_depth() {
+        let dialect = ClickHouseDialect {};
+        for sql in [
+            "WITH T AS (SELECT 1) SELECT * FROM (SELECT * FROM t) s",
+            "WITH T AS (SELECT 1), U AS (SELECT * FROM t) SELECT * FROM T",
+            "WITH T AS (WITH U AS (SELECT 1) SELECT * FROM t) SELECT * FROM T",
+            "WITH T AS (SELECT 1) SELECT * FROM t UNION ALL SELECT * FROM T",
+            "WITH T AS (SELECT 1) SELECT (SELECT max(id) FROM t) AS m FROM T",
+        ] {
+            assert_eq!(
+                referenced_tables(sql, &dialect),
+                Some(vec!["t".to_owned()]),
+                "sql={sql}"
+            );
+        }
     }
 
     #[test]
@@ -825,6 +1011,28 @@ mod gate_targets {
                     "WITH orders AS (SELECT 1) SELECT * FROM orders",
                     dialect.as_ref()
                 ),
+                Some(GateTargets::Tables(vec![]))
+            );
+        }
+    }
+
+    /// SEC-73: the gate shares the collector, so a bare name that differs
+    /// from a `WITH` name only in case is still a gate target — otherwise a
+    /// restricted principal could read `t` in the connection's database
+    /// with no gate and no mask.
+    #[test]
+    fn a_mixed_case_cte_does_not_hide_a_bare_table_from_the_gate() {
+        for dialect in dialects() {
+            assert_eq!(
+                super::gate_targets("WITH T AS (SELECT 1) SELECT * FROM t", dialect.as_ref()),
+                Some(GateTargets::Tables(vec!["t".to_owned()]))
+            );
+            assert_eq!(
+                super::gate_targets("WITH T AS (SELECT 1) SELECT * FROM T", dialect.as_ref()),
+                Some(GateTargets::Tables(vec![]))
+            );
+            assert_eq!(
+                super::gate_targets("WITH t AS (SELECT 1) SELECT * FROM t", dialect.as_ref()),
                 Some(GateTargets::Tables(vec![]))
             );
         }
@@ -1379,7 +1587,31 @@ pub const PRINCIPAL_TENANT_IDS_PLACEHOLDER: &str = "__principal_tenant_ids__";
 /// `CAST(.. AS varchar)`/`CAST(.. AS date)` — see
 /// [`translate_row_filter_for_trino`]). Every other function is refused
 /// on `Trino` too, with a message that names it.
-const ALLOWED_ROW_FILTER_FUNCTIONS: &[&str] = &["lower", "upper", "tostring", "todate"];
+pub const ALLOWED_ROW_FILTER_FUNCTIONS: &[&str] = &["lower", "upper", "tostring", "todate"];
+
+/// Operator tokens a row filter may use, spelled as the filter writes them:
+/// the comparisons, `AND`/`OR`, the arithmetic of `+ - * / %`, and unary
+/// `NOT`. [`is_allowed_binary_operator`] and [`validate_unary_op`] both read
+/// this same list, and `GET /api/governance/row-filter-grammar` (`WEB-8` S2
+/// T8, D8) serves it, so the console's help line cannot drift from what the
+/// validator accepts. Not a second copy: this is the one definition the
+/// validator itself uses.
+pub const ALLOWED_ROW_FILTER_OPERATORS: &[&str] = &[
+    "=", "<>", "<", "<=", ">", ">=", "AND", "OR", "+", "-", "*", "/", "%", "NOT",
+];
+
+/// The other forms a row filter may take, spelled as the filter writes them
+/// (`WEB-8` S2 review round 1, S2). These are **shapes**, match arms in
+/// [`validate_expr_shape`] rather than a list it tests membership in — so
+/// this constant is not what makes them pass. It names them for
+/// `GET /api/governance/row-filter-grammar`, and that route's test feeds one
+/// filter per name back to [`validate_row_filter_expr`] on both
+/// [`Engine::ClickHouse`] and [`Engine::Trino`], which is what ties the list
+/// to the match arms. The forms here are the only ones beyond the operators'
+/// two comparisons: `NOT LIKE`, `NOT ILIKE`, `NOT BETWEEN` and `NOT IN`
+/// stay accepted through the same arms.
+pub const ALLOWED_ROW_FILTER_FORMS: &[&str] =
+    &["LIKE", "ILIKE", "BETWEEN", "IN", "IS NULL", "IS NOT NULL"];
 
 /// The one entry point WS7 item B6 calls. Parses `sql`, and for EVERY
 /// `TableFactor::Table` this module can reach — any `FROM`, any
@@ -1388,9 +1620,9 @@ const ALLOWED_ROW_FILTER_FUNCTIONS: &[&str] = &["lower", "upper", "tostring", "t
 /// `SELECT`-list subquery — whose canonicalized name has an entry in
 /// `obligations`, replaces that node with a derived table masking/
 /// filtering it. A canonicalized name absent from `obligations`
-/// (including a CTE's own alias, never looked up — see
-/// [`referenced_tables`]'s own doc comment for why that is safe) is
-/// left completely untouched.
+/// (including a CTE's own alias, matched by exact case and so never
+/// looked up — see [`referenced_tables`]'s own doc comment, SEC-73, for
+/// why that is safe) is left completely untouched.
 ///
 /// `engine` says which engine's SQL the derived table is written in
 /// (`DATA-21` D1): the same obligations, the engine's own identifiers
@@ -1533,11 +1765,12 @@ fn substitute_in_query(
 ) -> Result<(), RewriteError> {
     if let Some(with) = &mut query.with {
         for cte in &mut with.cte_tables {
-            // Substituted inside the CTE's own body — a later
-            // reference to the CTE's name never looks up `obligations`
-            // at all (bare names never match a dotted governed-table
-            // key; see `referenced_tables`'s own doc comment), so no
-            // separate CTE-name bookkeeping is needed here either.
+            // Substituted inside the CTE's own body — a later reference
+            // to the CTE's own exact-case name never looks up
+            // `obligations` at all (bare names never match a dotted
+            // governed-table key; see `referenced_tables`'s doc comment,
+            // SEC-73), so no separate CTE-name bookkeeping is needed
+            // here either.
             substitute_in_query(
                 &mut cte.query,
                 dialect,
@@ -1908,6 +2141,56 @@ fn derived_alias_ident(name: &ObjectName, dialect: &dyn Dialect) -> SqlIdent {
     SqlIdent::with_quote(quote, last.value.clone())
 }
 
+/// The obligations that apply to one table reference, from BOTH its
+/// historical short key and its catalog-scoped full key (`BI-44` slice 2).
+///
+/// A two-part policy (`public.customers`) matches the short key and so still
+/// governs `erp_pg.public.customers`; a three-part policy
+/// (`erp_pg.public.customers`) matches only the full key and never leaks to
+/// `crm_pg.public.customers`. When both match, masks are unioned and row
+/// filters are AND-ed — never dropped — and a disagreement about the real
+/// columns refuses the rewrite rather than guessing a projection.
+fn obligations_for_keys(
+    short: &str,
+    full: &str,
+    obligations: &HashMap<String, TableObligations>,
+) -> Result<Option<TableObligations>, RewriteError> {
+    let short_obl = obligations.get(short);
+    let full_obl = if full == short {
+        None
+    } else {
+        obligations.get(full)
+    };
+    let (Some(a), Some(b)) = (short_obl, full_obl) else {
+        return Ok(short_obl.or(full_obl).cloned());
+    };
+    let mut mask = a.mask.clone();
+    for column in &b.mask {
+        if !mask.iter().any(|m| m.eq_ignore_ascii_case(column)) {
+            mask.push(column.clone());
+        }
+    }
+    let row_filter = match (&a.row_filter, &b.row_filter) {
+        (Some(left), Some(right)) => Some(format!("({left}) AND ({right})")),
+        (Some(only), None) | (None, Some(only)) => Some(only.clone()),
+        (None, None) => None,
+    };
+    let real_columns = match (&a.real_columns, &b.real_columns) {
+        (Some(left), Some(right)) if left != right => {
+            return Err(RewriteError::UnprovableSubstitution {
+                table: full.to_owned(),
+            });
+        }
+        (Some(columns), _) | (None, Some(columns)) => Some(columns.clone()),
+        (None, None) => None,
+    };
+    Ok(Some(TableObligations {
+        mask,
+        row_filter,
+        real_columns,
+    }))
+}
+
 fn substitute_table_factor(
     factor: &mut TableFactor,
     dialect: &dyn Dialect,
@@ -1931,7 +2214,8 @@ fn substitute_table_factor(
                 .map(|ident| ident.value.to_ascii_lowercase())
                 .collect();
             let canonical = canonicalize(&parts);
-            let Some(obl) = obligations.get(&canonical) else {
+            let full = canonicalize_full(&parts);
+            let Some(obl) = obligations_for_keys(&canonical, &full, obligations)? else {
                 // `DATA-21` D3: a table that is NOT governed keeps its
                 // own version, but `sqlparser` prints a version AFTER
                 // the alias and `Trino` reads it BEFORE — so a table
@@ -2069,6 +2353,28 @@ fn substitute_table_factor(
 /// version the caller asked for. `ClickHouse` never has one — its
 /// dialect reads no table version, and its past version is a query-wide
 /// setting instead.
+/// How the derived table names its source. A two-part name keeps the
+/// exact old rendering (`name.to_string()`), so every existing `ClickHouse`
+/// answer stays byte-for-byte the same. A three-part external catalog name
+/// is quoted part by part with the active engine's identifier quote, so the
+/// derived table reads that catalog rather than a same-named table in the
+/// default one (`BI-44` slice 2). Each part comes from the parsed AST; the
+/// engine's own quote doubling/escaping keeps it inside its identifier.
+fn rewritten_table_name(name: &ObjectName, engine: Engine) -> String {
+    let parts: Vec<&SqlIdent> = name.0.iter().filter_map(ObjectNamePart::as_ident).collect();
+    if parts.len() < 3 {
+        return name.to_string();
+    }
+    let escaped: Vec<String> = parts
+        .iter()
+        .map(|part| match engine {
+            Engine::Trino => format!("\"{}\"", part.value.replace('"', "\"\"")),
+            Engine::ClickHouse => format!("`{}`", part.value.replace('`', "\\`")),
+        })
+        .collect();
+    escaped.join(".")
+}
+
 fn build_masked_filtered_select(
     name: &ObjectName,
     real_columns: &[String],
@@ -2124,8 +2430,9 @@ fn build_masked_filtered_select(
         None => String::new(),
     };
     Ok(format!(
-        "SELECT {} FROM {name}{version_clause}{where_clause}",
-        projections.join(", ")
+        "SELECT {} FROM {}{version_clause}{where_clause}",
+        projections.join(", "),
+        rewritten_table_name(name, engine)
     ))
 }
 
@@ -2317,15 +2624,17 @@ fn validate_unary_op(
     real_columns: &[String],
     engine: Engine,
 ) -> Result<(), RewriteError> {
-    if !matches!(
-        op,
-        UnaryOperator::Not | UnaryOperator::Minus | UnaryOperator::Plus
-    ) {
+    let Some(symbol) = unary_operator_symbol(op) else {
+        return Err(RewriteError::InvalidRowFilter {
+            reason: OPERATOR_REFUSAL.to_owned(),
+        });
+    };
+    if !ALLOWED_ROW_FILTER_OPERATORS.contains(&symbol) {
         return Err(RewriteError::InvalidRowFilter {
             reason: OPERATOR_REFUSAL.to_owned(),
         });
     }
-    if matches!(op, UnaryOperator::Minus | UnaryOperator::Plus)
+    if matches!(symbol, "-" | "+")
         && matches!(
             inner,
             Expr::UnaryOp {
@@ -2453,24 +2762,45 @@ fn validate_expr_shape(
 
 /// The binary operators a row filter may use (SEC-43): comparisons, `AND`,
 /// `OR` and the arithmetic of `+ - * / %`. Every other variant is refused,
-/// including the ones a later `sqlparser` adds.
+/// including the ones a later `sqlparser` adds. The accepted set is
+/// [`ALLOWED_ROW_FILTER_OPERATORS`], the one list `GET
+/// /api/governance/row-filter-grammar` serves.
 fn is_allowed_binary_operator(op: &BinaryOperator) -> bool {
-    matches!(
-        op,
-        BinaryOperator::Eq
-            | BinaryOperator::NotEq
-            | BinaryOperator::Lt
-            | BinaryOperator::LtEq
-            | BinaryOperator::Gt
-            | BinaryOperator::GtEq
-            | BinaryOperator::And
-            | BinaryOperator::Or
-            | BinaryOperator::Plus
-            | BinaryOperator::Minus
-            | BinaryOperator::Multiply
-            | BinaryOperator::Divide
-            | BinaryOperator::Modulo
-    )
+    binary_operator_symbol(op).is_some_and(|symbol| ALLOWED_ROW_FILTER_OPERATORS.contains(&symbol))
+}
+
+/// The token [`is_allowed_binary_operator`] checks `op` against, or `None`
+/// for a variant no row filter accepts. Listing every accepted variant here
+/// (and no other) keeps the spelling in [`ALLOWED_ROW_FILTER_OPERATORS`] the
+/// only place the list is written down.
+fn binary_operator_symbol(op: &BinaryOperator) -> Option<&'static str> {
+    match op {
+        BinaryOperator::Eq => Some("="),
+        BinaryOperator::NotEq => Some("<>"),
+        BinaryOperator::Lt => Some("<"),
+        BinaryOperator::LtEq => Some("<="),
+        BinaryOperator::Gt => Some(">"),
+        BinaryOperator::GtEq => Some(">="),
+        BinaryOperator::And => Some("AND"),
+        BinaryOperator::Or => Some("OR"),
+        BinaryOperator::Plus => Some("+"),
+        BinaryOperator::Minus => Some("-"),
+        BinaryOperator::Multiply => Some("*"),
+        BinaryOperator::Divide => Some("/"),
+        BinaryOperator::Modulo => Some("%"),
+        _ => None,
+    }
+}
+
+/// The token [`validate_unary_op`] checks `op` against, or `None` for a
+/// variant no row filter accepts.
+fn unary_operator_symbol(op: UnaryOperator) -> Option<&'static str> {
+    match op {
+        UnaryOperator::Not => Some("NOT"),
+        UnaryOperator::Minus => Some("-"),
+        UnaryOperator::Plus => Some("+"),
+        _ => None,
+    }
 }
 
 /// A column, with at most one plain table name before it (SEC-43). Only the
@@ -5363,14 +5693,29 @@ pub fn enforce(
     // Passing an empty list states the rule instead of relying on a type
     // mix-up (decision 2026-09-27, plan §8 item 3).
     classify_statement_for_principal(sql, dialect, &[], has_any_obligation)?;
-    let tables = referenced_tables(sql, dialect).ok_or(RewriteError::Unparseable)?;
+    let keys = referenced_table_keys(sql, dialect).ok_or(RewriteError::Unparseable)?;
     let mut obligations = HashMap::new();
-    for table in &tables {
-        if let Some(obl) = obligations_source.obligations_for(table, principal_roles) {
-            obligations.insert(table.clone(), obl);
+    for key in &keys {
+        if let Some(obl) = obligations_source.obligations_for(&key.short, principal_roles) {
+            obligations.insert(key.short.clone(), obl);
+        }
+        // `BI-44` slice 2: keep the catalog-scoped obligation under its own
+        // key too. `substitute_governed_tables` merges the two when both
+        // apply, and fails closed if they disagree about the real columns.
+        if key.full != key.short
+            && let Some(obl) = obligations_source.obligations_for(&key.full, principal_roles)
+        {
+            obligations.insert(key.full.clone(), obl);
         }
     }
-    let obligated: HashSet<String> = obligations.keys().cloned().collect();
+    let mut obligated: HashSet<String> = obligations.keys().cloned().collect();
+    // A view is classified by short keys (the shape `system.tables` holds),
+    // so a catalog-scoped obligation must also mark its short key there.
+    obligated.extend(
+        keys.iter()
+            .filter(|key| obligations.contains_key(&key.full))
+            .map(|key| key.short.clone()),
+    );
     classify_views(sql, dialect, views_catalog, &obligated)?;
     substitute_governed_tables(sql, dialect, engine, &obligations, placeholders)
 }
@@ -5846,5 +6191,253 @@ mod parses_real_repository_query_shapes {
         // Presto/Trino entry), so this is GenericDialect's job.
         let sql = "SELECT o.id, o.email FROM iceberg.serving.mart_orders o WHERE o.tahun = 2024";
         assert!(Parser::parse_sql(&GenericDialect {}, sql).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod external_catalog_substitution {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use sqlparser::dialect::{ClickHouseDialect, Dialect};
+    use sqlparser::parser::Parser;
+
+    use super::{
+        Engine, PlaceholderValues, TableObligations, canonicalize_full, referenced_table_keys,
+        substitute_governed_tables,
+    };
+
+    fn obligation(mask: &[&str], filter: Option<&str>, columns: &[&str]) -> TableObligations {
+        TableObligations {
+            mask: mask.iter().map(|c| (*c).to_owned()).collect(),
+            row_filter: filter.map(str::to_owned),
+            real_columns: Some(columns.iter().map(|c| (*c).to_owned()).collect()),
+        }
+    }
+
+    fn rewrite(
+        sql: &str,
+        dialect: &dyn Dialect,
+        engine: Engine,
+        obligations: &HashMap<String, TableObligations>,
+    ) -> String {
+        let out = substitute_governed_tables(
+            sql,
+            dialect,
+            engine,
+            obligations,
+            &PlaceholderValues::none(),
+        )
+        .unwrap_or_else(|err| panic!("rewrite failed ({err}): {sql}"));
+        Parser::parse_sql(dialect, &out)
+            .unwrap_or_else(|err| panic!("rewrite does not parse ({err}): {out}"));
+        out
+    }
+
+    fn catalog_obligation() -> HashMap<String, TableObligations> {
+        HashMap::from([(
+            "erp_pg.public.customers".to_owned(),
+            obligation(
+                &["email"],
+                Some("tenant_id = 'tenant-a'"),
+                &["id", "email", "tenant_id"],
+            ),
+        )])
+    }
+
+    /// A policy authored on the full 3-part name binds to that catalog on
+    /// `Trino` and keeps the whole identifier on the derived table's `FROM`.
+    #[test]
+    fn a_three_part_policy_masks_and_filters_its_trino_catalog() {
+        let out = rewrite(
+            "SELECT * FROM erp_pg.public.customers",
+            &super::TrinoDialect::default(),
+            Engine::Trino,
+            &catalog_obligation(),
+        );
+        assert!(out.contains("\"erp_pg\".\"public\".\"customers\""), "{out}");
+        assert!(
+            out.contains("CASE WHEN \"email\" IS NULL THEN NULL ELSE '***' END AS \"email\""),
+            "{out}"
+        );
+        assert!(out.contains("WHERE tenant_id = 'tenant-a'"), "{out}");
+    }
+
+    /// The same 3-part policy on `ClickHouse`, in that engine's dialect and
+    /// with its own quote characters.
+    #[test]
+    fn a_three_part_policy_masks_and_filters_its_clickhouse_catalog() {
+        let out = rewrite(
+            "SELECT * FROM erp_pg.public.customers",
+            &ClickHouseDialect {},
+            Engine::ClickHouse,
+            &catalog_obligation(),
+        );
+        assert!(out.contains("`erp_pg`.`public`.`customers`"), "{out}");
+        assert!(
+            out.contains("replaceRegexpOne(toString(`email`), '(?s)^.*$', '***') AS `email`"),
+            "{out}"
+        );
+        assert!(out.contains("WHERE tenant_id = 'tenant-a'"), "{out}");
+    }
+
+    /// A catalog-scoped policy must not govern the same schema/table in a
+    /// different catalog.
+    #[test]
+    fn a_three_part_policy_does_not_leak_onto_another_catalog() {
+        for (dialect, engine) in [
+            (&ClickHouseDialect {} as &dyn Dialect, Engine::ClickHouse),
+            (
+                &super::TrinoDialect::default() as &dyn Dialect,
+                Engine::Trino,
+            ),
+        ] {
+            let out = rewrite(
+                "SELECT * FROM crm_pg.public.customers",
+                dialect,
+                engine,
+                &catalog_obligation(),
+            );
+            assert!(!out.contains("***"), "{out}");
+            assert!(!out.contains("tenant-a"), "{out}");
+            assert!(!out.contains("FROM (SELECT"), "{out}");
+        }
+    }
+
+    /// The historical behaviour: a two-part policy still governs a table
+    /// reached through a catalog-qualified name, and the derived table
+    /// keeps the full 3-part source.
+    #[test]
+    fn a_two_part_policy_still_applies_to_a_three_part_query() {
+        let obligations = HashMap::from([(
+            "public.customers".to_owned(),
+            obligation(&["email"], Some("id <= 4"), &["id", "email"]),
+        )]);
+        for (dialect, engine) in [
+            (&ClickHouseDialect {} as &dyn Dialect, Engine::ClickHouse),
+            (
+                &super::TrinoDialect::default() as &dyn Dialect,
+                Engine::Trino,
+            ),
+        ] {
+            let out = rewrite(
+                "SELECT * FROM erp_pg.public.customers",
+                dialect,
+                engine,
+                &obligations,
+            );
+            assert!(out.contains("***"), "{out}");
+            assert!(out.contains("WHERE id <= 4"), "{out}");
+        }
+    }
+
+    /// When both policies match, every mask applies and the row filters are
+    /// AND-ed — no obligation is silently dropped.
+    #[test]
+    fn two_part_and_three_part_policies_merge_masks_and_row_filters() {
+        let obligations = HashMap::from([
+            (
+                "public.customers".to_owned(),
+                obligation(
+                    &["phone"],
+                    Some("region = 'east'"),
+                    &["id", "email", "phone", "region", "tenant_id"],
+                ),
+            ),
+            (
+                "erp_pg.public.customers".to_owned(),
+                obligation(
+                    &["email"],
+                    Some("tenant_id = 'tenant-a'"),
+                    &["id", "email", "phone", "region", "tenant_id"],
+                ),
+            ),
+        ]);
+        let out = rewrite(
+            "SELECT * FROM erp_pg.public.customers",
+            &ClickHouseDialect {},
+            Engine::ClickHouse,
+            &obligations,
+        );
+        assert!(out.contains("`email`"), "{out}");
+        assert!(out.contains("`phone`"), "{out}");
+        assert!(out.contains(") AND ("), "{out}");
+        assert!(out.contains("region = 'east'"), "{out}");
+        assert!(out.contains("tenant_id = 'tenant-a'"), "{out}");
+
+        // The other catalog sees only the two-part policy.
+        let other = rewrite(
+            "SELECT * FROM crm_pg.public.customers",
+            &ClickHouseDialect {},
+            Engine::ClickHouse,
+            &obligations,
+        );
+        assert!(other.contains("region = 'east'"), "{other}");
+        assert!(!other.contains("tenant-a"), "{other}");
+    }
+
+    #[test]
+    fn a_three_part_authored_name_keeps_its_full_canonical_key() {
+        let dialect = ClickHouseDialect {};
+        let keys = referenced_table_keys("SELECT * FROM ERC_PG.Public.Customers", &dialect)
+            .expect("parse");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].short, "public.customers");
+        assert_eq!(keys[0].full, "erc_pg.public.customers");
+        assert_eq!(
+            canonicalize_full(&[
+                "ERC_PG".to_owned(),
+                "Public".to_owned(),
+                "Customers".to_owned()
+            ]),
+            "erc_pg.public.customers"
+        );
+    }
+
+    #[test]
+    fn unparseable_sql_over_a_three_part_external_table_fails_closed() {
+        for (dialect, engine) in [
+            (&ClickHouseDialect {} as &dyn Dialect, Engine::ClickHouse),
+            (
+                &super::TrinoDialect::default() as &dyn Dialect,
+                Engine::Trino,
+            ),
+        ] {
+            assert!(
+                substitute_governed_tables(
+                    "SELCT * FROM erp_pg.public.customers",
+                    dialect,
+                    engine,
+                    &catalog_obligation(),
+                    &PlaceholderValues::none(),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_real_columns_refuse_the_rewrite() {
+        let obligations = HashMap::from([
+            (
+                "public.customers".to_owned(),
+                obligation(&["email"], None, &["id", "email"]),
+            ),
+            (
+                "erp_pg.public.customers".to_owned(),
+                obligation(&["email"], None, &["id", "email", "phone"]),
+            ),
+        ]);
+        assert!(
+            substitute_governed_tables(
+                "SELECT * FROM erp_pg.public.customers",
+                &ClickHouseDialect {},
+                Engine::ClickHouse,
+                &obligations,
+                &PlaceholderValues::none(),
+            )
+            .is_err()
+        );
     }
 }

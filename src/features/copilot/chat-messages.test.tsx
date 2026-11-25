@@ -3,7 +3,7 @@ import { describe, expect, it, mock } from "bun:test"
 import * as React from "react"
 
 import { ChatMessages, useStickToBottom } from "./chat-messages"
-import { CopilotStreamProvider, type CopilotStreamValue, type Msg } from "./use-copilot"
+import { chatHistory, CopilotStreamProvider, type CopilotStreamValue, type Msg } from "./use-copilot"
 
 /**
  * Renders the list with a stream value (AI-24 D6: the list reads the
@@ -219,5 +219,102 @@ describe("the chat follows the shown text while it arrives (AI-24 D7)", () => {
 
     view.unmount()
     scroller.remove()
+  })
+})
+
+/** One answer that holds the given tool steps; the model wrote its text before any confirm. */
+function draftReply(tools: NonNullable<Msg["tools"]>): Msg[] {
+  return [
+    { id: "u1", role: "user", content: "Add a chart", at: "2026-11-05T07:00:00Z" },
+    {
+      id: "a1",
+      role: "assistant",
+      content: "The draft is ready. Confirm it in the console to save it.",
+      at: "2026-11-05T07:00:05Z",
+      tools,
+    },
+  ]
+}
+
+const SAVED_CHART = {
+  tool: "create_chart",
+  args: { title: "Revenue by month" },
+  ok: true,
+  confirmed: true,
+  result: { created: true, id: "c1", title: "Revenue by month" },
+}
+
+describe("ChatMessages status line after a confirm", () => {
+  it("says what was saved, under the reply text", () => {
+    const { container } = renderMessages({ messages: draftReply([SAVED_CHART]), busy: false })
+    const text = container.textContent ?? ""
+    expect(text).toContain("Saved: Revenue by month")
+    // The model's sentence stays as written; the console's line follows it.
+    expect(text.indexOf("Saved: Revenue by month")).toBeGreaterThan(text.indexOf("Confirm it in the console"))
+  })
+
+  it("says a confirmed step was not saved, with its error", () => {
+    const failed = {
+      tool: "create_chart",
+      args: { title: "Revenue by month" },
+      ok: false,
+      confirmed: false,
+      result: { error: "mart sales_daily does not exist" },
+    }
+    const { container } = renderMessages({ messages: draftReply([failed]), busy: false })
+    expect(container.textContent).toContain("Not saved: mart sales_daily does not exist")
+    expect(container.textContent).not.toContain("Saved: Revenue")
+  })
+
+  it("shows no status line for a draft still waiting for the person", () => {
+    const pending = {
+      tool: "create_board",
+      args: { name: "Overview" },
+      ok: true,
+      result: { needs_confirmation: true, tool: "create_board", summary: "Create the board Overview." },
+    }
+    const { container } = renderMessages({ messages: draftReply([pending]), busy: false })
+    expect(container.textContent).toContain("Create the board Overview.")
+    expect(container.textContent).not.toContain("Saved:")
+    expect(container.textContent).not.toContain("Not saved")
+  })
+
+  it("shows no status line for a cancelled draft", () => {
+    const cancelled = {
+      tool: "create_chart",
+      args: { title: "Revenue by month" },
+      ok: false,
+      result: { cancelled: true },
+    }
+    const { container } = renderMessages({ messages: draftReply([cancelled]), busy: false })
+    expect(container.textContent).not.toContain("Saved:")
+    expect(container.textContent).not.toContain("Not saved")
+  })
+
+  it("gives one line per confirmed step, in step order", () => {
+    const board = {
+      tool: "create_board",
+      args: { name: "Overview" },
+      ok: true,
+      confirmed: true,
+      result: { created: true, id: "b1", name: "Overview" },
+    }
+    const { container } = renderMessages({ messages: draftReply([board, SAVED_CHART]), busy: false })
+    const lines = Array.from(container.querySelectorAll('[role="status"]')).map((el) => el.textContent)
+    expect(lines).toEqual(["Saved: Overview", "Saved: Revenue by month"])
+  })
+
+  it("falls back to the tool's label when the result carries no title", () => {
+    const bare = { tool: "rename_board", args: {}, ok: true, confirmed: true, result: { updated: true } }
+    const { container } = renderMessages({ messages: draftReply([bare]), busy: false })
+    expect(container.textContent).toContain("Saved: Rename board")
+  })
+
+  it("keeps the line out of the history the console sends next", () => {
+    const messages = draftReply([SAVED_CHART])
+    expect(chatHistory(messages)).toEqual([
+      { role: "user", content: "Add a chart" },
+      { role: "assistant", content: "The draft is ready. Confirm it in the console to save it." },
+    ])
   })
 })

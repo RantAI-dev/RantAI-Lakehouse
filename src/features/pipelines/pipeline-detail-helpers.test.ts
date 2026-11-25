@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { describeTransform, parseTransformDraft, renderTransformDraft } from "@/lib/transform-draft"
+import { describeTransform } from "@/lib/transform-draft"
 import type { PipelineRun } from "@/services/contracts/pipelines"
 import { describeCron, localizeScheduleTime, parseSchedule } from "./pipeline-schedule"
 import { runDurationMs, summarizeRuns } from "./pipeline-run-stats"
@@ -207,23 +207,3 @@ describe("localizeScheduleTime", () => {
   })
 })
 
-describe("parseTransformDraft", () => {
-  test("every shape renderTransformDraft writes reads back to the same draft", () => {
-    const drafts = [
-      { verb: "dedupe", key: "id" },
-      { verb: "filter", column: "tahun", operator: ">=", value: "2020" },
-      { verb: "filter", column: "x", operator: "!=", value: "a b" },
-      { verb: "rename", from: "a", to: "b" },
-      { verb: "cast", column: "tahun", type: "Int32" },
-      { verb: "select", columns: "a,b" },
-    ] as const
-    for (const d of drafts) {
-      expect(parseTransformDraft(renderTransformDraft(d))).toEqual(d)
-    }
-  })
-  test("anything outside those shapes is null", () => {
-    expect(parseTransformDraft("drop(x)")).toBeNull()
-    expect(parseTransformDraft("cast(a,Decimal)")).toBeNull()
-    expect(parseTransformDraft("filter(a LIKE 'x')")).toBeNull()
-  })
-})

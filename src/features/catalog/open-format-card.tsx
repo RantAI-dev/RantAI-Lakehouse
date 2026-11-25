@@ -3,6 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { RefreshCwIcon } from "lucide-react"
+import { Copyable } from "@/components/copyable"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Button } from "@/components/ui/button"
@@ -24,18 +25,19 @@ import { goldService } from "@/services"
 import type {
   GoldConsumers,
   GoldExportRun,
+  GoldLatestCopyHolds,
   GoldPublication,
   GoldReadBack,
+  GoldTrimSummary,
 } from "@/services/contracts/gold"
+// Shared with the asset "Connect" dialog: both name the mart the Gold export
+// routes use, not the `serving.`-prefixed catalog id.
+import { martFromAssetId as trimmedMart } from "./asset-connect-snippets"
 
-function trimmedMart(assetId: string): string {
-  return assetId.startsWith("serving.") ? assetId.slice("serving.".length) : assetId
-}
-
-function LastFiveRuns({ mart }: { mart: string }) {
+function LastFiveRuns({ mart, runsKey }: { mart: string; runsKey: number }) {
   const state = useService<GoldExportRun[]>(
     (signal) => goldService.listExportRuns(mart, signal),
-    [mart]
+    [mart, runsKey]
   )
   if (state.status === "loading") return <LoadingSkeleton rows={3} />
   if (state.status === "error") return <ErrorState error={state.error} onRetry={state.reload} />
@@ -74,9 +76,71 @@ function LastFiveRuns({ mart }: { mart: string }) {
   )
 }
 
+/**
+ * The detail after the copy count (`DATA-49`, D17): when the last trim counted
+ * it, and the oldest copy that trim kept.
+ *
+ * The number is the trim's, and no trim follows a manual publish (the Dagster
+ * `trim_gold_mart` op is the only writer of `console.gold_trim_run`), so a
+ * publish after the trim is not in it. Saying when it was counted is what keeps
+ * the number honest; the card must not pass it off as a live count.
+ */
+function copiesKeptDetail(trim: GoldTrimSummary): string {
+  const parts = [
+    trim.finishedAt !== "" ? `counted ${formatDateTime(trim.finishedAt)}` : null,
+    trim.oldestKeptExportedAt ? `oldest ${formatDateTime(trim.oldestKeptExportedAt)}` : null,
+  ].filter((part): part is string => part !== null)
+  return parts.length > 0 ? ` (${parts.join("; ")})` : ""
+}
+
+/**
+ * The "Holds" line of the latest-copy block (`DATA-6` D4): which publish
+ * the held copy came from and how many rows it carries. A success row
+ * always records both; a missing fact renders as an em dash rather than
+ * a guessed number (the same "never fabricated" posture as every other
+ * measured value on this card).
+ */
+function latestHoldsLine(holds: GoldLatestCopyHolds): string {
+  const when = holds.copyExportedAt ? formatDateTime(holds.copyExportedAt) : "—"
+  const rows = holds.rows !== null ? `${holds.rows} rows` : "—"
+  return `The copy published ${when} (${rows})`
+}
+
+/**
+ * The fixed sentence for a failed latest-copy run (`DATA-6` D12): one
+ * English sentence per recorded reason, the map this feature owes the
+ * card. An unknown code gets the generic sentence with the code in
+ * parentheses — the code is this repo's own fixed string, never
+ * exception text, so showing it is honest; inventing a sentence for it
+ * would not be.
+ */
+function latestCopyFailureText(reason: string | null): string {
+  const sentences: Record<string, string> = {
+    not_started: "The latest copy was not updated: the update job could not be started.",
+    invalid_request: "The latest copy was not updated: the update request was malformed.",
+    publication_state_unavailable:
+      "The latest copy was not updated: the publishing state could not be read.",
+    catalog_unavailable: "The latest copy was not updated: the data catalog could not be reached.",
+    name_taken:
+      "The latest copy was not updated: the latest-copy table name is already used by another table.",
+    schema_incompatible:
+      "The latest copy was not updated: the latest-copy table's columns no longer match the published table's.",
+    copy_incomplete:
+      "The latest copy was not updated: the published copy was incomplete or already removed.",
+    commit_conflict: "The latest copy was not updated: another update committed at the same moment.",
+    write_failed: "The latest copy was not updated: writing the new copy failed.",
+  }
+  if (reason === null) return "The latest copy was not updated."
+  const sentence = sentences[reason]
+  return sentence ?? `The latest copy was not updated. (${reason})`
+}
+
 const stateLabelClass = (label: string): string => {
   if (label === "Up to date") return "font-medium text-green-600 dark:text-green-400"
   if (label === "Out of date") return "font-medium text-amber-600 dark:text-amber-400"
+  // QA LH-DATA-1-01 (DATA-49): a failed newest run is the state that needs a
+  // person, so it reads in the destructive tone, not the muted one.
+  if (label === "Last publish failed") return "font-medium text-destructive"
   return "font-medium text-muted-foreground"
 }
 
@@ -135,13 +199,19 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
     (signal) => goldService.getPublication(mart, signal),
     [mart]
   )
+  // QA LH-DATA-1-02 (plan D7): the publish history is read through routes
+  // that need gold:export. A person without it got a 4xx there, and the
+  // console read a 401 as an expired session. So nothing is requested until
+  // the publication says this person may; the card still shows its state.
+  const mayReadHistory = pub.status === "success" && pub.data.canEdit
+  // QA LH-DATA-1-01 (DATA-49): a mart never published answers 200 with
+  // `published: false`, so nothing is caught here — a failure is a failure and
+  // the row below says it could not be read, instead of passing as "never
+  // published".
   const lastExport = useService<GoldReadBack | null>(async (signal) => {
-    try {
-      return await goldService.getLastExport(mart, signal)
-    } catch {
-      return null
-    }
-  }, [mart])
+    if (!mayReadHistory) return null
+    return await goldService.getLastExport(mart, signal)
+  }, [mart, mayReadHistory])
   const readers = useService<GoldConsumers>(
     (signal) => goldService.getConsumers(mart, signal),
     [mart]
@@ -150,6 +220,9 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
     (signal, enabled: boolean) => goldService.setPublication(mart, enabled, signal)
   )
   const exportNow = useServiceAction((signal) => goldService.triggerExport(mart, signal))
+  // Bumped after a publish so `LastFiveRuns` reads again: its `useService` is keyed
+  // on the mart alone, so a new run would otherwise stay unseen.
+  const [runsKey, setRunsKey] = React.useState(0)
 
   async function handleToggle(checked: boolean) {
     const result = await toggle.run(checked)
@@ -169,12 +242,12 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
   // PR slice D review D-B3: always show the freshness line and,
   // when a publish exists, the last published time and snapshot,
   // whether the switch is on or off.
-  const showHistory = hasHistory && lastExport.status === "success" && lastExport.data
+  const showHistory = hasHistory && lastExport.status === "success" && lastExport.data?.published === true
 
   return (
     <SectionCard
       title="Publish in open format (Iceberg)"
-      description="A copy in open Iceberg format that outside tools can read. Publishing adds one full copy each time; old copies stay."
+      description="A copy in open Iceberg format that outside tools can read. Publishing adds one full copy each time; old copies stay. A second table holds only the newest copy, for tools that do not filter on export time."
       action={
         <label className="flex items-center gap-2" data-testid="open-format-switch">
           <Switch
@@ -216,6 +289,23 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
             {line}
           </span>
         </div>
+        {/* QA LH-DATA-1-01 (DATA-49): what failed, when, and where the last good
+            copy stands — so "Last publish failed" is actionable without opening
+            the history. The failure's own sentence is the API's. */}
+        {p.lastFailure && (
+          <>
+            <p className="text-xs text-destructive" data-testid="publication-failure">
+              {p.lastFailure.failedAt
+                ? `Failed ${formatDateTime(p.lastFailure.failedAt)}: ${p.lastFailure.reason}`
+                : `Failed: ${p.lastFailure.reason}`}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {p.lastExportedAt
+                ? `Last successful publish: ${formatDateTime(p.lastExportedAt)}.`
+                : "Nothing has been published yet."}
+            </p>
+          </>
+        )}
         {!enabled && hasHistory && (
           <p className="text-xs text-muted-foreground">
             Publishing is off; this copy is no longer updated.
@@ -226,22 +316,33 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
           <dd className="col-span-2">
             <ReadersValue state={readers} />
           </dd>
-          {showHistory && (
+          {showHistory && lastExport.data && (
             <>
               <dt className="text-muted-foreground">Last published</dt>
-              <dd className="col-span-2">{lastExport.data!.exportedAt ? formatDateTime(lastExport.data!.exportedAt) : "—"}</dd>
+              <dd className="col-span-2">{lastExport.data.exportedAt ? formatDateTime(lastExport.data.exportedAt) : "—"}</dd>
               <dt className="text-muted-foreground">Snapshot</dt>
               <dd className="col-span-2 font-mono text-xs">
-                {fmtMeasured(lastExport.data!.snapshotId, (v) => String(v))}
+                {fmtMeasured(lastExport.data.snapshotId, (v) => String(v))}
+              </dd>
+            </>
+          )}
+          {/* QA LH-DATA-1-01 (DATA-49): the read-back failed, so the copy's time
+              and snapshot cannot be shown — say that, rather than leaving the rows
+              out and looking like a mart nobody published. */}
+          {hasHistory && lastExport.status === "error" && (
+            <>
+              <dt className="text-muted-foreground">Last published</dt>
+              <dd className="col-span-2 text-destructive" title={lastExport.error.message}>
+                Could not be read
               </dd>
             </>
           )}
           {p.trim && (p.trim.status === "success" || p.trim.status === "nothing_to_trim") && p.trim.copiesKept !== null && (
             <>
-              <dt className="text-muted-foreground">Copies kept</dt>
+              <dt className="text-muted-foreground">Copies kept at last trim</dt>
               <dd className="col-span-2">
                 {p.trim.copiesKept}
-                {p.trim.oldestKeptExportedAt ? ` (oldest ${formatDateTime(p.trim.oldestKeptExportedAt)})` : ""}
+                {copiesKeptDetail(p.trim)}
               </dd>
             </>
           )}
@@ -251,6 +352,42 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
               <dd className="col-span-2 text-destructive">
                 Trim failed{p.trim.reason ? `: ${p.trim.reason}` : ""}
               </dd>
+            </>
+          )}
+          {p.latestCopy && (
+            <>
+              {/* DATA-6 D4: the second table's name with a copy button, so a
+                  tool can be pointed at it without retyping it. The name is
+                  shown before the first update too — it is a fact of the
+                  design, not of any run. */}
+              <dt className="text-muted-foreground">Latest copy only</dt>
+              <dd className="col-span-2">
+                <Copyable value={p.latestCopy.table}>
+                  <span className="font-mono text-xs">{p.latestCopy.table}</span>
+                </Copyable>
+              </dd>
+              <dt className="text-muted-foreground">Holds</dt>
+              <dd className="col-span-2">
+                {p.latestCopy.holds ? latestHoldsLine(p.latestCopy.holds) : "Not written yet"}
+              </dd>
+              {/* The run's own outcome, after the holds: a failure never
+                  erases the copy that is still there, so the card says both. */}
+              {p.latestCopy.lastRun?.status === "failed" && (
+                <>
+                  <dt className="text-muted-foreground">Latest copy run</dt>
+                  <dd className="col-span-2 text-destructive" data-testid="latest-copy-failure">
+                    {latestCopyFailureText(p.latestCopy.lastRun.reason)}
+                  </dd>
+                </>
+              )}
+              {p.latestCopy.lastRun?.status === "skipped" && (
+                <>
+                  <dt className="text-muted-foreground">Latest copy run</dt>
+                  <dd className="col-span-2 text-muted-foreground">
+                    Not updated: publishing is off.
+                  </dd>
+                </>
+              )}
             </>
           )}
         </dl>
@@ -266,11 +403,14 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
                   variant="outline"
                   disabled={exportNow.status === "pending"}
                   onClick={() => {
+                    // QA LH-DATA-1-01 (DATA-49), review round 1 R1: a failed publish
+                    // answers `lastFailure` and records a run, so the state and the run
+                    // list are read again whatever the result — the card kept saying
+                    // "Up to date" until the page was loaded again.
                     void exportNow.run().then((result) => {
-                      if (result) {
-                        lastExport.reload()
-                        pub.reload()
-                      }
+                      pub.reload()
+                      setRunsKey((key) => key + 1)
+                      if (result) lastExport.reload()
                     })
                   }}
                 >
@@ -284,10 +424,13 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
                 </p>
               )}
             </div>
-            <div>
-              <h4 className="mb-1 text-sm font-medium">Last 5 publish runs</h4>
-              <LastFiveRuns mart={mart} />
-            </div>
+            {/* QA LH-DATA-1-02 (plan D7): the run list needs gold:export too. */}
+            {canEdit && (
+              <div>
+                <h4 className="mb-1 text-sm font-medium">Last 5 publish runs</h4>
+                <LastFiveRuns mart={mart} runsKey={runsKey} />
+              </div>
+            )}
             <Link
               href="/gold-exports"
               className="self-start text-sm text-primary hover:underline"

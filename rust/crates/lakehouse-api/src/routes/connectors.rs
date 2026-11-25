@@ -33,18 +33,20 @@ use lakehouse_core::ApiError;
 use lakehouse_core::secret::{SecretError, SecretValue};
 use lakehouse_dagster::{DgConfiguredRun, map_run_status};
 use lakehouse_store::PgPool;
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
 use lakehouse_store::cdc::ConnectorSlug;
 use lakehouse_store::connector_probe_result::{self, ConnectorProbeResult};
+use lakehouse_store::connector_run;
 use lakehouse_store::connector_type::{self, ConnectorType};
 use lakehouse_store::connectors::{self, ConnectorDetail, ConnectorDialInfo, CreateConnectorInput};
-use lakehouse_store::ingest_spec::{Dial, RestAuth, SqlDriver};
+use lakehouse_store::ingest_spec::{Dial, IngestSpecError, RestAuth, SqlDriver};
 use lakehouse_store::schema_change::{self, SchemaChangePolicy};
 use lakehouse_store::uploads;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::audit_coverage;
 use crate::connector_deprovision::{self, DeprovisionError, Deprovisioned, PgTarget};
 use crate::connector_probe;
 use crate::error::ApiResult;
@@ -261,7 +263,7 @@ fn due_window(
     }
 }
 
-/// A `cdc` connector streams through its own Debezium service and is never
+/// A `cdc` connector streams through `Kafka Connect` and is never
 /// launched on a schedule, whatever its row says. A paused connector is never
 /// due either (`SRC-8` F6): only this DUE list filters, the unfiltered list
 /// the orchestrator reads for one connector still carries it.
@@ -511,9 +513,7 @@ pub async fn update(
         json!({ "fields": fields }),
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool(&state)?, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record connector.update audit event");
-    }
+    audit_coverage::record_best_effort(&state, event).await;
     Ok(ApiJson(updated))
 }
 
@@ -596,6 +596,58 @@ impl SecretInput {
     }
 }
 
+/// What a refused `dial` answers (`SRC-41` D12).
+///
+/// `InvalidDial`'s `source` is a fixed sentence written in this repository —
+/// one of `ingest_spec.rs`'s (`account is not in the form this vendor uses`,
+/// `host must be a hostname`, …) or serde's field text about the caller's own
+/// `dial` (``missing field `host` ``). Nothing has been dialled when it is
+/// produced, so it holds no text from a source and no resolved address. It can
+/// repeat a value the caller typed in the same request (a host that is not a
+/// hostname), exactly as `resolve_checked`'s refusal does (`SEC-15`); that is
+/// not changed here.
+fn dial_refusal(err: &IngestSpecError) -> ApiError {
+    match err {
+        IngestSpecError::UnknownAdapter { .. } => ApiError::BadRequest(
+            "The connection settings name a connector type this build does not know.".to_owned(),
+        ),
+        IngestSpecError::InvalidDial { source, .. } => {
+            ApiError::BadRequest(format!("The connection settings are not valid: {source}"))
+        }
+    }
+}
+
+/// Check the `connection` a console create sends, before any row exists
+/// (`SRC-41` D11): the same three checks the save runs, in the same order —
+/// `Dial::parse`, then the OAuth addresses, then the address check — so a
+/// refusal is a 400 and no connector is created. The settings themselves are
+/// still stored by the second call, which checks again.
+///
+/// # Errors
+///
+/// 400 from [`dial_refusal`] for a dial that does not parse or validate, and
+/// the fixed texts of [`check_oauth_addresses`] and [`check_dial_ssrf`] for an
+/// address the product will not dial.
+async fn check_new_connection(
+    state: &AppState,
+    connection: &NewConnectionBody,
+) -> Result<(), ApiError> {
+    let dial =
+        Dial::parse(&connection.adapter, &connection.dial).map_err(|err| dial_refusal(&err))?;
+    check_oauth_addresses(
+        &dial,
+        &state.config.connector_internal_hosts(),
+        state.config.oauth_settings(),
+    )
+    .await?;
+    check_dial_ssrf(
+        &dial,
+        &state.config.connector_internal_hosts(),
+        state.config.oauth_settings(),
+    )
+    .await
+}
+
 /// `credential.values` on `POST /api/connectors`: one value per slot the
 /// connector declares. `deny_unknown_fields` so a misspelled slot is an
 /// error, not a silently unset credential.
@@ -635,6 +687,45 @@ pub struct CreateConnectorBody {
     capabilities: Vec<String>,
     #[serde(default)]
     owner: Option<String>,
+    /// The connection settings the console sends with the create, so they are
+    /// checked before the row exists (`SRC-41` D11). Absent for the assistant
+    /// (`create_connector` offers no such field), whose calls are unchanged.
+    #[serde(default)]
+    connection: Option<NewConnectionBody>,
+}
+
+/// `connection` of `POST /api/connectors`: what the second call
+/// (`PUT .../ingest-spec`) would store, sent early so a refused dial creates
+/// nothing. Checked by [`check_new_connection`]; nothing is stored from here.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewConnectionBody {
+    /// The adapter the `dial` is parsed as (`sql`, `saas`, …).
+    adapter: String,
+    /// The dial itself, the same object `PUT .../ingest-spec` takes.
+    #[serde(default)]
+    dial: Value,
+}
+
+/// `BI-44` slice 2's one connector-source gate. `full` mode is left exactly
+/// as it was; a `bi-only` install refuses, with a 400 carrying the honest
+/// `supported: false` reason, any source the active engine cannot read in
+/// place. This runs before SSRF checks and before any credential is stored,
+/// so a refused source leaves nothing behind.
+fn refuse_unsupported_in_place_source(state: &AppState, source_type: &str) -> Result<(), ApiError> {
+    if !state.config.is_bi_only() {
+        return Ok(());
+    }
+    let support = crate::in_place::source_support(state.config.query_engine, source_type);
+    if support.supported {
+        return Ok(());
+    }
+    let reason = support
+        .reason
+        .unwrap_or_else(|| "the active engine does not support this source in place".to_owned());
+    Err(ApiError::BadRequest(format!(
+        "source type {source_type:?} is not supported in place by the installed engine: {reason}"
+    )))
 }
 
 /// The `POST /api/connectors` response: the created
@@ -760,10 +851,12 @@ pub(super) fn connector_audit_event(
 /// # Errors
 ///
 /// 401 if no principal is present (see above); 400 on a malformed body, a
-/// blank required field, an unrecognized `direction`, or a body that still
+/// blank required field, an unrecognized `direction`, a body that still
 /// names `secretRef`/`secretRefSecondary` (see
 /// [`reject_legacy_secret_ref_fields`] — ADR 0002 Addendum 3 removed both
-/// fields); 409 if the name is taken; 503/500 as above.
+/// fields), or a `connection` the product refuses (a dial that does not parse
+/// or validate, or an address it will not dial: `SRC-41` D11) — and in that
+/// last case nothing is created; 409 if the name is taken; 503/500 as above.
 pub async fn create(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -781,6 +874,17 @@ pub async fn create(
             "direction must be one of {VALID_DIRECTIONS:?}, got {direction:?}"
         ))
         .into());
+    }
+    // `BI-44` slice 2: a `bi-only` install reads sources in place through ONE
+    // engine. Refuse a source that engine cannot read BEFORE any row, secret
+    // or probe exists, and say why. `full` mode is unchanged — it copies
+    // data and its connector set is not narrowed by the query engine.
+    refuse_unsupported_in_place_source(&state, &body.kind)?;
+    // QA LH-SRC-3-11 (SRC-41 D11): the console sends the connection settings
+    // with the create, so a refused dial creates nothing. The save that stores
+    // them checks again.
+    if let Some(connection) = &body.connection {
+        check_new_connection(&state, connection).await?;
     }
     let source = body.credential.source;
     check_create_credential(&state, &body.credential)?;
@@ -860,9 +964,7 @@ pub async fn create(
         }),
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool(&state)?, event).await {
-        tracing::warn!(%err, connector_id = %created.id, "failed to record connector.create audit event");
-    }
+    audit_coverage::record_best_effort(&state, event).await;
     Ok((
         StatusCode::CREATED,
         ApiJson(CreateConnectorResponse {
@@ -1036,10 +1138,15 @@ async fn remove_managed_credentials(
 /// `PostgreSQL`, `MySQL`/`MariaDB`, SQL Server, REST and S3-compatible
 /// object-storage connectors (an object-storage connector is tested at the
 /// endpoint in its `dial`, `SRC-6`) — see `crate::connector_probe`'s module
-/// doc comment for exactly what that does and does not cover. Every other
-/// connector gets an honest `supported: false` result, never a fabricated
-/// latency or success: Oracle, `MongoDB`, Kafka and SFTP connect only from
-/// the orchestrator (`SRC-6` F3, F4), and a stored `health` is left alone.
+/// doc comment for exactly what that does and does not cover. Oracle and a
+/// `MongoDB` change-capture connector connect only from the orchestrator, so
+/// their test runs there (`SRC-4` T1.1, slice 5): the
+/// answer is `pending: true` at once, the job's result is recorded when it
+/// posts (stored health, audit, probe history) and the console polls
+/// `GET /api/connectors/{id}/discovery/test`. Every other connector gets an
+/// honest `supported: false` result, never a fabricated latency or success:
+/// `MongoDB`, Kafka and SFTP connect only from the orchestrator (`SRC-6` F3,
+/// F4), and a stored `health` is left alone.
 ///
 /// # Errors
 ///
@@ -1061,7 +1168,33 @@ pub async fn test_connection(
     let Some(dial_info) = dial_info else {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
     };
-    let mut outcome = run_probe(&state, &dial_info, state.connector_secret_resolver.as_ref()).await;
+    // `BI-44` slice 2: a stored connector whose source the installed engine
+    // cannot read in place is refused on test too, before any probe dial.
+    refuse_unsupported_in_place_source(&state, &dial_info.kind)?;
+    // `SRC-4` T1.1: a type only the orchestrator can dial (Oracle) is tested
+    // there. The answer is "running", never a success this API has not seen.
+    if connector_probe::is_tested_in_orchestrator(&dial_info) {
+        let pending = start_orchestrator_test(&state, &principal, &id).await?;
+        return Ok(ApiJson(pending));
+    }
+    // `SRC-4` slice 6 (S10-a): an Oracle change-capture connector is tested by
+    // `Kafka Connect`, with the driver and encryption the connector uses.
+    let is_oracle_cdc = crate::cdc_oracle::is_oracle_cdc(&dial_info);
+    let oracle_tables = if is_oracle_cdc {
+        // The checks never decide a test: a store error leaves the placeholder table.
+        super::capture_lag::selected_tables(pool(&state)?, &id)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut outcome = if let Some(tested) =
+        crate::cdc_oracle::test(&state, &dial_info, &id, &oracle_tables).await
+    {
+        tested
+    } else {
+        run_probe(&state, &dial_info, state.connector_secret_resolver.as_ref()).await
+    };
     // `SRC-12` part C: a provider that rotates refresh tokens retired the one
     // the test just used; keep the new one or the test would sign the
     // connector out.
@@ -1074,9 +1207,93 @@ pub async fn test_connection(
         )
         .await?;
     }
+    // `SRC-4` Amendment 11 (S11-a): once Kafka Connect's validation passed, the
+    // orchestrator reads Oracle's setup facts (a second, unencrypted, dictionary-only
+    // session: the owner-signed `SEC-14` exception). The answer says so and is
+    // `pending`: the checks arrive by `GET .../discovery/test`, and the console waits for
+    // them. A launch that fails leaves the test as it was, with no checks.
+    let mut setup_pending = false;
+    if is_oracle_cdc && outcome.ok {
+        match super::connector_discovery::launch_test(&state, &id).await {
+            Ok(()) => {
+                outcome.message.push(' ');
+                outcome
+                    .message
+                    .push_str(crate::cdc_oracle::UNENCRYPTED_SETUP_READ);
+                setup_pending = true;
+            }
+            Err(err) => {
+                tracing::warn!(?err, connector_id = %id, "the Oracle setup read was not launched");
+            }
+        }
+    }
+    // `SRC-4` slice 4 (S4-f): a change-capture source is also asked what it must
+    // have switched on. Only after the test passed (there is nothing to read from
+    // a source that cannot be reached), and never part of `ok`.
+    let setup_checks = if outcome.ok {
+        change_capture_setup_checks(&state, &dial_info, &id).await?
+    } else {
+        Vec::new()
+    };
+    let mut result = record_test_outcome(&state, &principal, &id, &outcome).await?;
+    result.setup_checks = setup_checks;
+    // A passed answer that still waits for its setup checks (see above): `pending` with `ok`.
+    result.pending = setup_pending;
+    Ok(ApiJson(result))
+}
+
+/// The setup checks of change-capture connector `id` (empty for any other
+/// connector), for the tables its spec selects.
+///
+/// # Errors
+///
+/// 404 if the connector is gone; 503/500 as the store reports.
+async fn change_capture_setup_checks(
+    state: &AppState,
+    info: &ConnectorDialInfo,
+    id: &str,
+) -> Result<Vec<connectors::SetupCheck>, ApiError> {
+    if info.adapter.as_deref() != Some("cdc") {
+        return Ok(Vec::new());
+    }
+    // Slice 4 review SHOULD-FIX 9: the checks never change the outcome of a test, so a
+    // store error here is logged (class only) and answers no checks, not a 500.
+    let tables = match super::capture_lag::selected_tables(pool(state)?, id).await {
+        Ok(tables) => tables,
+        Err(err) => {
+            tracing::warn!(?err, connector_id = %id, "the tables for the setup checks could not be read");
+            return Ok(Vec::new());
+        }
+    };
+    Ok(crate::cdc_setup_probe::setup_checks(
+        info,
+        state.connector_secret_resolver.as_ref(),
+        &state.config.connector_internal_hosts(),
+        state.config.connector_tls_ca(),
+        &tables,
+    )
+    .await)
+}
+
+/// Record a finished connection test the way every test is recorded: the stored
+/// health and the probe history (`connectors::record_test_result`) and one
+/// audit event. Shared by [`test_connection`] (a test the API ran itself) and
+/// by the discovery result route (a test the orchestrator ran for Oracle,
+/// `SRC-4` T1.1), so both answer with the same fixed `Outcome` sentences and
+/// leave the same traces.
+///
+/// # Errors
+///
+/// 404 if the connector is gone; 503/500 as the store reports.
+pub(super) async fn record_test_outcome(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+    outcome: &connector_probe::Outcome,
+) -> Result<connectors::ConnectorTestResult, ApiError> {
     match connectors::record_test_result(
-        pool(&state)?,
-        &id,
+        pool(state)?,
+        id,
         outcome.ok,
         outcome.supported,
         outcome.latency_ms,
@@ -1091,22 +1308,53 @@ pub async fn test_connection(
             // detail). Best-effort: a failed audit write never turns a
             // completed test into an error response.
             let event = connector_audit_event(
-                &principal,
+                principal,
                 "connector.test",
-                &id,
+                id,
                 json!({ "supported": result.supported, "ok": result.ok }),
                 "executed",
             );
-            if let Err(err) = store_audit::insert(pool(&state)?, event).await {
-                tracing::warn!(%err, connector_id = %id, "failed to record connector.test audit event");
-            }
-            Ok(ApiJson(result))
+            audit_coverage::record_best_effort(state, event).await;
+            Ok(result)
         }
         Err(lakehouse_store::StoreError::NotFound) => {
-            Err(ApiError::NotFound(format!("Connector {id} not found")).into())
+            Err(ApiError::NotFound(format!("Connector {id} not found")))
         }
-        Err(err) => Err(ApiError::from(err).into()),
+        Err(err) => Err(ApiError::from(err)),
     }
+}
+
+/// The fixed sentence a launched Oracle test answers with: it ran nowhere yet,
+/// so it claims nothing about the connection (AGENTS.md principle 2).
+const ORCHESTRATOR_TEST_RUNNING: &str = "The connection test is running in the orchestrator. \
+     Read its result from GET /api/connectors/{id}/discovery/test, and from the probe history.";
+
+/// Launch the orchestrator's connection test for `id` (`SRC-4` T1.1) and answer
+/// at once with a pending result. The result is recorded when the job posts it
+/// (`routes::connector_discovery::report_result`); until then the stored health
+/// is not touched.
+///
+/// # Errors
+///
+/// 422/503 with the fixed texts of the discovery launch when the orchestrator
+/// refuses or cannot be reached; 503/500 as the store reports.
+async fn start_orchestrator_test(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> Result<connectors::ConnectorTestResult, ApiError> {
+    super::connector_discovery::launch_test(state, id).await?;
+    let event = connector_audit_event(
+        principal,
+        "connector.test",
+        id,
+        json!({ "supported": true, "pending": true }),
+        "executed",
+    );
+    audit_coverage::record_best_effort(state, event).await;
+    Ok(connectors::ConnectorTestResult::pending(
+        ORCHESTRATOR_TEST_RUNNING,
+    ))
 }
 
 /// `?limit=` query for `GET /api/connectors/{id}/probe-history`.
@@ -1403,9 +1651,7 @@ pub async fn rotate_secret(
         json!({ "slot": body.slot.as_str(), "probeOk": true }),
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool(&state)?, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record connector.secret_rotate audit event");
-    }
+    audit_coverage::record_best_effort(&state, event).await;
 
     Ok(ApiJson(RotateSecretResponse {
         rotated: true,
@@ -2277,9 +2523,7 @@ pub async fn set_credential(
         ),
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool(&state)?, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record connector.credential_set audit event");
-    }
+    audit_coverage::record_best_effort(&state, event).await;
 
     Ok(ApiJson(SetCredentialResponse {
         saved: true,
@@ -2340,431 +2584,6 @@ pub async fn discover(
     )
     .await?;
     Ok(ApiJson(result))
-}
-
-/// `?table=` query for `GET /api/connectors/{id}/debezium-properties`.
-#[derive(Debug, Deserialize)]
-pub struct DebeziumPropertiesQuery {
-    /// Schema-qualified source table to capture, e.g. `"public.orders"`.
-    /// Required: no registry column stores which table a CDC connector
-    /// captures yet — WS3's `connector_ingest_spec` migration
-    /// (`dial`/`sourceObjects` JSONB) adds one. Until then this is a
-    /// required query parameter, not an oversight.
-    table: String,
-}
-
-/// The response body for `GET /api/connectors/{id}/debezium-properties`.
-///
-/// An `untagged` enum so the same route can return either:
-/// - the rendered `${ENV_VAR_NAME}`-reference template (the
-///   [`DebeziumPropertiesResponse::Rendered`] variant — every supported
-///   driver), or
-/// - the honest `{ supported: false, reason: ... }` body for an
-///   Oracle-driver CDC connector arriving with
-///   `ORACLE_CDC_LOGMINER_ENABLED=false` (the
-///   [`DebeziumPropertiesResponse::Unsupported`] variant).
-///
-/// `Rendered.properties` contains ONLY `${ENV_VAR_NAME}` references for
-/// every credential-shaped field — never a resolved secret — see
-/// [`lakehouse_store::cdc::render_debezium_properties_template`]'s doc
-/// comment. Consumed by a future `ops/debezium/render_compose.py`
-/// (WS3), which is what actually expands the references when it
-/// generates a real `debezium-server` compose service; nothing in this
-/// handler or its caller resolves them.
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-pub enum DebeziumPropertiesResponse {
-    /// The rendered template body.
-    Rendered {
-        /// The `.properties` file body, with `${ENV_VAR_NAME}` references
-        /// in place of every credential value.
-        properties: String,
-        /// The `table` query parameter this response was rendered for,
-        /// echoed back so a caller does not have to track it separately.
-        table: String,
-        /// A human-readable reminder of what `properties` is and is not —
-        /// present so this is self-documenting even if read outside this
-        /// handler's own doc comment.
-        note: String,
-    },
-    /// The honest `supported: false` response, carrying the REAL reason
-    /// an Oracle-driver CDC connector's `Debezium` properties template
-    /// cannot be rendered. The shape mirrors `POST .../ingest/run`'s own
-    /// `supported: false` body (`ingest_run` below), so the connector
-    /// detail page can show one canonical message for both routes.
-    Unsupported {
-        /// Always `false`; this variant exists so the field's name is
-        /// visible at the call site and in the wire shape, not to
-        /// permit a `true` future — `Debezium` CDC is either supported
-        /// (rendered) or it isn't.
-        supported: bool,
-        /// Why this connector's `Debezium` properties template is not
-        /// being rendered. Self-contained text, never carries an
-        /// upstream error (AGENTS.md rule 4).
-        reason: String,
-    },
-}
-
-/// Map a [`SqlDriver`] to the real, documented `Debezium` connector class
-/// name that source driver runs under (WS3 item 15). Used only by
-/// [`debezium_properties`] to pick
-/// [`lakehouse_store::cdc::render_debezium_properties_template`]'s
-/// `connector_class` argument — before this task, that argument did not
-/// exist and the renderer always hardcoded the `PostgreSQL` class, which
-/// would have silently mislabeled a `mysql`/`mssql` connector's rendered
-/// template.
-///
-/// The `SqlDriver::Oracle` arm names `Debezium`'s real Oracle class, but no
-/// rendered template ever carries it: [`debezium_properties`] refuses every
-/// Oracle-driver connector before rendering, whatever
-/// `ORACLE_CDC_LOGMINER_ENABLED` says (see `oracle_cdc_refusal`).
-fn debezium_connector_class(driver: SqlDriver) -> &'static str {
-    match driver {
-        SqlDriver::Postgres => "io.debezium.connector.postgresql.PostgresConnector",
-        SqlDriver::Mysql => "io.debezium.connector.mysql.MySqlConnector",
-        SqlDriver::Mssql => "io.debezium.connector.sqlserver.SqlServerConnector",
-        SqlDriver::Oracle => "io.debezium.connector.oracle.OracleConnector",
-    }
-}
-
-/// The source-connection fields [`debezium_properties`] needs, resolved
-/// from `dial_info` by [`resolve_debezium_source_target`] — pulled out of
-/// that handler into its own type/function so the handler itself stays
-/// under `clippy::too_many_lines`, not for any reuse beyond this module.
-struct DebeziumSourceTarget {
-    host: String,
-    port: u16,
-    database: String,
-    user: String,
-    connector_class: &'static str,
-    /// The original [`SqlDriver`] value the parsed `dial` carried — kept
-    /// on the target so [`debezium_properties`] can decide whether the
-    /// Oracle refusal applies, without
-    /// the route handler having to re-parse the dial just to inspect the
-    /// driver.
-    driver: SqlDriver,
-}
-
-/// Resolve `id`/`dial_info` into a [`DebeziumSourceTarget`] — see
-/// [`debezium_properties`]'s "Adapter dispatch" doc section for the full
-/// `adapter`-first-then-legacy-`kind` rule this implements.
-///
-/// # Errors
-///
-/// A 400 [`ApiError`] for every case documented on [`debezium_properties`]
-/// as producing one.
-fn resolve_debezium_source_target(
-    id: &str,
-    dial_info: &ConnectorDialInfo,
-) -> Result<DebeziumSourceTarget, ApiError> {
-    match dial_info.adapter.as_deref() {
-        Some(adapter @ ("sql" | "cdc")) => {
-            let parsed = Dial::parse(adapter, &dial_info.dial).map_err(|err| {
-                ApiError::BadRequest(format!(
-                    "connector {id}'s dial does not parse as its own adapter {adapter:?}: {err}"
-                ))
-            })?;
-            let (driver, host, port, database, user) = match &parsed {
-                Dial::Sql(dial) => (
-                    dial.driver,
-                    dial.host.clone(),
-                    dial.port,
-                    dial.database.clone(),
-                    dial.user.clone(),
-                ),
-                Dial::Cdc(dial) => (
-                    dial.driver,
-                    dial.host.clone(),
-                    dial.port,
-                    dial.database.clone(),
-                    dial.user.clone(),
-                ),
-                Dial::Files(_)
-                | Dial::Rest(_)
-                | Dial::Sheets(_)
-                | Dial::Mongo(_)
-                | Dial::Kafka(_)
-                | Dial::Sftp(_)
-                | Dial::Saas(_) => {
-                    return Err(ApiError::BadRequest(format!(
-                        "connector {id} is registered with adapter {adapter:?} but its parsed \
-                         dial is not a sql/cdc shape"
-                    )));
-                }
-            };
-            // Oracle still resolves here; it is refused one step later, at
-            // the `debezium_properties` call site (`oracle_cdc_refusal`),
-            // which is why the driver is kept on the target — the route can
-            // branch on it without re-parsing the dial.
-            Ok(DebeziumSourceTarget {
-                host,
-                port,
-                database,
-                user,
-                connector_class: debezium_connector_class(driver),
-                driver,
-            })
-        }
-        Some("mongodb") => {
-            // The `mongodb` adapter is NOT a `SqlDriver` variant (`MongoDB`
-            // is a document store, not a SQL/CDC source for `SqlDriver`'s
-            // purposes), so the dispatch here is on the adapter string
-            // itself. The mongo
-            // source block in `render_debezium_properties_template` only
-            // reads `source.connector_slug` (for the offset/schema-
-            // history filenames and topic prefix) and
-            // `source.schema_qualified_table` (currently a no-op for
-            // mongo, kept for parity with the postgres/mysql/mssql
-            // branches); the host/port/database/user fields of
-            // `DebeziumSourceSpec` are validated but never interpolated
-            // into the mongo branch — so we hand the resolver safe,
-            // non-empty placeholder values here rather than inventing a
-            // real host/port from `MongoDial.hosts` (the operator's
-            // real MongoDB host:port are env-var references in the
-            // rendered template, resolved by the container's shell,
-            // never by us).
-            let parsed = Dial::parse("mongodb", &dial_info.dial).map_err(|err| {
-                ApiError::BadRequest(format!(
-                    "connector {id}'s dial does not parse as a mongodb dial: {err}"
-                ))
-            })?;
-            if !matches!(parsed, Dial::Mongo(_)) {
-                return Err(ApiError::BadRequest(format!(
-                    "connector {id} is registered with adapter \"mongodb\" but its parsed \
-                     dial is not a Mongo dial"
-                )));
-            }
-            Ok(DebeziumSourceTarget {
-                host: "mongo.placeholder".to_owned(),
-                port: 27017,
-                database: "placeholder".to_owned(),
-                user: "placeholder".to_owned(),
-                connector_class: lakehouse_store::cdc::MONGO_CONNECTOR_CLASS,
-                driver: SqlDriver::Postgres,
-            })
-        }
-        None if dial_info.kind.to_lowercase().contains("postgres") => {
-            let Some(target) = connector_probe::parse_postgres_host(&dial_info.host) else {
-                return Err(ApiError::BadRequest(format!(
-                    "connector {id} is registered as PostgreSQL but its host is not shaped \
-                     \"<user>@<host>:<port>/<database>\""
-                )));
-            };
-            Ok(DebeziumSourceTarget {
-                host: target.host.to_owned(),
-                port: target.port,
-                database: target.database.to_owned(),
-                user: target.user.to_owned(),
-                connector_class: debezium_connector_class(SqlDriver::Postgres),
-                driver: SqlDriver::Postgres,
-            })
-        }
-        _ => Err(ApiError::BadRequest(format!(
-            "connector {id} is type {kind:?} with adapter {adapter:?} — Debezium properties \
-             only apply to a sql/cdc/mongodb adapter connector, or a legacy null-adapter \
-             PostgreSQL connector",
-            kind = dial_info.kind,
-            adapter = dial_info.adapter,
-        ))),
-    }
-}
-
-/// `GET /api/connectors/{id}/debezium-properties` — render the
-/// `debezium-server` `application.properties` TEMPLATE a CDC connector
-/// would run with, using `${ENV_VAR_NAME}` references for every
-/// credential-shaped field. See
-/// [`lakehouse_store::cdc::render_debezium_properties_template`]'s doc
-/// comment for why this is a template, never a resolved config, and
-/// why that is a correctness requirement (a resolved config would
-/// expose the deployment's database password, S3 keys, and catalog
-/// token to any `connector:manage` principal) rather than a shortcut.
-///
-/// # Adapter dispatch
-///
-/// A connector whose `adapter` column (`0033_connector_ingest_spec.sql`) is
-/// `sql` or `cdc` has its connection fields read from the structured
-/// `dial` column via [`Dial::parse`] — this covers `postgres`, `mysql`,
-/// and `mssql` drivers, each rendering its own real `Debezium` connector
-/// class via [`debezium_connector_class`]. A connector whose `adapter` is
-/// `mongodb` is dispatched on the adapter string itself,
-/// since `MongoDB` is not a `SqlDriver` variant; its rendered template
-/// carries a single `mongodb.connection.string` env-var-reference
-/// instead of the SQL source's per-field host/port/user/password/dbname.
-/// A connector with `adapter IS NULL` (a pre-WS3 row) falls back to the
-/// ORIGINAL `kind`-string check plus
-/// [`connector_probe::parse_postgres_host`]'s `host`-string parsing —
-/// mirrors the same `adapter`-first-then-legacy-`kind` pattern
-/// `connector_probe::probe`'s own dispatch and the connector-deletion
-/// deprovision step already use (WS3 plan review X4, Z14). Every other
-/// adapter (`files`/`rest`/`sheets`), or a null-adapter connector whose
-/// `kind` does not name `PostgreSQL`, is not a CDC source and gets an
-/// honest 400.
-///
-/// # Errors
-///
-/// 404 if `id` is unknown; 400 if the connector is not a
-/// `sql`/`cdc`/`mongodb` adapter connector (nor a legacy null-adapter
-/// `PostgreSQL` connector), its dial does not parse or is not shaped
-/// `sql`/`cdc`/`mongodb`, a legacy connector's `host` is not shaped
-/// `"<user>@<host>:<port>/<database>"`, its `secretRef` is not an
-/// `env:`-scheme reference (this template can only name an env var, so
-/// a `vault:`-scheme or other reference cannot be rendered as one — an
-/// honest 400, not a guess), `table` is missing or blank, or any field
-/// fails `DebeziumSourceSpec`/`render_debezium_properties_template`'s
-/// validation; 409 for an Oracle-driver CDC connector arriving with
-/// `ORACLE_CDC_LOGMINER_ENABLED=false`; 503/500 as every other
-/// connector route.
-pub async fn debezium_properties(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Query(query): Query<DebeziumPropertiesQuery>,
-) -> ApiResult<(StatusCode, ApiJson<DebeziumPropertiesResponse>)> {
-    let dial_info = connectors::get_connector_dial_info(pool(&state)?, &id).await?;
-    let Some(dial_info) = dial_info else {
-        return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
-    };
-    let table = query.table.trim();
-    if table.is_empty() {
-        return Err(ApiError::BadRequest("table query parameter is required".to_owned()).into());
-    }
-
-    let target = resolve_debezium_source_target(&id, &dial_info)?;
-
-    // Oracle CDC refusal. Fires BEFORE the secretRef `env:` check on
-    // purpose: an Oracle CDC connector with a `vault:`-schemed credential
-    // should report "this build does not do LogMiner", not a
-    // downstream-shaped error about an unrenderable ref scheme.
-    if let Some(response) = oracle_cdc_refusal(&target, state.config.oracle_cdc_logminer_enabled) {
-        return Ok((StatusCode::CONFLICT, ApiJson(response)));
-    }
-    // SRC-9 decision 8: MySQL and SQL Server CDC have no usable template.
-    // Same position and status as the Oracle refusal, for the same reason.
-    if let Some(response) = unbuilt_cdc_template_refusal(&target) {
-        return Ok((StatusCode::CONFLICT, ApiJson(response)));
-    }
-
-    let Some(database_password_ref) = dial_info.secret_ref.strip_prefix("env:") else {
-        return Err(ApiError::BadRequest(format!(
-            "connector {id}'s secretRef {:?} is not an env: reference; this template can \
-             only name an environment variable, not a vault: or other reference scheme",
-            dial_info.secret_ref
-        ))
-        .into());
-    };
-    let slug = connector_slug_for_id(&id)?;
-    let source = lakehouse_store::cdc::DebeziumSourceSpec::new(
-        slug,
-        target.host,
-        target.port,
-        target.database,
-        target.user,
-        table,
-    )
-    .map_err(|err| ApiError::BadRequest(format!("connector {id}'s fields are invalid: {err}")))?;
-
-    let sink = lakehouse_store::cdc::IcebergSinkLocation {
-        catalog_uri: &state.config.lakekeeper_catalog_uri,
-        warehouse: &state.config.lakekeeper_warehouse,
-        s3_endpoint: &state.config.rustfs_s3_endpoint,
-    };
-    // RUSTFS_ACCESS_KEY/RUSTFS_SECRET_KEY/LAKEKEEPER_TOKEN name the SAME
-    // deployment-wide Iceberg-sink env vars `docker-compose.yml`'s
-    // `debezium-server` heredoc already references — every CDC connector in
-    // this deployment writes to the one shared warehouse, unlike the
-    // source database password, which is per-connector.
-    let refs = lakehouse_store::cdc::DebeziumEnvRefs {
-        database_password_ref,
-        s3_access_key_ref: "RUSTFS_ACCESS_KEY",
-        s3_secret_key_ref: "RUSTFS_SECRET_KEY",
-        catalog_token_ref: Some("LAKEKEEPER_TOKEN"),
-    };
-    let properties = lakehouse_store::cdc::render_debezium_properties_template(
-        &source,
-        &sink,
-        &refs,
-        target.connector_class,
-    )
-    .map_err(|err| ApiError::BadRequest(format!("connector {id}'s fields are invalid: {err}")))?;
-
-    Ok((
-        StatusCode::OK,
-        ApiJson(DebeziumPropertiesResponse::Rendered {
-            properties,
-            table: table.to_owned(),
-            note: "values are ${ENV_VAR_NAME} references the deployment's own shell expands at \
-                   container start — never a resolved secret"
-                .to_owned(),
-        }),
-    ))
-}
-
-/// The only gate between an Oracle-driver CDC connector and
-/// [`render_debezium_properties_template`] — and it always refuses.
-///
-/// This build ships no `Debezium` Oracle `LogMiner` property template. The
-/// template it can render is shaped for the Postgres/MySQL/SQL Server
-/// connectors, so rendering it for Oracle would put Oracle's connector class
-/// on properties an Oracle connector would reject — a config that looks
-/// ready and is not. `ORACLE_CDC_LOGMINER_ENABLED` names where that support
-/// will attach; it does not provide it. The two flag states therefore differ
-/// only in what the refusal tells the operator.
-fn oracle_cdc_refusal(
-    target: &DebeziumSourceTarget,
-    oracle_cdc_logminer_enabled: bool,
-) -> Option<DebeziumPropertiesResponse> {
-    if target.driver != SqlDriver::Oracle {
-        return None;
-    }
-    let reason = if oracle_cdc_logminer_enabled {
-        "ORACLE_CDC_LOGMINER_ENABLED is set, but this build ships no Debezium Oracle \
-         LogMiner property template: the template it can render is shaped for the \
-         Postgres connector, and Oracle's connector would reject it. Oracle ingestion runs through the batch sql adapter until LogMiner support \
-         is built (docs/adr/0008-initial-snapshot-backfill.md)."
-    } else {
-        "Oracle CDC via Debezium LogMiner is not enabled on this deployment \
-         (ORACLE_CDC_LOGMINER_ENABLED is unset or not \"true\"), and this build ships no \
-         LogMiner property template in any case. LogMiner capture needs ARCHIVELOG mode \
-         and supplemental logging on the source database, which the batch sql adapter \
-         neither assumes nor configures (docs/adr/0008-initial-snapshot-backfill.md)."
-    };
-    Some(DebeziumPropertiesResponse::Unsupported {
-        supported: false,
-        reason: reason.to_owned(),
-    })
-}
-
-/// `SRC-9` decision 8: refuses a `mysql` or `mssql` driver CDC connector.
-///
-/// [`render_debezium_properties_template`] renders one `PostgreSQL`-shaped
-/// property set and only swaps the connector class. `Debezium` 3.6.3 rejects
-/// that for `MySQL` (no `database.server.id`; `PostgreSQL`-only `pgoutput`,
-/// slot and publication properties) and for `SQL Server` (no
-/// `database.names`), so a `Debezium Server` started from it fails
-/// configuration validation. The two types are listed as not supported
-/// (migration `0066`); this keeps the route honest for connectors created
-/// before that, instead of handing back a config that looks ready and is not.
-fn unbuilt_cdc_template_refusal(
-    target: &DebeziumSourceTarget,
-) -> Option<DebeziumPropertiesResponse> {
-    let reason = match target.driver {
-        SqlDriver::Mysql => {
-            "Change capture for MySQL is not built yet: this build can only prepare it for \
-             PostgreSQL. The Debezium template it can render lacks the MySQL settings \
-             (database.server.id) and carries PostgreSQL-only ones, so a Debezium Server \
-             started from it would fail to start."
-        }
-        SqlDriver::Mssql => {
-            "Change capture for SQL Server is not built yet: this build can only prepare it \
-             for PostgreSQL. The Debezium template it can render lacks the SQL Server \
-             settings (database.names) and carries PostgreSQL-only ones, so a Debezium \
-             Server started from it would fail to start."
-        }
-        _ => return None,
-    };
-    Some(DebeziumPropertiesResponse::Unsupported {
-        supported: false,
-        reason: reason.to_owned(),
-    })
 }
 
 /// `?force=true` on `DELETE /api/connectors/{id}` — see [`delete`]'s doc
@@ -2861,6 +2680,13 @@ async fn deprovision_postgres_connector(
                      parse as a CDC dial; see the server log for the parse error"
                 ))
             })?;
+            // `SRC-4` slice 5: a `MongoDB` change stream keeps no server-side object
+            // for this connector (the resume token lives in `Kafka Connect`'s offsets),
+            // so there is nothing to drop; the worker's connector and the password file
+            // are removed by the delete route, as for every change-capture connector.
+            if dial.as_cdc_mongo().is_some() {
+                return Ok(None);
+            }
             let Some(cdc) = dial.as_cdc() else {
                 // Unreachable in practice (`Dial::parse("cdc", ..)` only
                 // ever returns `Dial::Cdc`), but matched honestly rather
@@ -2881,6 +2707,20 @@ async fn deprovision_postgres_connector(
             if cdc.driver != SqlDriver::Postgres {
                 return Ok(None);
             }
+            // `Dial::parse` requires both names for PostgreSQL; a row without
+            // them is a data-integrity problem, refused with fixed text.
+            let (Some(slot_name), Some(publication_name)) =
+                (cdc.slot_name.as_deref(), cdc.publication_name.as_deref())
+            else {
+                tracing::error!(
+                    connector_id = %id,
+                    "a PostgreSQL change-capture dial has no slot or publication name"
+                );
+                return Err(ApiError::Internal(format!(
+                    "connector {id} is a PostgreSQL change-capture connector whose stored dial \
+                     has no slot or publication name"
+                )));
+            };
             // The wizard stores `host` as a bare hostname; user, port and
             // database live only in `dial` (same as `connector_probe`).
             let target = PgHost {
@@ -2889,16 +2729,9 @@ async fn deprovision_postgres_connector(
                 user: cdc.user.clone(),
                 database: cdc.database.clone(),
             };
-            deprovision_with_names(
-                state,
-                id,
-                dial_info,
-                &target,
-                &cdc.slot_name,
-                &cdc.publication_name,
-            )
-            .await
-            .map(Some)
+            deprovision_with_names(state, id, dial_info, &target, slot_name, publication_name)
+                .await
+                .map(Some)
         }
         None if dial_info.kind.to_lowercase().contains("postgres") => {
             let slug = connector_slug_for_id(id)?;
@@ -3031,6 +2864,43 @@ fn deprovision_error_message(
     )
 }
 
+/// `SRC-4` slice 2 (S2-e): remove a change-capture connector from Kafka Connect
+/// before its slot is dropped (the slot cannot be dropped while the worker reads
+/// it). With `force` a worker that cannot do it is logged and the delete goes on.
+///
+/// # Errors
+///
+/// 409 with a fixed text when Kafka Connect did not remove it and `force` is not
+/// set.
+async fn remove_connect_connector(state: &AppState, id: &str, force: bool) -> Result<(), ApiError> {
+    let Err(err) = crate::cdc_lifecycle::remove_from_connect(state, id).await else {
+        return Ok(());
+    };
+    if force {
+        tracing::error!(
+            connector_id = %id,
+            error = %err,
+            "force-deleting connector despite Kafka Connect not removing its connector: \
+             it may keep reading the source until removed by hand"
+        );
+        return Ok(());
+    }
+    // SRC-4 S2 review BLOCKER-1 (principle 4, SEC-11): Kafka Connect's error text is
+    // logged for the operator and never put in the response body.
+    tracing::error!(
+        connector_id = %id,
+        error = %err,
+        "Kafka Connect did not remove the change-capture connector; delete refused"
+    );
+    Err(ApiError::Conflict(format!(
+        "connector {id} was NOT deleted: Kafka Connect did not remove its \
+         change-capture connector; the registry row is kept so the \
+         connector stays visible. Retry once Kafka Connect is reachable, or pass \
+         ?force=true to delete the row anyway (the connector will then have to be \
+         removed from Kafka Connect by hand)."
+    )))
+}
+
 /// `DELETE /api/connectors/{id}` — remove a connector registration.
 ///
 /// # CDC deprovisioning happens FIRST, decided by `adapter` not `kind`
@@ -3119,6 +2989,12 @@ pub async fn delete(
         .into());
     }
 
+    // `SRC-4` slice 2 (S2-e): the worker's connector goes first, because the
+    // slot cannot be dropped while the worker reads it.
+    if dial_info.adapter.as_deref() == Some("cdc") {
+        remove_connect_connector(&state, &id, query.force).await?;
+    }
+
     if let Err(err) = deprovision_postgres_connector(&state, &id, &dial_info).await {
         if query.force {
             let slug = connector_slug_for_id(&id).ok();
@@ -3153,6 +3029,10 @@ pub async fn delete(
     let deleted = connectors::delete_connector(pool(&state)?, &id).await?;
     if !deleted {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
+    }
+    if dial_info.adapter.as_deref() == Some("cdc") {
+        // The password file is memory only and the row is gone: remove it now.
+        crate::cdc_lifecycle::remove_secret(&state, &id);
     }
     // `SRC-12` part C, decision 8: an OAuth connector's refresh token is told
     // to the provider before the file goes. Best effort: the connector is gone
@@ -3193,9 +3073,7 @@ pub async fn delete(
         delete_details,
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool(&state)?, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record connector.delete audit event");
-    }
+    audit_coverage::record_best_effort(&state, event).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3390,8 +3268,35 @@ async fn check_dial_ssrf(
         // already has (its dial names a spreadsheet id, not a
         // caller-chosen host). The authoritative check for these
         // adapters stays in Dagster, not here.
-        Dial::Sheets(_) | Dial::Mongo(_) | Dial::Kafka(_) | Dial::Sftp(_) | Dial::Saas(_) => None,
+        // `SRC-4` S5-b: a `MongoDB` change-capture dial has a `hosts` list (one entry), checked
+        // below, so it has no single `host_port`.
+        Dial::Sheets(_)
+        | Dial::Mongo(_)
+        | Dial::CdcMongo(_)
+        | Dial::Kafka(_)
+        | Dial::Sftp(_)
+        | Dial::Saas(_) => None,
     };
+    // `SRC-4` S5-b: every entry of `hosts` is checked (`Dial::parse` allows exactly one, review
+    // BLOCKER 1). `Dial::parse` has already refused an entry that is not `host:port` with a
+    // numeric port, but a check that skips what it cannot read fails open (review
+    // SHOULD-FIX 2), so such a seed is refused here with a fixed sentence.
+    if let Dial::CdcMongo(mongo) = dial {
+        for seed in &mongo.hosts {
+            let Some((host, port)) = seed
+                .rsplit_once(':')
+                .and_then(|(host, port)| Some((host, port.parse::<u16>().ok()?)))
+            else {
+                return Err(ApiError::BadRequest(
+                    "a MongoDB change-capture host must be written host:port".to_owned(),
+                ));
+            };
+            connector_probe::resolve_checked(host, port, internal_hosts)
+                .await
+                .map(|_approved| ())
+                .map_err(ApiError::BadRequest)?;
+        }
+    }
     for url in &saas_urls {
         if let Some((host, port)) = connector_probe::parse_endpoint_host_port(url) {
             connector_probe::resolve_checked(host, port, internal_hosts)
@@ -3618,7 +3523,96 @@ pub async fn ingest_spec_put(
     Path(id): Path<String>,
     body: Bytes,
 ) -> ApiResult<ApiJson<IngestSpecResponse>> {
-    let body: IngestSpecBody = parse_body(&body)?;
+    let saved = save_ingest_spec(&state, principal, &id, body).await?;
+    // `SRC-4` slice 2 (S2-e): a saved change-capture connector is created or
+    // updated in Kafka Connect. The spec is already stored; a failure here says
+    // so, and saving again repeats the provisioning (it is idempotent).
+    if saved.0.spec.adapter.as_deref() == Some("cdc") {
+        crate::cdc_lifecycle::provision(&state, &id)
+            .await
+            .map_err(crate::cdc_lifecycle::after_save)?;
+    }
+    Ok(saved)
+}
+
+/// The fields every save of an ingest spec writes, by their wire names: what
+/// the audit row of a save without a credential records in place of values.
+const INGEST_SPEC_FIELDS: [&str; 5] = [
+    "adapter",
+    "ingestMode",
+    "dial",
+    "sourceObjects",
+    "scheduleCron",
+];
+
+/// `GOV-1`: a save with no credential is on the audit trail like the one with
+/// credentials, which writes its own row in [`save_with_credentials`]. The
+/// row names the fields saved, never a value: the dial and the table names
+/// stay out. The assistant's save has no principal; its tool call is audited
+/// by the assistant's own gate. Best effort: the save already happened.
+async fn record_spec_save(
+    state: &AppState,
+    principal: Option<&Extension<Principal>>,
+    id: &str,
+    repoint: bool,
+) {
+    let Some(Extension(principal)) = principal else {
+        return;
+    };
+    let event = connector_audit_event(
+        principal,
+        if repoint {
+            "connector.repoint"
+        } else {
+            "connector.update"
+        },
+        id,
+        json!({ "fields": INGEST_SPEC_FIELDS }),
+        "executed",
+    );
+    audit_coverage::record_best_effort(state, event).await;
+}
+
+/// `SRC-45` (QA `LH-SRC-6-41`): the console sends a Kafka connector's topic
+/// in `dial.topic` and no source object, yet the loader reads its Bronze
+/// table from the first object. The server gives the spec its target here,
+/// so the console wizard, the topic picker and the assistant's
+/// `set_ingest_spec` all save a loadable connector. Kept out of
+/// [`save_ingest_spec`] so that handler stays under `clippy::too_many_lines`
+/// (`PR #597 review 2 BLOCKER 1`, `SRC-45`) without an `allow`.
+///
+/// # Errors
+/// `NotFound` when the connector does not exist, or a database error.
+async fn fill_kafka_source_objects(
+    state: &AppState,
+    id: &str,
+    body: &mut IngestSpecBody,
+) -> ApiResult<()> {
+    if body.adapter != "kafka" {
+        return Ok(());
+    }
+    let detail = connectors::get_connector(pool(state)?, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Connector {id} not found")))?;
+    body.source_objects = lakehouse_store::ingest_spec::kafka_source_objects(
+        &body.adapter,
+        &body.dial,
+        &detail.connector.name,
+        &body.source_objects,
+    );
+    Ok(())
+}
+
+/// The save behind [`ingest_spec_put`]; see its doc for the order of the answers.
+async fn save_ingest_spec(
+    state: &AppState,
+    principal: Option<Extension<Principal>>,
+    id: &str,
+    body: Bytes,
+) -> ApiResult<ApiJson<IngestSpecResponse>> {
+    let state = state.clone();
+    let id = id.to_owned();
+    let mut body: IngestSpecBody = parse_body(&body)?;
     // Refused here rather than at the first tick: the schedule sensor
     // would otherwise skip a malformed cron without a word, forever.
     if let Some(problem) = body
@@ -3632,13 +3626,25 @@ pub async fn ingest_spec_put(
     // than surfacing as a rejected run later.
     lakehouse_store::ingest_spec::validate_load_modes(&body.adapter, &body.source_objects)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    // `SRC-44` (QA `LH-SRC-6-41`): a Kafka connector saved as a batch, or a
+    // stream on any other adapter, has no loader and would only fail at the
+    // first run; refused here with a fixed sentence.
+    lakehouse_store::ingest_spec::validate_ingest_mode(&body.adapter, &body.ingest_mode)
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    fill_kafka_source_objects(&state, &id, &mut body).await?;
     refuse_uploaded_targets(&state, &body.source_objects).await?;
     // Parsed here, in the route, ahead of `set_ingest_spec`'s own (later,
     // authoritative-for-persistence) `Dial::parse` call: this handler
     // needs the typed `Dial` itself to extract a host for
     // `check_dial_ssrf`, which `set_ingest_spec` never returns.
-    let dial = Dial::parse(&body.adapter, &body.dial)
-        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    let dial = Dial::parse(&body.adapter, &body.dial).map_err(|err| dial_refusal(&err))?;
+    // `SRC-4` slice 6 (S10-c): an Oracle change-capture connector's tables are
+    // typed by hand, so each is checked as SCHEMA.TABLE in Oracle's spelling.
+    lakehouse_store::ingest_spec::validate_oracle_change_capture_tables(
+        &dial,
+        &body.source_objects,
+    )
+    .map_err(|err| ApiError::BadRequest(err.to_string()))?; // SEC-11 allowlisted: InvalidOracleTable is fixed text
     // `SRC-11` decisions D9 to D11: columns left out of a load. A malformed
     // list is a 400; a source that cannot list its columns, and a key or
     // cursor column, are well-formed requests the product refuses: 422, with
@@ -3718,10 +3724,13 @@ pub async fn ingest_spec_put(
             connectors::set_ingest_spec(pool(&state)?, &id, &input).await
         };
         return match saved {
-            Ok(spec) => Ok(ApiJson(IngestSpecResponse::new(
-                spec,
-                time::OffsetDateTime::now_utc(),
-            ))),
+            Ok(spec) => {
+                record_spec_save(&state, principal.as_ref(), &id, repoint).await;
+                Ok(ApiJson(IngestSpecResponse::new(
+                    spec,
+                    time::OffsetDateTime::now_utc(),
+                )))
+            }
             Err(lakehouse_store::StoreError::NotFound) => {
                 Err(ApiError::NotFound(format!("Connector {id} not found")).into())
             }
@@ -3859,9 +3868,7 @@ async fn save_with_credentials(
         ),
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool(state)?, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record the connector credential audit event");
-    }
+    audit_coverage::record_best_effort(state, event).await;
     Ok(ApiJson(IngestSpecResponse::new(
         spec,
         time::OffsetDateTime::now_utc(),
@@ -3873,32 +3880,20 @@ async fn save_with_credentials(
 /// "snapshot started" response, and never a launch (ADR 0008).
 ///
 /// `ADR 0008` (`docs/adr/0008-initial-snapshot-backfill.md`) explicitly
-/// declines to build a signal-table/incremental-snapshot mechanism —
-/// there is no `debezium_signal` table anywhere in this codebase.
+/// declines to build a signal-table/incremental-snapshot mechanism.
 /// `Debezium`'s own default `snapshot.mode=initial` already performs the
-/// initial-snapshot-then-stream sequence automatically, the moment this
-/// connector's own `debezium-<slug>` compose service
-/// (`ops/debezium/render_compose.py`'s `service_name = f"debezium-
-/// {sanitized_id}"`, the SAME [`connector_slug_for_id`] sanitize transform
-/// used here) starts against its replication slot/publication. So there
-/// is nothing a route can trigger: the trigger already happened, at that
-/// service's startup, not at a caller's request.
-///
-/// Falls back to the raw `connector_id` (rather than failing the whole
-/// "unsupported" response) on the practically-unreachable case
-/// [`connector_slug_for_id`] itself documents — an honest refusal should
-/// not itself 500 over a display-string detail.
-fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
-    let slug = connector_slug_for_id(connector_id)
-        .map_or_else(|_| connector_id.to_owned(), |slug| slug.to_string());
-    format!(
-        "CDC ingestion has no separate trigger: Debezium's own \
-         snapshot.mode=initial (ADR 0008) runs the initial snapshot \
-         automatically the moment the debezium-{slug} compose service \
-         (ops/debezium/render_compose.py) starts against this \
-         connector's replication slot/publication. Bring that service up \
-         to start ingestion; there is nothing this route can trigger."
-    )
+/// initial-snapshot-then-stream sequence automatically when the connector is
+/// created on `Kafka Connect` (ADR 0016; `SRC-4` slice 2 removed the fixed
+/// `debezium-server` service this text used to name), and the applier job
+/// writes what it captures to Bronze. So there is nothing a route can
+/// trigger: the trigger already happened, when the connector was provisioned.
+fn cdc_ingest_run_unsupported_reason() -> &'static str {
+    "CDC ingestion has no separate trigger: Debezium's own \
+     snapshot.mode=initial (ADR 0008) runs the initial snapshot \
+     automatically when the connector is created on Kafka Connect, and the \
+     applier then writes the table and its changes to Bronze. To stop or \
+     restart capture, pause or resume the connector; there is nothing this \
+     route can trigger."
 }
 
 /// `POST /api/connectors/{id}/ingest/run` — launch this connector's
@@ -3967,7 +3962,8 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// stream connector answers `supported: false` as before. The run config gets
 /// `object` and `action` beside `connector_id`, and an audit event
 /// `connector.ingest.<action>` names the table and the action, never row data.
-/// An empty body behaves exactly as it always did.
+/// An empty body behaves exactly as it always did, and its run is audited as
+/// `connector.ingest.run`, naming only the run (`GOV-1`).
 pub async fn ingest_run_request(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -3992,6 +3988,135 @@ pub async fn ingest_run(
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<Value>> {
     launch_ingest(&state, &id, None, None).await
+}
+
+/// The runs of this connector that stand between it and a launch, decided
+/// only: every refusal is an error, and the overdue runs that may be stopped
+/// are returned for the caller to stop immediately before the launch
+/// (`review round 1, R3`). One run at a time per connector. Bronze is
+/// append-only, so a second run started while the first is still going copies
+/// every table into Bronze a second time — a double click was enough to do it.
+/// Checked against `Dagster`'s own run list, so a run started by the schedule
+/// counts too. Not a lock: two requests in the same instant can both pass,
+/// which the console's disabled button covers.
+///
+/// QA `TC-1702` (`SRC-39`): a run that never finishes used to hold this 409
+/// for days. A run the orchestrator launched and did not start, past the
+/// start limit, and a run going past the run limit, each plus a grace, no
+/// longer hold the connector: such a run is cancelled in the orchestrator (or
+/// recorded as `timed_out` for a run that was going) and the launch goes on
+/// (D10). The grace lets the orchestrator's own run monitoring act first.
+///
+/// `review round 1, R1`: a run still waiting in the orchestrator's queue is
+/// not judged by the start limit, because the monitoring never ends a queued
+/// run; it holds the connector until it has waited longer than a run may run.
+/// A `STARTING` run holds the connector and is left to the monitoring.
+///
+/// `may_stop` says whether this caller may stop an overdue run. It is false
+/// for the assistant's `run_ingest`, which has no signed-in person
+/// (`review round 1, R10`): stopping a run is a person's decision (the
+/// assistant's own `cancel_pipeline_run` needs approval), so an overdue run is
+/// the 409 there and nothing is cancelled.
+///
+/// # Errors
+///
+/// 409 naming the run that is still going, 503 when the orchestrator cannot
+/// be asked for the run list.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Unix seconds to f64 to match DgConfiguredRun's wire shape; \
+              a timestamp this size loses no meaningful precision"
+)]
+async fn runs_holding_the_lock(
+    state: &AppState,
+    connector_id: &str,
+    may_stop: bool,
+) -> Result<Vec<ConnectorIngestRun>, ApiError> {
+    let recent = state
+        .dagster
+        .list_runs_for_job_with_config(INGEST_JOB, RECENT_INGEST_RUNS)
+        .await
+        .map_err(|err| orchestrator_unreachable(&err))?;
+    let now = time::OffsetDateTime::now_utc();
+    let limits = RunAgeLimits::from_config(&state.config);
+    let active: Vec<ConnectorIngestRun> =
+        connector_runs(&recent, connector_id, now.unix_timestamp() as f64, &limits)
+            .into_iter()
+            .filter(ConnectorIngestRun::is_active)
+            .collect();
+    if let Some(blocking) = active.iter().find(|run| run.overdue.is_none()) {
+        return Err(ApiError::Conflict(format!(
+            "a run for this connector is already {} (run {}); wait for it to finish before \
+             starting another",
+            blocking.status,
+            blocking.run_id.get(..8).unwrap_or(&blocking.run_id),
+        )));
+    }
+    if !may_stop && !active.is_empty() {
+        return Err(ApiError::Conflict(OVERDUE_RUN_FOR_THE_ASSISTANT.to_owned()));
+    }
+    Ok(active)
+}
+
+/// Stop one run that is past its limit, so its connector can run again
+/// (`SRC-39`, QA `TC-1702`, D10).
+///
+/// The route asks the orchestrator to cancel the run for good
+/// (`MARK_AS_CANCELED_IMMEDIATELY`): a run that never started, and a running
+/// run whose worker is gone, cannot be stopped cleanly. A running run's record
+/// is then closed as `timed_out` (D11).
+///
+/// `review round 1, R2`: the cancel is asked for first, and only a cancel that
+/// was accepted writes anything. An orchestrator that cannot be reached for it
+/// is a retryable `503` and nothing is written — the run may still be going,
+/// so launching now could load on top of a live run, which is the reason this
+/// guard exists. A typed refusal is different: the run is not stopping, the
+/// launch goes on as D10 decided (the alternative is a connector locked for
+/// good), and no stop is claimed — no `info!` line and no `timed_out` record;
+/// the record is left to the orchestrator's own report.
+///
+/// # Errors
+///
+/// 503/502 when the orchestrator cannot be reached for the cancel (nothing is
+/// written), and the store's classified error when the run record cannot be
+/// closed.
+async fn stop_overdue_run(
+    state: &AppState,
+    connector_id: &str,
+    run: &ConnectorIngestRun,
+    now: time::OffsetDateTime,
+) -> Result<(), ApiError> {
+    // The error's text goes to the log only, never into an `ApiError`
+    // (SEC-11).
+    let outcome = state
+        .dagster
+        .cancel_run_now(&run.run_id)
+        .await
+        .map_err(|err| orchestrator_unreachable(&err))?;
+    if let Some(failure) = outcome.failure {
+        tracing::warn!(
+            run_id = %run.run_id,
+            failure = ?failure,
+            "Dagster refused to cancel an overdue run; the launch goes on"
+        );
+        return Ok(());
+    }
+    if run.overdue == Some(Overdue::RanTooLong) {
+        connector_run::end_timed_out_run(
+            pool(state)?,
+            connector_id,
+            &run.run_id,
+            i64::from(state.config.ingest_run_max_runtime_seconds),
+            now,
+        )
+        .await?;
+    }
+    tracing::info!(
+        connector_id,
+        run_id = %run.run_id,
+        "stopped an overdue run so the connector can run again"
+    );
+    Ok(())
 }
 
 /// The run itself; see [`ingest_run_request`] for the order of the answers.
@@ -4021,7 +4146,7 @@ async fn launch_ingest(
     if adapter == "cdc" {
         return Ok(ApiJson(json!({
             "supported": false,
-            "reason": cdc_ingest_run_unsupported_reason(&id),
+            "reason": cdc_ingest_run_unsupported_reason(),
         })));
     }
     // A stream connector (Kafka) has no per-table batch to refresh or clear: its
@@ -4033,32 +4158,19 @@ async fn launch_ingest(
         })));
     }
 
-    // One run at a time per connector. Bronze is append-only, so a second
-    // run started while the first is still going copies every table into
-    // Bronze a second time — a double click was enough to do it. Checked
-    // against Dagster's own run list, so a run started by the schedule
-    // counts too. Not a lock: two requests in the same instant can both
-    // pass, which the console's disabled button covers.
-    let recent = state
-        .dagster
-        .list_runs_for_job_with_config(INGEST_JOB, RECENT_INGEST_RUNS)
-        .await
-        .map_err(|err| orchestrator_unreachable(&err))?;
-    if let Some(active) = connector_runs(&recent, &id)
-        .into_iter()
-        .find(ConnectorIngestRun::is_active)
-    {
-        return Err(ApiError::Conflict(format!(
-            "a run for this connector is already {} (run {}); wait for it to finish before \
-             starting another",
-            active.status,
-            active.run_id.get(..8).unwrap_or(&active.run_id),
-        ))
-        .into());
-    }
+    // One run at a time per connector, unless a run is past its limit
+    // (`SRC-39`, QA `TC-1702`). This decides only: the 409 for a run that is
+    // still going, or the overdue runs to stop later (`review round 1, R3`).
+    // The 409 comes before the body is judged, as it always did.
+    // A person's route may stop a run; the assistant's `run_ingest` (no
+    // principal) may not (`review round 1, R10`).
+    let overdue = runs_holding_the_lock(&state, &id, principal.is_some()).await?;
 
-    // The two refusals of a run of one table come after the 409s above, which
-    // are the existing, stated answers for "not now".
+    // The request's own refusals come next, and they have no side effect: a
+    // body naming a table the connector does not load, or a table waiting for
+    // a schema decision, is refused before any run is stopped. The guard used
+    // to stop an overdue run for a request it then refused, which lost a run
+    // for a typo (`review round 1, R3`).
     if let Some((object, _)) = &request {
         let selected = spec
             .source_objects
@@ -4088,6 +4200,12 @@ async fn launch_ingest(
         op_config["action"] = json!(action.as_str());
     }
     let run_config = json!({"ops": {"run_ingest": {"config": op_config}}});
+    // The stop is the last thing before the launch, so every answer above is
+    // free of side effects (`review round 1, R3`).
+    let now = time::OffsetDateTime::now_utc();
+    for run in &overdue {
+        stop_overdue_run(&state, &id, run, now).await?;
+    }
     // `SRC-11` review 1 SHOULD-FIX 1: a launch through this route is a
     // person's ("Run now", refresh, clear); the orchestrator's start report
     // reads this tag, and a run with no tag is recorded as `other`.
@@ -4113,18 +4231,24 @@ async fn launch_ingest(
                 )
                 .into());
             }
-            if let (Some((object, action)), Some(principal)) = (&request, principal) {
+            if let Some(principal) = principal {
                 // The table's name and the action, never a row or a count.
-                let event = connector_audit_event(
-                    principal,
-                    &format!("connector.ingest.{}", action.as_str()),
-                    &id,
-                    json!({"object": object, "action": action.as_str(), "runId": outcome.run_id}),
-                    "executed",
-                );
-                if let Err(err) = store_audit::insert(pool(&state)?, event).await {
-                    tracing::warn!(%err, connector_id = %id, "failed to record the connector table action audit event");
-                }
+                // `GOV-1`: a run of every table is audited too, as
+                // `connector.ingest.run`, naming the run and nothing else.
+                // The assistant's run has no principal; its tool call is
+                // audited by the assistant's own gate.
+                let (action, args) = match &request {
+                    Some((object, action)) => (
+                        format!("connector.ingest.{}", action.as_str()),
+                        json!({"object": object, "action": action.as_str(), "runId": outcome.run_id}),
+                    ),
+                    None => (
+                        "connector.ingest.run".to_owned(),
+                        json!({"runId": outcome.run_id}),
+                    ),
+                };
+                let event = connector_audit_event(principal, &action, &id, args, "executed");
+                audit_coverage::record_best_effort(&state, event).await;
             }
             Ok(ApiJson(json!({ "runId": outcome.run_id })))
         }
@@ -4174,6 +4298,12 @@ const INGEST_RUN_NEEDS_BOTH: &str =
 /// Fixed 404 text: the connector does not load the table asked for. No name from
 /// the request is repeated.
 const INGEST_OBJECT_NOT_SELECTED: &str = "This connector does not load that table.";
+
+/// Fixed 409 text for a caller that may not stop a run (the assistant's
+/// `run_ingest`, which has no signed-in person): `review round 1, R10`.
+const OVERDUE_RUN_FOR_THE_ASSISTANT: &str = "The earlier run for this connector has run too long \
+     to wait for, and starting another one from here would load the same tables twice. It can be \
+     replaced with \"Run now\" on the connector's page.";
 
 /// Fixed 409 text: the table waits for a schema decision (`SRC-8`).
 const INGEST_OBJECT_WAITS: &str = "This table is waiting for a schema decision, so it cannot be \
@@ -4228,6 +4358,87 @@ const RECENT_INGEST_RUNS: u32 = 100;
 /// How many of one connector's runs [`connector_runs`] keeps.
 const CONNECTOR_RUN_HISTORY: usize = 20;
 
+/// How long past its limit a run may be before the route stops holding the
+/// connector for it (`SRC-39`, QA `TC-1702`, D10). The orchestrator's run
+/// monitoring polls every 60 seconds, so five minutes is its turn to end the
+/// run first; the route only steps in when that did not happen, because a
+/// cancel from here is the less clean of the two. A run still waiting in the
+/// queue is the exception: the monitoring never ends one, so it is judged by
+/// the run limit instead of the start limit (`review round 1, R1`).
+const OVERDUE_GRACE_SECONDS: f64 = 300.0;
+
+/// Why a run no longer holds its connector's lock (`SRC-39`, QA `TC-1702`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Overdue {
+    /// A run that never started: one the orchestrator launched and did not
+    /// start, past the start limit, or one still waiting in its queue past the
+    /// run limit (`review round 1, R1`).
+    NeverStarted,
+    /// A running run past the run limit.
+    RanTooLong,
+}
+
+/// How old a run may be before [`overdue`] calls it so: the two API settings
+/// of `SRC-39` (D9), each plus [`OVERDUE_GRACE_SECONDS`].
+#[derive(Debug, Clone, Copy)]
+struct RunAgeLimits {
+    start_seconds: f64,
+    running_seconds: f64,
+}
+
+impl RunAgeLimits {
+    /// The limits the route judges a run by.
+    fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            start_seconds: f64::from(config.ingest_run_start_timeout_seconds)
+                + OVERDUE_GRACE_SECONDS,
+            running_seconds: f64::from(config.ingest_run_max_runtime_seconds)
+                + OVERDUE_GRACE_SECONDS,
+        }
+    }
+}
+
+/// Whether `run` is past the limit that applies to its `Dagster` status
+/// (`SRC-39`, QA `TC-1702`, D10), judged by the orchestrator's own status
+/// word and its own times. A missing time, and every other status, is `None`:
+/// a run nobody measured keeps the 409 (fail closed).
+///
+/// The start limit does not cover a run still waiting in the queue
+/// (`review round 1, R1`): the orchestrator queues every run, and its run
+/// monitoring reads only `NOT_STARTED`, `STARTING`, `STARTED` and `CANCELING`
+/// (`dagster/_daemon/monitoring/run_monitoring.py`), so nothing there ever
+/// ends a `QUEUED` run. Judging one by the start limit would have "Run now"
+/// cancel a healthy run that is merely waiting behind other runs.
+fn overdue(run: &DgConfiguredRun, now_unix: f64, limits: &RunAgeLimits) -> Option<Overdue> {
+    match run.status.as_str() {
+        // `review round 1, R1`: a run may wait in the queue longer than a run
+        // may run. Until then it holds the connector (the 409 stays).
+        "QUEUED" => run
+            .creation_time
+            .filter(|created| now_unix - created > limits.running_seconds)
+            .map(|_| Overdue::NeverStarted),
+        // A run the orchestrator took off the queue and did not start. Its
+        // monitoring fails it `start_timeout_seconds` after the launch, so the
+        // grace lets that happen first.
+        "NOT_STARTED" => run
+            .creation_time
+            .filter(|created| now_unix - created > limits.start_seconds)
+            .map(|_| Overdue::NeverStarted),
+        "STARTED" | "MANAGED" => run
+            .start_time
+            .filter(|started| now_unix - started > limits.running_seconds)
+            .map(|_| Overdue::RanTooLong),
+        // `review round 1, R1`: a `STARTING` run is never overdue here. This
+        // route measures it from `creationTime` and the orchestrator from the
+        // launch time (`monitor_starting_run`), so a run that waited in the
+        // queue and was taken a second ago would look overdue; the monitoring
+        // ends it after the start limit, so the 409 stays. Every other status
+        // is one nobody measured (`CANCELING`, a finished run), and it keeps
+        // the 409 too (fail closed).
+        _ => None,
+    }
+}
+
 /// One `ingest_job` run of one connector, as far as the one-run-at-a-time
 /// guard in [`ingest_run_request`] needs it. The run list the console shows
 /// is the product's own record (`SRC-11`, `routes::connector_runs`); the old
@@ -4240,6 +4451,9 @@ pub struct ConnectorIngestRun {
     /// `queued | running | completed | failed | cancelled | unknown`
     /// ([`map_run_status`], the vocabulary the pipelines pages use).
     pub status: &'static str,
+    /// Why this run no longer holds the connector, `None` while it still
+    /// does (`SRC-39`, QA `TC-1702`).
+    overdue: Option<Overdue>,
 }
 
 impl ConnectorIngestRun {
@@ -4251,8 +4465,14 @@ impl ConnectorIngestRun {
 
 /// `connector_id`'s runs among `runs`, keeping `Dagster`'s newest-first
 /// order. Every connector runs the same `ingest_job`; only the run config
-/// (`ops.run_ingest.config.connector_id`) tells whose run it is.
-fn connector_runs(runs: &[DgConfiguredRun], connector_id: &str) -> Vec<ConnectorIngestRun> {
+/// (`ops.run_ingest.config.connector_id`) tells whose run it is. Each run is
+/// judged against `limits` at `now_unix` (`SRC-39`, QA `TC-1702`).
+fn connector_runs(
+    runs: &[DgConfiguredRun],
+    connector_id: &str,
+    now_unix: f64,
+    limits: &RunAgeLimits,
+) -> Vec<ConnectorIngestRun> {
     runs.iter()
         .filter(|run| {
             run.run_config
@@ -4264,6 +4484,7 @@ fn connector_runs(runs: &[DgConfiguredRun], connector_id: &str) -> Vec<Connector
         .map(|run| ConnectorIngestRun {
             run_id: run.run_id.clone(),
             status: map_run_status(&run.status),
+            overdue: overdue(run, now_unix, limits),
         })
         .collect()
 }
@@ -4271,16 +4492,157 @@ fn connector_runs(runs: &[DgConfiguredRun], connector_id: &str) -> Vec<Connector
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(
+        clippy::cast_precision_loss,
+        reason = "test fixture times are real-world Unix seconds, cast to f64 to match \
+                  DgConfiguredRun's wire shape; no meaningful precision is lost"
+    )]
 
     use std::collections::HashMap;
 
+    fn limits() -> RunAgeLimits {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+        RunAgeLimits::from_config(&Config::from_map(&env).unwrap())
+    }
+
+    /// A run that is "going" started 60 seconds ago, not at a fixed time in
+    /// September 2026: QA `TC-1702` (`SRC-39`) makes a run older than the
+    /// limit overdue, so a fixed old start would say something else than the
+    /// test's name. This does not weaken those tests: it makes the fixture
+    /// say what they assert.
     fn dg_run(id: &str, status: &str, connector: &str) -> DgConfiguredRun {
+        let started = time::OffsetDateTime::now_utc().unix_timestamp() as f64 - 60.0;
         DgConfiguredRun {
             run_id: id.to_owned(),
             status: status.to_owned(),
-            start_time: Some(1_790_670_111.0),
-            end_time: (status == "SUCCESS").then_some(1_790_670_153.0),
+            start_time: Some(started),
+            end_time: (status == "SUCCESS").then_some(started + 42.0),
+            creation_time: Some(started),
             run_config: json!({ "ops": { "run_ingest": { "config": { "connector_id": connector } } } }),
+        }
+    }
+
+    /// QA `TC-1702` (`SRC-39`, D10): a run that started longer ago than the
+    /// run limit plus its grace is overdue; a younger one is not.
+    #[test]
+    fn a_run_started_longer_ago_than_the_limit_is_overdue_and_a_younger_one_is_not() {
+        let limits = limits();
+        let now = 1_800_000_000.0;
+        let mut old = dg_run("run-old", "STARTED", "conn-a");
+        old.start_time = Some(now - limits.running_seconds - 1.0);
+        assert_eq!(overdue(&old, now, &limits), Some(Overdue::RanTooLong));
+        let mut managed = dg_run("run-managed", "MANAGED", "conn-a");
+        managed.start_time = Some(now - limits.running_seconds - 1.0);
+        assert_eq!(overdue(&managed, now, &limits), Some(Overdue::RanTooLong));
+        let mut young = dg_run("run-young", "STARTED", "conn-a");
+        young.start_time = Some(now - 60.0);
+        assert_eq!(overdue(&young, now, &limits), None);
+    }
+
+    /// `review round 1, R4` (QA `TC-1702`): the five-minute grace of D10 is
+    /// pinned on absolute numbers from the default config, not on times built
+    /// from the limits themselves (which already hold the grace, so they
+    /// would follow it to zero). The grace is the orchestrator's turn to act
+    /// first; without it the route races the daemon at exactly the limit.
+    #[test]
+    fn a_run_inside_the_grace_after_its_limit_still_holds_the_connector() {
+        let limits = limits();
+        // The default settings plus the grace: 21600 + 300 and 600 + 300.
+        assert_eq!(limits.running_seconds, 21_900.0);
+        assert_eq!(limits.start_seconds, 900.0);
+        let now = 1_800_000_000.0;
+        let mut running = dg_run("run-r", "STARTED", "conn-a");
+        running.start_time = Some(now - 21_600.0 - 299.0);
+        assert_eq!(overdue(&running, now, &limits), None);
+        running.start_time = Some(now - 21_600.0 - 301.0);
+        assert_eq!(overdue(&running, now, &limits), Some(Overdue::RanTooLong));
+        let mut launched = dg_run("run-n", "NOT_STARTED", "conn-a");
+        launched.start_time = None;
+        launched.creation_time = Some(now - 600.0 - 299.0);
+        assert_eq!(overdue(&launched, now, &limits), None);
+        launched.creation_time = Some(now - 600.0 - 301.0);
+        assert_eq!(
+            overdue(&launched, now, &limits),
+            Some(Overdue::NeverStarted)
+        );
+    }
+
+    /// A launched run that never started is overdue after the start limit;
+    /// one inside the limit is not.
+    #[test]
+    fn a_run_that_never_started_is_overdue_after_the_start_limit() {
+        let limits = limits();
+        let now = 1_800_000_000.0;
+        let mut run = dg_run("run-ns", "NOT_STARTED", "conn-a");
+        run.start_time = None;
+        run.creation_time = Some(now - limits.start_seconds - 1.0);
+        assert_eq!(overdue(&run, now, &limits), Some(Overdue::NeverStarted));
+        run.creation_time = Some(now - 60.0);
+        assert_eq!(overdue(&run, now, &limits), None);
+    }
+
+    /// `review round 1, R1` (QA `TC-1702`): the orchestrator queues every run
+    /// and its monitoring never ends a queued one, so a run that has waited in
+    /// the queue for longer than the start limit is not overdue. Before the
+    /// fix the route cancelled it, which "Run now" turned into a lost run.
+    #[test]
+    fn a_queued_run_is_not_overdue_after_the_start_limit() {
+        let limits = limits();
+        let now = 1_800_000_000.0;
+        let mut run = dg_run("run-q", "QUEUED", "conn-a");
+        run.start_time = None;
+        run.creation_time = Some(now - limits.start_seconds - 1.0);
+        assert_eq!(
+            overdue(&run, now, &limits),
+            None,
+            "a queued run inside the run limit still holds the connector"
+        );
+        // A run may wait in the queue longer than a run may run; past that it
+        // is overdue, as the last resort for a queue that never moves.
+        run.creation_time = Some(now - limits.running_seconds - 1.0);
+        assert_eq!(overdue(&run, now, &limits), Some(Overdue::NeverStarted));
+    }
+
+    /// `review round 1, R1`: a `STARTING` run is measured by the orchestrator
+    /// from its launch, not by its creation time, so this route never calls it
+    /// overdue — the monitoring ends it after the start limit.
+    #[test]
+    fn a_starting_run_is_not_judged_by_when_it_was_created() {
+        let limits = limits();
+        let now = 1_800_000_000.0;
+        let mut run = dg_run("run-s", "STARTING", "conn-a");
+        run.start_time = None;
+        run.creation_time = Some(now - 20.0 * 60.0);
+        assert_eq!(overdue(&run, now, &limits), None);
+        run.creation_time = Some(now - limits.running_seconds - 1.0);
+        assert_eq!(overdue(&run, now, &limits), None);
+    }
+
+    /// Fail closed: a run whose time the orchestrator did not give is never
+    /// overdue, so the 409 stays.
+    #[test]
+    fn a_run_with_no_time_recorded_is_never_overdue() {
+        let limits = limits();
+        let now = 1_800_000_000.0;
+        let mut queued = dg_run("run-q", "QUEUED", "conn-a");
+        queued.creation_time = None;
+        assert_eq!(overdue(&queued, now, &limits), None);
+        let mut started = dg_run("run-s", "STARTED", "conn-a");
+        started.start_time = None;
+        assert_eq!(overdue(&started, now, &limits), None);
+    }
+
+    /// A finished run never holds the connector, however old it is.
+    #[test]
+    fn a_finished_run_is_never_overdue() {
+        let limits = limits();
+        let now = 1_800_000_000.0;
+        for status in ["SUCCESS", "FAILURE", "CANCELED", "CANCELING"] {
+            let mut run = dg_run("run-done", status, "conn-a");
+            run.start_time = Some(now - limits.running_seconds - 10_000.0);
+            run.creation_time = Some(now - limits.start_seconds - 10_000.0);
+            assert_eq!(overdue(&run, now, &limits), None, "{status}");
         }
     }
 
@@ -4291,13 +4653,19 @@ mod tests {
             dg_run("run-2", "SUCCESS", "conn-b"),
             dg_run("run-1", "SUCCESS", "conn-a"),
         ];
-        let mine = connector_runs(&runs, "conn-a");
+        let mine = connector_runs(
+            &runs,
+            "conn-a",
+            time::OffsetDateTime::now_utc().unix_timestamp() as f64,
+            &limits(),
+        );
         assert_eq!(
             mine.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
             ["run-3", "run-1"]
         );
         assert_eq!(mine[0].status, "running");
         assert!(mine[0].is_active());
+        assert_eq!(mine[0].overdue, None, "a run 60 s old is not overdue");
         assert_eq!(mine[1].status, "completed");
         assert!(!mine[1].is_active());
     }
@@ -4307,7 +4675,7 @@ mod tests {
         let mut run = dg_run("run-1", "SUCCESS", "conn-a");
         run.run_config = json!({});
         assert_eq!(
-            connector_runs(&[run], "conn-a"),
+            connector_runs(&[run], "conn-a", 1_800_000_000.0, &limits()),
             [] as [crate::routes::connectors::ConnectorIngestRun; 0]
         );
     }
@@ -4454,25 +4822,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn debezium_properties_route_is_registered() {
-        let app = crate::routes::router(state_without_pool());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/connectors/conn-x/debezium-properties?table=public.orders")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no pool -> 503, not 404"
-        );
-    }
-
     #[test]
     fn create_body_rejects_unknown_direction() {
         let body = CreateConnectorBody {
@@ -4492,6 +4841,7 @@ mod tests {
             residency: String::new(),
             capabilities: vec![],
             owner: None,
+            connection: None,
         };
         assert!(!VALID_DIRECTIONS.contains(&body.direction.as_str()));
     }
@@ -5243,171 +5593,6 @@ mod tests {
             .expect_err("an unknown connector id must be refused");
             assert_eq!(err.0.status(), 404);
         }
-    }
-
-    // ---- mongodb adapter dispatch tests ----
-
-    /// The `mongodb` adapter's dispatch lives in
-    /// [`resolve_debezium_source_target`] (not on [`SqlDriver`], since
-    /// `MongoDB` is not a SQL/CDC source) and returns a target carrying
-    /// the real `Debezium` `MongoDB` connector class — `Some("mongodb")`
-    /// is a dispatch arm alongside the existing `sql`/`cdc` arms. The
-    /// test passes through
-    /// `resolve_debezium_source_target` directly (no router, no DB) so it
-    /// stays inside `cargo test -p lakehouse-api --lib`, never the
-    /// `tests/` directory's `#[sqlx::test]`-backed harness.
-    #[test]
-    fn mongodb_adapter_dispatch_returns_the_mongo_connector_class() {
-        let info = ConnectorDialInfo {
-            kind: "MongoDB CDC".to_owned(),
-            host: "mongo.internal:27017".to_owned(),
-            secret_ref: "env:CONNECTOR_MONGO_PASSWORD".to_owned(),
-            secret_ref_secondary: None,
-            adapter: Some("mongodb".to_owned()),
-            dial: serde_json::json!({
-                "hosts": ["mongo-a.internal:27017"],
-                "database": "oms",
-                "username": "cdc_reader",
-                "directConnection": true,
-            }),
-        };
-        let target = resolve_debezium_source_target("conn-mongo-1", &info)
-            .expect("a mongodb adapter with a Mongo-shaped dial must dispatch");
-        assert_eq!(
-            target.connector_class,
-            lakehouse_store::cdc::MONGO_CONNECTOR_CLASS
-        );
-        assert_eq!(
-            target.connector_class,
-            "io.debezium.connector.mongodb.MongoDbConnector"
-        );
-    }
-
-    // ---- the Oracle CDC gate ----
-
-    fn target_with_driver(driver: SqlDriver) -> DebeziumSourceTarget {
-        DebeziumSourceTarget {
-            host: "unused".to_owned(),
-            port: 0,
-            database: "unused".to_owned(),
-            user: "unused".to_owned(),
-            connector_class: "unused",
-            driver,
-        }
-    }
-
-    fn refusal_reason(response: Option<DebeziumPropertiesResponse>) -> String {
-        match response.expect("an Oracle-driver connector must be refused") {
-            DebeziumPropertiesResponse::Unsupported { supported, reason } => {
-                assert!(!supported);
-                reason
-            }
-            DebeziumPropertiesResponse::Rendered { .. } => {
-                panic!("an Oracle-driver connector must never get a rendered template")
-            }
-        }
-    }
-
-    /// Flag off (the default): refused, and the reason names the setting and
-    /// what `LogMiner` capture would need from the source database.
-    #[test]
-    fn an_oracle_connector_is_refused_when_the_logminer_flag_is_off() {
-        let reason = refusal_reason(oracle_cdc_refusal(
-            &target_with_driver(SqlDriver::Oracle),
-            false,
-        ));
-        assert!(reason.contains("ORACLE_CDC_LOGMINER_ENABLED"), "{reason}");
-        assert!(reason.contains("ARCHIVELOG"), "{reason}");
-    }
-
-    /// Flag ON: still refused. The only template this build can render is
-    /// shaped for the Postgres/MySQL/SQL Server connectors; handing it back
-    /// with Oracle's connector class on it would be a config that looks ready
-    /// and that Oracle's connector rejects. The reason says the flag is set
-    /// and why that is not enough, rather than repeating "not enabled".
-    #[test]
-    fn an_oracle_connector_is_refused_even_when_the_logminer_flag_is_on() {
-        let reason = refusal_reason(oracle_cdc_refusal(
-            &target_with_driver(SqlDriver::Oracle),
-            true,
-        ));
-        assert!(reason.contains("is set"), "{reason}");
-        assert!(reason.contains("no Debezium Oracle"), "{reason}");
-    }
-
-    /// The Oracle gate touches Oracle only (`MySQL` and `SQL Server` have their
-    /// own refusal below).
-    #[test]
-    fn the_oracle_gate_never_touches_the_other_drivers() {
-        for driver in [SqlDriver::Postgres, SqlDriver::Mysql, SqlDriver::Mssql] {
-            for flag in [false, true] {
-                assert!(
-                    oracle_cdc_refusal(&target_with_driver(driver), flag).is_none(),
-                    "{driver:?} with flag={flag} must render"
-                );
-            }
-        }
-    }
-
-    /// `SRC-9` decision 8: `MySQL` and `SQL Server` are refused with a fixed
-    /// message that names what is missing; `PostgreSQL` is not touched.
-    #[test]
-    fn mysql_and_sql_server_cdc_connectors_are_refused_with_what_is_missing() {
-        let for_mysql = refusal_reason(unbuilt_cdc_template_refusal(&target_with_driver(
-            SqlDriver::Mysql,
-        )));
-        assert!(for_mysql.contains("MySQL"), "{for_mysql}");
-        assert!(for_mysql.contains("database.server.id"), "{for_mysql}");
-        let for_sql_server = refusal_reason(unbuilt_cdc_template_refusal(&target_with_driver(
-            SqlDriver::Mssql,
-        )));
-        assert!(for_sql_server.contains("SQL Server"), "{for_sql_server}");
-        assert!(
-            for_sql_server.contains("database.names"),
-            "{for_sql_server}"
-        );
-    }
-
-    #[test]
-    fn the_unbuilt_template_refusal_leaves_postgres_and_oracle_alone() {
-        for driver in [SqlDriver::Postgres, SqlDriver::Oracle] {
-            assert!(
-                unbuilt_cdc_template_refusal(&target_with_driver(driver)).is_none(),
-                "{driver:?} must not get this refusal"
-            );
-        }
-    }
-
-    /// An Oracle-driver CDC connector still
-    /// resolves cleanly through [`resolve_debezium_source_target`]
-    /// regardless of the gate — the gate is a separate call in the
-    /// handler. This regression-tests that the resolver does not
-    /// silently start rejecting Oracle just because the gate was added.
-    #[test]
-    fn oracle_driver_still_resolves_through_resolve_debezium_source_target() {
-        let info = ConnectorDialInfo {
-            kind: "Oracle".to_owned(),
-            host: "oracle.internal:1521".to_owned(),
-            secret_ref: "env:CONNECTOR_ORACLE_PASSWORD".to_owned(),
-            secret_ref_secondary: None,
-            adapter: Some("cdc".to_owned()),
-            dial: serde_json::json!({
-                "driver": "oracle",
-                "host": "oracle.internal",
-                "port": 1521,
-                "database": "ORCL",
-                "user": "cdc_reader",
-                "slotName": "oracle_slot",
-                "publicationName": "oracle_pub",
-            }),
-        };
-        let target = resolve_debezium_source_target("conn-oracle-1", &info)
-            .expect("Oracle driver must still resolve, the gate fires later");
-        assert_eq!(target.driver, SqlDriver::Oracle);
-        assert_eq!(
-            target.connector_class,
-            "io.debezium.connector.oracle.OracleConnector"
-        );
     }
 
     // ── ADR 0002 Addendum 4: user-supplied (managed) credentials ────────

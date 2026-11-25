@@ -102,15 +102,29 @@ export type Asset = {
    * of a search with a term, and absent when every word matched the name.
    * With several words it explains the first word, in typed order, that the
    * name does not (`DATA-11` review `SHOULD-FIX 8`).
-   * `field` is `"id"`, `"namespace"`, `"tag"`, `"column"`, `"owner"`,
-   * `"description"` or `"columnDescription"`; `value` is the tag or column
-   * name and `""` for the rest; `approximate` is true when the match
-   * forgave a typo.
+   * `field` is `"table"`, `"namespace"`, `"tag"`, `"column"`, `"owner"`,
+   * `"description"` or `"columnDescription"`; `value` is the tag, the
+   * column, the table key or a piece of the description, and `""` for the
+   * rest; `approximate` is true when the match forgave a typo. `"table"`
+   * names the physical name a person types (QA `LH-DATA-11-05`,
+   * `DATA-54`); an API build older than that sends `"id"` instead.
    * `"name"` is the one field outside that list (`DATA-32` D1): the server
    * reports it when the name forgave a typo and no other field explains the
    * hit, so `value` is `""` and `approximate` is true.
    */
   matchedOn?: { field: string; value: string; approximate: boolean }
+  /**
+   * The `<schema>.<table>` key the lineage graph, policies and quality rules
+   * name this asset by. A Bronze list row carries `bronze.<table_name>` —
+   * the registry's own table name beside the `id` slug — or `null` when the
+   * registry records no table name (`GOV-7` D9, `bronze_catalog_row`). A
+   * Silver or Gold list row carries none: its `id` already is its key, and
+   * its builder emits no `tableKey` (`silver_catalog_row`,
+   * `gold_catalog_row`). The detail body of every asset carries it
+   * (`clickhouse_detail_body`, `bronze_detail_body`). Absent from an older
+   * API build; fall back to `id` then.
+   */
+  tableKey?: string | null
 }
 
 /**
@@ -168,6 +182,7 @@ export type AssetUsage = {
   basedOn: number
   /** True when that read was full, so the oldest queries of the window are not in the figures. */
   truncated: boolean
+  /** `name` is the person's display name, or "Unknown user" (`DATA-52`); the id is never sent. */
   frequentUsers: { name: string; queries: number }[]
   /** `sql` has every literal replaced by `?`; queries are grouped by that form. */
   frequentQueries: { sql: string; runs: number; lastAt: string }[]
@@ -247,6 +262,7 @@ export type AssetDetail = Asset & {
   recentQueries: {
     id: string
     sql: string
+    /** The caller's display name, or "Unknown user" (`DATA-52`); the id is never sent. */
     user: string
     at: string
     status?: string
@@ -298,14 +314,6 @@ export type AssetDetail = Asset & {
    */
   registry?: { owner: string | null; description: string | null }
   /**
-   * The `<namespace>.<table>` key the lineage graph, policies and quality
-   * rules name this asset by — `bronze.orders` for a Bronze dataset whose
-   * `id` is the registry slug, the id itself for `silver.*`/`serving.*`.
-   * `null` when the registry recorded no table, absent from an older API
-   * build; fall back to `id` then.
-   */
-  tableKey?: string | null
-  /**
    * The classification rules in force for this asset — the asset's own
    * first, then one per classified column — each removable by its id. An
    * older rule a newer one overrode is not listed. Absent from an older
@@ -332,6 +340,19 @@ export type AssetDetail = Asset & {
     /** Every column of the table, system columns included. */
     tableColumns: number
   }
+  /**
+   * `true` when the API admitted the caller by a `query:read` grant made
+   * from this table rather than by `catalog:read` (`GOV-11`, `DEC-20`;
+   * review round 1 R2). The body then holds the table's own facts only:
+   * `upstream`, `downstream`, `dependents` and the usage lists
+   * (`joinedTables`, `frequentUsers`, `frequentQueries`) are empty because
+   * they are withheld, not because nothing exists, and a deprecation's
+   * `replacementAssetId`/`replacementName` are absent. The server decides
+   * this from how the caller was admitted; the console must not infer it
+   * from a permission. Absent for a `catalog:read` caller, and from an
+   * older API build, which sent the whole body.
+   */
+  shownWithTableGrant?: boolean
   /**
    * `true` when `sample` is empty because the caller lacks `query:read`
    * (the API withholds rows from `catalog:read`-only callers), not
@@ -504,8 +525,62 @@ export type AssetRestoreStatus =
       expiresAt?: string
     }
 
+/**
+ * `GET /api/catalog/{id}/drop` (`DATA-55`, QA `LH-DATA-15-06`, `TC-1731`):
+ * whether this table may be dropped
+ * from its page, and, only when asked for, how many rows it holds.
+ *
+ * `rowCount` is absent when the count was not asked for (`withRowCount`) and
+ * `null` when the rows could not be counted — never 0 for "unknown", because 0
+ * is a real answer for an empty table.
+ */
+export type AssetDropStatus =
+  | { supported: false; reason: string }
+  | { supported?: undefined; droppable: false; reason: string }
+  | { supported?: undefined; droppable: true; table: string; keptDays: number; rowCount?: number | null }
+
+/**
+ * `POST /api/catalog/{id}/drop` (`DATA-55`, QA `LH-DATA-15-06`, `TC-1731`):
+ * what was dropped and until when.
+ */
+export type AssetDropResult = {
+  table: string
+  rowCount: number | null
+  droppedAt: string
+  expiresAt: string
+}
+
+/**
+ * One row of `GET /api/catalog/dropped/tables` (`DATA-55` D13, QA
+ * `LH-DATA-15-06`, `TC-1731`): a table the
+ * caller's tenant dropped from the console, while it can still be restored.
+ * `rowCount` is `null` when the rows could not be counted.
+ */
+export type DroppedTableEntry = {
+  assetId: string
+  table: string
+  droppedBy: string
+  rowCount: number | null
+  droppedAt: string
+  expiresAt: string
+}
+
+/**
+ * A catalog search's answer: the best matches and how many matched in all
+ * (`DATA-41` D3, `DATA-54`). The palette shows a few of them and says how
+ * many more there are.
+ */
+export type AssetSearchResult = { assets: Asset[]; total: number }
+
 export interface AssetService {
   listAssets(filter: AssetFilter, signal?: AbortSignal): Promise<Asset[]>
+  /**
+   * The best matches for `term` and how many matched in all (`DATA-41` D3).
+   *
+   * `limit` is how many assets to return; the server ranks every match and
+   * counts them, so a caller that shows eight still knows there are more.
+   */
+  searchAssets(term: string, limit: number, signal?: AbortSignal): Promise<AssetSearchResult>
   /**
    * One page of assets, with search/filter/sort/grouping applied on the
    * server (`GET /api/catalog/query`).
@@ -609,6 +684,25 @@ export interface AssetService {
    * passed (410).
    */
   restoreTable(id: string, signal?: AbortSignal): Promise<void>
+  /**
+   * `GET /api/catalog/{id}/drop` — whether this table may be dropped from its
+   * page (`DATA-55`). The row count is a scan of the whole table, so it is
+   * only asked for (`withRowCount`) when the confirmation dialog opens.
+   */
+  getDropStatus(
+    id: string,
+    options?: { withRowCount?: boolean },
+    signal?: AbortSignal
+  ): Promise<AssetDropStatus>
+  /**
+   * `POST /api/catalog/{id}/drop` — drop a table a file upload made, keeping it
+   * restorable for 7 days (`DATA-55`, `governance:write`). Refused with the
+   * server's sentence when the table is not an upload's, is already dropped, a
+   * load is running into it, or the install cannot keep it.
+   */
+  dropTable(id: string, signal?: AbortSignal): Promise<AssetDropResult>
+  /** `GET /api/catalog/dropped/tables` — the caller's tenants' restorable drops (`DATA-55`). */
+  listDroppedTables(signal?: AbortSignal): Promise<DroppedTableEntry[]>
   /** `DELETE /api/catalog/{id}/grants/{grantId}` — end a grant made from this asset. */
   revokeGrant(id: string, grantId: string, signal?: AbortSignal): Promise<void>
 }

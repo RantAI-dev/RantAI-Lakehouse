@@ -103,13 +103,13 @@ export function HierarchyDialog({
                 </li>
               ))}
             </ol>
-            {levels.length < MAX_LEVELS ? (
-              <div>
-                <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => setLevels([...levels, ""])}>
-                  <Plus className="size-3" aria-hidden /> Add a level
-                </Button>
-              </div>
-            ) : null}
+            {/* QA LH-BI-10-08 (BI-54): the button stays at the limit, off, with the reason under it. */}
+            <div className="space-y-1">
+              <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={levels.length >= MAX_LEVELS} onClick={() => setLevels([...levels, ""])}>
+                <Plus className="size-3" aria-hidden /> Add a level
+              </Button>
+              {levels.length >= MAX_LEVELS ? <p className="px-2 text-xs text-muted-foreground">A hierarchy takes at most six levels.</p> : null}
+            </div>
           </div>
           {missing.length && !problem ? <p className="text-xs text-muted-foreground">Still needed: {missing.join(", ")}.</p> : null}
           {problem ? <p role="alert" className="text-sm text-destructive">{problem}</p> : null}

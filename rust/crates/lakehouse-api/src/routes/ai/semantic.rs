@@ -125,7 +125,10 @@ async fn run_pass(
     call_timeout: Duration,
 ) -> PassReport {
     let mut report = PassReport::default();
-    if !state.config.ai_semantic_layer || state.config.llm_key.is_empty() {
+    // `ADM-9`: the key may now come from the console, so the check reads
+    // the resolver's answer and not the environment's value.
+    let assistant = crate::runtime_settings::assistant(state).await;
+    if !state.config.ai_semantic_layer || !assistant.settings.key_set {
         return report;
     }
     let Some(pg) = state.pg.as_deref() else {
@@ -263,12 +266,16 @@ async fn draft_table(
         temperature: Some(0.0),
         max_tokens: Some(MAX_TOKENS),
     };
-    let reply = match tokio::time::timeout(call_timeout, state.llm.chat(&messages, options)).await {
-        Err(_) => return Err("model call timed out"),
-        Ok(Err(LlmError::Transport(_))) => return Err("model call failed in transport"),
-        Ok(Err(LlmError::Api(_))) => return Err("model answered with an error status"),
-        Ok(Ok(reply)) => reply,
-    };
+    // `ADM-9`: the client and the model name come from the resolver, so a
+    // console's saved provider is the one that describes the table.
+    let assistant = crate::runtime_settings::assistant(state).await;
+    let reply =
+        match tokio::time::timeout(call_timeout, assistant.client.chat(&messages, options)).await {
+            Err(_) => return Err("model call timed out"),
+            Ok(Err(LlmError::Transport(_))) => return Err("model call failed in transport"),
+            Ok(Err(LlmError::Api(_))) => return Err("model answered with an error status"),
+            Ok(Ok(reply)) => reply,
+        };
     let draft: Value = extract_json_object(&reply)
         .and_then(|json| serde_json::from_str(json).ok())
         .ok_or("reply was not a JSON object")?;
@@ -276,7 +283,7 @@ async fn draft_table(
     // is what marks it as asked, so a write that fails halfway leaves the
     // table to be drafted again (the rows already written are kept).
     for entry in entries_from(&draft, table) {
-        semantic::insert_draft(pg, &entry, &state.config.llm_model)
+        semantic::insert_draft(pg, &entry, &assistant.settings.model)
             .await
             .map_err(|_| "storing the draft failed")?;
     }
@@ -875,10 +882,18 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn a_timeout_writes_nothing_and_the_next_table_is_drafted(pool: PgPool) {
+        // `REL-21`: the timeout is per model call, so it bounds the second
+        // table's call too, and that reply is answered at once. A loaded
+        // runner (nextest runs many test processes at once) can miss a 200 ms
+        // budget, and the second call then timed out as well: the pass
+        // reported two failures instead of one. Two seconds is still five
+        // times shorter than the 10 s delay below, so the first call still
+        // times out and the test still proves that a timed-out call writes
+        // nothing.
         a_failing_call_writes_nothing_and_the_next_table_is_drafted(
             pool,
             chat_ok(GOOD_REPLY).set_delay(Duration::from_secs(10)),
-            Duration::from_millis(200),
+            Duration::from_secs(2),
         )
         .await;
     }

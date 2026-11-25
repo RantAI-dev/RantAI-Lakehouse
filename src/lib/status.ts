@@ -16,6 +16,7 @@ export type EntityStatus =
   | "degraded"
   | "failed"
   | "completed"
+  | "stopped"
   | "cancelled"
   | "blocked"
   | "partial"
@@ -31,6 +32,7 @@ export const ENTITY_STATUS_LABEL: Record<EntityStatus, string> = {
   degraded: "Degraded",
   failed: "Failed",
   completed: "Completed",
+  stopped: "Stopped",
   cancelled: "Cancelled",
   blocked: "Blocked",
   partial: "Partial success",
@@ -61,6 +63,7 @@ export const ENTITY_STATUS_DESCRIPTION: Record<EntityStatus, string> = {
   degraded: "Operating with reduced health or delayed output.",
   failed: "The last execution ended with an error.",
   completed: "Finished successfully.",
+  stopped: "Stopped by the person who ran it.",
   cancelled: "Stopped before completion.",
   blocked: "Stopped by policy, quota, or approval gate.",
   partial: "Finished with some accepted and some rejected work.",
@@ -196,6 +199,24 @@ export const ENGINE_CATEGORY_LABEL: Record<EngineCategory, string> = {
   "federated-compute": "Federated compute",
   "ai-store": "AI retrieval store",
   "telemetry-store": "Telemetry store",
+}
+
+/**
+ * The name of the engine a run or an estimate really used, spelled the way
+ * the tab's engine picker spells it (`ClickHouse`, `Trino`).
+ *
+ * Query Studio's tabs name an engine (`clickhouse`/`trino`), not a storage
+ * tier: since `QS-6` the panel and the result summary say which engine
+ * answered, so a Trino tab no longer reads "Hot analytical store" or a
+ * ClickHouse-only estimate about Trino SQL. The legacy `hot-store` value is
+ * read as `ClickHouse` — that is what it always meant — and any other value
+ * is returned unchanged, because guessing a name would be worse than showing
+ * what the server said.
+ */
+export function queryEngineLabel(engine: string): string {
+  if (engine === "trino") return "Trino"
+  if (engine === "clickhouse" || engine === "hot-store") return "ClickHouse"
+  return engine
 }
 
 /** Alert / severity scale shared by alerts, quality results, and violations. */

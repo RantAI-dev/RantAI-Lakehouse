@@ -4,8 +4,9 @@
 // API recorded. A mapping the statement could not fully trace says so, with
 // its reason; a caller without dashboard access is told so instead of
 // being shown an empty list.
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import type { ColumnLineage, ColumnMapping } from "@/services/contracts/governance"
 import { ColumnLineageCard, columnLabel, producerLabel, retentionLine } from "./column-lineage"
 
@@ -89,7 +90,7 @@ function renderCard() {
 }
 
 function pick(column: string) {
-  fireEvent.change(screen.getByLabelText("Column"), { target: { value: column } })
+  chooseOption(screen.getByRole("combobox", { name: "Column" }), column)
 }
 
 describe("ColumnLineageCard", () => {
@@ -105,8 +106,11 @@ describe("ColumnLineageCard", () => {
     stubColumns()
     renderCard()
 
-    const options = within(screen.getByLabelText("Column")).getAllByRole("option")
-    expect(options.map((o) => o.textContent)).toEqual(["Pick a column", "id", "amt"])
+    // WEB-9 D2: "Pick a column" is the placeholder, not an option.
+    const trigger = screen.getByRole("combobox", { name: "Column" })
+    expect(trigger.querySelector('[data-slot="select-value"]')?.textContent).toBe("Pick a column")
+    fireEvent.click(trigger)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["id", "amt"])
   })
 
   it("asks for both directions of the table key and column, then draws upstream, downstream, charts and retention", async () => {

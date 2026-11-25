@@ -6,7 +6,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 
@@ -110,6 +110,8 @@ impl App {
         let created = pipelines::create_pipeline(
             &self.pool,
             &CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: format!("orders-{run_id}"),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),

@@ -21,20 +21,20 @@ use axum::extract::{Extension, Query, State};
 use axum::http::HeaderMap;
 use iceberg::{NamespaceIdent, TableIdent};
 use lakehouse_alerts::{
-    AlertKind, AlertRule, AlertRuleInput, AlertState, FreshnessSource, GateRefusal, LateSource,
-    SilenceSource, SqlGate, StateSource,
+    AlertKind, AlertRule, AlertRuleInput, AlertState, DigestClaim, DigestTurn, FreshnessSource,
+    GateRefusal, LateSource, SilenceSource, SqlGate, StateSource,
 };
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
 use lakehouse_iceberg::IcebergClient;
-use lakehouse_notify::{EmailSender, SmtpConfig};
+use lakehouse_notify::EmailSender;
 use lakehouse_store::PgPool;
 use lakehouse_store::overview::{self, FiredRule};
+use lakehouse_store::report_schedule::{Schedule, zone_is_known};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
-use crate::config::Config;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
@@ -49,6 +49,10 @@ use crate::upstream_error;
 /// and carries a webhook target). Whether run reports can arrive is a
 /// separate route, [`status`], so this body stays what the parity corpus
 /// recorded (`SRC-7` review SHOULD-FIX 3).
+///
+/// `DEC-16` (QA `LH-SRC-7-04`, `SRC-42`): a rule's `target` is returned only
+/// to a caller who may manage the rule; everyone else gets the rule with
+/// `"targetHidden": true` ([`rule_json_for`]).
 ///
 /// The `TypeScript` handler's `catch` returns a 500 with `e.message`
 /// (`alerts/route.ts`'s `GET`), unlike `POST`/`PUT` which return 400 for
@@ -77,6 +81,68 @@ pub async fn list(
     Ok(ApiJson(json!({ "rules": rules })))
 }
 
+/// Query parameters for `GET /api/alerts/mine` (`?chart=`).
+#[derive(Debug, Deserialize)]
+pub struct MineQuery {
+    chart: Option<String>,
+}
+
+/// `GET /api/alerts/mine?chart=` — the signed-in person's own alerts on one
+/// chart (`BI-43`, decision D1 of
+/// `docs/superpowers/plans/2026-11-13-bi-follow-ups.md`).
+///
+/// `GET /api/alerts` needs `alert:read` since `ADM-13`, and Dashboard Viewer
+/// does not hold it, while `BI-19` C3 lets anybody who can view a chart save an
+/// alert on it. This is the door that closes the gap: it answers only rules
+/// the caller owns (`owner_id` is theirs), of the alert kind, on that chart, so
+/// it needs nothing beyond a session. The caller owns each rule listed, so
+/// [`rule_json_for`] keeps the target in (the same [`chart_alerts::may_manage`]
+/// test as the write routes). Removing one is the existing
+/// `DELETE /api/alerts?id=`, which already lets a person remove their own chart
+/// alert.
+///
+/// # Errors
+///
+/// 401 with no principal; 400 when `chart` is missing or empty; a fixed 500
+/// when the rules cannot be read or serialized.
+pub async fn mine(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Query(query): Query<MineQuery>,
+) -> ApiResult<ApiJson<Value>> {
+    let Some(Extension(principal)) = principal else {
+        return Err(ApiError::unauthorized().into());
+    };
+    let chart = query
+        .chart
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("chart is required".to_owned()))?;
+    let me = principal.id.uuid().to_string();
+    let rules = lakehouse_alerts::list_rules(&state.clickhouse)
+        .await
+        .map_err(|err| {
+            upstream_error::ch_error_as(
+                &upstream_error::DATABASE,
+                &err,
+                upstream_error::FailedAs::Internal,
+            )
+        })?;
+    let mut out = Vec::new();
+    for rule in rules.iter().filter(|r| {
+        r.kind == AlertKind::Alert
+            && r.chart.as_deref() == Some(chart)
+            && r.owner_id.as_deref() == Some(me.as_str())
+    }) {
+        out.push(rule_json_for(Some(&principal), rule).map_err(|err| {
+            tracing::warn!(%err, rule_id = %rule.id, "an alert rule could not be serialized");
+            ApiError::Internal("the alert rules could not be listed".to_owned())
+        })?);
+    }
+    Ok(ApiJson(json!({ "rules": out })))
+}
+
 /// What a chart rule's row says about the chart it watches (`BI-39` D8), read
 /// live: the title is never stored, so a rename shows at once and a chart the
 /// caller lost access to stops naming itself (the same reason the bell is built
@@ -85,6 +151,34 @@ struct ChartTitle {
     title: String,
     board_id: String,
     board_title: String,
+}
+
+/// A rule as the list's JSON, with its `target` only for a caller who may
+/// manage it (`DEC-16`, QA `LH-SRC-7-04`, `SRC-42`).
+///
+/// A webhook address can carry a token and an e-mail address is personal, so a
+/// caller with `alert:read` and nothing more sees `channel` (Webhook or
+/// E-mail) but not where the rule sends: the key is left out and
+/// `"targetHidden": true` says so. This is the one place — `GET /api/alerts`
+/// and the assistant's `list_alert_rules` both go through [`listed_rules`]
+/// (D15) — and the test of who may manage a rule is
+/// [`chart_alerts::may_manage`], the same one the write routes use.
+///
+/// # Errors
+///
+/// The serializer's error, which the caller turns into a fixed 500.
+fn rule_json_for(
+    principal: Option<&Principal>,
+    rule: &AlertRule,
+) -> Result<Value, serde_json::Error> {
+    let mut value = serde_json::to_value(rule)?;
+    if !crate::routes::chart_alerts::may_manage(principal, Some(rule))
+        && let Some(map) = value.as_object_mut()
+    {
+        map.remove("target");
+        map.insert("targetHidden".to_owned(), json!(true));
+    }
+    Ok(value)
 }
 
 /// The rules of `rules` the caller may see, each as the list's JSON
@@ -96,6 +190,16 @@ struct ChartTitle {
 /// they cannot see carries none of the three, and the console keeps
 /// "Dashboard chart". The caller's charts and boards are read once for the whole
 /// list, never once per rule.
+///
+/// `DEC-16` (`SRC-42`): a rule's target is included only for a caller who may
+/// manage that rule ([`rule_json_for`]).
+///
+/// `SRC-40` D6: a rule that has a latest delivery row (`alert_rule_delivery`)
+/// also carries `lastDelivery` — when it last sent, or that it did not and
+/// why. That is the same two facts the incident list shows to `alert:read`, so
+/// every caller who may list the rule sees it. A rule with no row has no key;
+/// a store that cannot be read is logged and leaves the key out (the list
+/// still answers).
 ///
 /// # Errors
 ///
@@ -113,11 +217,17 @@ pub(crate) async fn listed_rules(
         HashMap::new()
     };
     let mut out = Vec::with_capacity(rules.len());
+    let last_deliveries = last_deliveries_for(state, &rules).await;
     for rule in rules {
-        let mut value = serde_json::to_value(&rule).map_err(|err| {
+        let mut value = rule_json_for(principal, &rule).map_err(|err| {
             tracing::warn!(%err, rule_id = %rule.id, "an alert rule could not be serialized");
             ApiError::Internal("the alert rules could not be listed".to_owned())
         })?;
+        if let Some(delivery) = last_deliveries.get(&rule.id)
+            && let Some(map) = value.as_object_mut()
+        {
+            map.insert("lastDelivery".to_owned(), json!(delivery));
+        }
         let found = rule.chart.as_deref().and_then(|id| titles.get(id));
         if let Some(found) = found
             && let Some(map) = value.as_object_mut()
@@ -129,6 +239,29 @@ pub(crate) async fn listed_rules(
         out.push(value);
     }
     Ok(out)
+}
+
+/// The latest delivery of each of `rules` (`SRC-40` D6), from
+/// `alert_rule_delivery`. One read for the whole list. No pool, or a read that
+/// fails, is logged and answers an empty map: the list then carries no
+/// `lastDelivery` key instead of failing.
+async fn last_deliveries_for(
+    state: &AppState,
+    rules: &[AlertRule],
+) -> HashMap<String, lakehouse_store::alert_delivery::LastDelivery> {
+    let Some(pg) = state.pg.as_deref() else {
+        return HashMap::new();
+    };
+    let ids: Vec<String> = rules.iter().map(|rule| rule.id.clone()).collect();
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+    lakehouse_store::alert_delivery::last_for(pg, &ids)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(%err, "the alert rules' last deliveries could not be read");
+            HashMap::new()
+        })
 }
 
 /// Chart id → its title and its dashboard's id and name, for the charts
@@ -655,6 +788,7 @@ pub(crate) async fn save_rule_with_checks(
     // chart and the owner are settled here.
     crate::routes::chart_alerts::authorise_save(state, principal, id, stored.as_ref(), input)
         .await?;
+    check_digest_schedule(state, input).await?;
     let rule = lakehouse_alerts::save_rule(&state.clickhouse, &state.webhook_sender(), input, id)
         .await
         .map_err(|err| {
@@ -672,7 +806,70 @@ pub(crate) async fn save_rule_with_checks(
     {
         forget_state(state, id).await;
     }
+    // BI-65: a digest whose schedule or zone changed counts from the next tick,
+    // so a new schedule does not send at once for a time that has already
+    // passed under the old one.
+    if let Some(id) = id
+        && stored
+            .as_ref()
+            .is_some_and(|old| old.schedule != rule.schedule || old.time_zone != rule.time_zone)
+        && let Some(pg) = state.pg.as_deref()
+        && let Err(err) = lakehouse_store::alert_state::clear_digest_clock(pg, id).await
+    {
+        tracing::warn!(%err, rule_id = %id, "a digest's clock could not be started over");
+    }
     Ok(rule)
+}
+
+/// `BI-65`: check a digest's schedule and zone before it is saved, and replace
+/// them with their canonical form, so what is stored is what
+/// [`digest_schedule`] reads and a stale or mistyped client gets a 400, never a
+/// digest that quietly runs on another schedule. A digest with no schedule gets
+/// none here (the store refuses a new one, and an old one keeps its daily
+/// default); a zone without a schedule is refused; the zone defaults to the
+/// report time zone, so the stored rule always says which zone it is read in.
+///
+/// Any other kind is left to `save_rule`, which refuses a schedule on it.
+///
+/// # Errors
+///
+/// 400 for a schedule or zone that is not valid, or a zone with no schedule.
+async fn check_digest_schedule(
+    state: &AppState,
+    input: &mut AlertRuleInput,
+) -> Result<(), ApiError> {
+    if input.kind.as_deref() != Some("digest") {
+        return Ok(());
+    }
+    let zone = input
+        .time_zone
+        .as_deref()
+        .map(str::trim)
+        .filter(|z| !z.is_empty());
+    let Some(raw) = input.schedule.clone() else {
+        return if zone.is_some() {
+            Err(ApiError::BadRequest(
+                "A time zone needs a schedule.".to_owned(),
+            ))
+        } else {
+            Ok(())
+        };
+    };
+    let bad = || ApiError::BadRequest("That schedule is not valid.".to_owned());
+    let parsed =
+        serde_json::from_value::<crate::routes::reports::ScheduleInput>(raw).map_err(|_| bad())?;
+    let schedule = crate::routes::reports::schedule_of(&parsed)?;
+    let zone = match zone {
+        Some(zone) if zone_is_known(zone) => zone.to_owned(),
+        Some(_) => return Err(ApiError::BadRequest("Unknown time zone.".to_owned())),
+        None => crate::routes::settings::time_context(state)
+            .await?
+            .zone()
+            .to_owned(),
+    };
+    input.schedule = Some(crate::routes::reports::schedule_json(schedule));
+    input.time_zone = Some(zone);
+    Ok(())
 }
 
 /// `POST /api/alerts` — create a rule.
@@ -774,11 +971,18 @@ pub async fn delete(
 /// route and for the assistant's `delete_alert_rule` (`BI-19` C review SF-7).
 /// Best effort: a state that cannot be removed is logged, not an error to the
 /// caller, because the rule itself is already changed.
+///
+/// `SRC-40` D5: the rule's latest delivery row (`alert_rule_delivery`) goes
+/// with it, for the same two moments, so a new rule that reuses neither the id
+/// nor the thing it watches starts with no "Last sent".
 pub(crate) async fn forget_state(state: &AppState, id: &str) {
-    if let Some(pg) = state.pg.as_deref()
-        && let Err(err) = lakehouse_store::alert_state::delete(pg, id).await
-    {
-        tracing::warn!(%err, rule_id = %id, "an alert's state could not be removed");
+    if let Some(pg) = state.pg.as_deref() {
+        if let Err(err) = lakehouse_store::alert_state::delete(pg, id).await {
+            tracing::warn!(%err, rule_id = %id, "an alert's state could not be removed");
+        }
+        if let Err(err) = lakehouse_store::alert_delivery::delete(pg, id).await {
+            tracing::warn!(%err, rule_id = %id, "an alert's last delivery could not be removed");
+        }
     }
 }
 
@@ -834,25 +1038,6 @@ fn check_run_token(
              service-identity credentials (not a human user session)"
                 .to_owned(),
         )),
-    }
-}
-
-/// `pub(in crate::routes)`: reused by `routes::ai::tools::alerts::run_alert_rule`
-/// (T1.1 of the copilot-operations-handover plan) so the copilot's
-/// `run_alert_rule` tool delivers through the exact same `SmtpConfig` the
-/// `/api/alerts/run` route builds, rather than a second, possibly-drifting
-/// copy of this six-field mapping.
-pub(crate) fn smtp_config(config: &Config) -> SmtpConfig {
-    SmtpConfig {
-        host: config.smtp_host.clone(),
-        port: config.smtp_port,
-        secure: config.smtp_secure,
-        user: config.smtp_user.clone(),
-        pass: config.smtp_pass.clone(),
-        from: config.smtp_from.clone(),
-        // `SEC-56` D1/D6: the bundle is read once, at start-up, and handed
-        // to the sender as it is.
-        ca_bundle: config.smtp_ca.clone(),
     }
 }
 
@@ -915,8 +1100,53 @@ impl SilenceSource for ApiSilenceSource<'_> {
 /// migration `0113`). A read that fails is the fixed sentence (principle 4), and
 /// the rule is then skipped rather than judged; a write that fails is logged
 /// here, because the caller has already sent or not sent.
+///
+/// `BI-65`: it also keeps a digest's clock (`digest_clock_at`, migration `0152`)
+/// and reads the digest's schedule, which is why it holds the whole state: a
+/// digest with no zone of its own is read in the report time zone.
 pub(crate) struct ApiStateSource<'a> {
     pub(crate) pg: &'a PgPool,
+    pub(crate) state: &'a AppState,
+}
+
+/// The schedule of a digest saved before schedules existed: every day at 08:00
+/// in the report time zone (`BI-65` decision 3), not on every tick.
+const LEGACY_DIGEST_SCHEDULE: Schedule = Schedule::Daily { hour: 8, minute: 0 };
+
+/// What a run records when a digest's schedule cannot be checked. One fixed
+/// sentence: the cause goes to the log (principle 4).
+const DIGEST_SCHEDULE_UNUSABLE: &str =
+    "the digest's schedule could not be checked, so it was not sent.";
+
+/// The schedule `rule` is sent on, as the report subscription type.
+///
+/// # Errors
+///
+/// [`DIGEST_SCHEDULE_UNUSABLE`] for a stored schedule that does not parse (only
+/// a hand edit of the row gets there: the save path stores a canonical one).
+fn digest_schedule(rule: &AlertRule) -> Result<Schedule, String> {
+    let Some(stored) = &rule.schedule else {
+        return Ok(LEGACY_DIGEST_SCHEDULE);
+    };
+    serde_json::from_value::<crate::routes::reports::ScheduleInput>(stored.clone())
+        .ok()
+        .and_then(|input| crate::routes::reports::schedule_of(&input).ok())
+        .ok_or_else(|| {
+            tracing::warn!(rule_id = %rule.id, "a digest's stored schedule is not valid");
+            DIGEST_SCHEDULE_UNUSABLE.to_owned()
+        })
+}
+
+/// `at` in whole milliseconds since the Unix epoch: the unit a
+/// [`DigestClaim`] carries, and the precision the clock is written with, so a
+/// claim can be matched exactly when it is given back.
+fn millis_of(at: OffsetDateTime) -> i64 {
+    i64::try_from(at.unix_timestamp_nanos() / 1_000_000).unwrap_or(i64::MAX)
+}
+
+/// The instant `ms` milliseconds after the Unix epoch.
+fn at_millis(ms: i64) -> Option<OffsetDateTime> {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()
 }
 
 #[async_trait::async_trait]
@@ -998,6 +1228,57 @@ impl StateSource for ApiStateSource<'_> {
         .await
         {
             tracing::warn!(%err, rule_id, "an alert's failed check could not be saved");
+        }
+    }
+
+    async fn digest_turn(&self, rule: &AlertRule) -> Result<DigestTurn, String> {
+        let schedule = digest_schedule(rule)?;
+        let zone = match rule.time_zone.as_deref() {
+            Some(zone) => zone.to_owned(),
+            None => crate::routes::settings::time_context(self.state)
+                .await
+                .map(|ctx| ctx.zone().to_owned())
+                .map_err(|err| {
+                    tracing::warn!(%err, rule_id = %rule.id, "the report time zone could not be read for a digest");
+                    DIGEST_SCHEDULE_UNUSABLE.to_owned()
+                })?,
+        };
+        let now_ms = millis_of(OffsetDateTime::now_utc());
+        let unusable = || DIGEST_SCHEDULE_UNUSABLE.to_owned();
+        let now = at_millis(now_ms).ok_or_else(unusable)?;
+        match lakehouse_store::alert_state::digest_turn(self.pg, &rule.id, schedule, &zone, now)
+            .await
+        {
+            Ok(lakehouse_store::alert_state::DigestTurn::Claimed { previous }) => {
+                Ok(DigestTurn::Send(DigestClaim {
+                    claimed_ms: now_ms,
+                    previous_ms: millis_of(previous),
+                }))
+            }
+            // Not due, just started, or claimed by another runner: nothing to send.
+            Ok(
+                lakehouse_store::alert_state::DigestTurn::StartedClock
+                | lakehouse_store::alert_state::DigestTurn::NotYet
+                | lakehouse_store::alert_state::DigestTurn::ClaimedElsewhere,
+            ) => Ok(DigestTurn::Wait),
+            Err(err) => {
+                tracing::warn!(%err, rule_id = %rule.id, "a digest's turn could not be worked out");
+                Err(unusable())
+            }
+        }
+    }
+
+    async fn digest_give_back(&self, rule_id: &str, claim: DigestClaim) {
+        let (Some(claimed), Some(previous)) =
+            (at_millis(claim.claimed_ms), at_millis(claim.previous_ms))
+        else {
+            return;
+        };
+        if let Err(err) =
+            lakehouse_store::alert_state::give_back_digest(self.pg, rule_id, claimed, previous)
+                .await
+        {
+            tracing::warn!(%err, rule_id, "a claimed digest send could not be given back");
         }
     }
 }
@@ -1178,8 +1459,10 @@ impl ApiSqlGate<'_> {
             &obligations,
         )
         .await
+        // GOV-7 D5: the run history records the not-found sentence itself,
+        // not a generic failure, for a table the owner may not read.
         .map_err(|err| {
-            GateRefusal::Refused(crate::policy_engine::enforcement_error_message(&err).to_owned())
+            GateRefusal::Refused(crate::routes::support::enforcement_refusal(sql, &err).to_string())
         })
     }
 }
@@ -1206,6 +1489,7 @@ fn fired_source(kind: AlertKind) -> &'static str {
         | AlertKind::ConnectorDisabled
         | AlertKind::ConnectorSchemaChange
         | AlertKind::ConnectorSuccess => "Connector runs",
+        AlertKind::ConnectorLag => "Change capture",
         AlertKind::UploadFailure => "File uploads",
         // `DATA-14`: delivered when an incident opens
         // (`routes::quality_incidents`), which persists its own instance;
@@ -1268,6 +1552,7 @@ fn fired_detail(rule: &AlertRule, value: Option<f64>) -> String {
         | AlertKind::ConnectorDisabled
         | AlertKind::ConnectorSchemaChange
         | AlertKind::ConnectorSuccess
+        | AlertKind::ConnectorLag
         | AlertKind::UploadFailure => "connector or upload event".to_owned(),
         // `DATA-14`: never reached from `run_rules`; the incident route writes its own.
         AlertKind::QualityIncident => "quality incident".to_owned(),
@@ -1413,7 +1698,7 @@ pub(crate) async fn run_one(
 ) -> Result<Vec<lakehouse_alerts::RunResult>, ApiError> {
     // SEC-10: the sender checks every webhook target and never follows a redirect.
     let http = state.webhook_sender();
-    let email = EmailSender::new(smtp_config(&state.config));
+    let email = EmailSender::new(crate::runtime_settings::email(state).await.smtp());
     // `freshness`/`silence` sources are real, Postgres/Iceberg-backed
     // implementations when both dependencies are configured for this
     // request; otherwise `None` — every `Freshness` rule then reports
@@ -1428,7 +1713,7 @@ pub(crate) async fn run_one(
         _ => None,
     };
     let silence_source = state.pg.as_deref().map(|pg| ApiSilenceSource { pg });
-    let state_source = state.pg.as_deref().map(|pg| ApiStateSource { pg });
+    let state_source = state.pg.as_deref().map(|pg| ApiStateSource { pg, state });
     // `SEC-50` slice 2 T7 (M1): the gate is the caller's, carried whole — the
     // state holds the pool the tenant count reads, the actor says whose reach
     // the rule's statement is measured against.
@@ -1546,7 +1831,7 @@ pub async fn run(
     // of the same configuration (`BI-40` D4).
     // SEC-10: the sender checks every webhook target and never follows a redirect.
     let http = state.webhook_sender();
-    let email = EmailSender::new(smtp_config(&state.config));
+    let email = EmailSender::new(crate::runtime_settings::email(&state).await.smtp());
     let silence_source = state.pg.as_deref().map(|pg| ApiSilenceSource { pg });
 
     // Plan 1f: `pipeline_late` rules fire from this op, not from the
@@ -1997,6 +2282,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::config::Config;
 
     fn service_principal() -> Principal {
         Principal {
@@ -2183,7 +2469,7 @@ mod tests {
                 })))
                 .mount(&server)
                 .await;
-            // `current_value`'s `SELECT round(sum(v)) FROM serving.<mart>`
+            // `current_value`'s `SELECT round(sum(v), 6) FROM serving.<mart>`
             // — a value far over the rule's threshold of 10, so it fires.
             Mock::given(method("POST"))
                 .and(body_string_contains("FROM serving."))
@@ -2432,7 +2718,11 @@ mod tests {
                 .await;
             let state = state_for(&server.uri());
 
-            let body = call_run(&state, Some("al-no-such-rule")).await;
+            // `call_run` clones `AppState` into its future; OPS-36's per-state
+            // DATA MAP cache adds an `Arc` to that clone, which pushed this
+            // test's future past clippy's 16 KiB threshold. Box it rather than
+            // allowing the lint away.
+            let body = Box::pin(call_run(&state, Some("al-no-such-rule"))).await;
 
             assert_eq!(body["schemaPassStarted"], json!(false));
             assert_eq!(body["qualityPassStarted"], json!(false));
@@ -2455,7 +2745,9 @@ mod tests {
             // so ask again until a pass of ours starts.
             let mut started = false;
             for _ in 0..100 {
-                if call_run(&state, None).await["schemaPassStarted"] == json!(true) {
+                // See the note in `a_single_rule_run_does_not_start_a_schema_pass`:
+                // box the state-cloning future to stay under the size lint.
+                if Box::pin(call_run(&state, None)).await["schemaPassStarted"] == json!(true) {
                     started = true;
                     break;
                 }
@@ -2481,7 +2773,8 @@ mod tests {
     /// run id must not re-deliver, via `pipeline_run_event`).
     mod late_pass {
         use lakehouse_clickhouse::ChClient;
-        use lakehouse_notify::EmailSender;
+        use lakehouse_core::secret::SecretValue;
+        use lakehouse_notify::{EmailSender, SmtpConfig};
         use wiremock::MockServer;
         use wiremock::matchers::method;
         use wiremock::{Mock, ResponseTemplate};
@@ -2495,7 +2788,7 @@ mod tests {
                 port: 587,
                 secure: false,
                 user: None,
-                pass: String::new(),
+                pass: SecretValue::new(String::new()),
                 from: String::new(),
                 ca_bundle: None,
             })
@@ -2715,6 +3008,7 @@ mod sql_gate_enforcement {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::ApiSqlGate;
+    use crate::config::Config;
 
     /// The tenant that owns the shared catalog in these tests — the first
     /// one `0002_seed_identity.sql` creates (`SEC-50` slice 2 M11).
@@ -2753,7 +3047,7 @@ mod sql_gate_enforcement {
         if let Some(tenant) = catalog_tenant {
             env.insert("CATALOG_TENANT_ID".to_owned(), tenant.to_owned());
         }
-        super::AppState::new(super::Config::from_map(&env).expect("a valid test Config"))
+        super::AppState::new(Config::from_map(&env).expect("a valid test Config"))
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -2878,14 +3172,17 @@ mod sql_gate_enforcement {
         .await
         .expect("insert the role");
         let user = Uuid::new_v4();
-        sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, $2, $3, $4)")
-            .bind(user)
-            .bind(format!("{role} person"))
-            .bind(format!("{user}@test.invalid"))
-            .bind(status)
-            .execute(pool)
-            .await
-            .expect("insert the person");
+        sqlx::query(
+            "INSERT INTO app_user (id, name, username, email, status) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(user)
+        .bind(format!("{role} person"))
+        .bind(user.to_string())
+        .bind(format!("{user}@test.invalid"))
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("insert the person");
         sqlx::query("INSERT INTO app_user_role (user_id, role_id) VALUES ($1, $2)")
             .bind(user)
             .bind(role_id)
@@ -3233,6 +3530,7 @@ mod save_tenant_scope {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+    use crate::config::Config;
 
     /// The tenant that owns the shared catalog in this deployment.
     const CATALOG_TENANT: &str = "11111111-1111-4111-8111-000000000001";
@@ -3484,6 +3782,7 @@ mod rule_scope_authorisation {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+    use crate::config::Config;
 
     const OWN_TENANT: &str = "11111111-1111-4111-8111-000000000001";
     const OTHER_TENANT: &str = "11111111-1111-4111-8111-000000000002";
@@ -3987,6 +4286,8 @@ mod rule_scope_authorisation {
             filters: Vec::new(),
             condition: None,
             owner_id: None,
+            schedule: None,
+            time_zone: None,
         };
         let rules = vec![
             rule("quality", AlertKind::QualityIncident),
@@ -4020,6 +4321,7 @@ mod run_events_configured {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::config::Config;
 
     async fn reported(token: Option<&str>) -> Value {
         let mut env = HashMap::new();
@@ -4044,5 +4346,108 @@ mod run_events_configured {
             reported(Some("")).await,
             json!({ "runEventsConfigured": false })
         );
+    }
+}
+
+/// `DEC-16` (QA `LH-SRC-7-04`, `SRC-42`): a rule's target is returned only to
+/// a caller who may manage the rule. Plain `#[test]`: no database.
+#[cfg(test)]
+mod hidden_targets {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_alerts::{AlertChannel, AlertKind, AlertOp, AlertRule};
+    use lakehouse_auth::{PermissionSet, Principal, PrincipalId};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::rule_json_for;
+
+    const ADDRESS: &str = "https://hooks.example.com/secret-token";
+
+    fn principal(permissions: &str, id: u128) -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(id)),
+            tenant_ids: Vec::new(),
+            display_name: "Rina Wijaya".to_owned(),
+            permissions: PermissionSet::parse(permissions),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    fn rule(chart: Option<&str>, owner: Option<&str>) -> AlertRule {
+        AlertRule {
+            id: "al_1".to_owned(),
+            name: "orders".to_owned(),
+            kind: AlertKind::Alert,
+            mart: Some("mart_orders".to_owned()),
+            measure: Some("orders".to_owned()),
+            agg: "sum".to_owned(),
+            op: AlertOp::Gt,
+            threshold: 10.0,
+            board: None,
+            channel: AlertChannel::Webhook,
+            target: ADDRESS.to_owned(),
+            enabled: true,
+            created_at: None,
+            severity: None,
+            pipeline: None,
+            metric: None,
+            connector: None,
+            asset: None,
+            chart: chart.map(str::to_owned),
+            series: None,
+            filters: Vec::new(),
+            condition: None,
+            owner_id: owner.map(str::to_owned),
+            schedule: None,
+            time_zone: None,
+        }
+    }
+
+    #[test]
+    fn a_caller_with_alert_read_only_gets_the_rule_without_its_target() {
+        let value = rule_json_for(Some(&principal("alert:read", 1)), &rule(None, None)).unwrap();
+        assert!(value.get("target").is_none(), "{value}");
+        assert_eq!(value["targetHidden"], json!(true));
+        assert_eq!(value["channel"], json!("webhook"));
+        assert!(!value.to_string().contains(ADDRESS), "{value}");
+    }
+
+    #[test]
+    fn a_caller_with_alert_write_gets_the_target() {
+        let value = rule_json_for(
+            Some(&principal("alert:read, alert:write", 1)),
+            &rule(None, None),
+        )
+        .unwrap();
+        assert_eq!(value["target"], json!(ADDRESS));
+        assert!(value.get("targetHidden").is_none(), "{value}");
+    }
+
+    #[test]
+    fn the_owner_of_a_chart_alert_gets_their_own_target_without_alert_write() {
+        let owner = principal("alert:read", 7);
+        let owner_id = owner.id.uuid().to_string();
+        let value = rule_json_for(Some(&owner), &rule(Some("chart-1"), Some(&owner_id))).unwrap();
+        assert_eq!(value["target"], json!(ADDRESS));
+        assert!(value.get("targetHidden").is_none(), "{value}");
+
+        // Another person's chart rule, and a mart rule of their own, stay
+        // hidden: only a chart alert they own carries their own address.
+        let someone_else = Uuid::from_u128(9).to_string();
+        let other =
+            rule_json_for(Some(&owner), &rule(Some("chart-1"), Some(&someone_else))).unwrap();
+        assert!(other.get("target").is_none(), "{other}");
+        let mart = rule_json_for(Some(&owner), &rule(None, Some(&owner_id))).unwrap();
+        assert!(mart.get("target").is_none(), "{mart}");
+    }
+
+    #[test]
+    fn a_caller_with_no_principal_gets_no_target() {
+        let value = rule_json_for(None, &rule(None, None)).unwrap();
+        assert!(value.get("target").is_none(), "{value}");
+        assert_eq!(value["targetHidden"], json!(true));
     }
 }

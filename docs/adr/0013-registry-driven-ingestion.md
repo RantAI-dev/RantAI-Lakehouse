@@ -159,3 +159,12 @@ for the existing seeded rows. `Dial::parse` and its per-adapter shape
 tests (`lakehouse_store::ingest_spec`, one shape-parses and one
 field-rejection test per adapter) land in a later commit; this ADR is the
 durable record of the shapes ahead of that code.
+
+## Note, 2026-10-29 (`SRC-4` slice 3, decision S3-a)
+
+"`slotName` and `publicationName` as **required**" now reads "required for
+PostgreSQL". `CdcDial`'s two names are `Option<String>` and `Dial::parse` checks
+them per driver: PostgreSQL requires both and refuses `serverId`; MySQL requires
+`serverId` (1 to 4294967295) and refuses both names; SQL Server refuses all
+three. Stored PostgreSQL rows parse unchanged. A refused or missing field is a
+400 with one fixed sentence that names the field.

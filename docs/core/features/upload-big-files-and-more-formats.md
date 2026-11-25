@@ -114,7 +114,7 @@ No spec target is left unmet, so there is no "Spec targets this feature does not
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `DATA-17-AC1` | Upload 10 Parquet files with the same columns, 2,040,000,000 bytes in total (1.9 GiB), into one new table | All 10 show progress at once; the load finishes; the table's row count is the sum of the files' row counts | Pass (product owner, 2026-11-02) |
+| `DATA-17-AC1` | Upload 10 Parquet files with the same columns, 2,040,000,000 bytes in total (1.9 GiB), into one new table | Each of the 10 has its own progress bar; four parts are sent at a time (`SEC-17` decision 6), so the files advance in turn, not all at once (`DEC-23`, 2026-11-12); the load finishes; the table's row count is the sum of the files' row counts | Pass (product owner, 2026-11-02) |
 | `DATA-17-AC2` | Upload an `.xlsx` with three sheets | The Check step asks which sheet, and loads the chosen one | Pass (product owner, 2026-11-02) |
 | `DATA-17-AC3` | Start a 500 MB upload, turn the network off halfway for a minute, turn it back on | The file shows it is waiting for the connection, then continues from where it was and loads; the row count is right | Pass (product owner, 2026-11-02) |
 | `DATA-17-AC4` | Pick files totalling 2,255,000,000 bytes (2.1 GiB) | Refused with a message naming the 2 GB limit, before any byte is sent | Pass (product owner, 2026-11-02) |

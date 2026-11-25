@@ -7,9 +7,51 @@
 //! These are word-level checks, not a parser: they run first and cheaply;
 //! `sql_rewrite` (a real `sqlparser` pass) still decides what a statement
 //! may touch.
+//!
+//! # The rules the guard reads with
+//!
+//! The guard reads the statement the way the engine that will run it reads
+//! it, and the rules are [`crate::sql_lex`]'s — one set, one lexer, one
+//! place (`SEC-62`; the findings came out of the `#420` and `#437`
+//! reviews). The guard takes the engine as an argument for that
+//! reason: a `ClickHouse` statement and a `Trino` statement are not the
+//! same text, and a copy of the rules that does not know the engine's is a
+//! hole rather than a nuisance.
+//!
+//! What that buys, in the two directions:
+//!
+//! - A write the old rules hid is now refused. `ClickHouse`'s heredoc
+//!   (`$$…$$`) is a quoted run, so the `'` inside it opens no string, and
+//!   `Trino` reads a `\` as a plain character, so `'a\'` is a complete
+//!   string there. The old guard read both the other way round and let a
+//!   `DROP` hide behind them.
+//! - A write is not invented either. A `#` line is a comment on `ClickHouse`
+//!   only, and a `/* … */` comment nests on `ClickHouse` only: the guard
+//!   follows the engine on both.
+//!
+//! ## The one case where `ClickHouse` is the more permissive engine
+//!
+//! `ClickHouse` nests block comments: `/* /* */ ; DROP TABLE t */` is one
+//! comment there, and the write inside it cannot run. `Trino` ends the
+//! comment at the first `*/`, so the same text is code there and the write
+//! is refused. The `ClickHouse` verdict is the more permissive one, and it
+//! is the correct one: the engine reads the whole run as a comment, so
+//! there is nothing there to write. `sqlparser`'s `ClickHouseDialect`
+//! nests block comments as well, so the rewrite that runs after this guard
+//! reads the text the same way.
+//!
+//! The lexer it reads with lives in [`crate::sql_lex`], the module that
+//! holds the engine's lexical rules (`SEC-62`).
 
-/// Whether `sql` is a read-only statement `ClickHouse` may run from Query
+use crate::sql_lex::{SpanKind, lex};
+use crate::sql_rewrite::Engine;
+
+/// Whether `sql` is a read-only statement `engine` may run from Query
 /// Studio.
+///
+/// Public so the engine-corpus test (`tests/sql_lex_corpus.rs`) can
+/// compare this verdict, statement by statement, with what a
+/// real `ClickHouse` reads; apart from that test, every caller is inside this crate.
 ///
 /// Both halves of the check run against [`strip_sql_noise`]'s output
 /// rather than the raw text, which is the difference from the
@@ -26,88 +68,143 @@
 /// with a read keyword, and smuggled DML such as `SELECT 1; DELETE FROM t`
 /// — the semicolon trick is why the denied-word test looks at the whole
 /// statement rather than just its first word.
+///
+/// `engine` says which engine's lexical rules the statement is read with
+/// ([`crate::sql_lex`]); the caller knows it, and the run path takes it
+/// from the request.
 #[must_use]
-pub(crate) fn is_read_only(sql: &str) -> bool {
-    let code = strip_sql_noise(sql);
-    starts_with_allowed_keyword(&code) && !contains_denied_keyword(&code)
+pub fn is_read_only(sql: &str, engine: Engine) -> bool {
+    read_only_verdict(sql, engine) == ReadOnlyVerdict::Read
+}
+
+/// Why [`read_only_verdict`] refused a statement, or that it did not.
+///
+/// One refusal used to cover three causes (QS-14): a character the
+/// lexer cannot read, a typo in the first word and a real write. The person
+/// with the first two could not tell what to change, so each cause has its
+/// own variant and [`not_read_only_message`] its own sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOnlyVerdict {
+    /// The statement is a read: it starts with an allowed keyword and holds
+    /// no denied one.
+    Read,
+    /// The statement holds a [`SpanKind::Uncertain`] span, such as a curly
+    /// quote on `ClickHouse` or a `$`-run no measured rule reads.
+    Unreadable,
+    /// A denied keyword (`DROP`, `INSERT`, ...) is in the code.
+    Writes,
+    /// No denied keyword, but the statement does not start with an allowed
+    /// one: a typo in the first word, or a statement Query Studio does not
+    /// run (`OPTIMIZE`).
+    NotARead,
+}
+
+/// The verdict [`is_read_only`] is the boolean form of.
+///
+/// The checks run in this order, and the order is the contract:
+///
+/// 1. An uncertain span is [`ReadOnlyVerdict::Unreadable`], before any word
+///    is read (today's first check, unchanged).
+/// 2. A denied keyword in the stripped code is [`ReadOnlyVerdict::Writes`].
+///    It comes before the first-word check, so `DROP TABLE t` is a write
+///    and not a typo.
+/// 3. No allowed first keyword is [`ReadOnlyVerdict::NotARead`].
+/// 4. Otherwise [`ReadOnlyVerdict::Read`].
+///
+/// A statement is accepted exactly when it starts with an allowed keyword
+/// and holds no denied one, as before: only the name of the refusal moved.
+#[must_use]
+pub fn read_only_verdict(sql: &str, engine: Engine) -> ReadOnlyVerdict {
+    // A `$`-run no measured rule reads, or a Unicode quote on `ClickHouse`
+    // (`SpanKind::Uncertain`), is a shape the lexer cannot follow. The
+    // engine refuses every `$` shape the measurements cover with
+    // `SYNTAX_ERROR` (code 62, 2026-11-10), and reads `‘ … ’` as a literal
+    // that this lexer would misplace (`#452` review SHOULD-FIX,
+    // 2026-11-12). Fail closed (AGENTS.md principle 3): the whole
+    // statement is refused before any word in it is read.
+    if lex(engine, sql)
+        .iter()
+        .any(|span| span.kind == SpanKind::Uncertain)
+    {
+        return ReadOnlyVerdict::Unreadable;
+    }
+    let code = strip_sql_noise(sql, engine);
+    if contains_denied_keyword(&code) {
+        return ReadOnlyVerdict::Writes;
+    }
+    if !starts_with_allowed_keyword(&code) {
+        return ReadOnlyVerdict::NotARead;
+    }
+    ReadOnlyVerdict::Read
+}
+
+/// The sentence a refused statement is told, one per cause.
+///
+/// Fixed text: it names no part of the statement and no engine text, so
+/// nothing a caller typed is echoed (`AGENTS.md` principle 4).
+/// [`ReadOnlyVerdict::Read`] is never refused, so no caller asks for its
+/// sentence; it returns the [`ReadOnlyVerdict::Writes`] text, the
+/// pre-existing one, rather than a fourth sentence nobody can reach.
+#[must_use]
+pub fn not_read_only_message(verdict: ReadOnlyVerdict) -> &'static str {
+    match verdict {
+        ReadOnlyVerdict::Unreadable => {
+            "The query has a character Query Studio cannot read safely, such as a curly quote \
+             (\u{2018} \u{2019} \u{201C} \u{201D}) or a `$$` sequence. Type straight quotes \
+             (' or \") and run it again."
+        }
+        ReadOnlyVerdict::NotARead => {
+            "Query Studio runs only statements that start with SELECT, WITH, SHOW, DESCRIBE or \
+             EXPLAIN. Check the first word for a typo."
+        }
+        ReadOnlyVerdict::Writes | ReadOnlyVerdict::Read => {
+            "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
+        }
+    }
 }
 
 /// `sql` with comments and quoted literals blanked out, so the guard reads
 /// only the parts of a statement that can actually do something.
 ///
-/// Removed: `-- line` and `# line` comments, `/* block */` comments, and
-/// `'single'`, `"double"` and `` `backtick` `` quoted runs (doubled quotes
-/// and backslash escapes inside them included). Each is replaced by a
-/// single space rather than deleted, so words either side of it cannot be
-/// glued into one.
+/// Removed: the comments and the quoted runs `engine` reads — `-- line`
+/// and `# line` comments, `/* block */` comments, and `'single'`,
+/// `"double"` and `` `backtick` `` quoted runs, the heredoc `$$…$$`
+/// included (the backtick run is blanked on `Trino` too, where such a
+/// statement is invalid anyway). Each is replaced by a single space
+/// rather than deleted, so words either side of it cannot be glued into
+/// one.
+///
+/// Kept: everything the engine reads as code, and the three texts it does
+/// not read as a comment. The run after a `#` the engine does not read as
+/// a comment start: the engine refuses the statement there, so the text
+/// cannot run. And the tail of a heredoc that is never closed: the engine
+/// reads that tail as code (`ClickHouse` opens a heredoc only when the
+/// closing delimiter is found again in the text), so a denied keyword in
+/// it is a keyword the engine would run. And an uncertain span
+/// ([`SpanKind::Uncertain`]): a `$`-run no measured rule reads, or on
+/// `ClickHouse` a Unicode quote outside a quoted run, a comment or a heredoc.
+/// [`is_read_only`] refuses the whole
+/// statement when one is present, so keeping it as it stands here cannot
+/// make a statement pass. The guard reads all three as they stand.
 #[must_use]
-pub(crate) fn strip_sql_noise(sql: &str) -> String {
+pub(crate) fn strip_sql_noise(sql: &str, engine: Engine) -> String {
     let chars: Vec<char> = sql.chars().collect();
     let mut out = String::with_capacity(sql.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let next = chars.get(i + 1).copied();
-        match c {
-            '-' if next == Some('-') => {
-                i = skip_to_line_end(&chars, i);
-                out.push(' ');
+    for span in lex(engine, sql) {
+        match span.kind {
+            // An `Uncertain` span is kept as it stands, like code: the
+            // guard refuses the whole statement when one is present, so
+            // nothing here can make it pass.
+            SpanKind::Code
+            | SpanKind::NotCode
+            | SpanKind::UnclosedHeredoc
+            | SpanKind::Uncertain => {
+                out.extend(chars[span.start..span.end].iter());
             }
-            '#' => {
-                i = skip_to_line_end(&chars, i);
-                out.push(' ');
-            }
-            '/' if next == Some('*') => {
-                i += 2;
-                while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
-                    i += 1;
-                }
-                i = (i + 2).min(chars.len());
-                out.push(' ');
-            }
-            '\'' | '"' | '`' => {
-                i = skip_quoted(&chars, i, c);
-                out.push(' ');
-            }
-            _ => {
-                out.push(c);
-                i += 1;
-            }
+            SpanKind::Comment | SpanKind::Literal => out.push(' '),
         }
     }
     out
-}
-
-/// Index just past the end of the line starting at `from`.
-fn skip_to_line_end(chars: &[char], from: usize) -> usize {
-    let mut i = from;
-    while i < chars.len() && chars[i] != '\n' {
-        i += 1;
-    }
-    i
-}
-
-/// Index just past the quoted run that opens at `from` with `quote`.
-/// An unterminated quote consumes the rest of the statement, which is the
-/// safe reading: the guard sees less, not more.
-fn skip_quoted(chars: &[char], from: usize, quote: char) -> usize {
-    let mut i = from + 1;
-    while i < chars.len() {
-        if chars[i] == '\\' {
-            i += 2;
-            continue;
-        }
-        if chars[i] == quote {
-            // A doubled quote is an escaped quote, not the end of the run.
-            if chars.get(i + 1) == Some(&quote) {
-                i += 2;
-                continue;
-            }
-            return i + 1;
-        }
-        i += 1;
-    }
-    chars.len()
 }
 
 /// `/^\s*(with|select|show|describe|desc|explain)\b/i.test(sql)` — leading
@@ -237,9 +334,14 @@ fn contains_trino_denied_keyword(sql: &str) -> bool {
 /// bound only keeps a pasted dump from being stored and re-sent per tile.
 const SQL_SOURCE_MAX_CHARS: usize = 20_000;
 
-/// Why a statement cannot become a dashboard SQL source. Every message is
-/// fixed text written here, never parser or engine output, so it is safe to
-/// return to the caller as-is.
+/// Why a piece of SQL text cannot become a dashboard SQL source or a
+/// pipeline step. Every message is fixed text written here, never parser or
+/// engine output, so it is safe to return to the caller as-is.
+///
+/// BLD-1 part 1 / D5 splits the lexical rules into [`SqlTextRefusal`], which
+/// this enum shares with the pipeline step's [`check_pipeline_step_sql`]:
+/// the two surfaces must not drift, and AGENTS.md rule 4 says a duplicated
+/// guard is a finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SqlSourceRefusal {
     /// Blank after trimming.
@@ -258,6 +360,47 @@ pub(crate) enum SqlSourceRefusal {
     /// It reads a table outside `serving` (including `console.*` and
     /// `system.*`), or a bare table name.
     OutsideServing,
+    /// A well-formed `{{name}}` placeholder (`QS-5`). A dashboard source cannot
+    /// take parameters until part 2, and the engine would answer with a
+    /// message about `{`.
+    ParametersLater,
+}
+
+/// The lexical half of [`check_sql_source`], shared with the pipeline step's
+/// [`check_pipeline_step_sql`] (BLD-1 part 1 / D5): blank, too long, a
+/// placeholder, not a `SELECT`/`WITH`, more than one statement, or a
+/// `SETTINGS`/`FORMAT` clause.
+///
+/// Returns the trimmed text a caller goes on to parse. Splitting this out is
+/// the only change `check_sql_source` got — its verdicts and its tests are
+/// the same, which is the point: two callers, one core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqlTextRefusal {
+    /// Blank after trimming.
+    Empty,
+    /// Over [`SQL_SOURCE_MAX_CHARS`].
+    TooLong,
+    /// Not a `SELECT`/`WITH` query, or [`is_read_only`] refused it.
+    NotASelect,
+    /// More than one statement.
+    MultipleStatements,
+    /// A `SETTINGS`/`FORMAT` clause.
+    SettingsOrFormat,
+    /// A well-formed `{{name}}` placeholder.
+    ParametersLater,
+}
+
+impl From<SqlTextRefusal> for SqlSourceRefusal {
+    fn from(refusal: SqlTextRefusal) -> Self {
+        match refusal {
+            SqlTextRefusal::Empty => Self::Empty,
+            SqlTextRefusal::TooLong => Self::TooLong,
+            SqlTextRefusal::NotASelect => Self::NotASelect,
+            SqlTextRefusal::MultipleStatements => Self::MultipleStatements,
+            SqlTextRefusal::SettingsOrFormat => Self::SettingsOrFormat,
+            SqlTextRefusal::ParametersLater => Self::ParametersLater,
+        }
+    }
 }
 
 impl SqlSourceRefusal {
@@ -276,6 +419,10 @@ impl SqlSourceRefusal {
             Self::OutsideServing => {
                 "a SQL source may only read Gold tables, written as serving.<table>."
             }
+            Self::ParametersLater => {
+                "Parameters in a dashboard's SQL source come later: give the value in the SQL \
+                 for now."
+            }
         }
     }
 }
@@ -290,37 +437,15 @@ impl SqlSourceRefusal {
 /// `policy_engine::rewrite_sql_for_roles` pass every execution goes through,
 /// which runs before the source is probed or stored.
 ///
+/// A dashboard SQL source runs on `ClickHouse`, so the guard reads it with
+/// the `ClickHouse` rules ([`crate::sql_lex`]), as the rewrite behind it
+/// does with `ClickHouse`'s dialect.
+///
 /// # Errors
 ///
 /// The [`SqlSourceRefusal`] naming the first rule `sql` breaks.
 pub(crate) fn check_sql_source(sql: &str) -> Result<String, SqlSourceRefusal> {
-    let trimmed = sql.trim();
-    let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
-    if trimmed.is_empty() {
-        return Err(SqlSourceRefusal::Empty);
-    }
-    if trimmed.chars().count() > SQL_SOURCE_MAX_CHARS {
-        return Err(SqlSourceRefusal::TooLong);
-    }
-    let code = strip_sql_noise(trimmed);
-    let lower = code.trim_start().to_ascii_lowercase();
-    let starts_select = ["select", "with"].iter().any(|kw| {
-        lower
-            .strip_prefix(kw)
-            .is_some_and(|rest| rest.chars().next().is_none_or(|c| !is_word_char(c)))
-    });
-    // `is_read_only` also admits SHOW/DESCRIBE/EXPLAIN, which cannot be a
-    // derived table, hence the narrower first-word check.
-    if !starts_select || !is_read_only(trimmed) {
-        return Err(SqlSourceRefusal::NotASelect);
-    }
-    if code.contains(';') {
-        return Err(SqlSourceRefusal::MultipleStatements);
-    }
-    let chars: Vec<char> = lower.chars().collect();
-    if word_occurs(&chars, "settings") || word_occurs(&chars, "format") {
-        return Err(SqlSourceRefusal::SettingsOrFormat);
-    }
+    let trimmed = check_sql_text(sql)?;
     let tables =
         crate::sql_rewrite::referenced_tables(trimmed, &sqlparser::dialect::ClickHouseDialect {})
             .ok_or(SqlSourceRefusal::Unparseable)?;
@@ -332,6 +457,449 @@ pub(crate) fn check_sql_source(sql: &str) -> Result<String, SqlSourceRefusal> {
         return Err(SqlSourceRefusal::OutsideServing);
     }
     Ok(trimmed.to_owned())
+}
+
+/// The shared lexical core: trimmed text (one trailing `;` dropped) that is
+/// non-blank, within [`SQL_SOURCE_MAX_CHARS`], free of `{{placeholder}}`s,
+/// one read-only `SELECT`/`WITH` statement with no `;` in its code and no
+/// `SETTINGS`/`FORMAT` clause.
+///
+/// Returns the trimmed text on the way through, because the two callers that
+/// share this need exactly that text to parse next.
+fn check_sql_text(sql: &str) -> Result<&str, SqlTextRefusal> {
+    let trimmed = sql.trim();
+    let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
+    if trimmed.is_empty() {
+        return Err(SqlTextRefusal::Empty);
+    }
+    if trimmed.chars().count() > SQL_SOURCE_MAX_CHARS {
+        return Err(SqlTextRefusal::TooLong);
+    }
+    // `query-parameters.md` decision 15: before anything reads the statement as ClickHouse SQL. The
+    // scanner is the one that knows comments and quotes, so a `{{` in a
+    // comment, or text that is not a well-formed placeholder, changes
+    // nothing here.
+    if crate::query_params::holds_placeholder(trimmed) {
+        return Err(SqlTextRefusal::ParametersLater);
+    }
+    let code = strip_sql_noise(trimmed, Engine::ClickHouse);
+    let lower = code.trim_start().to_ascii_lowercase();
+    let starts_select = ["select", "with"].iter().any(|kw| {
+        lower
+            .strip_prefix(kw)
+            .is_some_and(|rest| rest.chars().next().is_none_or(|c| !is_word_char(c)))
+    });
+    // `is_read_only` also admits SHOW/DESCRIBE/EXPLAIN, which cannot be a
+    // derived table, hence the narrower first-word check.
+    if !starts_select || !is_read_only(trimmed, Engine::ClickHouse) {
+        return Err(SqlTextRefusal::NotASelect);
+    }
+    if code.contains(';') {
+        return Err(SqlTextRefusal::MultipleStatements);
+    }
+    let chars: Vec<char> = lower.chars().collect();
+    if word_occurs(&chars, "settings") || word_occurs(&chars, "format") {
+        return Err(SqlTextRefusal::SettingsOrFormat);
+    }
+    Ok(trimmed)
+}
+
+/// Why a pipeline step's SQL is refused (BLD-1 part 1 / D5). Fixed text, for
+/// the same reason as [`SqlSourceRefusal`]: it reaches the person who wrote
+/// the step, never the parser's own words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipelineStepRefusal {
+    /// Blank after trimming.
+    Empty,
+    /// Over [`SQL_SOURCE_MAX_CHARS`] (decision 16: the dashboard source's own
+    /// limit, shared rather than copied).
+    TooLong,
+    /// Not a read-only `SELECT`/`WITH`.
+    NotASelect,
+    /// More than one statement, after the engine's own parse.
+    MultipleStatements,
+    /// A `SETTINGS`/`FORMAT` clause.
+    SettingsOrFormat,
+    /// A `{{name}}` placeholder.
+    ParametersLater,
+}
+
+impl PipelineStepRefusal {
+    /// The caller-facing message. Each one names what to change, never the
+    /// text that was refused.
+    #[must_use]
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::Empty => "a step needs SQL",
+            Self::TooLong => "this step's SQL is too long (max 20000 characters)",
+            Self::NotASelect => "a step must be a read-only SELECT or WITH query",
+            Self::MultipleStatements => "a step must be a single statement",
+            Self::SettingsOrFormat => "remove the SETTINGS/FORMAT clause; a step cannot set them",
+            Self::ParametersLater => "parameters are not supported in a step yet",
+        }
+    }
+}
+
+impl From<SqlTextRefusal> for PipelineStepRefusal {
+    fn from(refusal: SqlTextRefusal) -> Self {
+        match refusal {
+            SqlTextRefusal::Empty => Self::Empty,
+            SqlTextRefusal::TooLong => Self::TooLong,
+            SqlTextRefusal::NotASelect => Self::NotASelect,
+            SqlTextRefusal::MultipleStatements => Self::MultipleStatements,
+            SqlTextRefusal::SettingsOrFormat => Self::SettingsOrFormat,
+            SqlTextRefusal::ParametersLater => Self::ParametersLater,
+        }
+    }
+}
+
+/// Decide whether `sql` may be a pipeline step's SQL (BLD-1 part 1 / D5).
+///
+/// The same lexical rules as [`check_sql_source`] (one shared core), and on
+/// top of them the spec's rule 1: the text parses, under `ClickHouse`'s
+/// dialect, to exactly one statement, and that statement is a query. Window
+/// functions are not refused (decision 12); table functions, `system.*` and
+/// dictionary functions are refused later by the policy rewrite, as they are
+/// for every other surface.
+///
+/// # Errors
+///
+/// [`PipelineStepRefusal`] naming the first rule `sql` breaks.
+pub(crate) fn check_pipeline_step_sql(sql: &str) -> Result<String, PipelineStepRefusal> {
+    let trimmed = check_sql_text(sql)?;
+    let statements =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::ClickHouseDialect {}, trimmed)
+            .map_err(|_| PipelineStepRefusal::NotASelect)?;
+    match statements.as_slice() {
+        [sqlparser::ast::Statement::Query(_)] => Ok(trimmed.to_owned()),
+        [_single] => Err(PipelineStepRefusal::NotASelect),
+        _ => Err(PipelineStepRefusal::MultipleStatements),
+    }
+}
+
+#[cfg(test)]
+mod engine_aware_rules {
+    use super::{is_read_only, strip_sql_noise};
+    use crate::sql_rewrite::Engine;
+
+    /// A `ClickHouse` heredoc is a quoted run, so the `'` inside it opens
+    /// no string and the write behind it is code the engine runs.
+    ///
+    /// `Trino` has no heredoc: the `'` opens a string there, and the write
+    /// behind it is inside that string, so there is nothing to refuse.
+    #[test]
+    fn a_clickhouse_heredoc_hides_no_write_behind_it() {
+        let sql = "SELECT $$'$$; DROP TABLE t; SELECT '";
+        assert!(
+            !is_read_only(sql, Engine::ClickHouse),
+            "the write behind the heredoc is code on ClickHouse"
+        );
+        assert!(
+            is_read_only(sql, Engine::Trino),
+            "the write is inside a quoted run on Trino"
+        );
+    }
+
+    /// A `ClickHouse` heredoc is a literal: its body is raw text the engine
+    /// reads as it stands and never as SQL again, so a write inside it is
+    /// a word, not a statement. `Trino` has no heredoc, so the same text
+    /// is code there and the write is a write.
+    #[test]
+    fn a_write_inside_a_clickhouse_heredoc_is_a_literal() {
+        let sql = "SELECT $$DROP TABLE t$$";
+        assert!(is_read_only(sql, Engine::ClickHouse), "{sql}");
+        assert!(!is_read_only(sql, Engine::Trino), "{sql}");
+    }
+
+    /// `Trino` reads a `\` as a plain character, so `'a\'` is a complete
+    /// string there and the write behind it is code. `ClickHouse` reads
+    /// `\'` as an escaped quote, so the string runs on and the write
+    /// cannot run.
+    #[test]
+    fn a_trino_backslash_ends_the_string_and_a_clickhouse_one_does_not() {
+        let sql = "SELECT 'a\\'; DROP TABLE t; SELECT '";
+        assert!(!is_read_only(sql, Engine::Trino), "{sql}");
+        assert!(is_read_only(sql, Engine::ClickHouse), "{sql}");
+    }
+
+    /// `ClickHouse` nests block comments, so the comment runs to the `*/`
+    /// that closes the outermost one and the write inside it cannot run.
+    /// `Trino` ends the comment at the first `*/`, so the write behind it
+    /// is code.
+    #[test]
+    fn a_nested_clickhouse_comment_hides_no_write() {
+        let sql = "SELECT 1 /* /* */ ; DROP TABLE t */";
+        assert!(is_read_only(sql, Engine::ClickHouse), "{sql}");
+        assert!(!is_read_only(sql, Engine::Trino), "{sql}");
+    }
+
+    // ── the rules measured 2026-11-10 on
+    // `clickhouse/clickhouse-server:26.8` ────────────────────────────────
+
+    /// The `#446` review shape: a `$$` written right after the closed
+    /// heredoc `$$x$$`. When the backward scan crossed into that heredoc
+    /// it read the run as part of one name, the `'` behind it opened a
+    /// string, and the `DROP` hid from this guard. Measured on
+    /// `clickhouse/clickhouse-server:26.8` (2026-11-10): the engine
+    /// refuses every shape of the family with `SYNTAX_ERROR` (code 62) and
+    /// runs nothing in it, so the guard refuses the whole statement — the
+    /// adjacent `$`-run is a construct no measured rule reads.
+    #[test]
+    fn an_adjacent_dollar_run_after_a_closed_heredoc_is_refused() {
+        let sql = "SELECT $$x$$$$ ' $$; DROP TABLE t; SELECT 'z'";
+        assert!(
+            !is_read_only(sql, Engine::ClickHouse),
+            "the shape the engine refuses with code 62 must not pass: {sql}"
+        );
+        assert!(!is_read_only("SELECT $$x$$$$y$$", Engine::ClickHouse));
+        assert!(!is_read_only("SELECT $$x$$$$ ' $$", Engine::ClickHouse));
+    }
+
+    /// Measured on `clickhouse/clickhouse-server:26.8` (2026-11-10): the
+    /// engine refuses `$'$x$'$` with `SYNTAX_ERROR` at the first `$` and
+    /// `$é$x$é$` with "Unrecognized token" at the non-ASCII character. No
+    /// measured rule reads a `$` before a quote or a non-ASCII character,
+    /// so both statements are refused here rather than guessed.
+    #[test]
+    fn a_dollar_no_measured_rule_reads_is_refused() {
+        assert!(!is_read_only("SELECT $'$x$'$", Engine::ClickHouse));
+        assert!(!is_read_only("SELECT $é$x$é$", Engine::ClickHouse));
+    }
+
+    /// The `#452` review SHOULD-FIX: measured on
+    /// `clickhouse/clickhouse-server:26.8` (2026-11-12), `‘ … ’` is a string
+    /// literal and `“ … ”` a quoted identifier, so the `'` inside them opens
+    /// no string and the `DROP` behind it is code the engine runs. The
+    /// lexer cannot follow them, so the whole statement is refused on
+    /// `ClickHouse`. `Trino` reads them as ordinary text (`sqlparser` fails
+    /// them later), so its verdict stays what it was.
+    #[test]
+    fn a_unicode_quote_hides_no_write_on_clickhouse() {
+        let sql = "SELECT \u{2018} ' \u{2019}; DROP TABLE t; SELECT \u{2018} ' \u{2019}";
+        assert!(!is_read_only(sql, Engine::ClickHouse), "{sql}");
+        assert!(is_read_only(sql, Engine::Trino), "{sql}");
+        let identifier = "SELECT \u{201C} ' \u{201D}; DROP TABLE t; SELECT \u{201C} ' \u{201D}";
+        assert!(
+            !is_read_only(identifier, Engine::ClickHouse),
+            "{identifier}"
+        );
+    }
+
+    /// Inside an ASCII literal, a quoted identifier or a comment the four
+    /// characters are data, so a statement that only holds them there stays
+    /// read-only on both engines.
+    #[test]
+    fn a_unicode_quote_inside_another_span_leaves_the_verdict_alone() {
+        for sql in [
+            "SELECT '\u{2018}'",
+            "SELECT \"\u{2019}\" FROM t",
+            "SELECT 1 -- \u{2018}",
+            "SELECT 1 /* \u{201C} */",
+        ] {
+            assert!(is_read_only(sql, Engine::ClickHouse), "{sql}");
+            assert!(is_read_only(sql, Engine::Trino), "{sql}");
+        }
+    }
+
+    /// The measured shapes that keep their verdicts: `SELECT $1$x$1$` runs
+    /// on the engine (a heredoc with a digit tag), `SELECT $a-b$x$a-b$`
+    /// parses (a `$` beside name characters is one identifier), `SELECT
+    /// $a b$x$a b$` opens no heredoc (the tag scan stops at the space),
+    /// and `//` is a line comment the engine reads. The last three are
+    /// refused by the engine at parse or analysis time, but the refusal
+    /// happens there and not here, so the guard keeps them allowed.
+    #[test]
+    fn the_measured_heredoc_and_slash_shapes_stay_allowed() {
+        assert!(is_read_only("SELECT $1$x$1$", Engine::ClickHouse));
+        assert!(is_read_only("SELECT $a-b$x$a-b$", Engine::ClickHouse));
+        assert!(is_read_only("SELECT $a b$x$a b$", Engine::ClickHouse));
+        assert!(is_read_only("SELECT 1 // c", Engine::ClickHouse));
+        assert!(is_read_only("SELECT 8 // 3", Engine::ClickHouse));
+        assert!(is_read_only("SELECT 1 // '\n, 2", Engine::ClickHouse));
+        assert!(is_read_only("SELECT 1 /\n-- c\n2", Engine::ClickHouse));
+    }
+
+    /// `#` starts a comment on `ClickHouse` only when a space or a `!`
+    /// follows it. `Trino` has no `#` comment, so the text behind it is
+    /// code.
+    #[test]
+    fn a_hash_is_a_comment_on_clickhouse_only() {
+        let sql = "SELECT 1 # ; DROP TABLE t";
+        assert!(is_read_only(sql, Engine::ClickHouse), "{sql}");
+        assert!(!is_read_only(sql, Engine::Trino), "{sql}");
+    }
+
+    /// A heredoc that is never closed is no heredoc to the engine: the `$`
+    /// opens nothing and the text behind it is ordinary SQL to run.
+    #[test]
+    fn an_unclosed_heredoc_is_code_on_clickhouse() {
+        assert!(
+            !is_read_only("SELECT 1$b$ ; DROP TABLE t", Engine::ClickHouse),
+            "the tail of an unclosed heredoc is code on ClickHouse"
+        );
+    }
+
+    /// A `#` line is a comment on `ClickHouse` and text the engine refuses
+    /// on `Trino`, so the statement behind it is code there.
+    #[test]
+    fn a_hash_comment_line_is_refused_on_trino() {
+        let sql = "# hash comment\nSELECT 1";
+        assert!(is_read_only(sql, Engine::ClickHouse), "{sql}");
+        assert!(!is_read_only(sql, Engine::Trino), "{sql}");
+    }
+
+    /// Where the two engines read the text the same way, the blanked text
+    /// is the same too.
+    #[test]
+    fn the_blanked_text_is_the_same_where_the_engines_read_the_same() {
+        assert_eq!(
+            strip_sql_noise("SELECT /* x */ 1", Engine::Trino),
+            "SELECT   1"
+        );
+        assert_eq!(
+            strip_sql_noise("SELECT 'a' , \"b\" , `c`", Engine::Trino),
+            "SELECT   ,   ,  "
+        );
+        assert_eq!(
+            strip_sql_noise("SELECT 'unterminated", Engine::Trino),
+            "SELECT  "
+        );
+    }
+}
+
+/// QS-14: the guard says why it refused, not only that it did.
+#[cfg(test)]
+mod read_only_verdict_rules {
+    use super::{ReadOnlyVerdict, is_read_only, not_read_only_message, read_only_verdict};
+    use crate::sql_rewrite::Engine;
+
+    const BOTH: [Engine; 2] = [Engine::ClickHouse, Engine::Trino];
+
+    #[test]
+    fn a_read_is_a_read_on_both_engines() {
+        for engine in BOTH {
+            for sql in ["SELECT 1", "  -- c\nWITH x AS (SELECT 1) SELECT * FROM x"] {
+                assert_eq!(
+                    read_only_verdict(sql, engine),
+                    ReadOnlyVerdict::Read,
+                    "{engine:?} {sql}"
+                );
+            }
+        }
+    }
+
+    /// A curly quote and a `$` shape no measured rule reads are the two
+    /// things the lexer calls uncertain. Both are `ClickHouse` rules: a
+    /// Unicode quote is plain code on `Trino`.
+    #[test]
+    fn a_character_the_lexer_cannot_read_is_unreadable_on_clickhouse() {
+        for sql in [
+            "\u{2018}SELECT\u{2019} 1",
+            "SELECT \u{201C}a\u{201D}",
+            "SELECT $'$x$'$",
+            "SELECT $$x$$$$y$$",
+        ] {
+            assert_eq!(
+                read_only_verdict(sql, Engine::ClickHouse),
+                ReadOnlyVerdict::Unreadable,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_statement_that_does_not_start_with_a_read_word_is_not_a_read() {
+        for engine in BOTH {
+            for sql in ["SELEC 1", "OPTIMIZE TABLE t", ""] {
+                assert_eq!(
+                    read_only_verdict(sql, engine),
+                    ReadOnlyVerdict::NotARead,
+                    "{engine:?} {sql:?}"
+                );
+            }
+        }
+        // `Trino` has no Unicode quote: the curly-quoted word is an
+        // ordinary first word that is no read keyword.
+        assert_eq!(
+            read_only_verdict("\u{2018}SELECT\u{2019} 1", Engine::Trino),
+            ReadOnlyVerdict::NotARead
+        );
+    }
+
+    /// A denied word wins over a missing read keyword: `DROP TABLE t` is a
+    /// write, not a typo.
+    #[test]
+    fn a_denied_word_is_a_write_even_without_a_read_keyword() {
+        for engine in BOTH {
+            for sql in [
+                "DROP TABLE t",
+                "SELECT 1; DELETE FROM t",
+                "INSERT INTO t VALUES (1)",
+            ] {
+                assert_eq!(
+                    read_only_verdict(sql, engine),
+                    ReadOnlyVerdict::Writes,
+                    "{engine:?} {sql}"
+                );
+            }
+        }
+    }
+
+    /// The `#437`/`#446` shapes the lexer exists for stay writes on
+    /// `ClickHouse`, and the QS-14 route tests name them, so the verdict
+    /// is pinned here, not only the boolean.
+    #[test]
+    fn a_write_behind_a_heredoc_or_a_trino_backslash_is_a_write() {
+        assert_eq!(
+            read_only_verdict("SELECT $$'$$; DROP TABLE t; SELECT '", Engine::ClickHouse),
+            ReadOnlyVerdict::Writes
+        );
+        assert_eq!(
+            read_only_verdict("SELECT 'a\\'; DROP TABLE t; SELECT '", Engine::Trino),
+            ReadOnlyVerdict::Writes
+        );
+    }
+
+    /// The accept set did not move: `is_read_only` is exactly "the verdict
+    /// is `Read`".
+    #[test]
+    fn is_read_only_is_the_read_verdict() {
+        for engine in BOTH {
+            for sql in [
+                "SELECT 1",
+                "SELEC 1",
+                "DROP TABLE t",
+                "\u{2018}SELECT\u{2019} 1",
+                "SHOW TABLES",
+                "EXPLAIN SELECT 1",
+                "SELECT 1; DELETE FROM t",
+            ] {
+                assert_eq!(
+                    is_read_only(sql, engine),
+                    read_only_verdict(sql, engine) == ReadOnlyVerdict::Read,
+                    "{engine:?} {sql}"
+                );
+            }
+        }
+    }
+
+    /// The sentences are the plan's, typed as literals. `Unreadable` holds
+    /// the curly quotes on purpose: they are the characters it names.
+    #[test]
+    fn each_refusal_has_its_own_sentence() {
+        assert_eq!(
+            not_read_only_message(ReadOnlyVerdict::Unreadable),
+            "The query has a character Query Studio cannot read safely, such as a curly quote (\u{2018} \u{2019} \u{201C} \u{201D}) or a `$$` sequence. Type straight quotes (' or \") and run it again."
+        );
+        assert_eq!(
+            not_read_only_message(ReadOnlyVerdict::Writes),
+            "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
+        );
+        assert_eq!(
+            not_read_only_message(ReadOnlyVerdict::NotARead),
+            "Query Studio runs only statements that start with SELECT, WITH, SHOW, DESCRIBE or EXPLAIN. Check the first word for a typo."
+        );
+    }
 }
 
 #[cfg(test)]
@@ -427,6 +995,61 @@ mod sql_source_rules {
     fn unparseable_sql_is_refused_not_passed_through() {
         assert_eq!(
             check_sql_source("SELECT * FROM serving.a WHERE ((("),
+            Err(SqlSourceRefusal::Unparseable)
+        );
+    }
+
+    /// `query-parameters.md` decision 15: parameters in a source come later, so a well-formed
+    /// placeholder is refused with the page's sentence instead of reaching
+    /// the engine parser, which would answer with a message about `{`.
+    #[test]
+    fn a_placeholder_in_a_source_is_refused_with_the_part_two_sentence() {
+        for sql in [
+            "SELECT * FROM serving.a WHERE region = {{region}}",
+            "SELECT * FROM serving.a WHERE region = {{ region }}",
+            "SELECT * FROM serving.a WHERE day >= {{days.start}} AND day <= {{days.end}}",
+            "SELECT * FROM serving.a WHERE region IN ({{regions}})",
+            // The same words in a string are a placeholder the person meant.
+            "SELECT * FROM serving.a WHERE region = '{{region}}'",
+        ] {
+            let refusal = check_sql_source(sql).unwrap_err();
+            assert_eq!(refusal, SqlSourceRefusal::ParametersLater, "{sql}");
+            assert_eq!(
+                refusal.message(),
+                "Parameters in a dashboard's SQL source come later: give the value in the \
+                 SQL for now.",
+                "{sql}"
+            );
+        }
+    }
+
+    /// The refusal comes before the engine parse: a source that holds a
+    /// placeholder and would also fail the parse says the placeholder first.
+    #[test]
+    fn the_placeholder_refusal_comes_before_the_engine_parse() {
+        assert_eq!(
+            check_sql_source("SELECT * FROM serving.a WHERE x = {{x}} AND ((("),
+            Err(SqlSourceRefusal::ParametersLater)
+        );
+    }
+
+    /// A `{{` that is not a well-formed placeholder, or that sits in a
+    /// comment, changes nothing: the source is judged as it was before.
+    #[test]
+    fn braces_that_are_not_a_placeholder_leave_the_verdict_as_it_was() {
+        for sql in [
+            "SELECT * FROM serving.a -- {{region}}",
+            "SELECT * FROM serving.a /* {{region}} */",
+            "SELECT '{{ not closed' AS note FROM serving.a",
+            "SELECT '{{9x}}' AS note FROM serving.a",
+        ] {
+            assert!(check_sql_source(sql).is_ok(), "{sql}");
+        }
+        // A stray `{{` outside quotes and comments is not a well-formed
+        // placeholder either: it keeps failing the way it did (a parse
+        // failure), not with the part-two sentence.
+        assert_eq!(
+            check_sql_source("SELECT * FROM serving.a WHERE x = {{"),
             Err(SqlSourceRefusal::Unparseable)
         );
     }

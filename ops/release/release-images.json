@@ -1,5 +1,5 @@
 {
-  "rantai-lakehouse-api": ["lakehouse-api"],
+  "rantai-lakehouse-api": ["lakehouse-api", "lakehouse-db-migrate"],
   "rantai-lakehouse-console": ["console"],
   "rantai-lakehouse-dagster": [
     "dagster-code-location",
@@ -7,5 +7,11 @@
     "dagster-daemon",
     "backup-job"
   ],
-  "rantai-lakehouse-oidc-mock": ["oidc-mock"]
+  "rantai-lakehouse-oidc-mock": ["oidc-mock"],
+  "rantai-lakehouse-init": [
+    "lakekeeper-warehouse-init",
+    "lakekeeper-authz-init",
+    "lakekeeper-warehouse-init-seaweedfs",
+    "lakekeeper-authz-init-seaweedfs"
+  ]
 }

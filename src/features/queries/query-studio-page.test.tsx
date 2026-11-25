@@ -6,11 +6,14 @@
 // `next/navigation` is stubbed before any import resolves (`mock.module` is
 // hoisted), and `TableProviders` supplies the URL state the results table
 // needs, as the root layout does.
+let pushed: string[] = []
 mock.module("next/navigation", () => ({
   usePathname: () => "/query-studio",
   useSearchParams: () => new URLSearchParams(),
   useRouter: () => ({
-    push: () => {},
+    push: (href: string) => {
+      pushed.push(href)
+    },
     replace: () => {},
     refresh: () => {},
     back: () => {},
@@ -22,18 +25,21 @@ mock.module("next/navigation", () => ({
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { TableProviders } from "@/components/app-shell/table-providers"
-import { AuthProvider } from "@/features/auth/auth-provider"
+import { AuthProvider, useAuth } from "@/features/auth/auth-provider"
 import { CopilotProvider } from "@/features/copilot/use-copilot"
 import { assetService, lakehouseService, queryService } from "@/services"
 import { ServiceError } from "@/services/errors"
-import { QUERY_DRAFT_KEY } from "@/lib/query-draft"
+import { queryDraftKey } from "@/lib/query-draft"
 import { SQL_FORMAT_SETTINGS_KEY } from "@/lib/sql-format-settings"
 import { QueryStudioPage } from "./query-studio-page"
+import { readSaveQueryDraft, readSaveSourceDraft } from "./save-draft"
 
 afterEach(() => {
   cleanup()
   mock.restore()
   window.localStorage.clear()
+  window.sessionStorage.clear()
+  pushed = []
   visit("/query-studio")
 })
 
@@ -47,11 +53,11 @@ function visit(path: string) {
 }
 
 /** Answers the session and the Copilot sessions list; everything else is an empty success. */
-function stubNetwork() {
+function stubNetwork(permissions: string[] = []) {
   spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
     const path = String(input)
     if (path.includes("/api/auth/me")) {
-      return json({ id: "u1", name: "Analyst", email: null, roles: ["Analyst"], permissions: [], tenants: [] })
+      return json({ id: "u1", name: "Analyst", email: null, roles: ["Analyst"], permissions, tenants: [] })
     }
     if (path.includes("/api/ai/sessions")) return json({ sessions: [] })
     return json({})
@@ -65,7 +71,7 @@ function stubNetwork() {
 
 /** Seeds the editor with a statement and opens the SQL tab, the way a saved draft would. */
 function seedDraft(sql: string) {
-  window.localStorage.setItem(QUERY_DRAFT_KEY, JSON.stringify({ sql, question: "", tab: "sql" }))
+  window.localStorage.setItem(queryDraftKey("u1", null), JSON.stringify({ sql, question: "", tab: "sql" }))
 }
 
 function renderPage() {
@@ -146,6 +152,24 @@ describe("QueryStudioPage Fix with AI", () => {
     await waitFor(() => expect(run).toHaveBeenCalledTimes(2))
     expect(await screen.findByRole("button", { name: /Fix with AI/ })).toBeTruthy()
   })
+
+  // QS-11 (LH-QS-1-04 F2), D11: a permission refusal is not a broken
+  // statement; changing the SQL cannot help, so no Fix with AI is offered.
+  it("does not offer Fix with AI for a permission refusal", async () => {
+    stubNetwork()
+    spyOn(queryService, "run").mockRejectedValueOnce(
+      new ServiceError("permission_denied", "You may not read this table.")
+    )
+    seedDraft("SELECT amont FROM t")
+    renderPage()
+
+    const runButton = await screen.findByRole("button", { name: "Run query" })
+    await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(runButton)
+
+    expect(await screen.findByText("You don't have access")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: /Fix with AI/ })).toBeNull()
+  })
 })
 
 describe("QueryStudioPage format settings", () => {
@@ -212,6 +236,52 @@ describe("QueryStudioPage query tabs", () => {
   })
 })
 
+describe("QueryStudioPage saved-query link", () => {
+  it("says the query is not available and opens no tab when the caller may not see it", async () => {
+    stubNetwork()
+    spyOn(queryService, "getSaved").mockRejectedValue(
+      new ServiceError("not_found", "That saved query could not be found.")
+    )
+    seedDraft("SELECT 1")
+    visit("/query-studio?saved=q1")
+    renderPage()
+
+    await screen.findByText("This query is not available to you.")
+    // No tab was opened for it: the tab bar still holds the draft's one. The
+    // wait is for the draft, which is read once the session has answered.
+    await waitFor(() =>
+      expect(screen.getAllByRole("button", { name: /^Query \d+$/ }).length).toBe(1)
+    )
+  })
+})
+
+describe("QueryStudioPage estimate panel", () => {
+  it("says there is no estimate for a Trino tab and leaves the Estimate button with nothing to do (LH-QS-4-08)", async () => {
+    stubNetwork()
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const estimateSpy = queryService.estimate as unknown as { mock: { calls: unknown[] } }
+    renderPage()
+
+    expect(await screen.findByText("No pre-run estimate for Trino queries.")).toBeTruthy()
+    expect(screen.queryByText("This query cannot be planned")).toBeNull()
+    expect(screen.queryByText("Type SQL for a pre-run estimate.")).toBeNull()
+    const estimate = screen.getByRole("button", { name: "Estimate" })
+    expect((estimate as HTMLButtonElement).disabled).toBe(true)
+    expect(estimate.getAttribute("title")).toBe("No pre-run estimate for Trino queries.")
+    await new Promise((resolve) => setTimeout(resolve, 700))
+    expect(estimateSpy.mock.calls.length).toBe(0)
+  })
+
+  it("names the parameter the estimate waits for (QS-5-AC14)", async () => {
+    stubNetwork()
+    seedDraft("SELECT {{region}}")
+    renderPage()
+
+    expect(await screen.findByText("Fill in {{region}} for a pre-run estimate.")).toBeTruthy()
+    expect(screen.queryByText("Type SQL for a pre-run estimate.")).toBeNull()
+  })
+})
+
 describe("QueryStudioPage statements", () => {
   it("disables the actions that work on one statement when the tab holds several", async () => {
     stubNetwork()
@@ -226,7 +296,7 @@ describe("QueryStudioPage statements", () => {
     expect((estimate as HTMLButtonElement).disabled).toBe(true)
     expect(estimate.getAttribute("title")).toBe("Select one statement")
 
-    const save = screen.getByRole("button", { name: "Save query" })
+    const save = screen.getByRole("button", { name: "Save as new" })
     expect((save as HTMLButtonElement).disabled).toBe(true)
     expect(save.getAttribute("title")).toBe("Select one statement")
   })
@@ -322,5 +392,294 @@ describe("QueryStudioPage schema browser", () => {
 
     expect(screen.queryByRole("complementary", { name: "Schema browser" })).toBeNull()
     expect(toggle.getAttribute("aria-pressed")).toBe("false")
+  })
+})
+
+describe("QueryStudioPage parameters", () => {
+  it("shows no field for SQL without a placeholder", async () => {
+    stubNetwork()
+    seedDraft("SELECT 1")
+    renderPage()
+    await screen.findByRole("button", { name: "Run query" })
+    expect(screen.queryByRole("group", { name: "Query parameters" })).toBeNull()
+  })
+
+  it("shows a field for each placeholder, above the toolbar, and a field for a name typed later", async () => {
+    stubNetwork()
+    seedDraft("SELECT {{region}}")
+    renderPage()
+    const fields = await screen.findByRole("group", { name: "Query parameters" })
+    const runButton = screen.getByRole("button", { name: "Run query" })
+    expect(within(fields).getByLabelText("region")).toBeTruthy()
+    // The row sits between the editor and the toolbar.
+    expect(fields.compareDocumentPosition(runButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it("restores the fields of a reload at the values the tab held", async () => {
+    stubNetwork()
+    window.localStorage.setItem(
+      queryDraftKey("u1", null),
+      JSON.stringify({
+        tabs: [
+          {
+            id: "tab-1",
+            name: "Query 1",
+            sql: "SELECT {{region}}",
+            engine: "clickhouse",
+            parameters: [{ name: "region", type: "text", default: "EU" }],
+            values: { region: "US" },
+          },
+        ],
+        activeId: "tab-1",
+        question: "",
+        tab: "sql",
+      })
+    )
+    renderPage()
+    const fields = await screen.findByRole("group", { name: "Query parameters" })
+    expect((within(fields).getByLabelText("region") as HTMLInputElement).value).toBe("US")
+  })
+
+  it("shows the server's sentence under the editor and marks the field it names", async () => {
+    stubNetwork()
+    spyOn(queryService, "run").mockRejectedValue(
+      new ServiceError("invalid_request", "Fill in {{region}} to run this query.")
+    )
+    seedDraft("SELECT {{region}}, {{city}}")
+    renderPage()
+    const fields = await screen.findByRole("group", { name: "Query parameters" })
+    const runButton = screen.getByRole("button", { name: "Run query" })
+    await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
+
+    fireEvent.click(runButton)
+
+    // The error card adds a hint after the server's sentence.
+    expect(await screen.findByText(/^Fill in \{\{region\}\} to run this query\./)).toBeTruthy()
+    expect(within(fields).getByLabelText("region").getAttribute("aria-invalid")).toBe("true")
+    expect(within(fields).getByLabelText("city").getAttribute("aria-invalid")).toBeNull()
+
+    // Typing a value takes the mark off that field.
+    fireEvent.change(within(fields).getByLabelText("region"), { target: { value: "EU" } })
+    expect(within(fields).getByLabelText("region").getAttribute("aria-invalid")).toBeNull()
+  })
+
+  it("runs with the values typed into the fields", async () => {
+    stubNetwork()
+    const run = spyOn(queryService, "run").mockResolvedValue(RESULT)
+    seedDraft("SELECT {{region}}")
+    renderPage()
+    const fields = await screen.findByRole("group", { name: "Query parameters" })
+    fireEvent.change(within(fields).getByLabelText("region"), { target: { value: "EU" } })
+
+    fireEvent.click(screen.getByRole("button", { name: "Run query" }))
+
+    await waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+    expect(run.mock.calls[0]?.[1]).toMatchObject({
+      parameters: { region: "EU" },
+      definitions: [{ name: "region", type: "text" }],
+    })
+  })
+
+  it("runs with no value for a dropdown whose value was taken away", async () => {
+    stubNetwork()
+    const run = spyOn(queryService, "run").mockResolvedValue(RESULT)
+    window.localStorage.setItem(
+      queryDraftKey("u1", null),
+      JSON.stringify({
+        tabs: [
+          {
+            id: "tab-1",
+            name: "Query 1",
+            sql: "SELECT {{region}}",
+            engine: "clickhouse",
+            parameters: [
+              {
+                name: "region",
+                type: "dropdown",
+                options: [
+                  { value: "eu", label: "Europe" },
+                  { value: "us", label: "United States" },
+                ],
+              },
+            ],
+            values: { region: "eu" },
+          },
+        ],
+        activeId: "tab-1",
+        question: "",
+        tab: "sql",
+      })
+    )
+    renderPage()
+    const fields = await screen.findByRole("group", { name: "Query parameters" })
+    // The value the tab held is taken away again, the way a person does it.
+    fireEvent.click(within(fields).getByLabelText("region"))
+    const none = await screen.findByRole("option", { name: "No value" })
+    fireEvent.focus(none)
+    fireEvent.click(none)
+
+    fireEvent.click(screen.getByRole("button", { name: "Run query" }))
+
+    await waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+    // The run holds no value for the parameter: the name is not sent at all.
+    expect(run.mock.calls[0]?.[1]).toMatchObject({ parameters: {} })
+  })
+})
+
+// `WEB-7` D5: saving is a page now, so the editor leaves the statement where
+// that page reads it and goes there. The editor's own draft keeps the SQL,
+// which is what makes Cancel and Save return to the same text.
+describe("QueryStudioPage save handoff ('WEB-7' D5)", () => {
+  it("writes the statement and the save mode where the save page reads them, and goes there", async () => {
+    stubNetwork()
+    seedDraft("SELECT 1")
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Save as new" }))
+
+    await waitFor(() => expect(pushed).toEqual(["/query-studio/save"]))
+    expect(readSaveQueryDraft()).toEqual({
+      sql: "SELECT 1",
+      parameters: [],
+      mode: "create",
+      savedId: null,
+      tabId: "tab-1",
+    })
+    // The statement travels in the browser session, never in the address.
+    expect(window.location.search).toBe("")
+  })
+
+  it("writes the SQL source draft for a caller who may author sources", async () => {
+    stubNetwork(["dashboard:sql"])
+    seedDraft("SELECT * FROM serving.orders")
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Save as SQL source" }))
+
+    await waitFor(() => expect(pushed).toEqual(["/query-studio/save-source"]))
+    expect(readSaveSourceDraft()).toEqual({ sql: "SELECT * FROM serving.orders" })
+  })
+
+  it("shows no Save as SQL source button to a caller without dashboard:sql", async () => {
+    stubNetwork()
+    seedDraft("SELECT * FROM serving.orders")
+    renderPage()
+
+    await screen.findByRole("button", { name: "Save as new" })
+    expect(screen.queryByRole("button", { name: "Save as SQL source" })).toBeNull()
+  })
+})
+
+// `QS-8` (`LH-QS-1-04` F1): the draft belongs to one person in one tenant.
+// The session fixture here belongs to two tenants, and switching the active
+// one mounts a new workspace over the other tenant's key.
+describe("QueryStudioPage draft owner", () => {
+  /** The session of a person who belongs to two tenants, `t1` and `t2`. */
+  function stubTwoTenants() {
+    spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.includes("/api/auth/me")) {
+        return json({
+          id: "u1",
+          name: "Analyst",
+          email: null,
+          roles: ["Analyst"],
+          permissions: [],
+          tenants: [
+            { id: "t1", name: "One", slug: "one" },
+            { id: "t2", name: "Two", slug: "two" },
+          ],
+        })
+      }
+      if (path.includes("/api/ai/sessions")) return json({ sessions: [] })
+      return json({})
+    }) as unknown as typeof fetch)
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
+    spyOn(assetService, "listAssets").mockResolvedValue([])
+    spyOn(lakehouseService, "listNamespaces").mockResolvedValue([])
+  }
+
+  /** One stored tab under a tenant's key, with the placeholder it holds. */
+  function seedTenantTab(tenantId: string, name: string) {
+    window.localStorage.setItem(
+      queryDraftKey("u1", tenantId),
+      JSON.stringify({
+        tabs: [
+          {
+            id: "tab-1",
+            name: "Query 1",
+            sql: `SELECT {{${name}}}`,
+            engine: "clickhouse",
+            parameters: [],
+            values: {},
+          },
+        ],
+        activeId: "tab-1",
+        question: "",
+        tab: "sql",
+      })
+    )
+  }
+
+  /** The navbar's tenant switch, rendered beside the page under one provider. */
+  function TenantSwitch() {
+    const { setActiveTenant } = useAuth()
+    return (
+      <button type="button" onClick={() => setActiveTenant("t2")}>
+        Switch to Two
+      </button>
+    )
+  }
+
+  it("shows the other tenant's tabs, and none of the first, when the active tenant changes", async () => {
+    stubTwoTenants()
+    seedTenantTab("t1", "first")
+    seedTenantTab("t2", "second")
+    render(
+      <AuthProvider>
+        <TableProviders>
+          <CopilotProvider>
+            <QueryStudioPage />
+            <TenantSwitch />
+          </CopilotProvider>
+        </TableProviders>
+      </AuthProvider>,
+    )
+
+    // The first tenant's tab is open before the switch, and the second's is not.
+    await screen.findByLabelText("first")
+    expect(screen.queryByLabelText("second")).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "Switch to Two" }))
+
+    // The new workspace reads the second tenant's key: its tab replaces the
+    // first tenant's in the editor, not beside it.
+    await screen.findByLabelText("second")
+    expect(screen.queryByLabelText("first")).toBeNull()
+    // The first tenant's tabs are still theirs to find on the next switch.
+    const firstKey = window.localStorage.getItem(queryDraftKey("u1", "t1"))
+    expect(JSON.parse(firstKey ?? "{}").tabs?.[0]?.sql).toBe("SELECT {{first}}")
+  })
+})
+
+// QS-11 (LH-QS-1-12), D9: a batch over the limit is refused in the page,
+// beside Run, with no request sent — not in a toast that vanishes.
+describe("QueryStudioPage batch refusal", () => {
+  it("shows the statement-limit alert and sends nothing when Run all is pressed", async () => {
+    stubNetwork()
+    const run = spyOn(queryService, "run").mockResolvedValue(RESULT)
+    seedDraft(Array.from({ length: 21 }, (_, i) => `SELECT ${i}`).join("; "))
+    renderPage()
+
+    await waitFor(() => expect(screen.getByRole("button", { name: /Run all/ })).toBeTruthy())
+    fireEvent.click(screen.getByRole("button", { name: /Run all/ }))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe(
+      "At most 20 statements are run at once. Split the buffer into smaller queries and run them one after another."
+    )
+    expect(run).not.toHaveBeenCalled()
   })
 })

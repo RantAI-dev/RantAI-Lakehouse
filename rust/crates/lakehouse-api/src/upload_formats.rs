@@ -233,8 +233,12 @@ pub enum Refusal {
         "The files of a zip archive must all be of one supported format: CSV, TSV, text, JSON, JSON Lines or Avro."
     )]
     ZipMixed,
-    /// The unpacked bytes passed the cap.
-    #[error("The file is larger than the upload limit once unpacked.")]
+    /// The unpacked bytes passed the cap. The cap's number is in the sentence
+    /// (`DATA-51`, QA `LH-DATA-17-13`), from the one constant that owns it.
+    #[error(
+        "The file is larger than the {} GB limit once unpacked.",
+        crate::routes::uploads::MAX_UNPACKED_BYTES / (1024 * 1024 * 1024)
+    )]
     TooLargeUnpacked,
     /// A JSON file that is not an array.
     #[error("A JSON file must hold an array of objects.")]

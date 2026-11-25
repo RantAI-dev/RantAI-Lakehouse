@@ -5,8 +5,18 @@
 //! interchangeable: JavaScript's `??` falls back only when the variable is
 //! `undefined` (an explicitly-set empty string is preserved), while `||`
 //! also falls back on the empty string. [`Config::llm_key`] is the one field
-//! in this module that uses `||` semantics — see
-//! `src/services/clients/llm.ts:10`. Every other field uses `??` semantics.
+//! that uses `||` semantics — see `src/services/clients/llm.ts:10`. Every
+//! other field uses `??` semantics.
+//!
+//! Four fields are `||` fields too, on purpose (`ADM-9 review R6`):
+//! [`Config::llm_url`], [`Config::llm_model`], [`Config::smtp_port`] and
+//! [`Config::smtp_from`] read an EMPTY value as "not set", so the code's own
+//! default applies and the environment does not own the field. The reason is
+//! the deployment: `docker-compose.yml` passes these four to the API as empty
+//! strings when the operator set none, and a value that reads as a value
+//! made the console's own fields read-only on every compose installation.
+//! An empty address is no address, an empty port is no port and an empty
+//! `From` is no sender — none of the three is worth keeping.
 //!
 //! Sources ported (see doc comments on each field for the exact line):
 //! `src/services/clients/clickhouse.ts`, `src/services/clients/dagster.ts`,
@@ -40,13 +50,40 @@ use uuid::Uuid;
 /// used, so the cost is nil for threads that never recurse deeply.
 pub const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
+/// The provider address the assistant uses when neither the environment's
+/// `LLM_URL` nor the console's saved row names one (`ADM-9`).
+///
+/// The code's own default, kept here so the resolver and the config resolve
+/// to the same address: the console's Assistant tab may set the address, and
+/// the deployment's own files may name one, but the value neither of them
+/// names is this one.
+pub const DEFAULT_LLM_URL: &str = "https://api.minimax.io/v1";
+
+/// The model the assistant uses when neither the environment's `LLM_MODEL`
+/// nor the console's saved row names one (`ADM-9`).
+pub const DEFAULT_LLM_MODEL: &str = "MiniMax-M3";
+/// The `prompt` the browser sign-in sends when `OIDC_PROMPT` says nothing
+/// (`Config::oidc_prompt`): `"login"`, so the provider shows its login form
+/// and the person in front of the browser chooses the account. See that
+/// field's doc comment for why the provider's own session is not the
+/// default answer.
+pub const DEFAULT_OIDC_PROMPT: &str = "login";
+/// `OIDC_PROMPT`'s spelling for "send no prompt parameter at all": the
+/// provider decides, and reuses the session it holds for that browser. This
+/// deployment's own word, not an OIDC value — the OIDC standard's `none`
+/// means something else (show no UI at all, fail when there is no session)
+/// and is forwarded verbatim when it is named.
+pub const OIDC_PROMPT_OFF: &str = "off";
+
 /// Errors that can occur while resolving [`Config`] from environment
 /// variables.
 ///
 /// Only `PORT`, `CATALOG_TENANT_ID`, `AI_DEFAULT_REPLY_LANGUAGE`,
 /// `AI_SEMANTIC_LAYER`, `AI_ASK_BACK`, `AI_RELEVANT_TABLES`, `AI_SQL_HELP`,
 /// `CONNECTOR_TYPED_CREDENTIALS`, `EMBED_TOKEN_MAX_LIFETIME_SECONDS`,
-/// `CONNECTOR_TLS_CA_FILE` and `SMTP_CA_FILE` can fail resolution. `PORT` is load-bearing and Rust-only (the TypeScript
+/// `CONNECTOR_TLS_CA_FILE`, `SMTP_CA_FILE`, `LAKEHOUSE_INSTALL_MODE`,
+/// `LAKEHOUSE_QUERY_ENGINE` and the two engines' mutual exclusion
+/// (`BI-44`) can fail resolution. `PORT` is load-bearing and Rust-only (the TypeScript
 /// backend runs under Next.js and never binds a port itself), so an
 /// unparseable value refusing to boot is the correct, Rust-specific failure
 /// mode. `SMTP_PORT` deliberately has no equivalent error variant —
@@ -185,6 +222,23 @@ pub enum ConfigError {
     /// bundle cannot be used (`SEC-56` D5).
     #[error("SMTP_CA_FILE must contain at least one PEM certificate, found none in {0:?}")]
     EmptySmtpCaFile(std::path::PathBuf),
+    /// `LAKEHOUSE_INSTALL_MODE` was set to something other than `"full"`
+    /// or `"bi-only"`. Failing start-up is the only honest answer: a typo
+    /// must not silently leave a customer's data being copied into a
+    /// lakehouse when they asked for an in-place installation (`BI-44`).
+    #[error("LAKEHOUSE_INSTALL_MODE must be \"full\" or \"bi-only\", got {0:?}")]
+    InvalidInstallMode(String),
+    /// `LAKEHOUSE_QUERY_ENGINE` was set to something other than
+    /// `"clickhouse"` or `"trino"`. A fallback would dial an engine the
+    /// operator did not choose, so the deployment refuses to boot.
+    #[error("LAKEHOUSE_QUERY_ENGINE must be \"clickhouse\" or \"trino\", got {0:?}")]
+    InvalidQueryEngine(String),
+    /// `bi-only` was configured with both engine URLs, or with Trino
+    /// chosen but no `TRINO_URL`: the owner decided that only ONE engine
+    /// runs per installation so the two never compete for the host's
+    /// memory (`BI-44`). The message names the conflicting variables.
+    #[error("{0}")]
+    EngineMutualExclusion(String),
 }
 
 /// The language the copilot answers in when the user's message is too short
@@ -205,6 +259,91 @@ impl ReplyLanguage {
         match self {
             Self::Indonesian => "Indonesian",
             Self::English => "English",
+        }
+    }
+}
+
+/// What kind of installation this deployment is (`BI-44`).
+///
+/// `Full` is the existing stack: it copies source data into the lakehouse
+/// and runs every service. `BiOnly` reads the customer's own database in
+/// place through ONE query engine; the lakehouse-only services (object
+/// store, catalog, orchestration) are not part of the installation. The
+/// default is `Full`, so every existing config and deployment is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallMode {
+    /// The whole lakehouse stack (the only mode before `BI-44`).
+    Full,
+    /// Dashboards, Query Studio and the assistant over an external source,
+    /// with no copy into the lakehouse.
+    BiOnly,
+}
+
+impl InstallMode {
+    /// The spelling `GET /api/settings/deployment` and the console use.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::BiOnly => "bi-only",
+        }
+    }
+
+    /// Parse `LAKEHOUSE_INSTALL_MODE`: trimmed and case-insensitive, with
+    /// unset or empty meaning the `Full` default. A non-empty unknown value
+    /// is an error, never a silent fallback.
+    fn from_env_value(raw: Option<&str>) -> Result<Self, ConfigError> {
+        let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::Full);
+        };
+        if raw.eq_ignore_ascii_case("full") {
+            Ok(Self::Full)
+        } else if raw.eq_ignore_ascii_case("bi-only") {
+            Ok(Self::BiOnly)
+        } else {
+            Err(ConfigError::InvalidInstallMode(raw.to_owned()))
+        }
+    }
+}
+
+/// The ONE query engine a `bi-only` installation reads its source through
+/// (`BI-44`). In `Full` mode both engines may run; this value names the
+/// default for ad hoc queries, not a restriction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueryEngine {
+    /// `ClickHouse` external engines (`PostgreSQL`, `MySQL`, remote
+    /// `ClickHouse`). The default, matching every pre-`BI-44` config.
+    ClickHouse,
+    /// `Trino` federated catalogs (the wider source list in
+    /// `docs/core/specs/bi-44.md`).
+    Trino,
+}
+
+impl QueryEngine {
+    /// The spelling `GET /api/settings/deployment`, the query routes and
+    /// the console use.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::ClickHouse => "clickhouse",
+            Self::Trino => "trino",
+        }
+    }
+
+    /// Parse `LAKEHOUSE_QUERY_ENGINE`: trimmed and case-insensitive, with
+    /// unset or empty meaning the `ClickHouse` default. A non-empty unknown
+    /// value is an error, never a silent fallback to a different engine.
+    fn from_env_value(raw: Option<&str>) -> Result<Self, ConfigError> {
+        let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::ClickHouse);
+        };
+        if raw.eq_ignore_ascii_case("clickhouse") {
+            Ok(Self::ClickHouse)
+        } else if raw.eq_ignore_ascii_case("trino") {
+            Ok(Self::Trino)
+        } else {
+            Err(ConfigError::InvalidQueryEngine(raw.to_owned()))
         }
     }
 }
@@ -338,19 +477,36 @@ pub struct Config {
     /// provider on a private network without a certificate. Never set it on a
     /// real installation. The address check (`resolve_checked`) applies either way.
     pub connector_oauth_allow_http: bool,
-    /// Whether this deployment says Oracle CDC via `Debezium`'s `LogMiner`
-    /// connector is wanted. Default `false`; `true` only for the exact string
-    /// `"true"`.
-    ///
-    /// It names an extension point, not a working feature: this build ships
-    /// no Oracle `LogMiner` property template, so `GET
-    /// /api/connectors/{id}/debezium-properties` refuses every Oracle-driver
-    /// connector in both states and only its explanation changes. `LogMiner`
-    /// capture also needs `ARCHIVELOG` mode and supplemental logging on the
-    /// source database, which the batch sql adapter (`adapters/oracle.py`,
-    /// read-only `SELECT`) neither assumes nor configures. See
-    /// `docs/adr/0008-initial-snapshot-backfill.md`.
-    pub oracle_cdc_logminer_enabled: bool,
+    /// Where the API reaches `Kafka Connect`'s REST API (`KAFKA_CONNECT_URL`,
+    /// `SRC-4` slice 2, ADR 0016). `None` when unset or blank: a change-capture
+    /// connector then answers `supported: false` with a fixed sentence instead
+    /// of dialing a guessed address (fail closed). Operator-set, never taken
+    /// from a request; the address is internal to the deployment's network.
+    pub kafka_connect_url: Option<String>,
+    /// The broker's address as `Kafka Connect` reaches it (`CDC_KAFKA_BOOTSTRAP`,
+    /// the variable the code location's applier reads too; `SRC-4` slice 3,
+    /// decision S3-b). A `MySQL` or `SQL Server` connector keeps its schema
+    /// history in a topic on this broker and cannot start without it; unset, such
+    /// a connector answers the same fixed "not configured" sentence as an unset
+    /// `KAFKA_CONNECT_URL`. `PostgreSQL` does not need it.
+    pub cdc_kafka_bootstrap: Option<String>,
+    /// The directory the API writes each change-capture connector's source
+    /// password into (`CDC_SECRETS_DIR`, `SRC-4` decision S2-a). Default
+    /// `/run/cdc-secrets`, the `tmpfs` volume `docker-compose.yml` mounts here
+    /// and read-only in `kafka-connect` at the SAME path, because the connector
+    /// JSON names the file by this path. Set it only in a test.
+    pub cdc_secrets_dir: String,
+    /// The kind of installation (`LAKEHOUSE_INSTALL_MODE`, `BI-44`).
+    /// `Full` by default: adding the variable to an existing deployment
+    /// changes nothing. `BiOnly` makes the API report lakehouse-only
+    /// services as unchecked and refuses to dial an engine the operator
+    /// did not choose — see [`Config::engine_allowed`].
+    pub install_mode: InstallMode,
+    /// The query engine chosen for this installation
+    /// (`LAKEHOUSE_QUERY_ENGINE`, `BI-44`). `ClickHouse` by default. In
+    /// `Full` mode this only sets the default engine of an ad hoc query; in
+    /// `BiOnly` mode it is the ONLY engine the API may use.
+    pub query_engine: QueryEngine,
     /// `ClickHouse` HTTP interface URL. Default
     /// `"http://localhost:18123"` (`clickhouse.ts:11`, `??`).
     pub ch_url: String,
@@ -372,9 +528,27 @@ pub struct Config {
     pub dagster_location: String,
     /// LLM chat-completions base URL. Default
     /// `"https://api.minimax.io/v1"` (`llm.ts:7`, `??`).
+    ///
+    /// An EMPTY `LLM_URL` is "not set": the default applies, and the
+    /// environment does not own the address (`ADM-9 review R6`), so the
+    /// console may set one.
     pub llm_url: String,
+    /// Whether `LLM_URL` was set and non-empty. `llm_url` is the
+    /// environment's value or the code default, so it alone cannot tell an
+    /// operator who set `LLM_URL` from one who never set it; the
+    /// console-settings resolver (`ADM-9`) needs exactly that to answer a
+    /// field's `source` and refuse a console write over an environment
+    /// value (`ADM-9 review R4`, the same rule as
+    /// [`Config::smtp_port_from_env`]).
+    pub llm_url_from_env: bool,
     /// LLM model name. Default `"MiniMax-M3"` (`llm.ts:8`, `??`).
+    ///
+    /// An EMPTY `LLM_MODEL` is "not set", like [`Config::llm_url`]
+    /// (`ADM-9 review R6`).
     pub llm_model: String,
+    /// Whether `LLM_MODEL` was set and non-empty — the model half of
+    /// [`Config::llm_url_from_env`] (`ADM-9 review R4`).
+    pub llm_model_from_env: bool,
     /// LLM API key: `LLM_KEY`, falling back to `MINIMAX_API_KEY`, falling
     /// back to `""` (`llm.ts:10`, `||` — an explicitly *empty* `LLM_KEY`
     /// also falls through to `MINIMAX_API_KEY`, unlike every other field
@@ -431,7 +605,18 @@ pub struct Config {
     /// cutover a stray `SMTP_PORT=` must not take the whole process down;
     /// `PORT` (below) is the one field that legitimately still hard-fails,
     /// since it is Rust-only and load-bearing.
+    ///
+    /// An EMPTY `SMTP_PORT` is "not set" and NOT a bad value
+    /// (`ADM-9 review R6`): the default applies and nothing is logged — a
+    /// warning would name a value the operator never chose.
     pub smtp_port: u16,
+    /// Whether `SMTP_PORT` was set and non-empty (and parsed). `smtp_port`
+    /// is the parsed value or the 587 default, so it alone cannot tell an
+    /// operator who set `SMTP_PORT=587` from one who never set it; the
+    /// console-settings resolver (`ADM-7`) needs exactly that to answer a
+    /// field's `source` and refuse a console write over an environment
+    /// value.
+    pub smtp_port_from_env: bool,
     /// Whether to use implicit TLS: the *effective* value nodemailer would
     /// use, matching `notify.ts:40` in full —
     /// `SMTP_SECURE === "true" || port === 465`, not just the raw env var.
@@ -452,7 +637,17 @@ pub struct Config {
     /// SMTP `From` header. `SMTP_FROM`, falling back to `SMTP_USER`,
     /// falling back to `"rantai-lake@localhost"` (`notify.ts:44`, `??`
     /// chain).
+    ///
+    /// An EMPTY value at any step of the chain is "not set" at that step
+    /// (`ADM-9 review R6`): an empty `From` is no sender, and no mail
+    /// server accepts one.
     pub smtp_from: String,
+    /// Whether `SMTP_FROM` was set and non-empty. `smtp_from` is the
+    /// fallback-chain result, so it alone cannot tell `SMTP_FROM` from the
+    /// `SMTP_USER`/literal fallback; the console-settings resolver (`ADM-7`)
+    /// needs that to answer `from`'s `source` (the `From` address is its own
+    /// console field, independent of the auth `SMTP_USER`).
+    pub smtp_from_from_env: bool,
     /// Port this service listens on. Default `8080`. Not derived from the
     /// TypeScript (which runs under Next.js), specific to this Rust
     /// service.
@@ -491,17 +686,16 @@ pub struct Config {
     /// This application's client id as registered with the `OIDC`
     /// provider. `None` when unset.
     pub oidc_client_id: Option<String>,
-    /// `OIDC` client secret. `None` when unset. Reserved for a future
-    /// authorization-code exchange (a login-UI concern, out of this task's
-    /// scope) — `lakehouse_auth::oidc::OidcAuthenticator` verifies already-
-    /// issued bearer tokens against the provider's public JWKS and needs no
-    /// shared secret to do that, so this field is parsed (and kept out of
-    /// `Debug`) but not currently read by anything.
+    /// `OIDC` client secret. `None` when unset. Sent during authorization-code
+    /// exchange at `routes/auth.rs` (`oidc_callback`) when configured. Kept
+    /// out of `Debug`.
     pub oidc_client_secret: Option<String>,
     /// A short, operator-chosen label for the configured provider (e.g.
     /// `"okta"`, `"entra"`). Combined with `"oidc:"` to form
     /// `auth_identity.provider`. Default `"default"`.
     pub oidc_provider_name: String,
+    /// Whether `OIDC_PROVIDER_NAME` was set and non-empty in the environment.
+    pub oidc_provider_name_from_env: bool,
     /// Explicit override for the JWKS endpoint URL. `None` when unset, in
     /// which case `SEC-38` applies: the address is the `jwks_uri` from the
     /// provider's discovery document
@@ -517,14 +711,28 @@ pub struct Config {
     /// for why the default matters. `true` only when `OIDC_JIT_PROVISIONING`
     /// is exactly `"true"`.
     pub oidc_jit_provisioning: bool,
+    /// Whether `OIDC_JIT_PROVISIONING` was set and non-empty in the environment.
+    pub oidc_jit_provisioning_from_env: bool,
+    /// Whether this provider's emails are trusted even when the token does
+    /// not carry `email_verified: true` (`SEC-65` D3). Default `false` —
+    /// the safe value the task establishes. `true` only when
+    /// `OIDC_TRUST_EMAIL` is exactly `"true"` (`AGENTS.md`: booleans from
+    /// the environment are parsed that way).
+    pub oidc_trust_email: bool,
+    /// Whether `OIDC_TRUST_EMAIL` was set and non-empty in the environment.
+    pub oidc_trust_email_from_env: bool,
     /// Maps an `OIDC` group/role claim value to a local `role.name`, parsed
     /// from `OIDC_ROLE_MAP` (e.g.
     /// `"lakehouse-admins=Platform Admin,analysts=Analyst"`). Empty when
     /// unset. See [`parse_role_map`].
     pub oidc_role_map: HashMap<String, String>,
+    /// Whether `OIDC_ROLE_MAP` was set and non-empty in the environment.
+    pub oidc_role_map_from_env: bool,
     /// Which claim in an `OIDC` token carries the caller's groups/roles.
     /// Default `"groups"`.
     pub oidc_groups_claim: String,
+    /// Whether `OIDC_GROUPS_CLAIM` was set and non-empty in the environment.
+    pub oidc_groups_claim_from_env: bool,
     /// Clock-skew tolerance (seconds) `OIDC` token validation applies to
     /// `exp`/`nbf`. Default `60`. An unparseable value falls back to the
     /// default (like [`Self::smtp_port`], not load-bearing enough to fail
@@ -547,6 +755,45 @@ pub struct Config {
     /// `OIDC_REDIRECT_URI` — never taken from a request, closing the open-
     /// redirect class a request-supplied `redirect_uri` would allow.
     pub oidc_redirect_uri: Option<String>,
+    /// This deployment's address the provider sends the browser back to
+    /// after an RP-initiated logout (`OIDC_POST_LOGOUT_REDIRECT_URI`). It
+    /// must be registered with the provider as a valid post-logout redirect
+    /// URI, or the provider refuses the logout. `None` when unset: the
+    /// sign-out then ends this deployment's session only, and the provider
+    /// keeps its own session for that browser — which is why the next
+    /// sign-in would land on the account that signed in last.
+    ///
+    /// Read ONLY from the environment — never from a request, so a caller
+    /// cannot steer a sign-out to an arbitrary host.
+    pub oidc_post_logout_redirect_uri: Option<String>,
+    /// The `prompt` parameter the browser sign-in sends to the provider
+    /// (`"login"`, `"consent"`, `"select_account"`, …). Read ONLY from
+    /// `OIDC_PROMPT` — never from a request, so a caller cannot change how
+    /// the provider is asked to authenticate.
+    ///
+    /// Default [`DEFAULT_OIDC_PROMPT`] (`"login"`): the provider shows its
+    /// login form on every sign-in, so the person in front of the browser
+    /// chooses the account. Without it a provider that still holds a session
+    /// for that browser answers the sign-in request from it and the person is
+    /// silently signed in as whoever used that browser last — a surprise on
+    /// a shared machine, and the reason "sign out, then sign in again" could
+    /// land on the previous person's account.
+    ///
+    /// [`OIDC_PROMPT_OFF`] (`"off"`) is this deployment's own spelling for
+    /// "send no prompt parameter at all": the provider then decides, and
+    /// reuses the session it holds for that browser. It is not an OIDC
+    /// value and is never forwarded — the OIDC standard's own `none` (which
+    /// asks the provider to show no UI at all, and to fail when there is no
+    /// session) is forwarded verbatim when it is named.
+    ///
+    /// An empty value is the default, not an opt-out: compose always passes
+    /// this variable (as every other `OIDC_*` one), so "empty" cannot mean
+    /// "the operator said nothing".
+    pub oidc_prompt: String,
+    /// Whether `OIDC_PROMPT` was set and non-empty in the environment — the
+    /// difference between "the operator named a prompt" and "the operator
+    /// said nothing, so the default applies".
+    pub oidc_prompt_from_env: bool,
     /// Lakekeeper Iceberg REST catalog base URI (P1,
     /// `lakehouse-iceberg::IcebergClientConfig::catalog_uri`). Default
     /// matches `docker-compose.yml`'s `lakekeeper` service port mapping.
@@ -636,6 +883,16 @@ pub struct Config {
     /// and any problem with it surfaces lazily, at first use, as an ordinary
     /// request-time error.
     pub database_url: String,
+    /// The password of the console's OWN database role
+    /// (`LAKEHOUSE_DB_APP_PASSWORD`, `SEC-78` decision 1). `None` when unset
+    /// or empty.
+    ///
+    /// Only the `migrate` command needs it: it is what sets the role's
+    /// password, and the server path never holds it (the server connects
+    /// with the role, not with its password). It is a
+    /// [`lakehouse_core::secret::SecretValue`], so it is neither logged nor
+    /// printed.
+    pub db_app_password: Option<lakehouse_core::secret::SecretValue>,
     /// ADR 0010/0011 — path to a file holding the `gold-export` Lakekeeper
     /// principal's pre-minted static bearer token (`iceberg-catalog-rest`'s
     /// `token` property — see `lakehouse-iceberg::catalog`'s module doc on
@@ -644,7 +901,7 @@ pub struct Config {
     /// minted at compose bring-up by `ops/oidc-mock` onto a shared volume
     /// (`lakehouse_oidc_tokens`) every writer in this stack already reads
     /// directly from disk the same way (`docker-compose.yml`'s
-    /// `g1-test-runner`, `debezium-server`, `trino`, ...) — there is no
+    /// `g1-test-runner`, `trino`, ...; SRC-4 S2 review SHOULD-FIX 2) — there is no
     /// static value to put behind an `env:` `secretRef` ahead of time.
     /// Always set to a default path — `/tokens/gold-export.jwt`, matching
     /// where `docker-compose.yml`'s `lakehouse-api` service mounts the
@@ -832,6 +1089,14 @@ pub struct Config {
     /// non-load-bearing parsing posture as
     /// [`Self::gold_export_max_rows`]. Default `20_000`.
     pub gold_export_batch_size: u64,
+    /// The least number of seconds between two "Send now" presses on the same
+    /// scheduled-report subscription (`BI-35`): each press makes the whole
+    /// report (a PDF, chart files) and emails the recipients, so a double click
+    /// or a loop would send the same report over and over. The count is kept in
+    /// the process, so it resets on a restart and is per replica. `0` turns the
+    /// limit off. Not load-bearing in the sense of [`Self::port`]: an
+    /// unparsable override falls back to the default. Default `60`.
+    pub report_send_now_interval_secs: u64,
     /// Shared token gating `POST /api/agents/employees/{id}/run`
     /// (Tier 3, copilot-operations-handover plan), same D4 shape as
     /// [`Self::gold_export_run_token`]/[`Self::alerts_run_token`]: with
@@ -918,7 +1183,7 @@ pub struct Config {
     pub catalog_tenant_id: Option<Uuid>,
     /// Language the copilot replies in when the latest chat message is too
     /// short for `routes::ai::prompt::reply_language` to detect one
-    /// (`Jelaskan chart ini`, `2024?`). `None` when unset or empty: the
+    /// (`total revenue`, `2024?`). `None` when unset or empty: the
     /// prompt's wording is then unchanged from before the setting existed
     /// (the Latin-script line keeps its English fallback, a message with no
     /// letters gets none). A detected language always wins over this
@@ -975,6 +1240,32 @@ pub struct Config {
     /// task deletes them. Zero, negative, or unparseable values fall back
     /// to the default (30).
     pub auth_retention_days: u32,
+    /// Whether the environment names [`Self::login_max_failures`] with a
+    /// whole number of 1 or more (`ADM-8`).
+    ///
+    /// The flag, not the value: the console may not change a setting the
+    /// environment owns (plan D1), and the value alone cannot say whether
+    /// the environment named it or the code default supplied it. An
+    /// unparseable value does not count — the operator's value is invalid,
+    /// the code default is in effect, and the console is free to set a real
+    /// one (the same rule as [`Self::smtp_port_from_env`]).
+    pub login_max_failures_from_env: bool,
+    /// Whether the environment names
+    /// [`Self::login_failure_window_secs`] with a whole number of 1 or more
+    /// (`ADM-8`). See [`Self::login_max_failures_from_env`].
+    pub login_failure_window_secs_from_env: bool,
+    /// Whether the environment names [`Self::login_lockout_secs`] with a
+    /// whole number of 1 or more (`ADM-8`). See
+    /// [`Self::login_max_failures_from_env`].
+    pub login_lockout_secs_from_env: bool,
+    /// Whether the environment names [`Self::auth_retention_days`] with a
+    /// whole number of 1 or more (`ADM-8`). See
+    /// [`Self::login_max_failures_from_env`].
+    pub auth_retention_days_from_env: bool,
+    /// Whether the environment names
+    /// [`Self::embed_token_max_lifetime_seconds`] with a whole number of 1
+    /// or more (`ADM-8`). See [`Self::login_max_failures_from_env`].
+    pub embed_token_max_lifetime_from_env: bool,
     /// Files one user may have being received, and loads one user may have
     /// running, at once: `UPLOAD_MAX_CONCURRENT_PER_USER`, default 4
     /// (`SEC-17`). A value that is not a whole number of 1 or more fails
@@ -1023,6 +1314,24 @@ pub struct Config {
     /// lowers it for its own job and says so; it is not a per-connector
     /// setting.
     pub connector_auto_disable_after: i32,
+    /// How long one connector run may run before the API stops treating it as
+    /// going (`SRC-39`, QA `TC-1702`): `INGEST_RUN_MAX_RUNTIME_SECONDS`,
+    /// default 21600 (six hours). The run route cancels a run older than this
+    /// plus its grace, records it as failed with `timed_out`, and lets the
+    /// next run start; the orchestrator's own run monitoring enforces the
+    /// same number through the `dagster/max_runtime` tag. Zero, negative, or
+    /// unparseable values keep the default.
+    pub ingest_run_max_runtime_seconds: u32,
+    /// How long a connector run the orchestrator has taken off its queue may
+    /// take to start before the API stops holding the connector for it
+    /// (`SRC-39`, QA `TC-1702`): `INGEST_RUN_START_TIMEOUT_SECONDS`, default
+    /// 600 (ten minutes). A run still waiting in the orchestrator's queue is
+    /// judged by [`Config::ingest_run_max_runtime_seconds`] instead
+    /// (`review round 1, R1`): its run monitoring never ends a queued run.
+    /// It MUST equal `start_timeout_seconds` in `dagster/dagster.yaml`:
+    /// whoever changes one changes both. Zero, negative, or unparseable
+    /// values keep the default.
+    pub ingest_run_start_timeout_seconds: u32,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -1041,6 +1350,8 @@ impl std::fmt::Debug for Config {
     )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
+            .field("install_mode", &self.install_mode)
+            .field("query_engine", &self.query_engine)
             .field("ch_url", &self.ch_url)
             .field("ch_user", &self.ch_user)
             .field("ch_password", &REDACTED)
@@ -1048,7 +1359,9 @@ impl std::fmt::Debug for Config {
             .field("dagster_repo", &self.dagster_repo)
             .field("dagster_location", &self.dagster_location)
             .field("llm_url", &self.llm_url)
+            .field("llm_url_from_env", &self.llm_url_from_env)
             .field("llm_model", &self.llm_model)
+            .field("llm_model_from_env", &self.llm_model_from_env)
             .field("llm_key", &REDACTED)
             .field(
                 "embed_secret",
@@ -1071,10 +1384,12 @@ impl std::fmt::Debug for Config {
             )
             .field("smtp_host", &self.smtp_host)
             .field("smtp_port", &self.smtp_port)
+            .field("smtp_port_from_env", &self.smtp_port_from_env)
             .field("smtp_secure", &self.smtp_secure)
             .field("smtp_user", &self.smtp_user)
             .field("smtp_pass", &REDACTED)
             .field("smtp_from", &self.smtp_from)
+            .field("smtp_from_from_env", &self.smtp_from_from_env)
             .field("lakekeeper_catalog_uri", &self.lakekeeper_catalog_uri)
             .field("lakekeeper_warehouse", &self.lakekeeper_warehouse)
             .field("outside_s3_endpoint", &self.outside_s3_endpoint)
@@ -1119,10 +1434,25 @@ impl std::fmt::Debug for Config {
                 &self.oidc_client_secret.as_ref().map(|_| REDACTED),
             )
             .field("oidc_provider_name", &self.oidc_provider_name)
+            .field(
+                "oidc_provider_name_from_env",
+                &self.oidc_provider_name_from_env,
+            )
             .field("oidc_jwks_url", &self.oidc_jwks_url)
             .field("oidc_jit_provisioning", &self.oidc_jit_provisioning)
+            .field(
+                "oidc_jit_provisioning_from_env",
+                &self.oidc_jit_provisioning_from_env,
+            )
+            .field("oidc_trust_email", &self.oidc_trust_email)
+            .field("oidc_trust_email_from_env", &self.oidc_trust_email_from_env)
             .field("oidc_role_map", &self.oidc_role_map)
+            .field("oidc_role_map_from_env", &self.oidc_role_map_from_env)
             .field("oidc_groups_claim", &self.oidc_groups_claim)
+            .field(
+                "oidc_groups_claim_from_env",
+                &self.oidc_groups_claim_from_env,
+            )
             .field(
                 "connector_probe_allow_internal_hosts",
                 &self.connector_probe_allow_internal_hosts,
@@ -1161,15 +1491,24 @@ impl std::fmt::Debug for Config {
                 "connector_oauth_allow_http",
                 &self.connector_oauth_allow_http,
             )
-            .field(
-                "oracle_cdc_logminer_enabled",
-                &self.oracle_cdc_logminer_enabled,
-            )
+            .field("kafka_connect_url", &self.kafka_connect_url)
+            .field("cdc_kafka_bootstrap", &self.cdc_kafka_bootstrap)
+            .field("cdc_secrets_dir", &self.cdc_secrets_dir)
             .field("oidc_clock_skew_seconds", &self.oidc_clock_skew_seconds)
             .field("oidc_authorize_url", &self.oidc_authorize_url)
             .field("oidc_token_url", &self.oidc_token_url)
             .field("oidc_redirect_uri", &self.oidc_redirect_uri)
+            .field(
+                "oidc_post_logout_redirect_uri",
+                &self.oidc_post_logout_redirect_uri,
+            )
+            .field("oidc_prompt", &self.oidc_prompt)
+            .field("oidc_prompt_from_env", &self.oidc_prompt_from_env)
             .field("database_url", &REDACTED)
+            .field(
+                "db_app_password",
+                &self.db_app_password.as_ref().map(|_| REDACTED),
+            )
             .field(
                 "lakekeeper_gold_export_token_file",
                 &self.lakekeeper_gold_export_token_file,
@@ -1228,6 +1567,10 @@ impl std::fmt::Debug for Config {
             .field("gold_export_max_rows", &self.gold_export_max_rows)
             .field("gold_export_batch_size", &self.gold_export_batch_size)
             .field(
+                "report_send_now_interval_secs",
+                &self.report_send_now_interval_secs,
+            )
+            .field(
                 "agent_run_token",
                 &self.agent_run_token.as_ref().map(|_| REDACTED),
             )
@@ -1255,9 +1598,29 @@ impl std::fmt::Debug for Config {
             .field("ai_relevant_tables", &self.ai_relevant_tables)
             .field("git_sha", &self.git_sha)
             .field("login_max_failures", &self.login_max_failures)
+            .field(
+                "login_max_failures_from_env",
+                &self.login_max_failures_from_env,
+            )
             .field("login_failure_window_secs", &self.login_failure_window_secs)
+            .field(
+                "login_failure_window_secs_from_env",
+                &self.login_failure_window_secs_from_env,
+            )
             .field("login_lockout_secs", &self.login_lockout_secs)
+            .field(
+                "login_lockout_secs_from_env",
+                &self.login_lockout_secs_from_env,
+            )
             .field("auth_retention_days", &self.auth_retention_days)
+            .field(
+                "auth_retention_days_from_env",
+                &self.auth_retention_days_from_env,
+            )
+            .field(
+                "embed_token_max_lifetime_from_env",
+                &self.embed_token_max_lifetime_from_env,
+            )
             .field(
                 "upload_max_concurrent_per_user",
                 &self.upload_max_concurrent_per_user,
@@ -1274,6 +1637,14 @@ impl std::fmt::Debug for Config {
                 "connector_auto_disable_after",
                 &self.connector_auto_disable_after,
             )
+            .field(
+                "ingest_run_max_runtime_seconds",
+                &self.ingest_run_max_runtime_seconds,
+            )
+            .field(
+                "ingest_run_start_timeout_seconds",
+                &self.ingest_run_start_timeout_seconds,
+            )
             .finish()
     }
 }
@@ -1288,6 +1659,44 @@ fn or_default(env: &HashMap<String, String>, key: &str, default: &str) -> String
 /// when `key` is absent *or* present-but-empty.
 fn truthy(env: &HashMap<String, String>, key: &str) -> Option<String> {
     env.get(key).filter(|v| !v.is_empty()).cloned()
+}
+
+/// Whether an operator explicitly named an engine's URL. An empty or
+/// whitespace-only value is "not set": compose files and `.env` templates
+/// pass empty strings for variables nobody filled in (`ADM-9 review R6`),
+/// and an empty address cannot dial anything.
+fn explicitly_set(env: &HashMap<String, String>, key: &str) -> bool {
+    env.get(key).is_some_and(|value| !value.trim().is_empty())
+}
+
+/// The `BI-44` mutual-exclusion gate: in `bi-only` mode exactly one engine
+/// may be named, and it must be the chosen one. The owner decided the two
+/// never run side by side so they do not compete for the host's memory.
+/// `Full` mode is deliberately untouched — a deployment with both URLs
+/// keeps working exactly as before this setting existed.
+fn validate_bi_only_engines(
+    install_mode: InstallMode,
+    query_engine: QueryEngine,
+    env: &HashMap<String, String>,
+) -> Result<(), ConfigError> {
+    if install_mode != InstallMode::BiOnly {
+        return Ok(());
+    }
+    let trino_set = explicitly_set(env, "TRINO_URL");
+    let clickhouse_set = explicitly_set(env, "CH_URL");
+    let side_by_side = "ClickHouse and Trino cannot run side by side in bi-only mode; unset the other engine's URL";
+    match query_engine {
+        QueryEngine::Trino if !trino_set => Err(ConfigError::EngineMutualExclusion(format!(
+            "LAKEHOUSE_QUERY_ENGINE=trino in bi-only mode requires TRINO_URL to be set; {side_by_side}"
+        ))),
+        QueryEngine::Trino if clickhouse_set => Err(ConfigError::EngineMutualExclusion(format!(
+            "LAKEHOUSE_QUERY_ENGINE=trino in bi-only mode forbids CH_URL; {side_by_side}"
+        ))),
+        QueryEngine::ClickHouse if trino_set => Err(ConfigError::EngineMutualExclusion(format!(
+            "LAKEHOUSE_QUERY_ENGINE=clickhouse in bi-only mode forbids TRINO_URL; {side_by_side}"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Reads an on/off switch that is on unless set. Empty is unset (see
@@ -1327,6 +1736,66 @@ fn parse_positive_u32_or_default(env: &HashMap<String, String>, key: &str, defau
         .filter(|v| *v > 0)
         .and_then(|v| u32::try_from(v).ok())
         .unwrap_or(default)
+}
+
+/// Reads one of the two run limits of `SRC-39` (QA `TC-1702`; `review round
+/// 1, R9`).
+///
+/// The same rule the orchestrator's `RunLimitSettings.from_env` applies
+/// (`dagster/dispar_orchestrate/ingest_factory.py`): surrounding spaces
+/// trimmed, ASCII digits only, a value from 1 to `u32::MAX`. It is not
+/// [`parse_positive_u32_or_default`]: that one accepts a leading `+` and
+/// rejects a padded number, so `"86_400"` or `" 900 "` would be read one way
+/// here and another there, and the API would cancel a run the orchestrator
+/// still believes in.
+///
+/// A value that cannot be read keeps `default`, with a warning that names the
+/// variable and never the value (the orchestrator's own rule; the API used to
+/// fall back without a word). An empty value is unset — the normal case in
+/// compose, which passes `${X:-}` — and warns about nothing.
+fn parse_run_limit(env: &HashMap<String, String>, key: &str, default: u32) -> u32 {
+    let Some(raw) = env.get(key) else {
+        return default;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return default;
+    }
+    if trimmed.bytes().all(|byte| byte.is_ascii_digit())
+        && let Ok(value) = trimmed.parse::<u32>()
+        && value > 0
+    {
+        return value;
+    }
+    tracing::warn!(
+        variable = key,
+        "a run limit is not a whole number of seconds of 1 or more; using the default"
+    );
+    default
+}
+
+/// Whether the environment names `key` with a whole number of 1 or more
+/// (`ADM-8`): a setting the environment owns is read-only in the console, and
+/// the value alone cannot say whether the environment named it or the code
+/// default supplied it.
+///
+/// The same rule as [`parse_positive_u32_or_default`]: an unparseable value
+/// does not count, because the operator's value is invalid and the code
+/// default is in effect.
+fn env_sets_positive_u32(env: &HashMap<String, String>, key: &str) -> bool {
+    env.get(key)
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .is_some_and(|value| u32::try_from(value).is_ok())
+}
+
+/// Whether the environment names `key` with a whole number of 1 or more
+/// (`ADM-8`), for a setting counted in seconds as a `u64`. See
+/// [`env_sets_positive_u32`].
+fn env_sets_positive_u64(env: &HashMap<String, String>, key: &str) -> bool {
+    env.get(key)
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .is_some_and(|value| value > 0)
 }
 
 /// Parses `key` as a whole number of 1 or more, `default` when unset or
@@ -1518,6 +1987,11 @@ impl Config {
     ///   [`ConfigError::EmptySmtpCaFile`], if `SMTP_CA_FILE` is set and
     ///   non-empty but names a file that cannot be read, or one that holds
     ///   no PEM certificate (`SEC-56` D5).
+    /// - [`ConfigError::InvalidInstallMode`] or
+    ///   [`ConfigError::InvalidQueryEngine`], if either `BI-44` setting is
+    ///   non-empty but not one of its two names.
+    /// - [`ConfigError::EngineMutualExclusion`], if `bi-only` mode names
+    ///   both engine URLs, or names Trino without a `TRINO_URL`.
     ///
     /// An unparseable `SMTP_PORT` does NOT error — see [`Config::smtp_port`].
     #[allow(
@@ -1529,7 +2003,13 @@ impl Config {
                   crossing the 100-line lint threshold)"
     )]
     pub fn from_map(env: &HashMap<String, String>) -> Result<Self, ConfigError> {
-        let smtp_port = match env.get("SMTP_PORT") {
+        // `SMTP_PORT`: an empty value is "not set", not a bad value
+        // (`ADM-9 review R6`). Compose passes the variable as an empty
+        // string when the operator set none, and an empty port is no
+        // port: the code's own 587 applies, with no warning — a warning
+        // would name a value the operator never chose. A value that IS set
+        // and unparseable still warns and falls back to 587, as before.
+        let smtp_port = match truthy(env, "SMTP_PORT") {
             Some(raw) => raw.parse::<u16>().unwrap_or_else(|_| {
                 tracing::warn!(
                     smtp_port = %raw,
@@ -1539,6 +2019,18 @@ impl Config {
             }),
             None => 587,
         };
+        // `SMTP_PORT` set, non-empty and parseable — the console may not
+        // override it (`ADM-7` D1). An unparseable `SMTP_PORT` does not
+        // count: the operator's value is invalid, and `smtp_port` already
+        // fell back to 587, so the console is free to set a real port. An
+        // EMPTY one does not count either (`ADM-9 review R6`): it is not
+        // set at all.
+        let smtp_port_from_env = env
+            .get("SMTP_PORT")
+            .is_some_and(|raw| !raw.is_empty() && raw.parse::<u16>().is_ok());
+        // `SMTP_FROM` set and non-empty — the one env value the `From` field
+        // owns; the `SMTP_USER`/literal fallback is not it.
+        let smtp_from_from_env = env.get("SMTP_FROM").is_some_and(|raw| !raw.is_empty());
         let port = match env.get("PORT") {
             Some(raw) => raw
                 .parse::<u16>()
@@ -1552,14 +2044,25 @@ impl Config {
             .or_else(|| truthy(env, "MINIMAX_API_KEY"))
             .unwrap_or_default();
 
-        // SMTP_FROM ?? SMTP_USER ?? "rantai-lake@localhost" — a `??` chain,
-        // so an explicitly empty SMTP_FROM is preserved and does NOT fall
-        // through to SMTP_USER.
-        let smtp_from = env.get("SMTP_FROM").cloned().unwrap_or_else(|| {
-            env.get("SMTP_USER")
-                .cloned()
-                .unwrap_or_else(|| "rantai-lake@localhost".to_owned())
-        });
+        // `LLM_URL` and `LLM_MODEL` set and non-empty: the environment owns
+        // that field, so the console shows it read-only and a save that
+        // sends it is refused (`ADM-9 review R4`). The same rule as
+        // `SMTP_PORT`: the value alone cannot tell an operator who set it
+        // from one who never did. An EMPTY value is "not set"
+        // (`ADM-9 review R6`): compose passes both as empty strings when
+        // the operator set none, and an empty address or model is no
+        // address or model at all.
+        let llm_url_from_env = env.get("LLM_URL").is_some_and(|raw| !raw.is_empty());
+        let llm_model_from_env = env.get("LLM_MODEL").is_some_and(|raw| !raw.is_empty());
+
+        // `SMTP_FROM` → `SMTP_USER` → "rantai-lake@localhost", with an EMPTY
+        // value meaning "not set" at every step (`ADM-9 review R6`):
+        // compose passes `SMTP_FROM` as an empty string when the operator
+        // set none, and an empty `From` is no sender — the old behaviour
+        // kept it as an empty address and sent mail with no sender.
+        let smtp_from = truthy(env, "SMTP_FROM")
+            .or_else(|| truthy(env, "SMTP_USER"))
+            .unwrap_or_else(|| "rantai-lake@localhost".to_owned());
 
         // `CONNECTOR_TLS_CA_FILE`: read the file now so an unreadable path
         // stops the API at start, not on the first connector dial (T1).
@@ -1573,15 +2076,32 @@ impl Config {
             None => (None, None),
         };
 
+        // `BI-44`: resolve the two installation settings before any field
+        // is built, then check the one-engine invariant. A typo or a
+        // both-engines config stops the process here rather than silently
+        // starting a second memory-hungry service.
+        let install_mode =
+            InstallMode::from_env_value(env.get("LAKEHOUSE_INSTALL_MODE").map(String::as_str))?;
+        let query_engine =
+            QueryEngine::from_env_value(env.get("LAKEHOUSE_QUERY_ENGINE").map(String::as_str))?;
+        validate_bi_only_engines(install_mode, query_engine, env)?;
+
         Ok(Self {
+            install_mode,
+            query_engine,
             ch_url: or_default(env, "CH_URL", "http://localhost:18123"),
             ch_user: or_default(env, "CH_USER", "default"),
             ch_password: or_default(env, "CH_PASSWORD", ""),
             dagster_url: or_default(env, "DAGSTER_URL", "http://localhost:13030/graphql"),
             dagster_repo: or_default(env, "DAGSTER_REPO", "__repository__"),
             dagster_location: or_default(env, "DAGSTER_LOCATION", "dispar_orchestrate.definitions"),
-            llm_url: or_default(env, "LLM_URL", "https://api.minimax.io/v1"),
-            llm_model: or_default(env, "LLM_MODEL", "MiniMax-M3"),
+            // `ADM-9 review R6`: an empty value is "not set", so the code's
+            // own default applies (an empty `LLM_URL` used to build a
+            // client with no address at all).
+            llm_url: truthy(env, "LLM_URL").unwrap_or_else(|| DEFAULT_LLM_URL.to_owned()),
+            llm_url_from_env,
+            llm_model: truthy(env, "LLM_MODEL").unwrap_or_else(|| DEFAULT_LLM_MODEL.to_owned()),
+            llm_model_from_env,
             llm_key,
             embed_secret: truthy(env, "EMBED_SECRET"),
             render_token_secret: truthy(env, "RENDER_TOKEN_SECRET")
@@ -1592,14 +2112,20 @@ impl Config {
                 .map(|url| url.trim_end_matches('/').to_owned())
                 .filter(|url| url.starts_with("https://") || url.starts_with("http://")),
             embed_token_max_lifetime_seconds: parse_embed_token_max_lifetime(env)?,
+            embed_token_max_lifetime_from_env: env_sets_positive_u64(
+                env,
+                "EMBED_TOKEN_MAX_LIFETIME_SECONDS",
+            ),
             alerts_run_token: truthy(env, "ALERTS_RUN_TOKEN"),
             smtp_host: truthy(env, "SMTP_HOST"),
             smtp_port,
+            smtp_port_from_env,
             // notify.ts:40 in full: `SMTP_SECURE === "true" || port === 465`.
             smtp_secure: env.get("SMTP_SECURE").is_some_and(|v| v == "true") || smtp_port == 465,
             smtp_user: truthy(env, "SMTP_USER"),
             smtp_pass: or_default(env, "SMTP_PASS", ""),
             smtp_from,
+            smtp_from_from_env,
             port,
             is_dev: env
                 .get("APP_ENV")
@@ -1610,13 +2136,21 @@ impl Config {
             oidc_issuer: truthy(env, "OIDC_ISSUER"),
             oidc_client_id: truthy(env, "OIDC_CLIENT_ID"),
             oidc_client_secret: truthy(env, "OIDC_CLIENT_SECRET"),
-            oidc_provider_name: or_default(env, "OIDC_PROVIDER_NAME", "default"),
+            oidc_provider_name: truthy(env, "OIDC_PROVIDER_NAME")
+                .unwrap_or_else(|| "default".to_owned()),
+            oidc_provider_name_from_env: truthy(env, "OIDC_PROVIDER_NAME").is_some(),
             oidc_jwks_url: truthy(env, "OIDC_JWKS_URL"),
             oidc_jit_provisioning: env
                 .get("OIDC_JIT_PROVISIONING")
                 .is_some_and(|v| v == "true"),
+            oidc_jit_provisioning_from_env: truthy(env, "OIDC_JIT_PROVISIONING").is_some(),
+            oidc_trust_email: env.get("OIDC_TRUST_EMAIL").is_some_and(|v| v == "true"),
+            oidc_trust_email_from_env: truthy(env, "OIDC_TRUST_EMAIL").is_some(),
             oidc_role_map: parse_role_map(env.get("OIDC_ROLE_MAP").map_or("", String::as_str)),
-            oidc_groups_claim: or_default(env, "OIDC_GROUPS_CLAIM", "groups"),
+            oidc_role_map_from_env: truthy(env, "OIDC_ROLE_MAP").is_some(),
+            oidc_groups_claim: truthy(env, "OIDC_GROUPS_CLAIM")
+                .unwrap_or_else(|| "groups".to_owned()),
+            oidc_groups_claim_from_env: truthy(env, "OIDC_GROUPS_CLAIM").is_some(),
             connector_probe_allow_internal_hosts: env
                 .get("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS")
                 .is_some_and(|v| v == "true"),
@@ -1652,9 +2186,13 @@ impl Config {
             connector_oauth_allow_http: env
                 .get("CONNECTOR_OAUTH_ALLOW_HTTP")
                 .is_some_and(|v| v == "true"),
-            oracle_cdc_logminer_enabled: env
-                .get("ORACLE_CDC_LOGMINER_ENABLED")
-                .is_some_and(|v| v == "true"),
+            kafka_connect_url: truthy(env, "KAFKA_CONNECT_URL"),
+            cdc_kafka_bootstrap: truthy(env, "CDC_KAFKA_BOOTSTRAP"),
+            cdc_secrets_dir: or_default(
+                env,
+                "CDC_SECRETS_DIR",
+                lakehouse_store::cdc::CDC_SECRETS_DIR,
+            ),
             oidc_clock_skew_seconds: env
                 .get("OIDC_CLOCK_SKEW_SECONDS")
                 .and_then(|v| v.parse::<u64>().ok())
@@ -1662,6 +2200,16 @@ impl Config {
             oidc_authorize_url: truthy(env, "OIDC_AUTHORIZE_URL"),
             oidc_token_url: truthy(env, "OIDC_TOKEN_URL"),
             oidc_redirect_uri: truthy(env, "OIDC_REDIRECT_URI"),
+            oidc_post_logout_redirect_uri: truthy(env, "OIDC_POST_LOGOUT_REDIRECT_URI"),
+            // An empty value is the DEFAULT, not an opt-out: compose always
+            // passes this variable (as every other `OIDC_*` one), so empty
+            // cannot mean "the operator said nothing". `off` is the
+            // spelling for "send no prompt at all".
+            oidc_prompt: match env.get("OIDC_PROMPT") {
+                Some(value) if !value.trim().is_empty() => value.trim().to_owned(),
+                _ => DEFAULT_OIDC_PROMPT.to_owned(),
+            },
+            oidc_prompt_from_env: env.get("OIDC_PROMPT").is_some_and(|v| !v.trim().is_empty()),
             lakekeeper_catalog_uri: or_default(
                 env,
                 "LAKEKEEPER_CATALOG_URI",
@@ -1681,6 +2229,8 @@ impl Config {
             rustfs_access_key_secret_ref: truthy(env, "RUSTFS_ACCESS_KEY_SECRET_REF"),
             rustfs_secret_key_secret_ref: truthy(env, "RUSTFS_SECRET_KEY_SECRET_REF"),
             database_url: or_default(env, "DATABASE_URL", ""),
+            db_app_password: truthy(env, "LAKEHOUSE_DB_APP_PASSWORD")
+                .map(lakehouse_core::secret::SecretValue::new),
             lakekeeper_gold_export_token_file: or_default(
                 env,
                 "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE",
@@ -1726,6 +2276,11 @@ impl Config {
             gold_export_run_token: truthy(env, "GOLD_EXPORT_RUN_TOKEN"),
             gold_export_max_rows: parse_u64_or_default(env, "GOLD_EXPORT_MAX_ROWS", 5_000_000),
             gold_export_batch_size: parse_u64_or_default(env, "GOLD_EXPORT_BATCH_SIZE", 20_000),
+            report_send_now_interval_secs: parse_u64_or_default(
+                env,
+                "REPORT_SEND_NOW_INTERVAL_SECS",
+                60,
+            ),
             agent_run_token: truthy(env, "AGENT_RUN_TOKEN"),
             lakehouse_maintenance_token: truthy(env, "LAKEHOUSE_MAINTENANCE_TOKEN"),
             ingest_service_token: truthy(env, "INGEST_SERVICE_TOKEN"),
@@ -1775,13 +2330,20 @@ impl Config {
             )?,
             git_sha: or_default(env, "GIT_SHA", "unknown"),
             login_max_failures: parse_positive_u32_or_default(env, "LOGIN_MAX_FAILURES", 5),
+            login_max_failures_from_env: env_sets_positive_u32(env, "LOGIN_MAX_FAILURES"),
             login_failure_window_secs: parse_positive_u32_or_default(
                 env,
                 "LOGIN_FAILURE_WINDOW_SECS",
                 900,
             ),
+            login_failure_window_secs_from_env: env_sets_positive_u32(
+                env,
+                "LOGIN_FAILURE_WINDOW_SECS",
+            ),
             login_lockout_secs: parse_positive_u32_or_default(env, "LOGIN_LOCKOUT_SECS", 300),
+            login_lockout_secs_from_env: env_sets_positive_u32(env, "LOGIN_LOCKOUT_SECS"),
             auth_retention_days: parse_positive_u32_or_default(env, "AUTH_RETENTION_DAYS", 30),
+            auth_retention_days_from_env: env_sets_positive_u32(env, "AUTH_RETENTION_DAYS"),
             upload_max_concurrent_per_user: parse_limit(env, "UPLOAD_MAX_CONCURRENT_PER_USER", 4)?,
             upload_max_concurrent: parse_limit(env, "UPLOAD_MAX_CONCURRENT", 16)?,
             upload_max_concurrent_large: parse_limit(env, "UPLOAD_MAX_CONCURRENT_LARGE", 2)?,
@@ -1798,6 +2360,16 @@ impl Config {
                 30,
             ))
             .unwrap_or(lakehouse_store::connectors::DEFAULT_AUTO_DISABLE_AFTER),
+            ingest_run_max_runtime_seconds: parse_run_limit(
+                env,
+                "INGEST_RUN_MAX_RUNTIME_SECONDS",
+                21_600,
+            ),
+            ingest_run_start_timeout_seconds: parse_run_limit(
+                env,
+                "INGEST_RUN_START_TIMEOUT_SECONDS",
+                600,
+            ),
         })
     }
 
@@ -1853,6 +2425,36 @@ impl Config {
             allow_all: self.webhook_test_allow_all,
             allowed: self.webhook_allowed_cidrs.clone(),
         }
+    }
+
+    /// Whether this installation reads its source in place and runs only
+    /// one query engine (`BI-44`).
+    #[must_use]
+    pub const fn is_bi_only(&self) -> bool {
+        matches!(self.install_mode, InstallMode::BiOnly)
+    }
+
+    /// The engine a request that names none gets: the installation's
+    /// chosen engine in `bi-only` mode, `ClickHouse` in the full stack
+    /// (unchanged pre-`BI-44` behaviour).
+    #[must_use]
+    pub const fn default_query_engine_name(&self) -> &'static str {
+        self.query_engine.name()
+    }
+
+    /// Whether a request may name this engine at all. In `bi-only` mode
+    /// only the configured engine is a real service; the other one was
+    /// deliberately not started, so a request naming it must be refused
+    /// before anything dials it. Unknown names are never allowed here, so
+    /// a typo cannot fall through to the full stack's `ClickHouse`
+    /// fallback (`sql_rewrite::Engine::from_name`). The full stack keeps
+    /// its two engines and its fallback for unknown names.
+    #[must_use]
+    pub fn engine_allowed(&self, engine_name: &str) -> bool {
+        if !self.is_bi_only() {
+            return true;
+        }
+        engine_name.trim() == self.query_engine.name()
     }
 }
 
@@ -2000,8 +2602,6 @@ mod tests {
         assert_eq!(cfg.trino_max_rows, 10_000);
         // Safe-by-default: SSRF blocking is ON unless explicitly disabled.
         assert!(!cfg.connector_probe_allow_internal_hosts);
-        // Oracle CDC via Debezium LogMiner is off by default.
-        assert!(!cfg.oracle_cdc_logminer_enabled);
     }
 
     /// Isolated from `defaults_match_typescript_fallbacks` so `cargo test
@@ -2150,6 +2750,20 @@ mod tests {
         assert_eq!(cfg.gold_export_batch_size, 7);
     }
 
+    /// `BI-35`: "Send now" waits 60 seconds between presses unless told
+    /// otherwise; `0` turns it off; garbage falls back to the default.
+    #[test]
+    fn the_send_now_interval_defaults_to_sixty_seconds_and_is_overridable() {
+        let cfg = Config::from_map(&map(&[])).unwrap();
+        assert_eq!(cfg.report_send_now_interval_secs, 60);
+        let cfg = Config::from_map(&map(&[("REPORT_SEND_NOW_INTERVAL_SECS", "5")])).unwrap();
+        assert_eq!(cfg.report_send_now_interval_secs, 5);
+        let cfg = Config::from_map(&map(&[("REPORT_SEND_NOW_INTERVAL_SECS", "0")])).unwrap();
+        assert_eq!(cfg.report_send_now_interval_secs, 0);
+        let cfg = Config::from_map(&map(&[("REPORT_SEND_NOW_INTERVAL_SECS", "soon")])).unwrap();
+        assert_eq!(cfg.report_send_now_interval_secs, 60);
+    }
+
     /// Same non-load-bearing posture as `OIDC_CLOCK_SKEW_SECONDS`: a
     /// garbage override must not fail config resolution — it falls back to
     /// the documented default instead.
@@ -2182,6 +2796,46 @@ mod tests {
         }
         let cfg = Config::from_map(&map(&[("CONNECTOR_AUTO_DISABLE_AFTER", "4")])).unwrap();
         assert_eq!(cfg.connector_auto_disable_after, 4);
+    }
+
+    /// `SRC-39` (QA `TC-1702`): six hours a run may run, ten minutes a run
+    /// the orchestrator launched may take to start; a value that is not a
+    /// whole number of 1 or more keeps the default.
+    ///
+    /// `review round 1, R9`: the orchestrator reads the same setting by the
+    /// same rule, so `"86_400"` (which `int()` would take), a number above
+    /// `u32::MAX` and a padded value are all decided here as they are there:
+    /// `" 900 "` is 900, `"86_400"` and `"4294967296"` keep the default.
+    #[test]
+    fn the_run_limits_default_to_six_hours_and_ten_minutes_and_ignore_garbage() {
+        let cfg = Config::from_map(&map(&[])).unwrap();
+        assert_eq!(cfg.ingest_run_max_runtime_seconds, 21_600);
+        assert_eq!(cfg.ingest_run_start_timeout_seconds, 600);
+        for bad in ["0", "-3", "many", "", "86_400", "4294967296", "+900", "1.5"] {
+            let cfg = Config::from_map(&map(&[
+                ("INGEST_RUN_MAX_RUNTIME_SECONDS", bad),
+                ("INGEST_RUN_START_TIMEOUT_SECONDS", bad),
+            ]))
+            .unwrap();
+            assert_eq!(cfg.ingest_run_max_runtime_seconds, 21_600, "{bad:?}");
+            assert_eq!(cfg.ingest_run_start_timeout_seconds, 600, "{bad:?}");
+        }
+        let cfg = Config::from_map(&map(&[
+            ("INGEST_RUN_MAX_RUNTIME_SECONDS", "900"),
+            ("INGEST_RUN_START_TIMEOUT_SECONDS", "120"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.ingest_run_max_runtime_seconds, 900);
+        assert_eq!(cfg.ingest_run_start_timeout_seconds, 120);
+        // `review round 1, R9`: both services trim, so a padded value is read,
+        // not thrown away.
+        let cfg = Config::from_map(&map(&[
+            ("INGEST_RUN_MAX_RUNTIME_SECONDS", " 900 "),
+            ("INGEST_RUN_START_TIMEOUT_SECONDS", " 120 "),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.ingest_run_max_runtime_seconds, 900);
+        assert_eq!(cfg.ingest_run_start_timeout_seconds, 120);
     }
 
     /// The compose stack's documented opt-out — only the literal string
@@ -2266,41 +2920,38 @@ mod tests {
         assert!(matches!(err, ConfigError::MalformedWebhookAllowedCidrs(_)));
     }
 
-    /// The `ORACLE_CDC_LOGMINER_ENABLED` flag defaults to `false`: an unset
-    /// variable must never read as a request for a capability this build
-    /// has not validated.
+    /// `KAFKA_CONNECT_URL` is unset by default, and a blank value is unset too:
+    /// the API never dials a guessed address (`SRC-4` decision S2-b).
     #[test]
-    fn oracle_cdc_logminer_enabled_defaults_to_false() {
-        let cfg = Config::from_map(&HashMap::new()).unwrap();
-        assert!(!cfg.oracle_cdc_logminer_enabled);
+    fn kafka_connect_url_is_unset_by_default_and_blank_counts_as_unset() {
+        assert_eq!(
+            Config::from_map(&HashMap::new()).unwrap().kafka_connect_url,
+            None
+        );
+        let cfg = Config::from_map(&map(&[("KAFKA_CONNECT_URL", "")])).unwrap();
+        assert_eq!(cfg.kafka_connect_url, None);
+        let cfg =
+            Config::from_map(&map(&[("KAFKA_CONNECT_URL", "http://kafka-connect:8083")])).unwrap();
+        assert_eq!(
+            cfg.kafka_connect_url.as_deref(),
+            Some("http://kafka-connect:8083")
+        );
     }
 
-    /// The codebase's boolean-parsing rule is exact
-    /// `== "true"`, mirroring `connector_probe_allow_internal_hosts` and
-    /// `oidc_jit_provisioning` — `TRUE`, `1`, `yes`, `on`, and any other
-    /// non-`"true"` string MUST NOT flip the flag on. This is the rule
-    /// AGENTS.md mandates, re-asserted here for the new field so a future
-    /// widening (e.g. `is_some_and` accepting truthy strings) fails this
-    /// test rather than silently extending the gate.
+    /// `CDC_KAFKA_BOOTSTRAP` is unset by default and blank counts as unset: a
+    /// `MySQL` or `SQL Server` connector then answers "not configured".
     #[test]
-    fn oracle_cdc_logminer_enabled_reads_the_true_string_only() {
-        let cfg = Config::from_map(&map(&[("ORACLE_CDC_LOGMINER_ENABLED", "true")])).unwrap();
-        assert!(cfg.oracle_cdc_logminer_enabled);
-
-        for bad in ["TRUE", "True", "1", "yes", "on", "enabled", " "] {
-            let cfg = Config::from_map(&map(&[("ORACLE_CDC_LOGMINER_ENABLED", bad)])).unwrap();
-            assert!(
-                !cfg.oracle_cdc_logminer_enabled,
-                "ORACLE_CDC_LOGMINER_ENABLED={bad:?} must not enable the flag"
-            );
-        }
-
-        // And the unset case (omitted entirely from the env map) also
-        // does not enable the flag — redundant with the `defaults_...`
-        // test, but cheap and reads as a self-contained "the gate stays
-        // closed for every non-`true` value" assertion.
-        let cfg = Config::from_map(&HashMap::new()).unwrap();
-        assert!(!cfg.oracle_cdc_logminer_enabled);
+    fn cdc_kafka_bootstrap_is_unset_by_default_and_blank_counts_as_unset() {
+        assert_eq!(
+            Config::from_map(&HashMap::new())
+                .unwrap()
+                .cdc_kafka_bootstrap,
+            None
+        );
+        let cfg = Config::from_map(&map(&[("CDC_KAFKA_BOOTSTRAP", "")])).unwrap();
+        assert_eq!(cfg.cdc_kafka_bootstrap, None);
+        let cfg = Config::from_map(&map(&[("CDC_KAFKA_BOOTSTRAP", "kafka:9092")])).unwrap();
+        assert_eq!(cfg.cdc_kafka_bootstrap.as_deref(), Some("kafka:9092"));
     }
 
     #[test]
@@ -2466,6 +3117,90 @@ mod tests {
         assert_eq!(cfg.smtp_from, "bot@example.com");
     }
 
+    /// `ADM-9 review R6`: an EMPTY value means "not set" for the four
+    /// variables `docker-compose.yml` hands to the API — `LLM_URL`,
+    /// `LLM_MODEL`, `SMTP_PORT` and `SMTP_FROM`. Compose passes them as
+    /// empty strings when the operator set none, and a value that read as
+    /// a value made the console's own fields read-only on every compose
+    /// installation.
+    ///
+    /// Each of the four was wrong on its own terms before the fix, which is
+    /// why the empty value cannot simply be kept: an empty `LLM_URL` built
+    /// a client with no address, an empty `LLM_MODEL` named no model, and
+    /// an empty `SMTP_FROM` was kept as an empty `From` — mail sent with no
+    /// sender, which no mail server accepts.
+    #[test]
+    fn an_empty_llm_url_is_unset_and_the_default_applies() {
+        let env = map(&[("LLM_URL", "")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.llm_url, DEFAULT_LLM_URL);
+        // The environment says nothing about the address, so the console
+        // owns it.
+        assert!(!cfg.llm_url_from_env);
+    }
+
+    /// The model half of the same rule (`ADM-9 review R6`).
+    #[test]
+    fn an_empty_llm_model_is_unset_and_the_default_applies() {
+        let env = map(&[("LLM_MODEL", "")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.llm_model, DEFAULT_LLM_MODEL);
+        assert!(!cfg.llm_model_from_env);
+    }
+
+    /// An empty `SMTP_PORT` is "not set", not a bad value
+    /// (`ADM-9 review R6`): the default applies, no warning is logged (a
+    /// warning would name a value the operator never chose), and the
+    /// environment does not own the port, so the console may set one.
+    ///
+    /// The old behaviour treated the empty value as an unparseable one and
+    /// logged a warning naming it — an operator who set nothing was told
+    /// their own deployment had a bad port.
+    #[test]
+    fn an_empty_smtp_port_is_unset_and_the_default_applies() {
+        let env = map(&[("SMTP_PORT", "")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.smtp_port, 587);
+        assert!(!cfg.smtp_port_from_env);
+    }
+
+    /// An empty `SMTP_FROM` is no sender: it falls through to `SMTP_USER`,
+    /// and to the literal when there is no account either (`ADM-9 review
+    /// R6`).
+    #[test]
+    fn an_empty_smtp_from_falls_through_to_smtp_user_then_the_literal() {
+        let env = map(&[("SMTP_FROM", ""), ("SMTP_USER", "bot@example.com")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.smtp_from, "bot@example.com");
+        assert!(!cfg.smtp_from_from_env);
+
+        let env = map(&[("SMTP_FROM", "")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.smtp_from, "rantai-lake@localhost");
+        assert!(!cfg.smtp_from_from_env);
+    }
+
+    /// The four together, the way compose hands them over: present, empty,
+    /// and therefore unset (`ADM-9 review R6`).
+    #[test]
+    fn the_four_empty_values_compose_passes_are_all_unset() {
+        let env = map(&[
+            ("LLM_URL", ""),
+            ("LLM_MODEL", ""),
+            ("SMTP_PORT", ""),
+            ("SMTP_FROM", ""),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.llm_url, DEFAULT_LLM_URL);
+        assert_eq!(cfg.llm_model, DEFAULT_LLM_MODEL);
+        assert_eq!(cfg.smtp_port, 587);
+        assert_eq!(cfg.smtp_from, "rantai-lake@localhost");
+        assert!(!cfg.llm_url_from_env);
+        assert!(!cfg.llm_model_from_env);
+        assert!(!cfg.smtp_port_from_env);
+        assert!(!cfg.smtp_from_from_env);
+    }
+
     #[test]
     fn smtp_secure_requires_exact_string_true() {
         let env = map(&[("SMTP_SECURE", "TRUE")]);
@@ -2501,15 +3236,9 @@ mod tests {
         assert_eq!(cfg.smtp_port, 587);
     }
 
-    #[test]
-    fn empty_smtp_port_falls_back_to_default_instead_of_erroring() {
-        let env = map(&[("SMTP_PORT", "")]);
-        let cfg = Config::from_map(&env).unwrap();
-        assert_eq!(cfg.smtp_port, 587);
-    }
-
     /// A wildly out-of-range value (`u16::MAX` + 1) also falls back rather
-    /// than erroring, exactly like the empty/non-numeric cases above.
+    /// than erroring, exactly like the non-numeric case above. It is a
+    /// value the operator DID set, so it still warns.
     #[test]
     fn out_of_range_smtp_port_falls_back_to_default_instead_of_erroring() {
         let env = map(&[("SMTP_PORT", "70000")]);
@@ -2575,6 +3304,11 @@ mod tests {
         assert_eq!(cfg.oidc_authorize_url, None);
         assert_eq!(cfg.oidc_token_url, None);
         assert_eq!(cfg.oidc_redirect_uri, None);
+        // The sign-in asks the provider for its login form by default, so a
+        // shared browser does not silently sign the next person in as the
+        // previous one.
+        assert_eq!(cfg.oidc_prompt, "login");
+        assert!(!cfg.oidc_prompt_from_env);
 
         let mut env = HashMap::new();
         env.insert(
@@ -2602,6 +3336,35 @@ mod tests {
             cfg.oidc_redirect_uri.as_deref(),
             Some("https://lake.invalid/api/auth/oidc/callback")
         );
+    }
+
+    // `OIDC_PROMPT` says what the browser sign-in asks the provider for.
+    // An empty value is the DEFAULT (compose always passes the variable, so
+    // empty cannot mean "the operator said nothing"); `off` is the
+    // deployment's own spelling for "send no prompt at all".
+    #[test]
+    fn oidc_prompt_defaults_to_login_and_off_is_the_deployments_own_spelling() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.oidc_prompt, "login");
+        assert!(!cfg.oidc_prompt_from_env);
+
+        // Empty is the default, not an opt-out.
+        let cfg = Config::from_map(&map(&[("OIDC_PROMPT", "")])).unwrap();
+        assert_eq!(cfg.oidc_prompt, "login");
+        assert!(!cfg.oidc_prompt_from_env);
+
+        let cfg = Config::from_map(&map(&[("OIDC_PROMPT", "consent")])).unwrap();
+        assert_eq!(cfg.oidc_prompt, "consent");
+        assert!(cfg.oidc_prompt_from_env);
+
+        let cfg = Config::from_map(&map(&[("OIDC_PROMPT", "off")])).unwrap();
+        assert_eq!(cfg.oidc_prompt, "off");
+        assert!(cfg.oidc_prompt_from_env);
+
+        // Surrounding whitespace is not part of the value.
+        let cfg = Config::from_map(&map(&[("OIDC_PROMPT", "  login  ")])).unwrap();
+        assert_eq!(cfg.oidc_prompt, "login");
+        assert!(cfg.oidc_prompt_from_env);
     }
 
     // An operator-stated owning tenant for the shared catalog/Dagster-job
@@ -3241,5 +4004,118 @@ mod tests {
                 ConfigError::InvalidUploadLimit("UPLOAD_SESSION_TTL_HOURS", bad.to_owned())
             );
         }
+    }
+
+    /// `BI-44`: an installation that never set the new variables keeps
+    /// every pre-existing config and its `ClickHouse` default, including a
+    /// deployment that names BOTH engine URLs (the full stack runs both).
+    #[test]
+    fn the_full_installation_remains_the_default_with_both_engines_allowed() {
+        let cfg = Config::from_map(&map(&[
+            ("CH_URL", "http://clickhouse:8123"),
+            ("TRINO_URL", "http://trino:8080"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.install_mode, InstallMode::Full);
+        assert_eq!(cfg.query_engine, QueryEngine::ClickHouse);
+        assert!(!cfg.is_bi_only());
+        assert_eq!(cfg.default_query_engine_name(), "clickhouse");
+        assert!(cfg.engine_allowed("clickhouse"));
+        assert!(cfg.engine_allowed("trino"));
+        assert!(cfg.engine_allowed("typo"));
+    }
+
+    /// The two values are trimmed and case-insensitive; an empty value is
+    /// the same as unset, but a non-empty unknown one refuses to boot.
+    #[test]
+    fn install_mode_and_query_engine_parse_trimmed_and_fail_closed_on_unknown_values() {
+        let cfg = Config::from_map(&map(&[
+            ("LAKEHOUSE_INSTALL_MODE", " BI-ONLY "),
+            ("LAKEHOUSE_QUERY_ENGINE", " TrInO "),
+            ("TRINO_URL", "http://trino:8080"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.install_mode, InstallMode::BiOnly);
+        assert_eq!(cfg.query_engine, QueryEngine::Trino);
+        assert_eq!(cfg.default_query_engine_name(), "trino");
+        assert_eq!(
+            Config::from_map(&env_with("LAKEHOUSE_INSTALL_MODE", "half")).unwrap_err(),
+            ConfigError::InvalidInstallMode("half".to_owned())
+        );
+        assert_eq!(
+            Config::from_map(&env_with("LAKEHOUSE_QUERY_ENGINE", "duckdb")).unwrap_err(),
+            ConfigError::InvalidQueryEngine("duckdb".to_owned())
+        );
+        let empty = Config::from_map(&map(&[
+            ("LAKEHOUSE_INSTALL_MODE", ""),
+            ("LAKEHOUSE_QUERY_ENGINE", "  "),
+        ]))
+        .unwrap();
+        assert_eq!(empty.install_mode, InstallMode::Full);
+        assert_eq!(empty.query_engine, QueryEngine::ClickHouse);
+    }
+
+    /// The owner's one-engine rule (`BI-44`): a Trino-only install must
+    /// name `TRINO_URL` and must not name `CH_URL`; an empty URL is not an
+    /// explicit setting.
+    #[test]
+    fn bi_only_trino_requires_its_url_and_forbids_clickhouse() {
+        let cfg = Config::from_map(&map(&[
+            ("LAKEHOUSE_INSTALL_MODE", "bi-only"),
+            ("LAKEHOUSE_QUERY_ENGINE", "trino"),
+            ("TRINO_URL", "http://trino:8080"),
+            ("CH_URL", "  "),
+        ]))
+        .unwrap();
+        assert!(cfg.is_bi_only());
+        assert!(cfg.engine_allowed("trino"));
+        assert!(!cfg.engine_allowed("clickhouse"));
+        assert!(!cfg.engine_allowed("typo"));
+        let err = Config::from_map(&map(&[
+            ("LAKEHOUSE_INSTALL_MODE", "bi-only"),
+            ("LAKEHOUSE_QUERY_ENGINE", "trino"),
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::EngineMutualExclusion(_)),
+            "a missing Trino URL must refuse start-up: {err:?}"
+        );
+        let err = Config::from_map(&map(&[
+            ("LAKEHOUSE_INSTALL_MODE", "bi-only"),
+            ("LAKEHOUSE_QUERY_ENGINE", "trino"),
+            ("TRINO_URL", "http://trino:8080"),
+            ("CH_URL", "http://clickhouse:8123"),
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::EngineMutualExclusion(_)),
+            "a second engine must refuse start-up: {err:?}"
+        );
+    }
+
+    /// The mirror of the Trino case: a ClickHouse-only install refuses a
+    /// `TRINO_URL` but needs none of its own (the code default applies).
+    #[test]
+    fn bi_only_clickhouse_forbids_a_trino_url() {
+        let cfg = Config::from_map(&map(&[
+            ("LAKEHOUSE_INSTALL_MODE", "bi-only"),
+            ("LAKEHOUSE_QUERY_ENGINE", "clickhouse"),
+            ("TRINO_URL", ""),
+        ]))
+        .unwrap();
+        assert!(cfg.engine_allowed("clickhouse"));
+        assert!(!cfg.engine_allowed("trino"));
+        assert_eq!(cfg.default_query_engine_name(), "clickhouse");
+        let err = Config::from_map(&map(&[
+            ("LAKEHOUSE_INSTALL_MODE", "bi-only"),
+            ("LAKEHOUSE_QUERY_ENGINE", "clickhouse"),
+            ("CH_URL", "http://clickhouse:8123"),
+            ("TRINO_URL", "http://trino:8080"),
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::EngineMutualExclusion(_)),
+            "a second engine must refuse start-up: {err:?}"
+        );
     }
 }

@@ -18,7 +18,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::sync::atomic::Ordering;
 
@@ -142,6 +142,8 @@ async fn create_pipeline(
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             name: name.to_owned(),
             kind: "batch".to_owned(),
             source_zone: source

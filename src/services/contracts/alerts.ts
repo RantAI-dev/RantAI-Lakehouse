@@ -5,6 +5,8 @@
  * `lakehouse_notify::DeliverResult` exactly.
  */
 
+import type { ReportSchedule } from "./reports"
+
 /**
  * Mirrors `AlertKind` (`rust/crates/lakehouse-alerts/src/lib.rs`): `alert`,
  * `digest`, `freshness`, the four pipeline kinds (which have no form here and
@@ -17,8 +19,8 @@
 export type AlertRuleKind = "alert" | "digest" | "freshness" | "pipeline_behind_target" | string
 
 /**
- * The six rule kinds for connector and upload loads (`SRC-7`). The first five
- * are scoped to one connector id, or `*` for all connectors (an administrator
+ * The seven rule kinds for connector and upload loads (`SRC-7`, and `connector_lag`
+ * of `SRC-4`). The first six are scoped to one connector id, or `*` for all connectors (an administrator
  * who sees every tenant only; never for `connector_success`); `upload_failure`
  * is always scoped to every upload and sends no connector.
  */
@@ -28,6 +30,7 @@ export const LOAD_ALERT_KINDS = [
   "connector_disabled",
   "connector_schema_change",
   "connector_success",
+  "connector_lag",
   "upload_failure",
 ] as const
 
@@ -70,7 +73,23 @@ export type AlertRule = {
   threshold: number
   board?: string
   channel: AlertChannel
-  target: string
+  /**
+   * Where the rule sends: a webhook URL or an e-mail address. Left out of the
+   * wire body, with `targetHidden: true`, when the caller may not manage the
+   * rule (`DEC-16`, QA `LH-SRC-7-04`, `SRC-42`); the list then says "Webhook"
+   * or "E-mail" instead.
+   */
+  target?: string
+  /** `true` when the API withheld `target` from this caller (`DEC-16`); never present otherwise. */
+  targetHidden?: boolean
+  /**
+   * The latest delivery of a "run succeeded" rule (`SRC-40`, QA `TC-1695`),
+   * read from `alert_rule_delivery`: a success opens no incident, so its
+   * outcome is kept on the rule instead. `at` is ISO 8601; `reason` is one of
+   * the API's fixed sentences and present only when `delivered` is `false`.
+   * Absent when no delivery was ever attempted.
+   */
+  lastDelivery?: { at: string; delivered: boolean; reason?: string }
   enabled: boolean
   createdAt?: string
   /**
@@ -110,6 +129,14 @@ export type AlertRule = {
    * keeps the Dashboard Viewer role until it is saved again (`BI-39` D4).
    */
   ownerId?: string
+  /**
+   * `BI-65`: when a digest is sent, the same shape as a report subscription's
+   * schedule. Absent on a digest saved before schedules (sent daily at 08:00 in
+   * the report time zone) and on every other kind.
+   */
+  schedule?: ReportSchedule
+  /** `BI-65`: the IANA zone `schedule` is read in. */
+  timeZone?: string
   /**
    * `BI-39` D8: the watched chart's title and its dashboard's id and name, read
    * live when the list is answered. All three are absent together when the
@@ -155,6 +182,9 @@ export type SaveAlertRuleInput = {
   series?: string
   filters?: unknown[]
   condition?: string
+  /** `BI-65`: a digest's schedule and zone; the server refuses them on any other kind. */
+  schedule?: ReportSchedule
+  timeZone?: string
 }
 
 /** Body of `GET /api/alerts/status`. */
@@ -193,6 +223,12 @@ export interface AlertRuleService {
   createRule(input: SaveAlertRuleInput, signal?: AbortSignal): Promise<AlertRule>
   updateRule(rule: SaveAlertRuleInput & { id: string }, signal?: AbortSignal): Promise<AlertRule>
   deleteRule(id: string, signal?: AbortSignal): Promise<void>
+  /**
+   * `BI-43` D1: the signed-in person's own alerts on one chart, for the chart's
+   * alert dialog. Needs no alert permission, unlike `listRules`, which is the
+   * Alerts page's list of everything the caller may see.
+   */
+  listMine(chart: string, signal?: AbortSignal): Promise<AlertRule[]>
   /**
    * `BI-40` D1: run one rule now, as a test. There is no "run every rule"
    * form: the whole tick belongs to the scheduler (`POST /api/alerts/run`,

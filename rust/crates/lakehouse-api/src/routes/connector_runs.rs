@@ -48,7 +48,7 @@ use axum::http::{HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
-use lakehouse_store::audit as store_audit;
+use lakehouse_store::PgPool;
 use lakehouse_store::connector_run::{
     self, AttemptReport, EndReason, ErrorClass, LogEvent, RUN_HISTORY_LIMIT, RunStatus, RunSummary,
     RunTrigger,
@@ -59,7 +59,9 @@ use serde_json::json;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use super::load_alerts::{FinalStatus, close_run_record};
 use super::schema_changes::{check_name, require_orchestrator};
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::connectors::{connector_audit_event, parse_body, pool};
@@ -80,6 +82,12 @@ const NOT_PAUSED: &str = "This connector is not paused.";
 const PAUSED_FOR_ANOTHER_REASON: &str = "This connector is not paused because of repeated \
      failures. If a schema change is waiting, approve it under Schema changes to resume it.";
 
+/// The most records one read of the run list asks the orchestrator about
+/// (`SRC-43` D16). A list with no `running` record asks nothing; the rest
+/// wait for a later read, so a page that polls every three seconds does not
+/// turn one stuck record into an unbounded list of questions.
+const RECONCILE_PER_READ: usize = 10;
+
 // ── The person's routes ────────────────────────────────────────────────────
 
 /// `GET /api/connectors/{id}/runs`.
@@ -88,12 +96,26 @@ const PAUSED_FOR_ANOTHER_REASON: &str = "This connector is not paused because of
 pub struct RunsResponse {
     /// The connector's newest runs, newest first, at most 50.
     runs: Vec<RunSummary>,
+    /// How long a run of this connector may run, in seconds, before the API
+    /// stops holding the connector for it (`INGEST_RUN_MAX_RUNTIME_SECONDS`,
+    /// `SRC-39`, QA `TC-1702`; `review round 1, R8`). The console shows a run
+    /// whose record still says `running` as going until this limit, and it
+    /// must not keep its own copy of the number: raising the setting would
+    /// otherwise bring the QA symptom back (the page would offer "Run now"
+    /// while the API still answers 409).
+    max_runtime_seconds: u32,
 }
 
 /// `GET /api/connectors/{id}/runs` -- the connector's last 50 runs with
-/// status, trigger, rows, duration and attempts (`SRC-11` decision D7).
+/// status, trigger, rows, duration and attempts (`SRC-11` decision D7), and
+/// the run limit the API judges them by.
 /// Exact for any number of connectors: the rows are the product's own, keyed
 /// by connector, not a search of a shared run list.
+///
+/// Before it answers, it closes a record whose run has ended in the
+/// orchestrator but whose end was never recorded (`SRC-43`), and reads the
+/// list once more so the answer shows the closed record. The read repeats, so
+/// whatever went wrong the first time is tried again.
 ///
 /// # Errors
 ///
@@ -103,9 +125,108 @@ pub async fn list(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<RunsResponse>> {
+    let pool = pool(&state)?;
+    let runs = connector_run::list_runs(pool, &id, RUN_HISTORY_LIMIT).await?;
+    let runs = if close_ended_runs(&state, pool, &id, &runs).await {
+        connector_run::list_runs(pool, &id, RUN_HISTORY_LIMIT)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(%err, connector_id = %id, "the run list could not be read again after a record was closed");
+                runs
+            })
+    } else {
+        runs
+    };
     Ok(ApiJson(RunsResponse {
-        runs: connector_run::list_runs(pool(&state)?, &id, RUN_HISTORY_LIMIT).await?,
+        runs,
+        max_runtime_seconds: state.config.ingest_run_max_runtime_seconds,
     }))
+}
+
+/// Close a record whose run has ended in the orchestrator but whose end was
+/// never recorded (`SRC-43` (#485 review, round 2 (R2))): the "Run now" route
+/// cancels an overdue run and then closes its record, and a store failure
+/// between the two leaves the record `running` for good, because a cancelled
+/// run is not an active run to anything else.
+///
+/// What is closed: a record that says `running` and whose run the
+/// orchestrator ended as `SUCCESS`, `FAILURE` or `CANCELED` — by
+/// [`close_run_record`], the same mapping the sensor's report uses. What is
+/// left alone: a run that is still going or being cancelled, a word this build
+/// does not know, and a run the orchestrator no longer knows (the record keeps
+/// saying `running`; nothing is guessed). What a failure does: one warning and
+/// the loop stops, so a dead orchestrator or a failing store costs one call per
+/// read and the list is returned as it was read. What it never does: insert a
+/// record, count a run, deliver an alert, cancel or launch a run, or write an
+/// audit entry — counting and alerting stay with the sensor's report.
+///
+/// Returns whether it closed anything.
+async fn close_ended_runs(
+    state: &AppState,
+    pool: &PgPool,
+    connector_id: &str,
+    runs: &[RunSummary],
+) -> bool {
+    let mut closed = false;
+    let mut asked = 0;
+    for run in runs {
+        if run.status != RunStatus::Running.as_str() {
+            continue;
+        }
+        if asked == RECONCILE_PER_READ {
+            break;
+        }
+        asked += 1;
+        let answer = tokio::time::timeout(
+            super::uploads::SETTLE_CALL_TIMEOUT,
+            state.dagster.pipeline_run_status(&run.run_id),
+        )
+        .await;
+        match answer {
+            Ok(Ok(Some(info))) => {
+                let Some(ended) = FinalStatus::of(&info.status) else {
+                    continue;
+                };
+                match close_run_record(state, pool, connector_id, &run.run_id, ended, &info).await {
+                    Ok(()) => closed = true,
+                    Err(err) => {
+                        tracing::warn!(
+                            %err,
+                            connector_id = %connector_id,
+                            run_id = %run.run_id,
+                            "a run record that ended could not be closed"
+                        );
+                        break;
+                    }
+                }
+            }
+            Ok(Ok(None)) => {
+                tracing::debug!(
+                    connector_id = %connector_id,
+                    run_id = %run.run_id,
+                    "the orchestrator does not know a run whose record says running"
+                );
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    %err,
+                    connector_id = %connector_id,
+                    run_id = %run.run_id,
+                    "the orchestrator could not be asked about a run"
+                );
+                break;
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    connector_id = %connector_id,
+                    run_id = %run.run_id,
+                    "the orchestrator did not answer about a run in time"
+                );
+                break;
+            }
+        }
+    }
+    closed
 }
 
 /// The `?format=` of the log route.
@@ -203,6 +324,22 @@ pub async fn resume(
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<ResumeResponse>> {
     let pool = pool(&state)?;
+    // `SRC-4` decision S2-e: the worker's connector is resumed BEFORE the row
+    // is, so a worker that cannot be reached leaves the connector paused (and
+    // this call repeatable) instead of resumed here and stopped there. Only a
+    // pause this route would lift is acted on.
+    if crate::cdc_lifecycle::is_change_capture(&state, &id).await? {
+        let detail = connectors::get_connector(pool, &id).await?;
+        let liftable = detail
+            .and_then(|d| d.connector.paused_reason)
+            .is_some_and(|r| {
+                connectors::is_auto_disable_pause_reason(&r)
+                    || connectors::is_person_pause_reason(&r)
+            });
+        if liftable {
+            crate::cdc_lifecycle::resume_in_connect(&state, &id).await?;
+        }
+    }
     match connectors::resume_connector(pool, &id).await? {
         ResumeOutcome::Resumed => {}
         ResumeOutcome::NotPaused => {
@@ -219,10 +356,166 @@ pub async fn resume(
         json!({ "pausedBy": "auto_disable" }),
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record connector.resume audit event");
-    }
+    audit_coverage::record_best_effort(&state, event).await;
     Ok(ApiJson(ResumeResponse { resumed: true }))
+}
+
+/// Shown when Pause finds the connector paused already.
+const ALREADY_PAUSED: &str = "This connector is already paused.";
+
+/// The answer to `POST /api/connectors/{id}/pause`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PauseResponse {
+    /// Always `true`; any other outcome is a 409.
+    paused: bool,
+}
+
+/// `POST /api/connectors/{id}/pause` -- pause a connector until a person
+/// resumes it (`SRC-4` decision S2-e). The row gets the fixed reason
+/// [`connectors::PERSON_PAUSE_REASON`]; a change-capture connector is paused in
+/// `Kafka Connect` too, and the row is put back as it was if the worker cannot
+/// be paused. Written to the audit trail.
+///
+/// # Errors
+///
+/// 409 with a fixed text when the connector is paused already; 404 for another
+/// tenant's or an unknown connector; 503 when `Kafka Connect` cannot be
+/// reached; 503/500 as the store reports.
+pub async fn pause(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<PauseResponse>> {
+    let pool = pool(&state)?;
+    let capture = crate::cdc_lifecycle::is_change_capture(&state, &id).await?;
+    match connectors::pause_connector(pool, &id).await? {
+        connectors::PauseOutcome::Paused => {}
+        connectors::PauseOutcome::AlreadyPaused => {
+            return Err(ApiError::Conflict(ALREADY_PAUSED.to_owned()).into());
+        }
+    }
+    if capture && let Err(err) = crate::cdc_lifecycle::pause_in_connect(&state, &id).await {
+        // Put the row back: a pause only the registry knows about would stop
+        // the loads and leave the worker reading.
+        if let Err(rollback) = connectors::resume_connector(pool, &id).await {
+            tracing::error!(%rollback, connector_id = %id, "could not undo a pause the worker refused");
+        }
+        return Err(err.into());
+    }
+    let event = connector_audit_event(&principal, "connector.pause", &id, json!({}), "executed");
+    audit_coverage::record_best_effort(&state, event).await;
+    Ok(ApiJson(PauseResponse { paused: true }))
+}
+
+/// The answer to `GET /api/connectors/{id}/change-capture`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeCaptureResponse {
+    /// `false` when this deployment cannot capture changes or the connector is
+    /// not a change-capture connector; `reason` then says why.
+    supported: bool,
+    /// Why not, in a fixed sentence; absent when supported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    /// `running`, `paused`, `failed`, `starting`, `not_created` (the worker has
+    /// no such connector yet) or `unreachable` (the worker could not be asked);
+    /// absent when not supported. Never a fabricated `running`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'static str>,
+    /// Each selected table's lag, the worst one, the lag limit and whether its
+    /// alert is open (`SRC-4` slice 4); absent when not supported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lag: Option<super::capture_lag::LagReadout>,
+    /// Setup checks a failed connector's trace explains (`SRC-4` Amendment 11, S11-d): for an
+    /// Oracle connector that failed because `ARCHIVELOG` or minimal supplemental logging is off.
+    /// Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    setup_checks: Option<Vec<connectors::SetupCheck>>,
+}
+
+/// Shown for a connector that does not capture changes.
+pub(super) const NOT_CHANGE_CAPTURE: &str = "This connector does not capture changes.";
+
+/// `GET /api/connectors/{id}/change-capture` -- the connector's state in
+/// `Kafka Connect`, in the fixed words of [`ChangeCaptureResponse`]
+/// (`SRC-4` decision S2-h; it replaces the `Debezium` properties panel).
+///
+/// # Errors
+///
+/// 404 for another tenant's or an unknown connector; 503/500 as the store
+/// reports. A worker that cannot be reached is an answer (`unreachable`), not an
+/// error.
+pub async fn change_capture(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<ChangeCaptureResponse>> {
+    use crate::cdc_lifecycle::CaptureState;
+    if !crate::cdc_lifecycle::is_change_capture(&state, &id).await? {
+        return Ok(ApiJson(ChangeCaptureResponse {
+            supported: false,
+            reason: Some(NOT_CHANGE_CAPTURE),
+            state: None,
+            lag: None,
+            setup_checks: None,
+        }));
+    }
+    let found = crate::cdc_lifecycle::capture_state(&state, &id).await?;
+    let state_word = match &found {
+        CaptureState::NotConfigured => {
+            return Ok(ApiJson(ChangeCaptureResponse {
+                supported: false,
+                reason: Some(crate::kafka_connect::NOT_CONFIGURED),
+                state: None,
+                lag: None,
+                setup_checks: None,
+            }));
+        }
+        CaptureState::NotCreated => "not_created",
+        CaptureState::Unreachable => "unreachable",
+        CaptureState::State(found) => found.word(),
+    };
+    // Up to date needs the capture to be running, not only an empty topic
+    // (`crate::capture_lag`).
+    let running = matches!(
+        found,
+        CaptureState::State(crate::kafka_connect::ConnectState::Running)
+    );
+    let lag = super::capture_lag::read_lag(&state, &id, running, OffsetDateTime::now_utc()).await?;
+    // S11-d: a failed Oracle connector says why, when its trace carries one of the two messages
+    // `Debezium` throws for a source that is not set up. The trace itself is never shown.
+    let failed = matches!(
+        found,
+        CaptureState::State(crate::kafka_connect::ConnectState::Failed)
+    );
+    let setup_checks = if failed && oracle_connector(&state, &id).await {
+        let checks = crate::cdc_lifecycle::failure_trace(&state, &id)
+            .await
+            .map(|trace| crate::cdc_setup_check::oracle_trace_checks(&trace))
+            .unwrap_or_default();
+        (!checks.is_empty()).then_some(checks)
+    } else {
+        None
+    };
+    Ok(ApiJson(ChangeCaptureResponse {
+        supported: true,
+        reason: None,
+        state: Some(state_word),
+        lag: Some(lag),
+        setup_checks,
+    }))
+}
+
+/// Whether connector `id` is an Oracle change-capture connector; a store error is "no" (the
+/// checks are advice, and the state answer must not fail for them).
+async fn oracle_connector(state: &AppState, id: &str) -> bool {
+    let Ok(pool) = pool(state) else {
+        return false;
+    };
+    matches!(
+        connectors::get_connector_dial_info(pool, id).await,
+        Ok(Some(info)) if crate::cdc_oracle::is_oracle_cdc(&info)
+    )
 }
 
 // ── The orchestrator's reports ─────────────────────────────────────────────
@@ -483,11 +776,13 @@ pub struct EndBody {
 /// `POST /api/connectors/{id}/run-reports/{runId}/end` -- the run ended
 /// (`SRC-11` decisions D5, D7, D13: `paused` is a run that loaded nothing
 /// because the connector is paused). The first end wins; a repeat, or an end
-/// after the run sensor already closed the run, answers `recorded: false`.
+/// after the run sensor or a read of the run list already closed the run,
+/// answers `recorded: false`.
 ///
 /// # Errors
 ///
-/// 403 as [`report_start`]; 400 for an invalid body or `status: running`;
+/// 403 as [`report_start`]; 400 for an invalid body, `status: running`, or
+/// `reason: timed_out` (D11: that word has two writers, and this is not one);
 /// 404 for an unknown connector or a run that is not this connector's;
 /// 503/500 as the store reports.
 pub async fn report_end(
@@ -500,6 +795,19 @@ pub async fn report_end(
     let req: EndBody = parse_body(&body)?;
     if req.status == RunStatus::Running {
         return Err(ApiError::BadRequest("a run cannot end as running".to_owned()).into());
+    }
+    // D11: `timed_out` is written by `close_run_record` in `load_alerts` (the
+    // sensor's failure report and the read of the run list) and by the run
+    // route, and nowhere else — so this report, whose vocabulary stays the
+    // four words of `SRC-11`, may not set it (`review round 1, R11`; `SRC-43`
+    // added the run list). The orchestrator's own list (`END_REASONS`,
+    // `dagster/dispar_orchestrate/run_reports.py`) does not know the word
+    // either, so nothing sends it today.
+    if req.reason == EndReason::TimedOut {
+        return Err(ApiError::BadRequest(
+            "a run's end report cannot end it as timed_out".to_owned(),
+        )
+        .into());
     }
     let ended_at = report_time("endedAt", req.ended_at.as_deref())?;
     require_connector(&state, &id).await?;
@@ -570,9 +878,16 @@ mod tests {
         tenant: Uuid,
     }
 
-    /// Postgres only: these routes touch neither the orchestrator nor the
+    /// Postgres only. The list route asks the orchestrator about a record still
+    /// `running` (`SRC-43`); here it cannot be reached, so the list answers
+    /// unchanged. No other route of this module touches the orchestrator or the
     /// rule store.
     async fn harness(pool: &sqlx::PgPool) -> Harness {
+        harness_with(pool, &[]).await
+    }
+
+    /// [`harness`] with more settings, for the routes that need `Kafka Connect`.
+    async fn harness_with(pool: &sqlx::PgPool, extra: &[(&str, &str)]) -> Harness {
         let options = pool.connect_options();
         let database_url = format!(
             "postgres://{}:postgres@{}:{}/{}",
@@ -583,6 +898,15 @@ mod tests {
         );
         let mut env = HashMap::new();
         env.insert("DATABASE_URL".to_owned(), database_url);
+        // The dead address `tests/common/mod.rs` uses (`DEAD_UPSTREAM`, which a
+        // unit test cannot see): the run list asks the orchestrator about a
+        // record still `running`, and without this it would call whatever
+        // listens on the default orchestrator address of the developer's
+        // machine.
+        env.insert("DAGSTER_URL".to_owned(), "http://127.0.0.1:1".to_owned());
+        for (key, value) in extra {
+            env.insert((*key).to_owned(), (*value).to_owned());
+        }
         let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
         let tenant: Uuid = sqlx::query_scalar("SELECT id FROM tenant LIMIT 1")
             .fetch_one(pool)
@@ -756,6 +1080,9 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{listed}");
         let run = &listed["runs"][0];
         assert_eq!(listed["runs"].as_array().unwrap().len(), 1);
+        // `review round 1, R8`: the run limit travels with the list, so the
+        // console shows a run as going for as long as the API holds it.
+        assert_eq!(listed["maxRuntimeSeconds"], 21_600);
         assert_eq!(run["runId"], "run-1");
         assert_eq!(run["trigger"], "schedule");
         assert_eq!(run["status"], "succeeded");
@@ -940,6 +1267,41 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "an end before the start");
     }
 
+    /// D11 (`review round 1, R11`): the orchestrator's end report may not end a
+    /// run as `timed_out`. That word is written by `close_run_record` in
+    /// `load_alerts` (the sensor's failure report and the read of the run list)
+    /// and by the run route, and nowhere else (`SRC-43` added the run list), so
+    /// this body is a 400 and the record is untouched.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_end_report_cannot_write_the_timed_out_reason(pool: sqlx::PgPool) {
+        let h = harness(&pool).await;
+        let id = connector(&h, "runs six").await;
+        let me = user(&[h.tenant]);
+        report(
+            &h,
+            &id,
+            "",
+            json!({ "runId": "run-1", "trigger": "schedule" }),
+        )
+        .await;
+
+        let (status, answer) = report(
+            &h,
+            &id,
+            "/run-1/end",
+            json!({ "status": "succeeded", "reason": "timed_out" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+
+        let (_, listed) = call(&h, &me, "GET", &format!("/api/connectors/{id}/runs"), None).await;
+        assert_eq!(
+            listed["runs"][0]["status"], "running",
+            "the refused end wrote nothing: {listed}"
+        );
+        assert_eq!(listed["runs"][0]["endReason"], Value::Null);
+    }
+
     /// D8: history, log and resume answer another tenant's user as an
     /// unknown connector (404), and a user of the tenant sees a run that does
     /// not exist as 404 too.
@@ -1033,6 +1395,197 @@ mod tests {
             StatusCode::CONFLICT,
             "a second resume finds nothing paused"
         );
+    }
+
+    /// `SRC-4` S2-e: a person's pause sets the fixed reason, is audited and
+    /// refused when repeated; Resume lifts it (and only it, with the other
+    /// reasons as before).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_persons_pause_is_audited_refused_twice_and_lifted_by_resume(pool: sqlx::PgPool) {
+        let h = harness(&pool).await;
+        let id = connector(&h, "runs pause one").await;
+        let me = user(&[h.tenant]);
+        let pause = format!("/api/connectors/{id}/pause");
+        let resume = format!("/api/connectors/{id}/resume");
+
+        let (status, answer) = call(&h, &me, "POST", &pause, None).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["paused"], true);
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT paused_reason FROM connector WHERE id = $1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            reason.as_deref(),
+            Some(lakehouse_store::connectors::PERSON_PAUSE_REASON)
+        );
+        let (status, answer) = call(&h, &me, "POST", &pause, None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(answer["error"], ALREADY_PAUSED);
+        let (audited,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM audit_event WHERE action = 'connector.pause' AND resource_id = $1",
+        )
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audited, 1);
+
+        let (status, answer) = call(&h, &me, "POST", &resume, None).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        let paused: bool =
+            sqlx::query_scalar("SELECT paused_at IS NOT NULL FROM connector WHERE id = $1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!paused);
+        // Another tenant's user sees an unknown connector.
+        let stranger = user(&[Uuid::from_u128(99)]);
+        let (status, _) = call(&h, &stranger, "POST", &pause, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Make `id` a change-capture connector (only the column the lifecycle
+    /// reads; no spec is needed for the pause, resume and state routes).
+    async fn make_cdc(pool: &sqlx::PgPool, id: &str) {
+        sqlx::query("UPDATE connector SET adapter = 'cdc', ingest_mode = 'cdc' WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// `SRC-4` S2-e: pausing a change-capture connector pauses its Kafka
+    /// Connect connector, resuming resumes it, and a worker that refuses the
+    /// pause leaves the registry row as it was.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn pausing_and_resuming_follow_into_kafka_connect_and_a_refusal_undoes_the_pause(
+        pool: sqlx::PgPool,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let h = harness_with(&pool, &[("KAFKA_CONNECT_URL", server.uri().as_str())]).await;
+        let id = connector(&h, "runs pause two").await;
+        make_cdc(&pool, &id).await;
+        let me = user(&[h.tenant]);
+        let name = format!("lakehouse-{id}");
+        let secret_text = "Task failed: password for user secret-user is wrong";
+
+        let pause_mock = Mock::given(method("PUT"))
+            .and(path(format!("/connectors/{name}/pause")))
+            .respond_with(ResponseTemplate::new(500).set_body_string(secret_text))
+            .mount_as_scoped(&server)
+            .await;
+        let (status, answer) = call(
+            &h,
+            &me,
+            "POST",
+            &format!("/api/connectors/{id}/pause"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
+        assert!(!answer.to_string().contains("secret-user"));
+        let paused: bool =
+            sqlx::query_scalar("SELECT paused_at IS NOT NULL FROM connector WHERE id = $1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!paused, "the refused pause left the row as it was");
+        drop(pause_mock);
+
+        Mock::given(method("PUT"))
+            .and(path(format!("/connectors/{name}/pause")))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/connectors/{name}/resume")))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (status, _) = call(
+            &h,
+            &me,
+            "POST",
+            &format!("/api/connectors/{id}/pause"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            &h,
+            &me,
+            "POST",
+            &format!("/api/connectors/{id}/resume"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// `SRC-4` S2-h: the state route says `supported: false` with a fixed
+    /// sentence for a connector that captures nothing and for a deployment
+    /// without Kafka Connect, and otherwise the worker's state in fixed words.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_change_capture_state_is_in_fixed_words_and_never_invented(pool: sqlx::PgPool) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let me_tenant = harness(&pool).await.tenant;
+        let me = user(&[me_tenant]);
+
+        let plain = harness(&pool).await;
+        let batch = connector(&plain, "runs state one").await;
+        let (status, answer) = call(
+            &plain,
+            &me,
+            "GET",
+            &format!("/api/connectors/{batch}/change-capture"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(answer["supported"], false);
+        assert_eq!(answer["reason"], NOT_CHANGE_CAPTURE);
+
+        let cdc = connector(&plain, "runs state two").await;
+        make_cdc(&pool, &cdc).await;
+        let (_, answer) = call(
+            &plain,
+            &me,
+            "GET",
+            &format!("/api/connectors/{cdc}/change-capture"),
+            None,
+        )
+        .await;
+        assert_eq!(answer["supported"], false);
+        assert_eq!(answer["reason"], crate::kafka_connect::NOT_CONFIGURED);
+
+        let server = MockServer::start().await;
+        let h = harness_with(&pool, &[("KAFKA_CONNECT_URL", server.uri().as_str())]).await;
+        let uri = format!("/api/connectors/{cdc}/change-capture");
+        let (_, answer) = call(&h, &me, "GET", &uri, None).await;
+        assert_eq!(answer["state"], "not_created", "{answer}");
+        Mock::given(method("GET"))
+            .and(path(format!("/connectors/lakehouse-{cdc}/status")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "connector": {"state": "RUNNING"},
+                "tasks": [{"state": "FAILED"}],
+            })))
+            .mount(&server)
+            .await;
+        let (_, answer) = call(&h, &me, "GET", &uri, None).await;
+        assert_eq!(answer["supported"], true);
+        assert_eq!(answer["state"], "failed", "a failed task is not running");
     }
 
     /// The history answers the newest 50 whatever other connectors ran.

@@ -21,7 +21,7 @@ Part 1:
 2. Get suggestions for columns and functions while typing, with a line of help per function.
 3. See a mistake marked at its position, and be unable to save a formula that does not check out.
 4. Pick a saved field in any chart on that source, like a column; others with access to the source can pick it too.
-5. Ask the assistant: "add profit as revenue minus cost"; it writes the formula, never SQL, and can explain an existing one.
+5. Ask the assistant: "add profit as revenue minus cost"; it writes the formula, never SQL, and can explain an existing one. In Ask mode it explains an existing field the same way, with `list_calculated_fields`, and runs no SQL for the answer.
 
 Part 2:
 
@@ -70,4 +70,15 @@ Part 2:
 - `BI-8-AC3` A formula with a typo shows the error at its position and cannot be saved.
 - `BI-8-AC4` A user without `dashboard:write` cannot create a field; a failure shows a plain message.
 - `BI-8-AC5` A formula over a masked column shows the masked value to a masked role.
-- `AI-4-AC1` "Add profit as revenue minus cost." creates the field through the formula language.
+- `AI-4-AC1` "Add profit as revenue minus cost." creates the field through the formula language. Accepted by the AI owner, 2026-11-13 (staging `80fb2f68`)
+
+## Acceptance run (2026-11-16)
+
+Run on the QA stack (main `0ea686e5` plus the open console pull requests) by browser automation and the API, with evidence kept by the planner. Accepted by the product owner on 2026-11-16.
+
+- `BI-8-AC1`: pass.
+- `BI-8-AC2`: pass.
+- `BI-8-AC3`: pass.
+- `BI-8-AC4`: pass.
+- `BI-8-AC5`: pass.
+- `AI-4-AC1`: pass.

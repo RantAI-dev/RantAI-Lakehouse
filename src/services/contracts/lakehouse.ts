@@ -65,8 +65,10 @@ export type LakehouseSnapshot = {
   operation: "append" | "replace" | "overwrite" | "delete" | string
   /**
    * Who made the commit, where the product recorded it (the snapshot summary
-   * key `rantai.author`, `DATA-15`); `null` where it did not — a load written
-   * through `dlt` records none — and the page then says "unknown".
+   * key `rantai.author`, `DATA-15`); `null` where it did not, and the page then
+   * says "unknown". A file upload records `<name> (file upload)` (`DATA-52`) and
+   * a connector's replace or append its run; a merge load, which `dlt` writes
+   * itself, and a version written before 2026-11-12 record none.
    */
   author: string | null
   summary: LakehouseSnapshotSummary
@@ -74,8 +76,17 @@ export type LakehouseSnapshot = {
 
 export type LakehouseTableStats = {
   fileCount: Measured
-  /** Needs a manifest read this workstream does not do — always `null`. */
+  /**
+   * Live data files below `smallFileThresholdBytes`, measured from the
+   * current snapshot's manifests (OPS-21). `null` only when those manifests
+   * could not be read — never a fabricated zero.
+   */
   smallFileCount: Measured
+  /**
+   * The read threshold a data file must be strictly below to be counted as
+   * small (OPS-21). A documented backend constant, so it is present even when
+   * `smallFileCount` is `null`.
+   */
   smallFileThresholdBytes: Measured
   recordCount: Measured
   totalBytes: Measured
@@ -106,6 +117,38 @@ export type LakehouseTableDetail = {
   /** Oldest first, exactly as the API returns them. */
   snapshots: LakehouseSnapshot[]
   stats: LakehouseTableStats
+  /**
+   * Whether compaction can actually run on this deployment (OPS-21):
+   * `checked && ok` on the same probe set Services reports. `trino` always
+   * has a URL in compose, so config alone cannot distinguish "profile on"
+   * from "never started". `false` means the `trino` profile is off or its
+   * coordinator is unreachable; only then may the console warn.
+   */
+  compactionAvailable: boolean
+}
+
+/** One row of `GET /api/lakehouse/compaction-status`'s `tables[]` (OPS-21). */
+export type LakehouseCompactionTable = {
+  namespace: string
+  name: string
+  /** Measured from manifests; only tables at/above the need count are listed. */
+  smallFileCount: number
+}
+
+/**
+ * `GET /api/lakehouse/compaction-status`'s body (OPS-21), mirroring
+ * `routes::lakehouse::compaction_status_body` field for field. The backend
+ * lists only Bronze tables whose measured count reaches
+ * `needsCompactionFileCount`; unreadable ones are counted in
+ * `unmeasuredTables`, never folded in as a zero.
+ */
+export type LakehouseCompactionStatus = {
+  compactionAvailable: boolean
+  smallFileThresholdBytes: number
+  needsCompactionFileCount: number
+  tables: LakehouseCompactionTable[]
+  measuredTables: number
+  unmeasuredTables: number
 }
 
 /**
@@ -215,6 +258,7 @@ export interface LakehouseService {
     signal?: AbortSignal
   ): Promise<LakehouseTableSummary[]>
   getTableDetail(namespace: string, table: string, signal?: AbortSignal): Promise<LakehouseTableDetail>
+  getCompactionStatus(signal?: AbortSignal): Promise<LakehouseCompactionStatus>
   getMaintenance(namespace: string, table: string, signal?: AbortSignal): Promise<LakehouseMaintenance>
   setMaintenancePolicy(
     namespace: string,

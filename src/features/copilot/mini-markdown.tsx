@@ -1,6 +1,6 @@
 import * as React from "react";
 import { OMITTED_TABLE_TEXT, UNVERIFIED_NUMBER_LABEL, tokenizeInline } from "@/lib/citation-markers";
-import { plainPreview } from "@/lib/copilot-sessions";
+import { plainPreview, stripUnverifiedMarkers } from "@/lib/copilot-sessions";
 import { CopyButton } from "./copy-button";
 
 /**
@@ -33,7 +33,7 @@ function renderInline(text: string, keyBase: string): React.ReactNode[] {
       case "code":
         return (
           <code key={key} className="rounded-md border border-border/70 bg-muted/70 px-1.5 py-px font-mono text-[0.85em] text-foreground">
-            {tok.content}
+            {stripUnverifiedMarkers(tok.content)}
           </code>
         );
       case "italic":
@@ -47,7 +47,7 @@ function renderInline(text: string, keyBase: string): React.ReactNode[] {
             rel="noopener noreferrer"
             className="font-medium text-primary underline underline-offset-2"
           >
-            {tok.content}
+            {renderInline(tok.content, key)}
           </a>
         );
       case "unverified":
@@ -97,7 +97,10 @@ function splitRow(line: string): string[] {
     .map((c) => c.trim());
 }
 
-function CodeBlock({ code, lang }: { code: string; lang: string }) {
+function CodeBlock({ code: raw, lang }: { code: string; lang: string }) {
+  // Code is not a claim, so a marker the server wrote into it shows as the
+  // bare number, and copying the block gives code without markup.
+  const code = stripUnverifiedMarkers(raw);
   return (
     <div className="my-2 overflow-hidden rounded-xl border border-border bg-muted/40">
       <div className="flex items-center justify-between border-b border-border bg-muted/40 px-3 py-1">

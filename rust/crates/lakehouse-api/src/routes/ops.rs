@@ -1,5 +1,4 @@
-//! `GET /api/ops/{kind}` — operational views: `observability`, `workloads`,
-//! `services`.
+//! `GET /api/ops/{kind}` — operational views: `workloads`, `services`.
 //!
 //! Ports `src/app/api/ops/[kind]/route.ts`. An unrecognized `kind` returns
 //! HTTP 400 with `{"error": "unknown kind: <kind>"}`, verified against
@@ -10,6 +9,14 @@
 //! with compute units relabelled as spend. Nothing but the now-removed
 //! Usage page called it, so `"usage"` now falls through to
 //! [`Kind::Unknown`] like any other unrecognized value.
+//!
+//! `observability` was retired in WEB-4: it served only the removed
+//! Observability page, and the audit found no assistant tool, console
+//! client, CLI or script caller. Its metrics helpers are gone; the path
+//! still matches the `{kind}` dispatcher, so it answers 404 rather than
+//! the 400 a never-known kind gets ([`Kind::Retired`]). `workloads` and
+//! `services` stay — the assistant's `list_workloads`/`kill_query` tools
+//! and the System status page still read them.
 
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
@@ -17,27 +24,29 @@ use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ident::SqlLiteral;
-use lakehouse_store::PgPool;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::health;
 use crate::json::ApiJson;
-use crate::routes::support::{num_or_zero, str_col, upstream_message};
+use crate::routes::support::{str_col, upstream_message};
 use crate::state::AppState;
 use crate::tenant::{TENANT_ID, TENANT_SITE};
 use lakehouse_dagster::DgError;
 
-/// The three recognized `ops/{kind}` values. Ported from the `if (kind ===
-/// ...)` chain in `ops/[kind]/route.ts`; anything else is [`Kind::Unknown`].
+/// The recognized `ops/{kind}` values. Ported from the `if (kind === ...)`
+/// chain in `ops/[kind]/route.ts`; anything else is [`Kind::Unknown`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
-    /// `ops/observability` — query SLOs.
-    Observability,
     /// `ops/workloads` — currently running `ClickHouse` processes.
     Workloads,
     /// `ops/services` — component health checks.
     Services,
+    /// A kind whose view was retired (WEB-4). The path still matches the
+    /// `{kind}` dispatcher, so it is a 404 — the resource is gone, not
+    /// misspelt. Kept distinct from [`Kind::Unknown`]'s 400 so a caller
+    /// can tell "removed" from "never existed".
+    Retired,
     /// Anything else, which the TypeScript rejects with HTTP 400. Also
     /// where `"usage"` lands now that the Usage page is gone (WS1).
     Unknown,
@@ -46,9 +55,11 @@ enum Kind {
 impl Kind {
     fn parse(kind: &str) -> Self {
         match kind {
-            "observability" => Self::Observability,
             "workloads" => Self::Workloads,
             "services" => Self::Services,
+            // WEB-4: observability served only the removed page; every
+            // caller was checked before retiring it (module doc).
+            "observability" => Self::Retired,
             _ => Self::Unknown,
         }
     }
@@ -65,6 +76,13 @@ enum OpsError {
 /// `GET /api/ops/{kind}`.
 pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Response {
     match Kind::parse(&kind) {
+        // WEB-4: the retired view is 404, distinct from a never-known kind's
+        // 400 (the parity corpus pins `bogus-kind` at 400).
+        Kind::Retired => (
+            StatusCode::NOT_FOUND,
+            ApiJson(json!({ "error": format!("unknown kind: {kind}") })),
+        )
+            .into_response(),
         Kind::Unknown => (
             StatusCode::BAD_REQUEST,
             ApiJson(json!({ "error": format!("unknown kind: {kind}") })),
@@ -85,196 +103,20 @@ pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Res
 
 async fn run(state: &AppState, kind: Kind) -> Result<Value, OpsError> {
     match kind {
-        Kind::Observability => observability(state).await,
         Kind::Workloads => workloads(&state.clickhouse).await,
         Kind::Services => services(state).await,
-        Kind::Unknown => unreachable!("Kind::Unknown is handled before `run` is called"),
+        Kind::Retired | Kind::Unknown => {
+            unreachable!("retired and unknown kinds are handled before `run` is called")
+        }
     }
 }
 
-/// Build the `ops/observability` JSON from measured `p95`/`err`, extracted
-/// so the unmeasured fields it nulls (and the dropped
-/// `streamingLagSeconds` key) can be asserted without a `ClickHouse` call.
-///
-/// `ingest_lag` (WS5 item B3), `cache_hit_rate` (WS5 item B4),
-/// `agent_success_rate` (WS5 item B5), and `policy_decision_p95_ms` (WS7
-/// item C2) are real, computed `Option<f64>`s from the caller
-/// (`observability`) -- `None` serializes to `null` the same way the
-/// still-unmeasured fields below do, never a fabricated `0`.
-fn observability_json(
-    p95: i64,
-    err: f64,
-    ingest_lag: Option<f64>,
-    cache_hit_rate: Option<f64>,
-    agent_success_rate: Option<f64>,
-    policy_decision_p95_ms: Option<f64>,
-) -> Value {
-    json!({
-        "queryP95Ms": p95,
-        "queryErrorRate": err,
-        "ingestLagSeconds": ingest_lag,
-        "cacheHitRate": cache_hit_rate,
-        // WS7 item C2: a real p95 over `AppState::policy_decision_latencies`
-        // once at least one query has run `sql_rewrite::enforce`'s
-        // prefetch+rewrite step (`routes::query::run`); `null` — never a
-        // fabricated `0` — until then. Nothing measures open incidents
-        // yet, so that one stays `null` (P5 review / WS1 honesty pass
-        // task 1.7). `streamingLagSeconds` is dropped outright: it has no
-        // consumer in the TypeScript contract and nothing measures
-        // streaming either.
-        "policyDecisionP95Ms": policy_decision_p95_ms,
-        "agentSuccessRate": agent_success_rate,
-        "activeIncidents": Value::Null,
-        "slos": [
-            {
-                "name": "Query p95 < 2s",
-                "target": "2000ms",
-                "current": format!("{p95}ms"),
-                "ok": p95 < 2000,
-            },
-            {
-                "name": "Query error rate < 1%",
-                "target": "1%",
-                "current": format!("{:.2}%", err * 100.0),
-                "ok": err < 0.01,
-            },
-        ],
-    })
-}
-
-async fn observability(state: &AppState) -> Result<Value, OpsError> {
-    let ch = &state.clickhouse;
-    let pg = state.pg.as_deref();
-    let rows = ch
-        .rows(
-            "SELECT toString(round(quantile(0.95)(query_duration_ms))) p95,
-                  toString(round(countIf(exception != '') / greatest(count(),1), 4)) err,
-                  toString(count()) n
-           FROM system.query_log
-           WHERE type='QueryFinish' AND event_time > now() - INTERVAL 24 HOUR",
-            None,
-        )
-        .await?;
-    let q = rows.first();
-    let p95 = num_or_zero(q, "p95");
-    let err = q
-        .and_then(|r| str_col(r, "err").parse::<f64>().ok())
-        .unwrap_or(0.0);
-    let ingest_lag = ingest_lag_seconds(ch).await;
-    let cache_hit_rate = cache_hit_rate(ch).await;
-    let agent_success_rate = agent_success_rate(pg).await;
-    let policy_decision_p95_ms = state.policy_decision_latencies.p95_ms();
-    Ok(observability_json(
-        p95,
-        err,
-        ingest_lag,
-        cache_hit_rate,
-        agent_success_rate,
-        policy_decision_p95_ms,
-    ))
-}
-
-/// `observability.ingestLagSeconds` (WS5 item B3, corrected against WS3's
-/// real, approved `bronze_meta.ingest_run` schema against a prior draft
-/// that assumed a `finished_at` temporal column this table does not have
-/// -- WS5 plan review U3). Per connector, the age of its own latest
-/// **successful** run; across connectors, the max of those ages -- the
-/// worst currently-stale connector, not the age of the single oldest row
-/// ever recorded (which only ever grows and never reflects current
-/// staleness). A connector with no successful run in the table
-/// contributes nothing to this aggregate: a connector that has never once
-/// ingested successfully is a real, separate gap this metric does not
-/// encode -- it is visible elsewhere (connector health status), not
-/// fabricated into a lag number here as "infinitely stale" (which would
-/// hide every other connector's real staleness behind one always-failing
-/// connector). If the table doesn't exist yet (WS3 not landed on this
-/// branch) or the query otherwise fails, this returns `None` and logs at
-/// `warn`, never a 500/503 for the rest of `/api/ops/observability`.
-async fn ingest_lag_seconds(ch: &ChClient) -> Option<f64> {
-    let rows = ch
-        .rows(
-            "SELECT connector_id, max(ended_at) AS latest_success \
-             FROM lake.`bronze_meta.ingest_run` \
-             WHERE status = 'succeeded' \
-             GROUP BY connector_id",
-            None,
-        )
-        .await;
-    let rows = match rows {
-        Ok(rows) => rows,
-        Err(err) => {
-            tracing::warn!(error = %err, "ingest_lag_seconds: bronze_meta.ingest_run unavailable");
-            return None;
-        }
-    };
-    let now = time::OffsetDateTime::now_utc();
-    rows.iter()
-        .filter_map(|r| {
-            let ended_at_str = str_col(r, "latest_success");
-            // `ended_at` is a `ClickHouse` `String` (WS3's own schema --
-            // not a temporal type), so parse it the same way this file
-            // already parses ISO-shaped `String` timestamps elsewhere
-            // (`started_at_from_ms_column`'s siblings), never a
-            // `dateDiff` push-down that assumes a temporal column type
-            // this table does not have.
-            time::OffsetDateTime::parse(
-                ended_at_str,
-                &time::format_description::well_known::Rfc3339,
-            )
-            .ok()
-        })
-        .map(|ended_at| (now - ended_at).as_seconds_f64())
-        .fold(None, |acc: Option<f64>, age| {
-            Some(acc.map_or(age, |a| a.max(age)))
-        })
-}
-
-/// `observability.cacheHitRate` (WS5 item B4) -- real, verified live on
-/// this instance (see the plan's "External signals verified" section).
-/// 24h window, matching `q_row`'s window in `overview.rs` for consistency
-/// across the two routes that both summarize the last day of
-/// `system.query_log`. `None` when no cache-eligible queries ran in the
-/// window (`hits + misses == 0`) -- "no data" is not "0% hit rate," which
-/// would read as a real, poor measurement rather than "not measured."
-async fn cache_hit_rate(ch: &ChClient) -> Option<f64> {
-    let rows = ch
-        .rows(
-            "SELECT toString(sum(ProfileEvents['QueryCacheHits'])) hits, \
-                    toString(sum(ProfileEvents['QueryCacheMisses'])) misses \
-             FROM system.query_log \
-             WHERE type = 'QueryFinish' AND event_time > now() - INTERVAL 24 HOUR",
-            None,
-        )
-        .await
-        .ok()?;
-    let row = rows.first()?;
-    let hits = str_col(row, "hits").parse::<f64>().ok()?;
-    let misses = str_col(row, "misses").parse::<f64>().ok()?;
-    let total = hits + misses;
-    (total > 0.0).then_some(hits / total)
-}
-
-/// `overview.agentSuccessRate`/`ops.observability.agentSuccessRate` (WS5
-/// item B5) -- the fraction of `agent_run` rows completed in the last 24h
-/// that succeeded. `None` both when no Postgres pool is configured and
-/// when there are zero completed runs (no denominator) -- "no data" is
-/// not "0% success," which would read as a real, poor measurement rather
-/// than "not measured." Any query failure also degrades to `None`, never
-/// a 503 for the rest of `/api/ops/observability`.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "agent_run counts in this deployment are nowhere near f64's 52-bit mantissa \
-              limit; the precision this could lose is not reachable in practice"
-)]
-async fn agent_success_rate(pg: Option<&PgPool>) -> Option<f64> {
-    let pool = pg?;
-    let (succeeded, failed) = lakehouse_store::agents::count_agent_run_outcomes(pool)
-        .await
-        .inspect_err(|err| tracing::warn!(%err, "count_agent_run_outcomes failed"))
-        .ok()?;
-    let total = succeeded + failed;
-    (total > 0).then_some(succeeded as f64 / total as f64)
-}
+// WEB-4: the observability view (query SLOs, ingest lag, cache hit rate,
+// agent success rate, policy-decision p95) lived here. It served only the
+// removed Observability page; the audit found no other caller. The helpers
+// and their tests were removed with the `Kind::Observability` arm, not
+// left as dead code. `count_agent_run_outcomes` stays in `lakehouse-store`
+// (a public store function, no schema change) for any future consumer.
 
 /// Build one `ops/workloads` row from a `system.processes` fixture row.
 /// `started_ms` is computed by `ClickHouse` in the same query as `elapsed`
@@ -296,7 +138,7 @@ fn started_at_from_ms_column(p: &Map<String, Value>) -> Option<String> {
 }
 
 fn workload_row(index: usize, p: &Map<String, Value>) -> Value {
-    let elapsed_secs = str_col(p, "elapsed").parse::<f64>().unwrap_or(0.0);
+    let elapsed_secs = str_col(p, "elapsed_s").parse::<f64>().unwrap_or(0.0);
     let started_at = started_at_from_ms_column(p);
     json!({
         "id": format!("w-{index}"),
@@ -320,7 +162,12 @@ fn workload_row(index: usize, p: &Map<String, Value>) -> Value {
 async fn workloads(ch: &ChClient) -> Result<Value, OpsError> {
     let procs = ch
         .rows(
-            "SELECT user, toString(elapsed) elapsed, substring(query,1,80) query,
+            // The computed column is named `elapsed_s`, not `elapsed`: an
+            // alias shadows the column it names, so `elapsed * 1000` in the
+            // same statement multiplied the alias's `String` by a `UInt16`
+            // and the engine refused the whole statement (error 43) —
+            // which the route turned into a 503 for every caller.
+            "SELECT user, toString(elapsed) AS elapsed_s, substring(query,1,80) query,
                   toString(toUnixTimestamp64Milli(now64(3)) - toInt64(elapsed * 1000)) started_ms
          FROM system.processes WHERE query NOT LIKE '%system.processes%' LIMIT 50",
             None,
@@ -376,7 +223,13 @@ async fn services(state: &AppState) -> Result<Value, OpsError> {
         .iter()
         .map(|h| platform_service_row(h, deps_for(h.id)))
         .collect();
-    Ok(json!({ "services": services }))
+    // `GOV-1` Decision 4: the audit rows this process could not write, shown
+    // on the Operations page beside the probes. It rides on this answer so the
+    // console makes no second request, and it counts since the start.
+    Ok(json!({
+        "services": services,
+        "auditWriteFailures": state.audit_write_failure_count(),
+    }))
 }
 
 /// `Math.round((Number(p.elapsed) || 0) * 1000)`.
@@ -503,7 +356,10 @@ async fn cancel_workload_body(ch: &ChClient, id: &str) -> Result<Option<Value>, 
     };
     let procs = ch
         .rows(
-            "SELECT query_id, user, toString(elapsed) elapsed, substring(query,1,80) query,
+            // The same statement the workloads route runs, plus the
+            // `query_id`; the computed column is named `elapsed_s` for the
+            // same reason (an alias named `elapsed` shadows the column).
+            "SELECT query_id, user, toString(elapsed) AS elapsed_s, substring(query,1,80) query,
                   toString(toUnixTimestamp64Milli(now64(3)) - toInt64(elapsed * 1000)) started_ms
              FROM system.processes WHERE query NOT LIKE '%system.processes%' LIMIT 50",
             None,
@@ -518,7 +374,7 @@ async fn cancel_workload_body(ch: &ChClient, id: &str) -> Result<Option<Value>, 
     }
     ch.exec(&kill_query_sql(&KillTarget::Exact(query_id)), None)
         .await?;
-    let elapsed_secs = str_col(row, "elapsed").parse::<f64>().unwrap_or(0.0);
+    let elapsed_secs = str_col(row, "elapsed_s").parse::<f64>().unwrap_or(0.0);
     Ok(Some(json!({
         "id": id,
         "principal": str_col(row, "user"),
@@ -738,9 +594,16 @@ mod tests {
 
     #[test]
     fn kind_parses_known_values() {
-        assert_eq!(Kind::parse("observability"), Kind::Observability);
         assert_eq!(Kind::parse("workloads"), Kind::Workloads);
         assert_eq!(Kind::parse("services"), Kind::Services);
+    }
+
+    /// WEB-4: the retired observability path still matches `{kind}`, but
+    /// must be told apart from a kind that never existed (400).
+    #[test]
+    fn kind_parse_retired_observability_is_distinct_from_unknown() {
+        assert_eq!(Kind::parse("observability"), Kind::Retired);
+        assert_eq!(Kind::parse("bogus-kind"), Kind::Unknown);
     }
 
     #[test]
@@ -848,62 +711,38 @@ mod tests {
         }
     }
 
-    #[test]
-    fn observability_nulls_every_unmeasured_metric_and_drops_streaming_lag() {
-        let v = observability_json(120, 0.002, None, None, None, None);
-        assert_eq!(v["queryP95Ms"], 120);
-        assert!((v["queryErrorRate"].as_f64().unwrap() - 0.002).abs() < f64::EPSILON);
-        for field in [
-            "ingestLagSeconds",
-            "cacheHitRate",
-            "policyDecisionP95Ms",
-            "agentSuccessRate",
-            "activeIncidents",
-        ] {
-            assert!(v[field].is_null(), "{field} should be null");
-        }
-        assert!(
-            v.get("streamingLagSeconds").is_none(),
-            "streamingLagSeconds must be removed, not just nulled"
-        );
-        assert!(v["slos"].is_array());
-    }
+    /// `GOV-1` Decision 4: the Operations page shows how many audit rows could
+    /// not be written since the process started, as a sibling of `services`.
+    /// A state with no database fails every audit write, so one best-effort
+    /// write moves the counter from 0 to 1 and the response follows it.
+    #[tokio::test]
+    async fn services_reports_the_failed_audit_write_count() {
+        let state = AppState::without_a_database();
+        let body = services(&state).await.unwrap();
+        assert_eq!(body["auditWriteFailures"], 0);
 
-    /// WS5 item B3 -- a real, computed ingest lag passes through as a real
-    /// number, never left null once it is actually measured.
-    #[test]
-    fn observability_reports_a_real_ingest_lag_when_measured() {
-        let v = observability_json(120, 0.002, Some(42.5), None, None, None);
-        assert_eq!(v["ingestLagSeconds"], 42.5);
-    }
+        crate::audit_coverage::record_best_effort(
+            &state,
+            lakehouse_store::audit::NewAuditEvent {
+                action: "saved_query.update".to_owned(),
+                outcome: "executed".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await;
 
-    /// WS5 item B4 -- likewise for a real, computed cache hit rate.
-    #[test]
-    fn observability_reports_a_real_cache_hit_rate_when_measured() {
-        let v = observability_json(120, 0.002, None, Some(0.8), None, None);
-        assert_eq!(v["cacheHitRate"], 0.8);
-    }
-
-    /// WS5 item B5 -- likewise for a real, computed agent success rate.
-    #[test]
-    fn observability_reports_a_real_agent_success_rate_when_measured() {
-        let v = observability_json(120, 0.002, None, None, Some(0.75), None);
-        assert_eq!(v["agentSuccessRate"], 0.75);
-    }
-
-    /// WS7 item C2 -- likewise for a real, measured `policyDecisionP95Ms`,
-    /// closing the `null` WS1's honesty pass left in place.
-    #[test]
-    fn observability_reports_a_real_policy_decision_p95_when_measured() {
-        let v = observability_json(120, 0.002, None, None, None, Some(3.5));
-        assert_eq!(v["policyDecisionP95Ms"], 3.5);
+        let body = services(&state).await.unwrap();
+        assert_eq!(body["auditWriteFailures"], 1);
+        assert!(body["services"].is_array(), "the rows stay as they were");
     }
 
     #[test]
     fn workload_started_at_is_derived_from_elapsed_not_the_request_time() {
         let mut row = Map::new();
         row.insert("user".to_owned(), Value::String("alice".to_owned()));
-        row.insert("elapsed".to_owned(), Value::String("1.5".to_owned()));
+        // The column the statement names is `elapsed_s` (`elapsed` is the
+        // column it is computed from, and an alias cannot shadow it).
+        row.insert("elapsed_s".to_owned(), Value::String("1.5".to_owned()));
         // `started_ms` is what `now64() - elapsed*1000` would produce on
         // the server; the epoch millisecond for 2026-08-27T04:00:10.075Z.
         row.insert(
@@ -915,13 +754,15 @@ mod tests {
         assert_eq!(v["engine"], "hot-store");
         assert!(v["class"].is_null());
         assert!(v["estimatedCost"].is_null());
+        // The elapsed time is read from the column the statement names.
+        assert_eq!(v["elapsedMs"], 1500);
     }
 
     #[test]
     fn workload_started_at_is_null_when_started_ms_does_not_parse() {
         let mut row = Map::new();
         row.insert("user".to_owned(), Value::String("bob".to_owned()));
-        row.insert("elapsed".to_owned(), Value::String("0.2".to_owned()));
+        row.insert("elapsed_s".to_owned(), Value::String("0.2".to_owned()));
         row.insert("started_ms".to_owned(), Value::String(String::new()));
         let v = workload_row(1, &row);
         assert!(
@@ -1041,156 +882,14 @@ mod tests {
         assert_eq!(index, None);
     }
 
-    // ── observability.ingestLagSeconds (WS5 item B3) ────────────────────
+    // ── shared ClickHouse fixture client (GET /api/ops/logs tests) ──────
 
     fn ch_client(url: &str) -> ChClient {
         ChClient::new(url.to_owned(), "default".to_owned(), String::new())
     }
 
-    /// The worst currently-stale connector: per connector, the age of its
-    /// own latest *successful* run -- across connectors, the max of those
-    /// ages. Never the age of the single oldest row ever recorded (which
-    /// only ever grows and would misreport every connector as equally
-    /// stale forever).
-    #[tokio::test]
-    async fn ingest_lag_seconds_is_the_max_per_connector_latest_success_age() {
-        let server = wiremock::MockServer::start().await;
-        // connector-a's latest success is 10 minutes old; connector-b's is
-        // 2 hours old -- connector-b is the worse (staler) of the two, so
-        // the aggregate must be ~2h, not connector-a's 10 minutes and not
-        // some other, older row from either connector's history.
-        let now = time::OffsetDateTime::now_utc();
-        let a_latest = now - time::Duration::minutes(10);
-        let b_latest = now - time::Duration::hours(2);
-        let body = json!({
-            "meta": [],
-            "data": [
-                { "connector_id": "connector-a", "latest_success": a_latest
-                    .format(&time::format_description::well_known::Rfc3339).unwrap() },
-                { "connector_id": "connector-b", "latest_success": b_latest
-                    .format(&time::format_description::well_known::Rfc3339).unwrap() },
-            ],
-            "rows": 2,
-        });
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
-            .mount(&server)
-            .await;
-
-        let lag = ingest_lag_seconds(&ch_client(&server.uri())).await;
-        let lag = lag.expect("a successful row must produce a lag");
-        // ~2 hours = 7200s, with generous slack for test wall-clock drift.
-        assert!(
-            (7100.0..7300.0).contains(&lag),
-            "expected ~2h staleness from connector-b, got {lag}s"
-        );
-    }
-
-    /// A connector whose only rows are non-`succeeded` contributes nothing
-    /// -- it must not be treated as "infinitely stale" (which would hide
-    /// every other connector's real staleness) and must not crash the
-    /// query (there is simply no `latest_success` row for it, since the
-    /// query already filters `WHERE status = 'succeeded'`).
-    #[tokio::test]
-    async fn ingest_lag_seconds_ignores_a_connector_with_no_successful_run() {
-        let server = wiremock::MockServer::start().await;
-        let now = time::OffsetDateTime::now_utc();
-        let only_success = now - time::Duration::minutes(5);
-        // The query's own `WHERE status = 'succeeded'` means an
-        // always-failing connector never appears in this result set at
-        // all -- simulated here by simply not including one.
-        let body = json!({
-            "meta": [],
-            "data": [
-                { "connector_id": "connector-ok", "latest_success": only_success
-                    .format(&time::format_description::well_known::Rfc3339).unwrap() },
-            ],
-            "rows": 1,
-        });
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
-            .mount(&server)
-            .await;
-
-        let lag = ingest_lag_seconds(&ch_client(&server.uri())).await;
-        let lag = lag.expect("the one successful connector must still produce a lag");
-        assert!(
-            (280.0..320.0).contains(&lag),
-            "expected ~5m staleness, got {lag}s"
-        );
-    }
-
-    /// A simulated "unknown table" failure (WS3's `bronze_meta.ingest_run`
-    /// not landed on this branch yet) is `None`, never propagated as a
-    /// 500/503 for the rest of `/api/ops/observability`.
-    #[tokio::test]
-    async fn ingest_lag_seconds_is_none_when_the_table_is_unavailable() {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string(
-                "Code: 60. DB::Exception: Table lake.bronze_meta.ingest_run doesn't exist",
-            ))
-            .mount(&server)
-            .await;
-
-        assert!(
-            ingest_lag_seconds(&ch_client(&server.uri()))
-                .await
-                .is_none()
-        );
-    }
-
-    // ── observability.cacheHitRate (WS5 item B4) ────────────────────────
-
-    #[tokio::test]
-    async fn cache_hit_rate_divides_hits_by_hits_plus_misses() {
-        let server = wiremock::MockServer::start().await;
-        let body = json!({
-            "meta": [],
-            "data": [{ "hits": "8", "misses": "2" }],
-            "rows": 1,
-        });
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
-            .mount(&server)
-            .await;
-
-        let rate = cache_hit_rate(&ch_client(&server.uri())).await;
-        assert_eq!(rate, Some(0.8));
-    }
-
-    /// No cache-eligible queries ran in the window: both counters are
-    /// zero, so this is "no data," not "0% hit rate" -- `None`, never `0`.
-    #[tokio::test]
-    async fn cache_hit_rate_is_none_when_there_is_no_denominator() {
-        let server = wiremock::MockServer::start().await;
-        let body = json!({
-            "meta": [],
-            "data": [{ "hits": "0", "misses": "0" }],
-            "rows": 1,
-        });
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
-            .mount(&server)
-            .await;
-
-        assert_eq!(cache_hit_rate(&ch_client(&server.uri())).await, None);
-    }
-
-    // ── observability.agentSuccessRate (WS5 item B5) ────────────────────
-    //
-    // The store-level `count_agent_run_outcomes` fixtures (running-runs
-    // excluded, zero-denominator -> (0, 0)) live in
-    // `lakehouse-store/tests/agents.rs` against a real Postgres per this
-    // plan's own testing rule ("store tests
-    // `#[sqlx::test(migrations = "../../migrations")]`"). This route-level
-    // test only needs the "no pool configured" path, which never reaches
-    // a database at all.
-
-    #[tokio::test]
-    async fn agent_success_rate_is_none_without_a_configured_pool() {
-        assert_eq!(agent_success_rate(None).await, None);
-    }
+    // WEB-4 removed the ingest-lag, cache-hit-rate and agent-success-rate
+    // tests with the observability view they measured.
 
     // ── GET /api/ops/logs (WS5 item G1) ─────────────────────────────────
 

@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import {
-  ChartColumn, Check, Copy, Download, Eye, FileDown, History, Mail, Printer, Maximize2, Minimize2, MoreHorizontal, Palette, Pencil, RefreshCw, Save, Share2, Timer, Trash2,
+  ChartColumn, Check, Copy, Download, Eye, FileDown, History, LayoutTemplate, Mail, Printer, Maximize2, Minimize2, MoreHorizontal, Palette, Pencil, RefreshCw, Save, Share2, Timer, Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -13,6 +13,7 @@ import {
   DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { REFRESH_OPTIONS } from "@/lib/dashboard-refresh";
@@ -22,7 +23,7 @@ import { PDF_NOT_SET_UP } from "./chart-download";
 export function DashboardActionsMenu({
   isDefault, canWrite, canManage = canWrite, isPrivate, onHistory, onTheme, onFreshness, loading, fullscreen, autoSec, savedSec, canSaveRefresh, savingRefresh,
   onRefresh, onToggleFullscreen, onAutoSec, onSaveRefresh, onRename, onShare, onExportPdf, onDuplicate, onDelete,
-  onDownloadPdf, pdfSupported = true, canDownload = true, onSubscriptions, onExportFile,
+  onDownloadPdf, pdfSupported = true, canDownload = true, onSubscriptions, onExportFile, onSaveTemplate,
 }: {
   readonly isDefault: boolean;
   /**
@@ -71,6 +72,8 @@ export function DashboardActionsMenu({
   readonly onSubscriptions?: () => void;
   /** Downloads the dashboard as a file to import elsewhere (`BI-19` part D); left out when absent. */
   readonly onExportFile?: () => void;
+  /** Opens "Save as template" (`BI-18` part D, T6); left out when absent, without edit, when downloads are off, and on the built-in dashboard. */
+  readonly onSaveTemplate?: () => void;
   readonly onDuplicate: () => void;
   readonly onDelete: () => void;
 }) {
@@ -218,6 +221,12 @@ export function DashboardActionsMenu({
                 <Copy className="size-4" /> Duplicate
               </DropdownMenuItem>
             ) : null}
+            {/* BI-18 D review round 1, BLOCKER 1: a template holds what the dashboard file holds, so it follows the download switch too. */}
+            {canWrite && canDownload && !isDefault && onSaveTemplate ? (
+              <DropdownMenuItem onClick={onSaveTemplate}>
+                <LayoutTemplate className="size-4" /> Save as template…
+              </DropdownMenuItem>
+            ) : null}
           </DropdownMenuGroup>
           {!isDefault && canManage ? (
             <>
@@ -252,14 +261,20 @@ export function RenameDashboardDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-sm">
         <DialogHeader><DialogTitle>Rename dashboard</DialogTitle></DialogHeader>
-        <Input
-          autoFocus
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter" && clean) onSave(clean); }}
-          placeholder="Dashboard name"
-          aria-label="Dashboard name"
-        />
+        <div className="grid gap-1.5">
+          {/* UX-4: the name is this dialog's one required input, so no star
+              and no legend; the input keeps `aria-required`. */}
+          <Label htmlFor="rename-dashboard-name">Name</Label>
+          <Input
+            id="rename-dashboard-name"
+            autoFocus
+            aria-required
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && clean) onSave(clean); }}
+            placeholder="Dashboard name"
+          />
+        </div>
         <DialogFooter>
           <DialogClose render={<Button variant="ghost" size="sm" />}>Cancel</DialogClose>
           <Button size="sm" disabled={!clean} onClick={() => onSave(clean)}>Save</Button>

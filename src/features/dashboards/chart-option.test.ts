@@ -79,6 +79,31 @@ test("a horizontal bar with several measures reverses every series with its cate
   assert.deepEqual((option.yAxis as { data: string[] }).data, ["b", "a"])
 })
 
+// QA LH-BI-6-25 (BI-49): a radar compares measures on one shared scale and
+// names each in the legend, instead of drawing only the first.
+test("a radar draws one shape per measure on one shared scale and names each in the legend", () => {
+  const rows = [{ kota: "X", a: 10, b: 2000 }, { kota: "Y", a: 30, b: 1000 }]
+  const option = buildOption({ kind: "radar", x: "kota", y: ["a", "b"] }, rows, false)
+  const series = option.series as { data: { name: string; value: number[] }[] }[]
+  assert.equal(series.length, 1)
+  assert.deepEqual(series[0].data.map((d) => d.name), ["a", "b"])
+  assert.deepEqual(series[0].data.map((d) => d.value), [[10, 30], [2000, 1000]])
+  const radar = option.radar as { indicator: { max: number }[] }
+  assert.deepEqual(radar.indicator.map((i) => i.max), [2200, 2200])
+  const legend = option.legend as { data: string[] }
+  assert.deepEqual(legend.data, ["a", "b"])
+})
+
+test("a radar with one measure has no legend and keeps the scale of its own values", () => {
+  const rows = [{ kota: "X", a: 10 }, { kota: "Y", a: 30 }]
+  const option = buildOption({ kind: "radar", x: "kota", y: "a" }, rows, false)
+  const series = option.series as { data: { value: number[] }[] }[]
+  assert.equal(series[0].data.length, 1)
+  const radar = option.radar as { indicator: { max: number }[] }
+  assert.deepEqual(radar.indicator.map((i) => i.max), [33, 33])
+  assert.equal("legend" in option, false)
+})
+
 test("a combo and a stacked bar name their series and axes by the label", () => {
   const rows = [{ c: "a", visitors: 10, avg_stay: 2 }]
   const labels = { avg_stay: "avg of stay" }
@@ -181,6 +206,14 @@ const tooltipCases: TooltipCase[] = [
   { name: "sankey", spec: { kind: "sankey", x: "c", y: "v", series: "g" }, rows: [{ c: XSS, g: XSS, v: 1 }], params: { name: `a:${XSS}`, value: 1, data: { source: `a:${XSS}`, target: `b:${XSS}` } } },
   { name: "sunburst", spec: { kind: "sunburst", x: "c", y: "v", series: "g" }, rows: [{ c: XSS, g: XSS, v: 1 }], params: { treePathInfo: [{ name: XSS }], value: 1 } },
   { name: "boxplot", spec: { kind: "boxplot", x: "c", y: "v" }, rows: [{ c: XSS, v: [1, 2, 3, 4, 5] }], params: { seriesType: "boxplot", data: [1, 2, 3, 4, 5], dataIndex: 0 } },
+  // BI-33 (`#199` review round O): the three branches the list above did not
+  // reach. A sankey LINK (`dataType: "edge"`) writes both ends; a boxplot's
+  // single-value dot (`seriesType: "scatter"`) writes its category; a scatter
+  // or bubble tooltip writes the measure LABELS, which a user can set to any text.
+  { name: "sankey edge", spec: { kind: "sankey", x: "c", y: "v", series: "g" }, rows: [{ c: XSS, g: XSS, v: 1 }], params: { dataType: "edge", value: 1, data: { source: `a:${XSS}`, target: `b:${XSS}` } } },
+  { name: "boxplot outlier", spec: { kind: "boxplot", x: "c", y: "v" }, rows: [{ c: XSS, v: [1, 2, 3, 4, 5] }], params: { seriesType: "scatter", data: [0, 1], dataIndex: 0 } },
+  { name: "scatter label", spec: { kind: "scatter", x: "c", y: ["v", "w"], measureLabels: { v: XSS, w: XSS } }, rows: [{ c: "p", v: 1, w: 2 }], params: { name: "p", value: [1, 2] } },
+  { name: "bubble size label", spec: { kind: "bubble", x: "c", y: ["v", "w", "s"], measureLabels: { v: "a", w: "b", s: XSS } }, rows: [{ c: "p", v: 1, w: 2, s: 3 }], params: { name: "p", value: [1, 2, 3] } },
   { name: "calendar", spec: { kind: "calendar", x: "d", y: "v" }, rows: [{ d: "2026-10-01", v: 1 }], params: { value: [XSS, 1] } },
 ]
 
@@ -193,5 +226,32 @@ test("PR #199 review O BLOCKER 1: a name with markup in any tooltip is written a
     assert.equal(typeof html, "string", `${c.name}: the formatter writes a string`)
     assert.ok(!html.includes("<img"), `${c.name}: the markup did not run`)
     assert.ok(html.includes(XSS_AS_TEXT), `${c.name}: the name is written as text`)
+  }
+})
+
+// QA LH-BI-6-38: a NULL category reads "(No value)", an empty one "(Empty)"; the rows keep the raw values.
+test("a bar labels a NULL category (No value) and an empty one (Empty)", () => {
+  const rows = [{ x: null, v: 1 }, { x: "", v: 2 }, { x: "Bali", v: 3 }]
+  const option = buildOption({ kind: "bar", x: "x", y: "v" }, rows, false)
+  const axis = (option.xAxis ?? option.yAxis) as { data?: string[] }
+  assert.deepEqual(axis.data, ["(No value)", "(Empty)", "Bali"])
+  assert.equal(rows[0].x, null)
+})
+
+test("a pie names a NULL slice (No value) and a breakdown names a NULL series (No value)", () => {
+  const pie = buildOption({ kind: "pie", x: "x", y: "v" }, [{ x: null, v: 1 }, { x: "Bali", v: 3 }], false)
+  assert.deepEqual((pie.series as { data: { name: string }[] }[])[0].data.map((d) => d.name), ["(No value)", "Bali"])
+  const stacked = buildOption({ kind: "bar", x: "x", y: "v", series: "g" }, [{ x: "Bali", g: null, v: 1 }, { x: "Bali", g: "A", v: 2 }], false)
+  assert.deepEqual((stacked.series as { name: string }[]).map((s) => s.name).sort(), ["(No value)", "A"])
+})
+
+// QA LH-BI-6-39 (BI-55, D6): a donut over many categories cut its legend off;
+// it pages like the rose and the funnel do.
+test("a donut's legend pages when its entries do not fit, like a rose's and a funnel's", () => {
+  const rows = Array.from({ length: 25 }, (_, i) => ({ x: `c${i}`, v: i + 1 }))
+  for (const kind of ["pie", "rose", "funnel"] as const) {
+    const option = buildOption({ kind, x: "x", y: "v" }, rows, false)
+    const legend = option.legend as { type?: string }
+    assert.equal(legend.type, "scroll", `${kind}: the legend pages`)
   }
 })

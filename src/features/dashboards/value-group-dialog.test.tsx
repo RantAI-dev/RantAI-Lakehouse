@@ -34,6 +34,10 @@ describe("ValueGroupDialog", () => {
     fireEvent.click(screen.getByLabelText("Column"))
     fireEvent.click(await screen.findByText("provinsi"))
     await waitFor(() => expect(screen.getByLabelText("Jawa Barat")).toBeTruthy())
+    // `BI-47`: the value list names the dialog's own source, never every mart.
+    const valuesCall = calls.find((c) => c.url.includes("/api/dashboard/values"))
+    expect(new URL(String(valuesCall?.url), "http://console.invalid").searchParams.get("mart")).toBe("m")
+    expect(new URL(String(valuesCall?.url), "http://console.invalid").searchParams.has("board")).toBe(false)
     fireEvent.change(screen.getByLabelText("Name of group 1"), { target: { value: "Java" } })
     fireEvent.click(screen.getByLabelText("Jawa Barat"))
     fireEvent.click(screen.getByLabelText("Jawa Timur"))

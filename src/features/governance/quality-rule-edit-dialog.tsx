@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -19,8 +20,7 @@ import { SEVERITY_LABEL, type Severity } from "@/lib/status"
 import { governanceService } from "@/services"
 import type { QualityRule, UpdateQualityRuleInput } from "@/services/contracts/governance"
 import { ThresholdForms } from "./quality-check-fields"
-
-const selectClassName = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+import { TablePicker, useTableCatalog } from "./table-picker"
 
 /** What the dialog needs of a rule — a list row and an asset's check both have it. */
 export type EditableRule = {
@@ -69,6 +69,9 @@ export function EditRuleDialog({
   const [severity, setSeverity] = React.useState<Severity>(
     isSeverity(rule.severity) ? rule.severity : "medium"
   )
+  // WEB-8 D8: the table is picked from the catalog, with the rule's own
+  // table shown even if the catalog no longer lists it.
+  const catalog = useTableCatalog()
   const save = useServiceAction((signal, input: UpdateQualityRuleInput) =>
     governanceService.updateQualityRule(rule.id, input, signal)
   )
@@ -101,20 +104,21 @@ export function EditRuleDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
+          {/* UX-4: table and threshold are required while severity is not,
+              so the stars stay; three inputs are too few for a legend. */}
+          <TablePicker
+            id="edit-rule-asset"
+            label="Table"
+            value={asset}
+            onChange={setAsset}
+            catalog={catalog}
+            required
+          />
           <div className="grid gap-1.5">
-            <Label htmlFor="edit-rule-asset">Table</Label>
-            <Input
-              id="edit-rule-asset"
-              className="font-mono"
-              value={asset}
-              onChange={(e) => setAsset(e.target.value)}
-              placeholder="silver.orders"
-            />
-          </div>
-          <div className="grid gap-1.5">
-            <Label htmlFor="edit-rule-threshold">Threshold</Label>
+            <Label htmlFor="edit-rule-threshold" required>Threshold</Label>
             <Input
               id="edit-rule-threshold"
+              aria-required
               className="font-mono"
               value={threshold}
               onChange={(e) => setThreshold(e.target.value)}
@@ -127,18 +131,16 @@ export function EditRuleDialog({
           </div>
           <div className="grid gap-1.5">
             <Label htmlFor="edit-rule-severity">Severity</Label>
-            <select
+            <SelectField
               id="edit-rule-severity"
-              className={selectClassName}
+              className="w-full"
               value={severity}
-              onChange={(e) => setSeverity(e.target.value as Severity)}
-            >
-              {(Object.keys(SEVERITY_LABEL) as Severity[]).map((s) => (
-                <option key={s} value={s}>
-                  {SEVERITY_LABEL[s]}
-                </option>
-              ))}
-            </select>
+              options={(Object.keys(SEVERITY_LABEL) as Severity[]).map((s) => ({
+                value: s,
+                label: SEVERITY_LABEL[s],
+              }))}
+              onValueChange={(next) => setSeverity(next as Severity)}
+            />
           </div>
           {clearsResults ? (
             <p className="text-xs text-muted-foreground">

@@ -9,8 +9,9 @@ import type { useQueryStudio } from "./use-query-studio"
  * written.
  *
  * A statement that did not run says so on its tab. "Not run" is the whole
- * truth about it: the batch stopped at the failure before it, and nothing
- * was sent to the engine.
+ * truth about it: nothing was sent to the engine. Why it did not run is on
+ * the statement itself — a failure of an earlier one, or the person's own
+ * Stop (`reason: "failure" | "stopped"`); the tab says the same for both.
  */
 export function QueryResultTabs({
   studio,

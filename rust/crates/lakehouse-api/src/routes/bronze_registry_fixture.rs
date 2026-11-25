@@ -25,9 +25,6 @@ use std::time::Duration;
 
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ident::SqlLiteral;
-use testcontainers::ImageExt;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::clickhouse::ClickHouse;
 
 use crate::config::Config;
 use crate::state::AppState;
@@ -39,23 +36,10 @@ use crate::state::AppState;
 /// Panics when the container cannot start or the server inside it never
 /// answers — a fixture that cannot be built fails the test that asked for
 /// it, which is the only honest outcome.
-pub(crate) async fn clickhouse() -> (String, testcontainers::ContainerAsync<ClickHouse>) {
-    // The compose service's env trio; all three are required, see
-    // `tests/gold_publication.rs`.
-    let container = ClickHouse::default()
-        .with_env_var("CLICKHOUSE_USER", "default")
-        .with_env_var("CLICKHOUSE_PASSWORD", "")
-        .with_env_var("CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT", "1")
-        .with_tag("26.8")
-        .start()
-        .await
-        .expect("start the ClickHouse testcontainer");
-    let host = container.get_host().await.expect("container host");
-    let port = container
-        .get_host_port_ipv4(8123)
-        .await
-        .expect("container HTTP port");
-    let url = format!("http://{host}:{port}");
+pub(crate) async fn clickhouse() -> lakehouse_test_support::clickhouse::Started {
+    // The env trio, the 26.8 tag and `REL-14`'s bounded start retry all live
+    // in the shared harness now.
+    let (url, container) = lakehouse_test_support::clickhouse::start().await;
     let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
     wait_until_ready(&ch).await;
     create_registry(&ch).await;
@@ -131,13 +115,37 @@ pub(crate) async fn seed_catalog(
     title: &str,
     table_name: &str,
 ) {
+    // The tier a real ingest writes (`bronze_catalog.py`'s
+    // `register_bronze_table`).
+    seed_catalog_with_tier(ch, registry, slug, title, table_name, "primer").await;
+}
+
+/// One catalog row with its own `tier`.
+///
+/// `WEB-3` S3a-D4: the classification list reports a registry dataset only
+/// when its tier is one of the product's classification levels, and a real
+/// ingest writes `primer`, so a test of that reader needs to write the other
+/// kind of tier. Kept beside [`seed_catalog`] rather than copied.
+///
+/// # Panics
+///
+/// Panics when the engine refuses the insert.
+pub(crate) async fn seed_catalog_with_tier(
+    ch: &ChClient,
+    registry: &str,
+    slug: &str,
+    title: &str,
+    table_name: &str,
+    tier: &str,
+) {
     let slug = SqlLiteral::from(slug);
     let title = SqlLiteral::from(title);
     let table_name = SqlLiteral::from(table_name);
+    let tier = SqlLiteral::from(tier);
     let sql = format!(
         "INSERT INTO lake.`{registry}.dataset_catalog` \
          (slug, title, description, tier, updated_at, table_name) \
-         VALUES ({slug}, {title}, 'the dataset', 'primer', '2026-11-01T00:00:00Z', {table_name})"
+         VALUES ({slug}, {title}, 'the dataset', {tier}, '2026-11-01T00:00:00Z', {table_name})"
     );
     ch.exec(&sql, None).await.expect("seed the catalog row");
 }

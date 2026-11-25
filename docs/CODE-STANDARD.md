@@ -229,7 +229,8 @@ denied, `missing_docs` warned (`rust/Cargo.toml` `[workspace.lints]`).
 ### 3.7 Tests
 
 - Unit tests in-module under `#[cfg(test)]`; integration tests in the crate's
-  `tests/` with a shared `tests/common/mod.rs`.
+  `tests/`, declared as modules of one `tests/it.rs` binary (`OPS-32`), with a
+  shared `tests/common/mod.rs` that `it.rs` declares once.
 - Names are assertions in `snake_case`:
   `out_of_scope_env_ref_is_rejected_not_silently_resolved`,
   `tenant_membership_is_not_used_to_scope_any_domain_query`.
@@ -386,7 +387,7 @@ keep it there rather than inside components.
 
 Code that changes behaviour changes these in the same commit:
 
-- `README.md` config table: `| Variable | Purpose | Default | Required? |`,
+- `docs/CONFIGURATION.md` config table (moved from `README.md`, 2026-11-05): `| Variable | Purpose | Default | Required? |`,
   purpose cell cites the ADR/finding.
 - `.env.example`: a comment block per variable — what it configures, which
   phase introduced it, cross-refs. Placeholder secrets are the sentinel
@@ -489,4 +490,4 @@ gitleaks git --log-opts="<base>..HEAD" --config .gitleaks.toml --redact
 
 Then read your own diff once as the reviewer will: every new comment true,
 every new error path classified, every new route in `POLICY_TABLE`, every new
-env var in README and `.env.example`, every number traceable.
+env var in `docs/CONFIGURATION.md` and `.env.example`, every number traceable.

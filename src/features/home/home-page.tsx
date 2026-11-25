@@ -14,6 +14,7 @@ import {
 } from "lucide-react"
 
 import { Skeleton } from "@/components/ui/skeleton"
+import { canOpen } from "@/components/app-shell/nav-config"
 import { useAuth } from "@/features/auth/auth-provider"
 import { ChatComposer } from "@/features/copilot/chat-composer"
 import { useCopilot, type Mode } from "@/features/copilot/use-copilot"
@@ -42,6 +43,7 @@ import {
   pipelineService,
   queryService,
 } from "@/services"
+import type { OverviewSummary } from "@/services/contracts/overview"
 import {
   CustomizeButton,
   EditableCards,
@@ -149,8 +151,9 @@ import { useHomeLayout } from "./use-home-layout"
  * form before a source or pipeline exists.
  *
  * Everything is read from real services, and a read that fails says so:
- * the status line never reports "all clear" unless every read succeeded,
- * and a list that cannot load says that instead of looking empty.
+ * the status line names only the reads it made, never "all clear" about a
+ * read that failed or was not made, and a list that cannot load says that
+ * instead of looking empty.
  *
  * Whether an LLM is configured is not known up front (no endpoint reports
  * it); when it is not, `POST /api/ai/chat` answers 503 and the
@@ -162,13 +165,23 @@ import { useHomeLayout } from "./use-home-layout"
  */
 export function HomePage() {
   const router = useRouter()
-  const { user } = useAuth()
+  const { user, hasPermission } = useAuth()
   const copilot = useCopilot()
   const reduce = useReducedMotion() ?? false
   const [pending, setPending] = React.useState<{
     text: string
     mode: Mode
   } | null>(null)
+
+  // ADM-13 review round 1, B3 (D10.3): Home widgets whose page the person cannot open
+  // are not rendered and send no request.
+  const canPipelines = canOpen("/pipelines", hasPermission)
+  const canAlerts = canOpen("/alerts", hasPermission)
+  const canConnectors = canOpen("/connectors", hasPermission)
+  const canBoards = canOpen("/dashboards", hasPermission)
+  const canSaved = canOpen("/query-studio", hasPermission)
+  const canCatalog = canOpen("/catalog", hasPermission)
+  const canCopilot = canOpen("/copilot", hasPermission)
 
   // `send` closes over the current mode, so a prompt that needs Build mode
   // waits one render for `setMode` to land before it is sent.
@@ -195,17 +208,39 @@ export function HomePage() {
   )
 
   const pipelines = useService(
-    (signal) => pipelineService.listPipelines(signal),
-    [],
+    (signal) =>
+      canPipelines
+        ? pipelineService.listPipelines(signal)
+        : Promise.resolve({ pipelines: [] }),
+    [canPipelines],
   )
-  const alerts = useService((signal) => overviewService.listAlerts(signal), [])
+  const alerts = useService(
+    (signal) =>
+      canAlerts ? overviewService.listAlerts(signal) : Promise.resolve([]),
+    [canAlerts],
+  )
   const connectors = useService(
-    (signal) => connectorService.listConnectors(signal),
-    [],
+    (signal) =>
+      canConnectors
+        ? connectorService.listConnectors(signal)
+        : Promise.resolve([]),
+    [canConnectors],
   )
-  const boards = useService((signal) => dashboardService.listBoards(signal), [])
-  const saved = useService((signal) => queryService.listSaved(signal), [])
-  const summary = useService((signal) => overviewService.getSummary(signal), [])
+  const boards = useService(
+    (signal) =>
+      canBoards ? dashboardService.listBoards(signal) : Promise.resolve([]),
+    [canBoards],
+  )
+  const saved = useService(
+    (signal) =>
+      canSaved ? queryService.listSaved(signal) : Promise.resolve([]),
+    [canSaved],
+  )
+  const summary = useService<OverviewSummary | null>(
+    (signal) =>
+      canCatalog ? overviewService.getSummary(signal) : Promise.resolve(null),
+    [canCatalog],
+  )
   // What Home shows and in what order: the saved layout, or the draft while
   // customising. Undecided until it has loaded (`phase`).
   const layout = useHomeLayout()
@@ -219,45 +254,57 @@ export function HomePage() {
   // Bootstrap" for the "Bootstrap Admin" account.
   const displayName = user?.name?.trim()
 
-  const failing = (pipelines.data?.pipelines ?? []).filter(
-    (p) => p.status === "failed" || p.status === "degraded",
-  )
-  const open = (alerts.data ?? []).filter((a) => a.status === "open")
-  const unhealthy = (connectors.data ?? []).filter(
-    (c) => c.health === "unhealthy" || c.health === "degraded",
-  )
+  const failing = canPipelines
+    ? (pipelines.data?.pipelines ?? []).filter(
+        (p) => p.status === "failed" || p.status === "degraded",
+      )
+    : []
+  const open = canAlerts
+    ? (alerts.data ?? []).filter((a) => a.status === "open")
+    : []
+  const unhealthy = canConnectors
+    ? (connectors.data ?? []).filter(
+        (c) => c.health === "unhealthy" || c.health === "degraded",
+      )
+    : []
 
   // Catalog datasets with no synced rows (`staleAssets`): missing data,
   // not old data. See `lib/home-status`.
-  const noData = summary.data?.staleAssets ?? 0
+  const noData = canCatalog ? (summary.data?.staleAssets ?? 0) : 0
 
   const attention: AttentionItem[] = [
-    ...failing.map((p) => ({
-      key: `p:${p.id}`,
-      kind: "Pipeline",
-      label: p.name,
-      state: p.status,
-      href: `/pipelines/${encodeURIComponent(p.id)}`,
-      prompt: `Why is pipeline "${p.name}" ${p.status}? Look at its recent runs and explain.`,
-    })),
-    ...open.map((a) => ({
-      key: `a:${a.id}`,
-      kind: "Alert",
-      label: a.title,
-      state: "open",
-      href: "/alerts",
-      prompt: `Explain the open alert "${a.title}" (${a.affected}) and what I should check.`,
-    })),
-    ...unhealthy.map((c) => ({
-      key: `c:${c.id}`,
-      kind: "Source",
-      label: c.name,
-      state: c.health,
-      href: "/connectors",
-      prompt: `Source "${c.name}" is ${c.health}. Test it and tell me what is wrong.`,
-    })),
+    ...(canPipelines
+      ? failing.map((p) => ({
+          key: `p:${p.id}`,
+          kind: "Pipeline",
+          label: p.name,
+          state: p.status,
+          href: `/pipelines/${encodeURIComponent(p.id)}`,
+          prompt: `Why is pipeline "${p.name}" ${p.status}? Look at its recent runs and explain.`,
+        }))
+      : []),
+    ...(canAlerts
+      ? open.map((a) => ({
+          key: `a:${a.id}`,
+          kind: "Alert",
+          label: a.title,
+          state: "open",
+          href: "/alerts",
+          prompt: `Explain the open alert "${a.title}" (${a.affected}) and what I should check.`,
+        }))
+      : []),
+    ...(canConnectors
+      ? unhealthy.map((c) => ({
+          key: `c:${c.id}`,
+          kind: "Source",
+          label: c.name,
+          state: c.health,
+          href: "/connectors",
+          prompt: `Source "${c.name}" is ${c.health}. Test it and tell me what is wrong.`,
+        }))
+      : []),
     // One row for all of them: the overview reports a count, not which.
-    ...(noData > 0
+    ...(canCatalog && noData > 0
       ? [
           {
             key: "datasets",
@@ -272,11 +319,23 @@ export function HomePage() {
       : []),
   ]
 
+  // ADM-13 review round 2, R2-B1: a check is passed only when the person may
+  // open its page. A check that was not made is not passed at all, so the
+  // line cannot say "all clear" about something never read; with none, there
+  // is no line.
   const status = homeStatus({
-    pipelines: { state: checkState(pipelines.status), count: failing.length },
-    alerts: { state: checkState(alerts.status), count: open.length },
-    sources: { state: checkState(connectors.status), count: unhealthy.length },
-    datasets: { state: checkState(summary.status), count: noData },
+    pipelines: canPipelines
+      ? { state: checkState(pipelines.status), count: failing.length }
+      : undefined,
+    alerts: canAlerts
+      ? { state: checkState(alerts.status), count: open.length }
+      : undefined,
+    sources: canConnectors
+      ? { state: checkState(connectors.status), count: unhealthy.length }
+      : undefined,
+    datasets: canCatalog
+      ? { state: checkState(summary.status), count: noData }
+      : undefined,
   })
 
   // The preview follows "where I left off": the board last opened, else
@@ -300,24 +359,30 @@ export function HomePage() {
 
   const recent = recentItems(
     {
-      dashboard: (boards.data ?? []).map((b) => ({
-        id: b.id,
-        title: b.name,
-        href: `/dashboards/${encodeURIComponent(b.id)}`,
-        at: b.updatedAt,
-      })),
-      conversation: copilot.sessions.map((s) => ({
-        id: s.id,
-        title: s.title || "Untitled conversation",
-        href: `/copilot?id=${encodeURIComponent(s.id)}`,
-        at: s.updatedAt,
-      })),
-      query: (saved.data ?? []).map((q) => ({
-        id: q.id,
-        title: q.title,
-        href: `/query-studio?saved=${encodeURIComponent(q.id)}`,
-        at: q.updatedAt,
-      })),
+      dashboard: canBoards
+        ? (boards.data ?? []).map((b) => ({
+            id: b.id,
+            title: b.name,
+            href: `/dashboards/${encodeURIComponent(b.id)}`,
+            at: b.updatedAt,
+          }))
+        : [],
+      conversation: canCopilot
+        ? copilot.sessions.map((s) => ({
+            id: s.id,
+            title: s.title || "Untitled conversation",
+            href: `/copilot?id=${encodeURIComponent(s.id)}`,
+            at: s.updatedAt,
+          }))
+        : [],
+      query: canSaved
+        ? (saved.data ?? []).map((q) => ({
+            id: q.id,
+            title: q.title,
+            href: `/query-studio?saved=${encodeURIComponent(q.id)}`,
+            at: q.updatedAt,
+          }))
+        : [],
     },
     lastBoard,
     5,
@@ -332,18 +397,20 @@ export function HomePage() {
     lastDashboard: (boards.data ?? []).find((b) => b.id === lastBoard)?.name,
   })
 
-  const starts = shown.shortcuts.map((id) => {
-    const s = SHORTCUTS[id]
-    const prompt = s.aiPrompt
-    return {
-      id,
-      icon: s.icon,
-      title: s.title,
-      description: s.description,
-      href: s.href,
-      onAi: prompt ? () => ask(prompt, s.aiMode ?? "build") : undefined,
-    }
-  })
+  const starts = shown.shortcuts
+    .filter((id) => canOpen(SHORTCUTS[id].href, hasPermission))
+    .map((id) => {
+      const s = SHORTCUTS[id]
+      const prompt = s.aiPrompt
+      return {
+        id,
+        icon: s.icon,
+        title: s.title,
+        description: s.description,
+        href: s.href,
+        onAi: prompt ? () => ask(prompt, s.aiMode ?? "build") : undefined,
+      }
+    })
 
   const pipelineRuns = (
     <PipelineRuns
@@ -353,13 +420,35 @@ export function HomePage() {
   )
   const recentList = (
     <RecentList
-      loading={boards.status === "loading" || saved.status === "loading"}
+      loading={(canBoards && boards.status === "loading") || (canSaved && saved.status === "loading")}
       failed={[
-        boards.status === "error" ? "dashboards" : null,
-        saved.status === "error" ? "saved queries" : null,
+        canBoards && boards.status === "error" ? "dashboards" : null,
+        canSaved && saved.status === "error" ? "saved queries" : null,
       ].filter((x): x is string => x !== null)}
       items={recent}
     />
+  )
+
+  const cardAllowed = React.useCallback(
+    (id: CardId): boolean => {
+      switch (id) {
+        case "dashboard-preview":
+          return canBoards
+        case "pipeline-runs":
+          return canPipelines
+        case "sources":
+          return canConnectors
+        case "open-alerts":
+          return canAlerts
+        case "saved-queries":
+          return canSaved
+        case "recent":
+          return canBoards || canSaved || canCopilot
+        default:
+          return false
+      }
+    },
+    [canBoards, canPipelines, canConnectors, canAlerts, canSaved, canCopilot],
   )
 
   // Every card the catalogue knows, by id. The layout decides which of
@@ -398,10 +487,10 @@ export function HomePage() {
       />
     ),
   }
-  const listCards = shown.cards.filter((c) => c !== WIDE_CARD)
+  const listCards = shown.cards.filter((c) => c !== WIDE_CARD && cardAllowed(c))
   // The wide card needs a board to show; without one it is left out and
   // the others share the width, as Home always did.
-  const wideShown = shown.cards.includes(WIDE_CARD) && previewBoard !== undefined
+  const wideShown = shown.cards.includes(WIDE_CARD) && previewBoard !== undefined && cardAllowed(WIDE_CARD)
   const customize = layout.phase === "ready" ? layout.startEditing : undefined
 
   // Home is two screens in its own scroller. The first is the hero alone,
@@ -479,8 +568,11 @@ export function HomePage() {
           </div>
         ) : layout.editing ? (
           <EditableShortcuts
-            ids={shown.shortcuts}
-            hidden={hiddenIds(SHORTCUT_IDS, shown.shortcuts)}
+            ids={shown.shortcuts.filter((id) => canOpen(SHORTCUTS[id].href, hasPermission))}
+            hidden={hiddenIds(
+              SHORTCUT_IDS.filter((id) => canOpen(SHORTCUTS[id].href, hasPermission)),
+              shown.shortcuts.filter((id) => canOpen(SHORTCUTS[id].href, hasPermission)),
+            )}
             onReorder={layout.reorderShortcuts}
             onHide={layout.hideShortcut}
             onAdd={layout.addShortcut}
@@ -520,11 +612,11 @@ export function HomePage() {
       {layout.phase === "loading" ? null : layout.editing ? (
         <>
           <EditableCards
-            cards={shown.cards}
+            cards={shown.cards.filter(cardAllowed)}
             nodes={cardNodes}
             previewPicker={
               <PreviewPicker
-                boards={boards.status === "success" ? boardList : null}
+                boards={canBoards && boards.status === "success" ? boardList : null}
                 value={shown.previewBoardId}
                 onChange={layout.setPreviewBoard}
               />
@@ -533,7 +625,7 @@ export function HomePage() {
             onHide={layout.hideCard}
           />
           <EditBar
-            hiddenCards={hiddenIds(CARD_IDS, shown.cards)}
+            hiddenCards={hiddenIds(CARD_IDS.filter(cardAllowed), shown.cards.filter(cardAllowed))}
             busy={layout.busy}
             error={layout.error}
             onAddCard={layout.addCard}
@@ -630,11 +722,14 @@ function StatusLine({
   items,
   onAsk,
 }: {
-  status: HomeStatus
+  status: HomeStatus | null
   items: AttentionItem[]
   onAsk: (prompt: string) => void
 }) {
   const [open, setOpen] = React.useState(false)
+  // ADM-13 review round 2, R2-B1: no check was made, so there is nothing to
+  // report and no line is drawn.
+  if (!status) return null
   if (status.tone === "loading") {
     return (
       <div aria-label="Lakehouse status" className="flex h-5 items-center">

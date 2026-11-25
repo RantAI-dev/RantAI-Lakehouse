@@ -1,0 +1,184 @@
+# ops/sso/docker-compose.staging-keycloak.override.yml -- the Keycloak the
+# STAGING deployment signs in through, and the only compose file that starts
+# it.
+#
+# Why a second override file, and not the base `docker-compose.yml`: the SEC-3
+# gate already has one (`ops/sso/docker-compose.keycloak.override.yml`), and it
+# is a CI-only stack that starts Keycloak in development mode (`start-dev`, an
+# in-container H2 database) and publishes NO host port -- a promise its own
+# comment makes on purpose. Staging needs the opposite of all three: a
+# published port (a person's browser has to reach the provider), a
+# Postgres-backed database (the realm must survive a restart), and `start`
+# rather than `start-dev`. Two files, one per context, keep the gate's
+# "nothing here publishes a host port" promise intact and keep the staging
+# deployment's own defaults out of the gate's throwaway stack.
+#
+# How the staging deployment uses this file:
+#
+#   scripts/compose.sh -f docker-compose.yml \
+#     -f ops/sso/docker-compose.staging-keycloak.override.yml \
+#     --profile sso --profile seaweedfs --profile dagster --profile trino \
+#     up -d --build --remove-orphans
+#
+# (`-f` replaces the default file list, so the base file is named explicitly.)
+# The API's own `OIDC_*` settings are NOT in this file: the base
+# `docker-compose.yml` already passes them through from `.env`
+# (`OIDC_ISSUER: ${OIDC_ISSUER:-}` and friends), and the deploy workflow
+# writes those values into `.env`.
+#
+# No literal password or client secret is in this file (`AGENTS.md` rule 5;
+# SEC-18): every credential arrives from the environment as `${VAR:?}`, so
+# compose refuses to start when one is missing. `keycloak-realm-init` renders
+# the generated client secret and the test users' passwords into the realm
+# file Keycloak imports, and the same client secret reaches the API as
+# `OIDC_CLIENT_SECRET`.
+#
+# Image: `quay.io/keycloak/keycloak:26.8.1`, pinned by tag AND digest -- the
+# same image the SEC-3 gate signs in through, so staging and CI run the same
+# provider. The digest was read from the Quay registry API
+# (`https://quay.io/api/v1/repository/keycloak/keycloak/tag/?specificTag=26.8.1`,
+# the `manifest_digest` field) on 2026-10-16; the gate's override carries the
+# same pin.
+volumes:
+  # The rendered realm file `keycloak-realm-init` writes and `keycloak` reads
+  # (read-only) through `--import-realm`. A named volume, not a host bind: the
+  # rendered file carries the generated client secret, so it must not land in
+  # the checkout (`git status` stays clean, rule 11).
+  keycloak_realm_import:
+
+services:
+  # ── keycloak-db-init ─────────────────────────────────────────────────────
+  # One-shot (CODE-STANDARD §6): creates Keycloak's own database on the
+  # EXISTING `postgres` service, exactly like `lakekeeper-db-init` and
+  # `openfga-db-init` do for their services -- a dedicated database, not a
+  # schema mixed into another service's database.
+  #
+  # The retry loop is `openfga-db-init`'s (WS0 item 9): `depends_on:
+  # condition: service_healthy` proves `pg_isready` passed, not that the
+  # server is ready to accept `CREATE DATABASE` from a fresh connection the
+  # instant that healthcheck first succeeds.
+  keycloak-db-init:
+    profiles: ["sso"]
+    image: postgres:16.15@sha256:1beaa3084eee2676f20a9cd9928f0bf2c5bf674f8e49f81017912183d377c61c
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      PGDATABASE: ${POSTGRES_DB:-lakehouse}
+      KEYCLOAK_PG_DB: ${KEYCLOAK_PG_DB:-keycloak}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        set -eu;
+        for attempt in $$(seq 1 10); do
+          if psql -v ON_ERROR_STOP=1 -tc "SELECT 1 FROM pg_database WHERE datname = '$${KEYCLOAK_PG_DB}'" | grep -q 1; then
+            echo "database $${KEYCLOAK_PG_DB} already present"; exit 0;
+          fi;
+          if psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$${KEYCLOAK_PG_DB}\"" 2>/dev/null; then
+            echo "created database $${KEYCLOAK_PG_DB}"; exit 0;
+          fi;
+          echo "keycloak-db-init: postgres not ready for CREATE DATABASE yet (attempt $${attempt}/10), retrying" >&2;
+          sleep 2;
+        done;
+        echo "keycloak-db-init: postgres never became ready after 20s" >&2;
+        psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$${KEYCLOAK_PG_DB}\""
+    restart: "no"
+
+  # ── keycloak-realm-init ──────────────────────────────────────────────────
+  # One-shot (CODE-STANDARD §6): renders `staging-realm.template.json` into
+  # `lakehouse-realm.json` in the shared volume, injecting the run's generated
+  # client secret, the test users' passwords and the deployment's callback
+  # address. Idempotent -- it overwrites its own output -- so a re-run against
+  # the same volume is safe.
+  #
+  # The callback address is injected too, and not committed: it is this
+  # deployment's own address (`AGENTS.md` rule 12 -- no real hostnames, IPs or
+  # ports in the repository), and a realm that carries the wrong one refuses
+  # every sign-in with an "invalid_redirect_uri" from the provider.
+  keycloak-realm-init:
+    profiles: ["sso"]
+    image: python:3.12-slim
+    restart: "no"
+    working_dir: /template
+    volumes:
+      - ./ops/sso:/template:ro
+      - type: volume
+        source: keycloak_realm_import
+        target: /import
+    environment:
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET is required (the Keycloak client's secret; see docs/OPERATIONS.md)}
+      SSO_USER_A_PASSWORD: ${SSO_USER_A_PASSWORD:?SSO_USER_A_PASSWORD is required (the first Keycloak test user's password)}
+      SSO_USER_B_PASSWORD: ${SSO_USER_B_PASSWORD:?SSO_USER_B_PASSWORD is required (the second Keycloak test user's password)}
+      SSO_USER_C_PASSWORD: ${SSO_USER_C_PASSWORD:?SSO_USER_C_PASSWORD is required (the third Keycloak test user's password)}
+      SSO_REDIRECT_URI: ${OIDC_REDIRECT_URI:?OIDC_REDIRECT_URI is required (this deployment's OIDC callback address)}
+      SSO_POST_LOGOUT_REDIRECT_URI: ${OIDC_POST_LOGOUT_REDIRECT_URI:?OIDC_POST_LOGOUT_REDIRECT_URI is required (where the provider sends the browser back to after a sign-out)}
+      SSO_REALM: ${SSO_REALM:-lakehouse}
+    entrypoint: ["python3", "/template/render_staging_realm.py"]
+
+  # ── keycloak ─────────────────────────────────────────────────────────────
+  # The identity provider the staging deployment signs in through.
+  #
+  # `start` (not `start-dev`): the realm, its users and its sessions live in
+  # the Postgres database `keycloak-db-init` creates, so a restart keeps them
+  # and `--import-realm` only fills an EMPTY realm. `start-dev` would keep the
+  # realm in an in-container H2 file, which a recreated container loses --
+  # and with it every user the administrator created.
+  #
+  # `KC_HOSTNAME` is the address a person's browser reaches the provider on,
+  # and it is what every token's `iss` claim carries. The API compares the
+  # token's `iss` with its configured issuer BYTE FOR BYTE, and the
+  # discovery document is trusted only when its own `issuer` equals the
+  # configured one -- so the browser's address, the API's issuer and
+  # Keycloak's hostname must be the SAME string. It is one value
+  # (`SSO_PUBLIC_BASE_URL`), written into `.env` by the deploy workflow.
+  #
+  # `KC_HTTP_ENABLED`: the staging deployment is served over plain HTTP (no
+  # TLS terminator in front of it), so the provider is too. The issuer is an
+  # `http://` address on the office LAN; that is why the settings live in
+  # `.env` and not in the console (the console refuses an issuer that is not
+  # `https://` -- see "Internal IdP via .env" in docs/OPERATIONS.md).
+  keycloak:
+    profiles: ["sso"]
+    image: quay.io/keycloak/keycloak:26.8.1@sha256:79c623a22abacf3fe6c00a5fb30f5b7843d717b234033b80995891c06116d244
+    restart: unless-stopped
+    command: ["start", "--import-realm"]
+    environment:
+      # The bootstrap admin: the account the administrator signs into the
+      # provider's own console with to manage realms, clients and users.
+      # The username is not a secret; the password is, and it is a repository
+      # secret (never in this file, never in the realm).
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USERNAME:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?KEYCLOAK_ADMIN_PASSWORD is required (the Keycloak bootstrap admin's password; see docs/OPERATIONS.md)}
+      # The issuer every token carries, and the address both the API and the
+      # browser resolve.
+      KC_HOSTNAME: ${SSO_PUBLIC_BASE_URL:?SSO_PUBLIC_BASE_URL is required (the address the browser reaches Keycloak on; see docs/OPERATIONS.md)}
+      KC_HTTP_ENABLED: "true"
+      # Postgres-backed store (the `keycloak-db-init` database above).
+      # The URL carries NO credentials: Keycloak parses this URL itself and
+      # reads the user and the password from `KC_DB_USERNAME` /
+      # `KC_DB_PASSWORD` below -- a `user:password@` in the URL is taken as
+      # part of the host name and the boot fails with
+      # `UnknownHostException: user:password@postgres`.
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/${KEYCLOAK_PG_DB:-keycloak}?sslmode=disable
+      KC_DB_USERNAME: ${POSTGRES_USER:-lakehouse}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
+    ports:
+      # The one port this provider publishes: a person's browser has to reach
+      # the login form, and the API has to reach the same address (the issuer
+      # is one string for both -- see `KC_HOSTNAME` above).
+      - "${KEYCLOAK_HOST_PORT:-8090}:8080"
+    volumes:
+      - type: volume
+        source: keycloak_realm_import
+        target: /opt/keycloak/data/import
+        read_only: true
+    depends_on:
+      keycloak-db-init:
+        condition: service_completed_successfully
+      keycloak-realm-init:
+        condition: service_completed_successfully

@@ -11,13 +11,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use lakehouse_store::audit::{AuditFilter, list as list_audit};
+use lakehouse_store::audit::{AuditFilter, AuditScope, list as list_audit};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -25,8 +25,9 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_seeded_user,
-    session_cookie_for_user, spin_up_with_env,
+    CLICKHOUSE_UNKNOWN_IDENTIFIER, COLUMN_DOES_NOT_EXIST, TestApp,
+    create_principal_with_permissions, mock_clickhouse_refusing, model_tool_result,
+    session_cookie_for_seeded_user, session_cookie_for_user, spin_up_with_env,
 };
 
 /// Insert a digital employee row directly (bypassing `POST
@@ -504,7 +505,7 @@ async fn run_employee_permission_ceiling_is_the_employees_own_not_the_triggering
 
     // The audit trail agrees: only "refused" outcomes for that action, on
     // this run, never "executed".
-    let events = list_audit(&app.pool, AuditFilter::default())
+    let events = list_audit(&app.pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let for_this_run: Vec<_> = events
@@ -556,8 +557,8 @@ async fn write_high_tool_call_ends_waiting_approval_with_a_linked_approval() {
 
     // The approval row itself is attributed to the REAL employee, not
     // `emp-copilot`.
-    let (employee_id, action, run_id_col): (String, String, Option<String>) =
-        sqlx::query_as("SELECT employee_id, action, run_id FROM approval_item WHERE id = $1")
+    let (employee_id, action, run_id_col, risk): (String, String, Option<String>, String) =
+        sqlx::query_as("SELECT employee_id, action, run_id, risk FROM approval_item WHERE id = $1")
             .bind(approvals[0]["id"].as_str().unwrap())
             .fetch_one(&app.pool)
             .await
@@ -565,6 +566,14 @@ async fn write_high_tool_call_ends_waiting_approval_with_a_linked_approval() {
     assert_eq!(employee_id, "emp-headless-10");
     assert_eq!(action, "delete_chart");
     assert_eq!(run_id_col.as_deref(), Some(run_id.as_str()));
+    // The risk sentence is the one the chat's approval card shows for
+    // `delete_chart`: a deleted chart goes to the trash and stays
+    // restorable, so the generic "cannot be undone" sentence would be false
+    // on this very card (`AI-1`, `GOV-13`).
+    assert_eq!(
+        risk, "High-risk action: the chart goes to the trash and can be restored for 30 days.",
+        "the headless approval stores the same risk sentence as the chat's"
+    );
 }
 
 /// LLM unavailable (transport failure — no mock mounted for this test's
@@ -601,40 +610,8 @@ async fn llm_unavailable_ends_the_run_failed_without_a_panic() {
     assert_eq!(steps[0]["status"], json!("failed"));
 }
 
-/// D (T3.2's fix): `POST /api/agents/employees` with an invalid `mode`
-/// returns a clean 400, not a raw database `CHECK`-violation error.
-#[tokio::test]
-async fn create_employee_with_invalid_mode_is_bad_request() {
-    let mock = MockServer::start().await;
-    let app = spin_up_with_llm(&mock.uri(), None).await;
-    let cookie = session_cookie_for_seeded_user(&app.pool, "fajar@meridian.example").await;
-
-    let resp = app
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/agents/employees")
-                .header("content-type", "application/json")
-                .header("cookie", cookie)
-                .body(Body::from(
-                    serde_json::to_vec(&json!({
-                        "name": "bad-mode-employee-http",
-                        "purpose": "p",
-                        "autonomy": "L1",
-                        "dataScope": "d",
-                        "budgetLimit": 0,
-                        "mode": "sleep",
-                    }))
-                    .unwrap(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
+// WEB-4 retired `POST /api/agents/employees`; the test that checked its
+// invalid-`mode` 400 went with the route (route_auth.rs pins the new 404).
 
 /// SEC-57: a SCHEDULED run's approval names NO requester — the schedule
 /// asked, not a person — so anybody holding `agent:approve` may decide
@@ -706,4 +683,284 @@ async fn a_scheduled_runs_approval_has_no_requester_and_any_approver_may_decide_
     assert_eq!(decided.status(), StatusCode::OK);
     let decided_body = json_body(decided).await;
     assert_eq!(decided_body["approval"]["status"], json!("approved"));
+}
+
+// ── LH-QS-2-08: a run's detail shows the fixed sentence, not the engine's text
+//
+// An engine failure reaches a person as a fixed sentence and a reference
+// (owner rule LH-QS-2-08, 2026-11-12). A run's step and an outcome executed
+// after approval are read by a browser on the run page, so they carry that
+// copy. The model that drives a run still reads the engine's diagnosis.
+
+/// The statement the mock engine refuses.
+const FAILING_SQL: &str = "SELECT pengunjungg FROM silver.orders";
+
+/// A statement the mock engine answers.
+const WORKING_SQL: &str = "SELECT 1 AS n FROM silver.orders";
+
+/// The text a person must never read from a failed statement.
+const ENGINE_TEXT: [&str; 4] = [
+    "UNKNOWN_IDENTIFIER",
+    "Code:",
+    "DB::Exception",
+    "pengunjungg",
+];
+
+fn engine_refuses_the_statement() -> ResponseTemplate {
+    ResponseTemplate::new(400).set_body_string(CLICKHOUSE_UNKNOWN_IDENTIFIER)
+}
+
+/// A proxy's page, not the engine saying the statement is wrong: the text
+/// is this repository's own, so the person's copy and the model's copy are
+/// the same fixed message.
+fn engine_is_not_answering() -> ResponseTemplate {
+    ResponseTemplate::new(502).set_body_string("<html><body>502 Bad Gateway</body></html>")
+}
+
+/// Runs an employee holding `query:read` whose model calls `run_sql` once
+/// with `sql`, against a `ClickHouse` that refuses `FAILING_SQL` with
+/// `answer`, then ends the run. Returns the run's `run_sql` step and the
+/// mock model, so the model's side can be read.
+async fn run_one_sql_step(sql: &str, answer: ResponseTemplate) -> (Value, MockServer) {
+    let llm = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{ "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": { "name": "run_sql", "arguments": json!({ "sql": sql }).to_string() },
+                }],
+            } }]
+        })))
+        .up_to_n_times(1)
+        .mount(&llm)
+        .await;
+    mount_final_answer(&llm, "The column is order_id.").await;
+    let ch = mock_clickhouse_refusing("pengunjungg", answer).await;
+    let mut env = HashMap::new();
+    env.insert("LLM_URL".to_owned(), llm.uri());
+    env.insert("CH_URL".to_owned(), ch.uri());
+    let app = spin_up_with_env(&env).await;
+    insert_employee(
+        &app.pool,
+        "emp-headless-sql",
+        "headless-runner-sql",
+        "ready",
+        "ask",
+        "query:read",
+        Some("Cek kunjungan harian."),
+    )
+    .await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "fajar@meridian.example").await;
+
+    let resp = run_employee(
+        &app.router,
+        "emp-headless-sql",
+        Some(&cookie),
+        None,
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let steps = body["run"]["steps"].as_array().expect("steps are a list");
+    let step = steps
+        .iter()
+        .find(|s| s["label"] == json!("run_sql"))
+        .unwrap_or_else(|| panic!("the run recorded a run_sql step: {steps:?}"))
+        .clone();
+    (step, llm)
+}
+
+/// The step's `detail`, which is the tool result serialised as JSON.
+fn step_detail(step: &Value) -> Value {
+    serde_json::from_str(step["detail"].as_str().expect("a detail string"))
+        .expect("the detail is JSON")
+}
+
+/// LH-QS-2-08: a `run_sql` step whose statement the engine refuses stores
+/// the fixed sentence and the reference, and none of the engine's text,
+/// while the model's next request carries the engine's diagnosis with the
+/// SAME reference.
+#[tokio::test]
+async fn a_failed_run_sql_step_stores_the_fixed_sentence_and_the_model_reads_the_diagnosis() {
+    let (step, llm) = run_one_sql_step(FAILING_SQL, engine_refuses_the_statement()).await;
+
+    assert_eq!(step["status"], json!("failed"));
+    let detail = step_detail(&step);
+    let stored = detail["error"].as_str().unwrap_or_default();
+    let reference = stored
+        .strip_prefix(&format!("{COLUMN_DOES_NOT_EXIST} Reference: "))
+        .unwrap_or_else(|| panic!("the fixed sentence and a reference: {detail}"));
+    assert!(!reference.is_empty(), "{detail}");
+    for engine_text in ENGINE_TEXT {
+        assert!(
+            !step["detail"].as_str().unwrap().contains(engine_text),
+            "{engine_text} in {detail}"
+        );
+    }
+    assert!(!step["detail"].as_str().unwrap().contains("_browserError"));
+
+    let model = model_tool_result(&llm, 1).await;
+    let model_error = model["error"].as_str().unwrap_or_default();
+    assert!(
+        model_error.contains("Unknown expression identifier 'pengunjungg' in scope."),
+        "the model reads the engine's diagnosis: {model}"
+    );
+    assert!(
+        model_error.contains(&format!(" Reference: {reference}")),
+        "the model's copy carries the same reference: {model}"
+    );
+}
+
+/// LH-QS-2-08, unchanged: a successful `run_sql` is stored exactly as the
+/// model read it.
+#[tokio::test]
+async fn a_successful_run_sql_step_is_stored_as_the_model_read_it() {
+    let (step, llm) = run_one_sql_step(WORKING_SQL, engine_refuses_the_statement()).await;
+
+    assert_eq!(step["status"], json!("succeeded"));
+    let detail = step_detail(&step);
+    assert_eq!(detail["rowCount"], json!(1), "{detail}");
+    assert_eq!(detail, model_tool_result(&llm, 1).await);
+}
+
+/// LH-QS-2-08, unchanged: a failure that is already a fixed message (the
+/// engine did not answer) is stored as it is, and it is the model's text
+/// too.
+#[tokio::test]
+async fn a_run_sql_step_that_fails_for_another_reason_stores_the_same_text_the_model_read() {
+    let (step, llm) = run_one_sql_step(FAILING_SQL, engine_is_not_answering()).await;
+
+    assert_eq!(step["status"], json!("failed"));
+    let detail = step_detail(&step);
+    assert!(
+        detail["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("The database request failed. Reference: "),
+        "{detail}"
+    );
+    assert_eq!(detail, model_tool_result(&llm, 1).await);
+}
+
+/// Creates a pending approval for a `run_sql` call, the way a copilot call
+/// would have (an approval for a `Read` tool does not arise in practice,
+/// but the decision route replays whatever tool the approval names), and
+/// has a second principal approve it. Returns the HTTP body of the decision
+/// and the run's last step, the outcome the route stored.
+async fn approve_a_pending_run_sql(sql: &str, answer: ResponseTemplate) -> (Value, Value) {
+    let ch = mock_clickhouse_refusing("pengunjungg", answer).await;
+    let mut env = HashMap::new();
+    env.insert("CH_URL".to_owned(), ch.uri());
+    env.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        common::CATALOG_TENANT.to_owned(),
+    );
+    let app = spin_up_with_env(&env).await;
+    let args = json!({ "sql": sql });
+    let created = lakehouse_store::agents::create_pending_approval(
+        &app.pool,
+        lakehouse_store::agents::NewApprovalRequest {
+            tool: "run_sql",
+            actor: "test",
+            resource: None,
+            reason: "test",
+            risk: "test",
+            redacted_args: &args,
+            requested_by: None,
+        },
+    )
+    .await
+    .expect("create a pending approval");
+    let approver =
+        create_principal_with_permissions(&app.pool, "query:read, catalog:read, agent:approve")
+            .await;
+    // The statement reads the shared catalog, which only its own tenant's
+    // members may.
+    common::in_the_catalog_tenant(&app.pool, approver).await;
+    let cookie = session_cookie_for_user(&app.pool, approver).await;
+
+    let resp = decide_approval(
+        &app.router,
+        &created.approval_id,
+        &cookie,
+        json!({ "decision": "approved" }),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let run = lakehouse_store::agents::get_run(&app.pool, &created.run_id)
+        .await
+        .expect("get the run")
+        .expect("the run exists");
+    let outcome = run.steps.last().expect("the run has an outcome step");
+    assert_eq!(outcome.label, "Executed after approval");
+    let stored = serde_json::to_value(outcome).expect("serialise the step");
+    (body, stored)
+}
+
+/// LH-QS-2-08: an outcome executed after approval shows the fixed sentence
+/// and the reference, in the run's stored outcome and in the HTTP answer,
+/// and none of the engine's text.
+#[tokio::test]
+async fn an_outcome_executed_after_approval_shows_the_fixed_sentence() {
+    let (body, outcome) =
+        approve_a_pending_run_sql(FAILING_SQL, engine_refuses_the_statement()).await;
+
+    assert_eq!(outcome["status"], json!("failed"));
+    let stored = step_detail(&outcome);
+    let stored_error = stored["error"].as_str().unwrap_or_default();
+    assert!(
+        stored_error.starts_with(&format!("{COLUMN_DOES_NOT_EXIST} Reference: ")),
+        "{stored}"
+    );
+    let answered_error = body["result"]["error"].as_str().unwrap_or_default();
+    assert_eq!(answered_error, stored_error, "{body}");
+    for engine_text in ENGINE_TEXT {
+        assert!(
+            !outcome["detail"].as_str().unwrap().contains(engine_text),
+            "{engine_text} in the stored outcome {stored}"
+        );
+        // The answer's `approval` echoes the statement itself, so only the
+        // tool's `result` is read.
+        assert!(
+            !body["result"].to_string().contains(engine_text),
+            "{engine_text} in the answer {body}"
+        );
+    }
+    assert!(
+        !body["result"].to_string().contains("_browserError"),
+        "{body}"
+    );
+}
+
+/// LH-QS-2-08, unchanged: an outcome whose tool succeeded, or failed with
+/// a message that is already fixed, is stored and answered as the tool
+/// returned it.
+#[tokio::test]
+async fn an_outcome_executed_after_approval_is_unchanged_without_an_engine_failure() {
+    let (body, outcome) =
+        approve_a_pending_run_sql(WORKING_SQL, engine_refuses_the_statement()).await;
+    assert_eq!(outcome["status"], json!("succeeded"));
+    assert_eq!(step_detail(&outcome)["rowCount"], json!(1));
+    assert_eq!(body["result"], step_detail(&outcome));
+
+    let (body, outcome) = approve_a_pending_run_sql(FAILING_SQL, engine_is_not_answering()).await;
+    assert_eq!(outcome["status"], json!("failed"));
+    let stored = step_detail(&outcome);
+    assert!(
+        stored["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("The database request failed. Reference: "),
+        "{stored}"
+    );
+    assert_eq!(body["result"], stored);
 }

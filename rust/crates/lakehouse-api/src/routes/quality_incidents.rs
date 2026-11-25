@@ -176,20 +176,19 @@ pub struct IncidentsQuery {
 ///
 /// # Errors
 ///
-/// `400` for a `status` that is not `open`, `resolved` or `all`;
-/// `503`/`500` on a store failure.
+/// `400` for a `status` that is not `open`, `resolved` or `all`; `403` for a
+/// caller outside the tenant that owns the shared catalog; `503`/`500` on a
+/// store or table-access failure.
 pub async fn list_incidents(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     headers: HeaderMap,
     Query(query): Query<IncidentsQuery>,
 ) -> ApiResult<ApiJson<Value>> {
-    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4
-    if let Some(reason) =
-        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await?
-    {
-        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
-    }
+    // GOV-16: the one GOV-15 gate — catalog tenant first, role table access
+    // second — so the list cannot be used to learn which tables a role hides.
+    let access =
+        crate::routes::quality::quality_table_access(&state, Some(&principal), &headers).await?;
     let status = match query.status.as_deref() {
         None | Some("") => StatusFilter::Open,
         Some(other) => StatusFilter::parse(other).ok_or_else(|| {
@@ -198,6 +197,22 @@ pub async fn list_incidents(
     };
     let asset = query.asset.as_deref().filter(|a| !a.trim().is_empty());
     let incidents = quality::list(pool(&state)?, status, asset).await?;
+    // `SEC-20` (plan ai-118): an incident names the table it is about, and
+    // the incidents of every tenant's upload are in the list, so the ones
+    // outside the caller's reach are left out — the reach Query Studio keeps
+    // (`crate::routes::query::resolve_reach` and
+    // `crate::routes::query::reachable_names`).
+    let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
+    let assets: Vec<String> = incidents.iter().map(|i| i.asset.clone()).collect();
+    let readable = crate::routes::query::reachable_names(&state, reach, &assets).await?;
+    // GOV-16: an incident names the table it is about, so a narrowed caller
+    // does not see the incidents of tables their role cannot read. The same
+    // predicate hides the rows on every quality/governance list.
+    let incidents: Vec<_> = incidents
+        .into_iter()
+        .filter(|i| readable.contains(&i.asset))
+        .filter(|i| crate::routes::quality::asset_readable(&access, Some(&i.asset)))
+        .collect();
     Ok(ApiJson(json!({ "incidents": incidents })))
 }
 
@@ -214,17 +229,51 @@ pub struct ResolveBody {
 /// # Errors
 ///
 /// `400` when the body is malformed or the reason is empty or too long;
-/// `404` when no incident has that id; `409` when it was resolved before;
-/// `503`/`500` on a store failure.
+/// `403` when the caller is outside the tenant that owns the shared catalog;
+/// `404` when no incident has that id, and for an incident on a table the
+/// caller's role does not read (it answers as an unknown incident,
+/// `GOV-15`) and for an incident on a table outside the caller's reach
+/// (`SEC-80`); `409` when it was resolved before; `503`/`500` on a store
+/// failure.
 pub async fn resolve_incident(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     body: axum::body::Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // GOV-15 (GOV-12 plan, section 4): the tenant gate comes first, before the
+    // body is read and before anything is looked up, so a caller outside it
+    // learns nothing about an incident id (D4).
+    let access =
+        crate::routes::quality::quality_table_access(&state, Some(&principal), &headers).await?;
     let body: ResolveBody = serde_json::from_slice(&body)
         // SEC-11 (CI run on DATA-14): a fixed sentence, not serde's text.
         .map_err(|_| ApiError::BadRequest("Body must be JSON {resolution}.".to_owned()))?;
+    match quality::get(pool(&state)?, &id).await? {
+        None => {
+            return Err(ApiError::NotFound("Quality incident not found".to_owned()).into());
+        }
+        // GOV-15 (GOV-12 plan, section 4): resolving is refused for an
+        // incident on a table the caller's role does not read, and it reads as
+        // an unknown id (the same 404). GOV-16 narrows the list itself the
+        // same way, so a hidden table's incident cannot be found from either.
+        Some(incident) => {
+            // SEC-80: an incident on a table another tenant claimed reads as an
+            // unknown id too.
+            if !access.allows_key(incident.asset.trim())
+                || !crate::routes::quality::quality_key_in_reach(
+                    &state,
+                    Some(&principal),
+                    &headers,
+                    incident.asset.trim(),
+                )
+                .await?
+            {
+                return Err(ApiError::NotFound("Quality incident not found".to_owned()).into());
+            }
+        }
+    }
     let incident = match quality::resolve(pool(&state)?, &id, principal.id.uuid(), &body.resolution)
         .await?
     {

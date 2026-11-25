@@ -13,7 +13,7 @@
     reason = "test timestamps are Unix seconds, exact in an f64"
 )]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -46,6 +46,9 @@ const REFUSAL: &str = "Table not found or not available to your organisation: se
 /// A recording `ClickHouse`: boards, charts and columns as the stores ask.
 #[derive(Clone)]
 struct FakeCh {
+    /// The address of one image card on the public board, when a test wants one
+    /// (`BI-42`); none keeps the board as every other test reads it.
+    image: Arc<Mutex<Option<String>>>,
     owner: String,
     log: Arc<Mutex<Vec<String>>>,
 }
@@ -91,6 +94,18 @@ impl Respond for FakeCh {
                 chart_row("c_one", PUBLIC_BOARD),
                 chart_row("c_two", PUBLIC_BOARD),
             ];
+            if let Some(url) = self.image.lock().unwrap().as_deref() {
+                let spec = json!({
+                    "id": "c_img", "title": "Logo", "kind": "image", "mart": "",
+                    "sql": "", "x": "", "y": ""
+                });
+                let def = json!({ "title": "Logo", "mart": "", "kind": "image", "url": url });
+                charts.push(json!({
+                    "id": "c_img", "board": PUBLIC_BOARD, "created_by": "ui",
+                    "created_at": "2026-01-01 00:00:00",
+                    "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+                }));
+            }
             // The owner's own personal board's chart is in the list only when
             // the statement does not leave that owner's boards out.
             if sql.contains(&format!("owner_id != '{}'", self.owner)) {
@@ -151,9 +166,10 @@ async fn user(pool: &PgPool, role: &str) -> Uuid {
         .await
         .unwrap();
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, $2, $3, 'active')")
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, $2, $3, $4, 'active')")
         .bind(user_id)
         .bind(format!("User of {role}"))
+        .bind(format!("{role}-{user_id}").replace(' ', "-").to_lowercase())
         .bind(format!("{role}-{user_id}@test.invalid").replace(' ', "-"))
         .execute(pool)
         .await
@@ -172,6 +188,7 @@ async fn fixture(secret: Option<&str>) -> Fixture {
     // is built first with a placeholder and the id is fixed up through `owner`.
     let owner_id = Uuid::new_v4();
     let fake = FakeCh {
+        image: Arc::new(Mutex::new(None)),
         owner: owner_id.to_string(),
         log: Arc::new(Mutex::new(Vec::new())),
     };
@@ -202,7 +219,7 @@ async fn fixture(secret: Option<&str>) -> Fixture {
         .execute(&app.pool)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Owner', 'owner@test.invalid', 'active')")
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Owner', 'owner', 'owner@test.invalid', 'active')")
         .bind(owner_id)
         .execute(&app.pool)
         .await
@@ -236,13 +253,27 @@ async fn fixture(secret: Option<&str>) -> Fixture {
 }
 
 fn render_token(user: Uuid, board: &str, age: f64, lifetime: f64) -> String {
+    render_token_for(user, board, None, age, lifetime)
+}
+
+/// A token minted under an explicit acting tenant (`SEC-54`), so a test can
+/// prove the print view reads under that tenant and not the person's first.
+fn render_token_for(
+    user: Uuid,
+    board: &str,
+    tenant: Option<&str>,
+    age: f64,
+    lifetime: f64,
+) -> String {
     let iat = (unix_now() - age).floor();
     sign_render(
         &RenderClaims {
             aud: "render".to_owned(),
             board: board.to_owned(),
             chart: None,
+            report: None,
             principal: user.to_string(),
+            tenant: tenant.map(str::to_owned),
             filters: Some(r#"[{"column":"region","values":["north"]}]"#.to_owned()),
             params: None,
             grain: None,
@@ -469,7 +500,9 @@ async fn a_render_token_signed_with_the_embed_secret_is_refused() {
         aud: "render".to_owned(),
         board: PUBLIC_BOARD.to_owned(),
         chart: None,
+        report: None,
         principal: f.owner.to_string(),
+        tenant: None,
         filters: None,
         params: None,
         grain: None,
@@ -528,13 +561,20 @@ async fn a_revoked_permission_or_a_download_switch_inside_the_tokens_life_stops_
 
 /// A token for one chart of a board.
 fn chart_token(user: Uuid, board: &str, chart: &str) -> String {
+    chart_token_for(user, board, chart, None)
+}
+
+/// A chart-image token with an explicit acting tenant (`SEC-54`).
+fn chart_token_for(user: Uuid, board: &str, chart: &str, tenant: Option<&str>) -> String {
     let iat = unix_now().floor();
     sign_render(
         &RenderClaims {
             aud: "render".to_owned(),
             board: board.to_owned(),
             chart: Some(chart.to_owned()),
+            report: None,
             principal: user.to_string(),
+            tenant: tenant.map(str::to_owned),
             filters: None,
             params: None,
             grain: None,
@@ -629,4 +669,209 @@ async fn a_person_of_another_tenant_sees_the_tile_refused() {
             .any(|sql| sql.contains("FROM serving.mart_x") && !sql.contains("system.")),
         "nothing is read when the person may not read the mart"
     );
+}
+
+/// `SEC-54` (SEC-50 slice 2 M5): the tenant in the token, not the person's
+/// first tenant, decides which data the PDF and the chart image read. `owner`
+/// belongs to both tenants; the seeded ids sort so the catalog tenant is
+/// first and the retail tenant second (`lakehouse_auth::repository` orders
+/// `app_user_tenant` by `tenant_id`).
+#[tokio::test]
+async fn a_token_carries_the_second_tenant_the_person_exported_under() {
+    let f = fixture(Some(SECRET)).await;
+    sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(f.owner)
+    .bind(OTHER_TENANT.parse::<Uuid>().unwrap())
+    .execute(&f.app.pool)
+    .await
+    .unwrap();
+
+    // Control: the catalog tenant is the first one and its mart is readable.
+    let first = render_token_for(
+        f.owner,
+        PUBLIC_BOARD,
+        Some(common::CATALOG_TENANT),
+        5.0,
+        120.0,
+    );
+    let (status, body) = post(&f.app, &json!({ "token": first }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["results"]["c_one"].is_object() && body["results"]["c_one"].get("rows").is_some(),
+        "CONTROL: the first tenant's mart is readable: {body}"
+    );
+
+    // The same person, same board and same token shape, but the second
+    // tenant: the shared mart belongs to no tenant, so only the catalog
+    // tenant reads it. This fails if the print view falls back to the first.
+    let second = render_token_for(f.owner, PUBLIC_BOARD, Some(OTHER_TENANT), 5.0, 120.0);
+    let (status, body) = post(&f.app, &json!({ "token": second }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"]["c_one"]["error"], REFUSAL, "{body}");
+
+    // A chart image follows the same tenant: only that chart is returned,
+    // with the gate's refusal in its own slot rather than the first tenant's
+    // rows drawn into the file.
+    let image = chart_token_for(f.owner, PUBLIC_BOARD, "c_one", Some(OTHER_TENANT));
+    let (status, body) = post(&f.app, &json!({ "token": image }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["charts"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(body["results"]["c_one"]["error"], REFUSAL, "{body}");
+    assert!(body["results"]["c_one"].get("rows").is_none(), "{body}");
+}
+
+/// `SEC-54`: membership is checked when the token is SPENT, not when it was
+/// minted. A person who left the tenant named in the token inside its two
+/// minutes gets the one fixed refusal, not the data of a tenant they no
+/// longer belong to.
+#[tokio::test]
+async fn a_token_for_a_tenant_the_person_has_since_left_is_refused_at_render_time() {
+    let f = fixture(Some(SECRET)).await;
+    let retail = OTHER_TENANT.parse::<Uuid>().unwrap();
+    sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(f.owner)
+    .bind(retail)
+    .execute(&f.app.pool)
+    .await
+    .unwrap();
+    let token = render_token_for(f.owner, PUBLIC_BOARD, Some(OTHER_TENANT), 5.0, 120.0);
+
+    // The person leaves the second tenant while the token is still valid.
+    sqlx::query("DELETE FROM app_user_tenant WHERE user_id = $1 AND tenant_id = $2")
+        .bind(f.owner)
+        .bind(retail)
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = post(&f.app, &json!({ "token": token }), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(
+        body["error"], "render token is invalid or expired",
+        "{body}"
+    );
+}
+
+// ── `GET /api/render/image` (`BI-42`, plan D6b) ──────────────────────────
+
+async fn get_image(app: &TestApp, query: &str) -> (StatusCode, Value) {
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/render/image{query}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+async fn save_content_sites(app: &TestApp, sites: &[&str]) {
+    let stored = lakehouse_store::reporting_settings::ReportingSettings {
+        time_zone: "UTC".to_owned(),
+        week_start: "monday".to_owned(),
+        number_locale: "en-US".to_owned(),
+        company_palette: Vec::new(),
+        fonts: Vec::new(),
+        content_sites: sites.iter().map(|s| (*s).to_owned()).collect(),
+        download_denied_roles: Vec::new(),
+        report_allowed_domains: Vec::new(),
+        public_links_enabled: true,
+        result_cache_mode: "default".to_owned(),
+        result_cache_minutes: None,
+    };
+    lakehouse_store::reporting_settings::upsert(&app.pool, &stored, "test")
+        .await
+        .expect("the settings are saved");
+}
+
+fn enc(text: &str) -> String {
+    text.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// `BI-42`: the route fetches only an address that is exactly an image card of
+/// the token's board and whose site is a content site now; everything else is
+/// one 404 sentence, and a token that is not good is refused as for the data.
+#[tokio::test]
+async fn the_image_route_serves_only_an_image_card_of_the_tokens_board_on_a_listed_site() {
+    let f = fixture(Some(SECRET)).await;
+    let card = "https://localhost:9/logo.png";
+    *f.fake.image.lock().unwrap() = Some(card.to_owned());
+    let token = render_token(f.owner, PUBLIC_BOARD, 5.0, 120.0);
+    let ask = |src: &str, token: &str| format!("?token={}&src={}", enc(token), enc(src));
+
+    // The site is not listed: the card's own address is a 404.
+    save_content_sites(&f.app, &[]).await;
+    let (status, body) = get_image(&f.app, &ask(card, &token)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "image is not available");
+
+    // Listed, but the address is not the card's: another path on the site,
+    // another site, an address that is not https, a web address nobody saved.
+    save_content_sites(&f.app, &["https://localhost:9", "https://other.example"]).await;
+    for other in [
+        "https://localhost:9/other.png",
+        "https://other.example/logo.png",
+        "http://localhost:9/logo.png",
+        "https://localhost:9/logo.png?x=1",
+        "file:///etc/passwd",
+    ] {
+        let (status, body) = get_image(&f.app, &ask(other, &token)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{other}: {body}");
+        assert_eq!(body["error"], "image is not available", "{other}");
+    }
+
+    // The card on a listed site passes the checks and reaches the fetch, where
+    // the deployment's own network is refused (a loopback address): a fixed
+    // 500 with a reference, never the host's or the resolver's text.
+    let (status, body) = get_image(&f.app, &ask(card, &token)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(!body.to_string().contains("localhost"), "{body}");
+
+    // A board the token does not name has no such card.
+    let other_board = render_token(f.owner, PRIVATE_BOARD, 5.0, 120.0);
+    let (status, _) = get_image(&f.app, &ask(card, &other_board)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn the_image_route_refuses_a_bad_token_and_a_request_with_no_address() {
+    let f = fixture(Some(SECRET)).await;
+    *f.fake.image.lock().unwrap() = Some("https://localhost:9/logo.png".to_owned());
+    save_content_sites(&f.app, &["https://localhost:9"]).await;
+    let src = enc("https://localhost:9/logo.png");
+    for token in [
+        render_token(f.owner, PUBLIC_BOARD, 500.0, 120.0),
+        "not.a.token".to_owned(),
+    ] {
+        let (status, body) = get_image(&f.app, &format!("?token={}&src={src}", enc(&token))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(body["error"], "render token is invalid or expired");
+    }
+    let token = render_token(f.owner, PUBLIC_BOARD, 5.0, 120.0);
+    let (status, _) = get_image(&f.app, &format!("?token={}", enc(&token))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = get_image(&f.app, "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }

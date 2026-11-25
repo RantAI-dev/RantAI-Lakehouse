@@ -21,7 +21,20 @@
      `pyiceberg` — a real Iceberg REST client, not a hand-rolled request.
      The row count must match what was seeded, a write must be refused
      403, another namespace must be refused 403, and the consumers route
-     must list the tool with one read.
+     must list the tool with one read. The same read also proves DATA-48:
+     the mart carries one decimal column per Parquet storage form
+     (`Decimal(9, 0)` as INT32, `Decimal(12, 2)` as INT64, `Decimal(38,
+     10)` as a fixed-length byte array), and every value pyiceberg reads
+     from the published table equals what ClickHouse holds.
+  6. DATA-6 — the LATEST-COPY table: after the 9-copy job sequence,
+     `gold.{MART}_latest` holds exactly the newest copy (one copy, the
+     mart's current row count, and the outside tool reads the same count
+     through the door); a reader that samples the table continuously
+     during a publish sees the old copy or the new one and never a mix;
+     a mart named `<other>_latest` is refused 422 and the latest table
+     is untouched; a human session is refused by the door on the latest
+     table like on any other; and switching publishing off stops updates
+     to BOTH tables while dropping neither.
 
 Same `g1-test-runner`/`g3a-test-runner` shape: run inside the compose
 network (`gold-export-test-runner` in `docker-compose.yml`), plain
@@ -40,9 +53,14 @@ Rust unit test (`routes::iceberg_door`'s `rewrite_endpoint`).
 
 from __future__ import annotations
 
+import datetime
+import decimal
+import gzip
+import json
 import os
 import random
 import sys
+import threading
 import time
 import uuid
 
@@ -77,6 +95,31 @@ GOLD_SOURCE_SCHEMA = os.environ.get("GOLD_SOURCE_SCHEMA", "serving")
 GOLD_EXPORT_RUN_TOKEN = os.environ.get("GOLD_EXPORT_RUN_TOKEN", "")
 MART_NAME = os.environ.get("GOLD_MART_NAME", "gold_export_smoke")
 ROW_COUNT = int(os.environ.get("GOLD_EXPORT_ROW_COUNT", "7"))
+# DATA-48 (QA LH-DATA-1-51): one decimal column per Parquet storage form —
+# `Decimal(9, 0)` is written as INT32, `Decimal(12, 2)` as INT64 and
+# `Decimal(38, 10)` as a fixed-length byte array — so the gate proves every
+# form survives the round trip. Row `i` takes entry `i % 7`, and each value
+# is written as decimal text through `toDecimal*`, so no value passes
+# through a float on the way in either.
+DECIMAL_UNITS = ["-999999999", "0", "1", "999999999", "-1", "42", "7"]
+DECIMAL_NET_AMOUNTS = [
+    "-1234567890.12",
+    "0",
+    "0.01",
+    "-0.01",
+    "9999999999.99",
+    "12.50",
+    "-0.50",
+]
+DECIMAL_FEES = [
+    None,
+    "-1234567890123456789012345678.0123456789",
+    "0.0000000001",
+    "9999999999999999999999999999.9999999999",
+    "0",
+    "-0.0000000001",
+    "1",
+]
 # DATA-5 (ADR 0016): the outside tool's service identity. The name
 # carries a random suffix because this test may run more than once
 # against the same deployment (a service identity's name is its natural
@@ -171,7 +214,8 @@ def step_login() -> None:
 
 def step_seed_gold_mart() -> None:
     """A real Gold aggregate mart shape: `region`/`total_sales`/
-    `order_count`/`updated_at` — one MergeTree table, ordinary (non-
+    `order_count`/`updated_at`, plus the three decimal columns of DATA-48
+    (`units`, `net_amount`, `fee`) — one MergeTree table, ordinary (non-
     Iceberg) `ClickHouse`, exactly the kind of `serving.*` table ADR 0010
     is exporting."""
     ch_query(f"CREATE DATABASE IF NOT EXISTS {GOLD_SOURCE_SCHEMA}")
@@ -179,7 +223,9 @@ def step_seed_gold_mart() -> None:
     ch_query(
         f"CREATE TABLE {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` ("
         "region String, total_sales Float64, order_count UInt64, "
-        "updated_at DateTime"
+        "updated_at DateTime, "
+        "units Decimal(9, 0), net_amount Decimal(12, 2), "
+        "fee Nullable(Decimal(38, 10))"
         ") ENGINE = MergeTree ORDER BY region"
     )
     rows = []
@@ -187,10 +233,21 @@ def step_seed_gold_mart() -> None:
         region = f"region-{i}"
         total_sales = round(random.uniform(100.0, 9999.0), 2)
         order_count = random.randint(1, 500)
-        rows.append(f"('{region}', {total_sales}, {order_count}, now())")
+        # The three storage forms, one entry of each list per row. The values
+        # are decimal TEXT converted by ClickHouse, never a Python float.
+        entry = i % len(DECIMAL_UNITS)
+        units = f"toDecimal32('{DECIMAL_UNITS[entry]}', 0)"
+        net_amount = f"toDecimal64('{DECIMAL_NET_AMOUNTS[entry]}', 2)"
+        fee_text = DECIMAL_FEES[entry]
+        fee = "NULL" if fee_text is None else f"toDecimal128('{fee_text}', 10)"
+        rows.append(
+            f"('{region}', {total_sales}, {order_count}, now(), "
+            f"{units}, {net_amount}, {fee})"
+        )
     ch_query(
         f"INSERT INTO {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` "
-        f"(region, total_sales, order_count, updated_at) VALUES {', '.join(rows)}"
+        f"(region, total_sales, order_count, updated_at, units, net_amount, fee) "
+        f"VALUES {', '.join(rows)}"
     )
     # Qualified with a WHERE, per R11 (`ops/lint/check_bare_iceberg_count.py`)
     # — not that this table is Iceberg at all (it's MergeTree, R11 doesn't
@@ -221,13 +278,16 @@ def step_trigger_export() -> dict:
     return body
 
 
-def _load_lakekeeper_metadata(mart_name: str) -> dict:
+def _warehouse_id() -> str:
+    """The deployment warehouse's own id — the prefix every door path
+    under `/api/iceberg/v1/{prefix}/...` carries. Read from Lakekeeper's
+    own management API (with the admin token the compose stack mints),
+    not through the door: a non-service session is refused by the door
+    before it could learn the prefix from the door's own config route
+    (DATA-6 D14)."""
     tokens_dir = os.environ.get("LAKEKEEPER_TOKENS_DIR", "/tokens")
     with open(f"{tokens_dir}/admin.jwt", encoding="utf-8") as f:
         admin_token = f.read().strip()
-    with open(f"{tokens_dir}/gold-export.jwt", encoding="utf-8") as f:
-        export_token = f.read().strip()
-
     warehouses = requests.get(
         f"{LAKEKEEPER_BASE_URI}/management/v1/warehouse",
         headers={"Authorization": f"Bearer {admin_token}"},
@@ -241,7 +301,15 @@ def _load_lakekeeper_metadata(mart_name: str) -> dict:
     )
     if not wh_id:
         raise GoldExportFailure(f"warehouse {LAKEKEEPER_WAREHOUSE!r} not found: {warehouses.json()}")
+    return wh_id
 
+
+def _load_lakekeeper_metadata(mart_name: str) -> dict:
+    tokens_dir = os.environ.get("LAKEKEEPER_TOKENS_DIR", "/tokens")
+    with open(f"{tokens_dir}/gold-export.jwt", encoding="utf-8") as f:
+        export_token = f.read().strip()
+
+    wh_id = _warehouse_id()
     load = requests.get(
         f"{LAKEKEEPER_BASE_URI}/catalog/v1/{wh_id}/namespaces/gold/tables/{mart_name}",
         headers={"Authorization": f"Bearer {export_token}"},
@@ -250,6 +318,39 @@ def _load_lakekeeper_metadata(mart_name: str) -> dict:
     if not load.ok:
         raise GoldExportFailure(f"Lakekeeper loadTable failed: {load.status_code} {load.text}")
     return load.json().get("metadata", {})
+
+
+def _decode_metadata_json(raw: bytes) -> dict:
+    """Decode an Iceberg metadata file stored plain or gzip-compressed.
+    The catalog writes `.metadata.json.gz` here (run 44772220357 crashed on
+    the gzip magic 0x1f 0x8b), but compression is a property of the bytes,
+    not the key suffix, so sniff the magic and leave plain JSON alone
+    (DATA-6 review R7, follow-up 2)."""
+    if raw.startswith(b"\x1f\x8b"):
+        raw = gzip.decompress(raw)
+    return json.loads(raw.decode("utf-8"))
+
+
+def _load_metadata_file(metadata_file: str) -> dict:
+    """Read one Iceberg metadata JSON named by a `metadata-log` entry.
+    The catalog's log holds file names, not documents; this uses the same
+    S3 client, endpoint and credentials as `get_s3_parquet_files`, so the
+    gate keeps one storage path and one auth path (DATA-6 review R7
+    follow-up — the evidence print needs each entry's snapshot ids and
+    operations, which are only in the file)."""
+    location_path = (
+        metadata_file.split("://", 1)[1] if "://" in metadata_file else metadata_file
+    )
+    bucket, _, key = location_path.partition("/")
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=RUSTFS_ENDPOINT,
+        aws_access_key_id=S3_ACCESS_KEY,
+        aws_secret_access_key=S3_SECRET_KEY,
+        region_name="us-east-1",
+    )
+    obj = s3.get_object(Bucket=bucket or S3_BUCKET, Key=key)
+    return _decode_metadata_json(obj["Body"].read())
 
 
 def get_s3_parquet_files(mart_name: str) -> list[str]:
@@ -409,22 +510,81 @@ def _outside_catalog(key: str):
     )
 
 
+def _clickhouse_decimal_values() -> dict[str, tuple]:
+    """The mart's three decimal columns as `decimal.Decimal`, keyed by
+    `region`, read as TEXT from `ClickHouse` — a TabSeparated `\\N` is a
+    NULL."""
+    raw = ch_query(
+        f"SELECT region, toString(units), toString(net_amount), toString(fee) "
+        f"FROM {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` ORDER BY region FORMAT TabSeparated"
+    )
+    held: dict[str, tuple] = {}
+    for line in raw.splitlines():
+        if not line:
+            continue
+        region, units, net_amount, fee = line.split("\t")
+        held[region] = (
+            decimal.Decimal(units),
+            decimal.Decimal(net_amount),
+            None if fee == "\\N" else decimal.Decimal(fee),
+        )
+    return held
+
+
 def step_outside_tool_reads_the_published_table(key: str) -> None:
     """The outside tool reads the published table through the door and
     sees exactly the rows that were seeded — the whole point of DATA-5:
     outside reading works, and the rows are the same ones the console
-    exports."""
+    exports.
+
+    DATA-48 (QA `LH-DATA-1-51`): from the SAME one load and one scan (the
+    consumers step counts exactly one read), the three decimal columns are
+    checked too — their Arrow types, and every value against what
+    `ClickHouse` holds. That is the proof the published decimals are exact,
+    in each of the three Parquet storage forms.
+    """
     catalog = _outside_catalog(key)
     table = catalog.load_table(("gold", MART_NAME))
-    rows = table.scan().to_arrow().num_rows
+    published = table.scan().to_arrow()
+    rows = published.num_rows
     if rows != ROW_COUNT:
         raise GoldExportFailure(
             f"the outside tool read {rows} rows through the door, "
             f"expected {ROW_COUNT}"
         )
+
+    for name, expected_type in [
+        ("units", pa.decimal128(9, 0)),
+        ("net_amount", pa.decimal128(12, 2)),
+        ("fee", pa.decimal128(38, 10)),
+    ]:
+        actual_type = published.schema.field(name).type
+        if actual_type != expected_type:
+            raise GoldExportFailure(
+                f"gold.{MART_NAME}.{name} reads back as {actual_type}, "
+                f"expected {expected_type}"
+            )
+
+    by_region = {
+        row["region"]: (row["units"], row["net_amount"], row["fee"])
+        for row in published.to_pylist()
+    }
+    held = _clickhouse_decimal_values()
+    if set(by_region) != set(held):
+        raise GoldExportFailure(
+            "the published regions differ from ClickHouse's: "
+            f"published {sorted(by_region)}, held {sorted(held)}"
+        )
+    for region, held_values in held.items():
+        if by_region[region] != held_values:
+            raise GoldExportFailure(
+                f"gold.{MART_NAME} region {region} reads back as {by_region[region]}, "
+                f"ClickHouse holds {held_values}"
+            )
+
     print(
         f"[gold-export] the outside tool read {rows} rows of gold.{MART_NAME} "
-        "through the door"
+        "through the door, and the three decimal columns match ClickHouse exactly"
     )
 
 
@@ -551,6 +711,28 @@ def step_insert_row_with_if_changed_exports() -> None:
         )
 
 
+def _wait_for_dagster_run_success(run_id: str, label: str, timeout_s: int, interval_s: float = 2.0) -> None:
+    """Poll Dagster's GraphQL until `run_id` reports SUCCESS, failing the
+    gate on FAILURE. The one shared poll for every step that triggers a
+    job and waits for it (DATA-6's switching-off step joins the
+    9-copy step in reusing it)."""
+    query = (
+        "query($rid:ID!){ pipelineRunOrError(runId:$rid){ __typename "
+        "... on Run { status } } }"
+    )
+
+    def check_run() -> bool:
+        r = requests.post(DAGSTER_URL, json={"query": query, "variables": {"rid": run_id}}, timeout=10)
+        r.raise_for_status()
+        st = r.json().get("data", {}).get("pipelineRunOrError", {}).get("status")
+        print(f"[gold-export] {label} run {run_id} status={st}")
+        if st == "FAILURE":
+            raise GoldExportFailure(f"{label} run {run_id} FAILED")
+        return st == "SUCCESS"
+
+    _wait_for(f"{label} run {run_id} SUCCESS", check_run, timeout_s, interval_s=interval_s)
+
+
 def step_job_export_9_copies_and_trim_to_7() -> None:
     """DATA-2 (T5): publish 9 changed copies through the job path:
     1. Wait for Dagster webserver.
@@ -592,11 +774,6 @@ def step_job_export_9_copies_and_trim_to_7() -> None:
     cycle_files: dict[int, str] = {}
     known_files = set(baseline_files)
 
-    query = (
-        "query($rid:ID!){ pipelineRunOrError(runId:$rid){ __typename "
-        "... on Run { status } } }"
-    )
-
     for cycle in range(1, 10):
         # Mutate mart rows in ClickHouse so ifChanged exports a new copy
         ch_query(
@@ -616,16 +793,7 @@ def step_job_export_9_copies_and_trim_to_7() -> None:
         if not run_id:
             raise GoldExportFailure(f"missing run id in trigger response: {trig_resp.json()}")
 
-        def check_run() -> bool:
-            r = requests.post(DAGSTER_URL, json={"query": query, "variables": {"rid": run_id}}, timeout=10)
-            r.raise_for_status()
-            st = r.json().get("data", {}).get("pipelineRunOrError", {}).get("status")
-            print(f"[gold-export] cycle {cycle} run {run_id} status={st}")
-            if st == "FAILURE":
-                raise GoldExportFailure(f"cycle {cycle} run {run_id} FAILED")
-            return st == "SUCCESS"
-
-        _wait_for(f"gold_export_job cycle {cycle} run {run_id} SUCCESS", check_run, 90, interval_s=2.0)
+        _wait_for_dagster_run_success(run_id, f"gold_export_job cycle {cycle}", 90, interval_s=2.0)
 
         current_files = get_s3_parquet_files(MART_NAME)
         new_files = [f for f in current_files if f not in known_files]
@@ -690,6 +858,499 @@ def step_job_export_9_copies_and_trim_to_7() -> None:
     )
 
 
+def _latest_copy_publication() -> dict:
+    """The publication detail's `latestCopy` block (DATA-6 D4), or `{}` on
+    an API that predates it — the steps assert on what they need."""
+    resp = API.get(f"{API_URL}/api/gold/export/{MART_NAME}/publication", timeout=10)
+    if not resp.ok:
+        raise GoldExportFailure(f"GET .../publication failed: {resp.status_code} {resp.text}")
+    return resp.json().get("latestCopy") or {}
+
+
+def _rfc3339_to_micros(text: str) -> int | None:
+    """An RFC 3339 instant as exact epoch microseconds (the copy stamp's
+    own precision), or `None` when the text does not parse."""
+    try:
+        parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    delta = parsed - datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+    return delta // datetime.timedelta(microseconds=1)
+
+
+def step_latest_copy_holds_only_the_newest_copy(tool_key: str) -> None:
+    """DATA-6 (AC1): after the 9-copy job sequence, the latest table holds
+    exactly the newest copy — the copy with `max(_exported_at)` of
+    `gold.{MART}`, one copy, the mart's current row count, and readable
+    through the door by the outside tool."""
+    started = time.time()
+
+    def holds_the_newest() -> bool:
+        latest = _latest_copy_publication()
+        if (latest.get("lastRun") or {}).get("status") != "success":
+            return False
+        holds = latest.get("holds") or {}
+        held_micros = _rfc3339_to_micros(holds.get("copyExportedAt") or "")
+        newest_micros = int(
+            ch_query(
+                f"SELECT toUnixTimestamp64Micro(max(_exported_at)) "
+                f"FROM icecat_gold_export.`gold.{MART_NAME}` WHERE 1 FORMAT TabSeparated"
+            ).strip()
+        )
+        if held_micros != newest_micros:
+            print(
+                f"[gold-export] the latest copy holds {held_micros}, the newest copy "
+                f"is {newest_micros}; still waiting"
+            )
+            return False
+        return True
+
+    _wait_for(
+        f"gold.{MART_NAME}_latest to hold the newest copy",
+        holds_the_newest,
+        120,
+        interval_s=2.0,
+    )
+    latest = _latest_copy_publication()
+    holds = latest.get("holds") or {}
+    replaced_at = _rfc3339_to_micros(holds.get("replacedAt") or "")
+    print(f"[gold-export] the latest copy holds: {holds}")
+
+    held_rows, held_copies = (
+        int(v)
+        for v in ch_query(
+            f"SELECT count(), count(DISTINCT _exported_at) "
+            f"FROM icecat_gold_export.`gold.{MART_NAME}_latest` WHERE 1 FORMAT TabSeparated"
+        )
+        .strip()
+        .split("\t")
+    )
+    if held_copies != 1:
+        raise GoldExportFailure(
+            f"gold.{MART_NAME}_latest holds {held_copies} copies, expected exactly 1"
+        )
+    serving_rows = int(
+        ch_query(
+            f"SELECT count() FROM {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` WHERE 1 "
+            "FORMAT TabSeparated"
+        ).strip()
+    )
+    if held_rows != serving_rows:
+        raise GoldExportFailure(
+            f"gold.{MART_NAME}_latest holds {held_rows} rows, the mart has {serving_rows}"
+        )
+    # AC1's third half: the outside tool reads the same count through the
+    # door — a real Iceberg client, the client the door exists for.
+    outside_rows = (
+        _outside_catalog(tool_key)
+        .load_table(("gold", f"{MART_NAME}_latest"))
+        .scan()
+        .to_arrow()
+        .num_rows
+    )
+    if outside_rows != held_rows:
+        raise GoldExportFailure(
+            f"the outside tool read {outside_rows} rows of gold.{MART_NAME}_latest "
+            f"through the door, the table holds {held_rows}"
+        )
+    print(
+        f"[gold-export] the outside tool read {outside_rows} rows of "
+        f"gold.{MART_NAME}_latest through the door"
+    )
+    # M1's customer-visible delay: an UPPER bound here (replacedAt is the
+    # follow-up run's own finish, lastExportedAt is the export run's
+    # start), because this step's publishes happened inside the 9-copy
+    # step. The step below measures the delay directly around its own
+    # publish and records the number.
+    detail = API.get(f"{API_URL}/api/gold/export/{MART_NAME}/publication", timeout=10).json()
+    last_exported_at = _rfc3339_to_micros(detail.get("lastExportedAt") or "")
+    if replaced_at is not None and last_exported_at is not None:
+        print(
+            f"[gold-export] the latest copy's replace finished at most "
+            f"{(replaced_at - last_exported_at) / 1_000_000:.1f}s after its publish "
+            f"began (upper bound; the step below measures the delay itself)"
+        )
+    print(f"[gold-export] step-1 settle time: {time.time() - started:.1f}s")
+
+
+def step_a_reader_during_a_publish_never_sees_a_mix() -> None:
+    """DATA-6 (AC2): a reader that samples the latest table continuously
+    during a publish sees the old copy or the new one, never a mix and
+    never a partial copy."""
+    samples: list[tuple[int, int]] = []
+    reader_errors: list[str] = []
+    stop = threading.Event()
+
+    def read_continuously() -> None:
+        sql = (
+            f"SELECT count(), count(DISTINCT _exported_at) "
+            f"FROM icecat_gold_export.`gold.{MART_NAME}_latest` WHERE 1 "
+            "FORMAT TabSeparated"
+        )
+        while not stop.is_set():
+            try:
+                raw = ch_query(sql).strip()
+                if "\t" in raw:
+                    count, distinct = (int(v) for v in raw.split("\t"))
+                    samples.append((count, distinct))
+            except Exception as exc:  # noqa: BLE001 - reported below
+                reader_errors.append(str(exc))
+            time.sleep(0.2)
+
+    old_count, old_distinct = (
+        int(v)
+        for v in ch_query(
+            f"SELECT count(), count(DISTINCT _exported_at) "
+            f"FROM icecat_gold_export.`gold.{MART_NAME}_latest` WHERE 1 FORMAT TabSeparated"
+        )
+        .strip()
+        .split("\t")
+    )
+    if old_distinct != 1:
+        raise GoldExportFailure(
+            f"gold.{MART_NAME}_latest held {old_distinct} copies before the read"
+        )
+
+    # DATA-6 review R1: T0 recorded no numbers, so the one-commit claim
+    # (D3) is measured here on the real stack, not asserted from a spike.
+    # Read the catalog's own metadata BEFORE the publish through the gate's
+    # existing helper: the metadata-log entries are the baseline for the
+    # replace below (DATA-6 review R7).
+    meta_before = _load_lakekeeper_metadata(f"{MART_NAME}_latest")
+    log_before = list(meta_before.get("metadata-log") or [])
+
+    reader = threading.Thread(target=read_continuously, daemon=True)
+    reader.start()
+    try:
+        ch_query(
+            f"INSERT INTO {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` "
+            f"(region, total_sales, order_count, updated_at) "
+            "VALUES ('region-latest-mix', 42.0, 7, now())"
+        )
+        published_at = time.time()
+        resp = API.post(f"{API_URL}/api/gold/export/{MART_NAME}", timeout=60)
+        if not resp.ok:
+            raise GoldExportFailure(f"POST /api/gold/export/{MART_NAME} failed: {resp.status_code} {resp.text}")
+        body = resp.json()
+        print(f"[gold-export] the publish's latest-copy answer: {body.get('latestCopy')}")
+        if (body.get("latestCopy") or {}).get("status") != "queued":
+            raise GoldExportFailure(f"expected latestCopy.status == 'queued', got: {body}")
+
+        new_count = old_count + 1
+
+        def holds_the_new_copy() -> bool:
+            count, distinct = (
+                int(v)
+                for v in ch_query(
+                    f"SELECT count(), count(DISTINCT _exported_at) "
+                    f"FROM icecat_gold_export.`gold.{MART_NAME}_latest` WHERE 1 "
+                    "FORMAT TabSeparated"
+                )
+                .strip()
+                .split("\t")
+            )
+            return count == new_count and distinct == 1
+
+        _wait_for(
+            f"gold.{MART_NAME}_latest to hold the new copy ({new_count} rows)",
+            holds_the_new_copy,
+            120,
+            interval_s=1.0,
+        )
+
+        def run_succeeded() -> bool:
+            return (_latest_copy_publication().get("lastRun") or {}).get("status") == "success"
+
+        _wait_for("the latest-copy run to report success", run_succeeded, 120, interval_s=1.0)
+
+        # DATA-6 review R1: prove the replace was ONE catalog commit (D3).
+        # DATA-6 review R7 (follow-up): CI run 44721191272 reported the new
+        # current snapshot at metadata-log entry 1, not 0. That entry is NOT
+        # a second commit: PyIceberg's `_update_table_metadata_log` appends an
+        # entry for the file it SUPERSEDES, stamped with THAT file's
+        # `last_updated_ms`. The entry right after the baseline is therefore
+        # the baseline's own metadata file, written before the new snapshot;
+        # the replace's own file is entry 1. Matching by timestamp mistook
+        # that bookkeeping entry for an extra commit. The baseline already
+        # measures an EXISTING latest table (AC1 ran a successful publish
+        # first), so no second publish is needed. Identify the introducing
+        # entry by what the files CONTAIN instead, and print every entry on
+        # failure so a genuine split replace is visible in the CI log.
+        meta_after = _load_lakekeeper_metadata(f"{MART_NAME}_latest")
+        log_after = list(meta_after.get("metadata-log") or [])
+        if len(log_after) <= len(log_before):
+            raise GoldExportFailure(
+                f"DATA-6 D3: the metadata log did not grow across the replace: "
+                f"{len(log_before)} -> {len(log_after)}"
+            )
+        current_id = meta_after.get("current-snapshot-id")
+        current_snapshot = next(
+            (
+                snapshot
+                for snapshot in (meta_after.get("snapshots") or [])
+                if snapshot.get("snapshot-id") == current_id
+            ),
+            None,
+        )
+        if current_snapshot is None:
+            raise GoldExportFailure(
+                f"DATA-6 D3: gold.{MART_NAME}_latest has no current snapshot {current_id}"
+            )
+
+        old_ids = {
+            snapshot.get("snapshot-id")
+            for snapshot in (meta_before.get("snapshots") or [])
+        }
+        new_entries = log_after[len(log_before):]
+        entry_docs = []
+        for entry in new_entries:
+            doc = _load_metadata_file(entry["metadata-file"])
+            snapshots = doc.get("snapshots") or []
+            entry_docs.append(
+                (
+                    entry,
+                    {s.get("snapshot-id") for s in snapshots},
+                    sorted(str((s.get("summary") or {}).get("operation")) for s in snapshots),
+                )
+            )
+
+        def entry_report() -> str:
+            """Every entry after the baseline, with its snapshot ids and
+            operations — the evidence the CI log was missing."""
+            return "\n".join(
+                f"  [{i}] timestamp-ms={entry.get('timestamp-ms')} "
+                f"metadata-file={entry.get('metadata-file')} "
+                f"snapshot-ids={sorted(ids)} operations={ops}"
+                for i, (entry, ids, ops) in enumerate(entry_docs)
+            )
+
+        print(f"[gold-export] DATA-6 D3 new metadata-log entries:\n{entry_report()}")
+        all_new_ids = set()
+        for _, ids, _ in entry_docs:
+            all_new_ids |= ids - old_ids
+        introducing = next(
+            (i for i, (_, ids, _) in enumerate(entry_docs) if current_id in ids),
+            None,
+        )
+        if introducing is None:
+            raise GoldExportFailure(
+                f"DATA-6 D3: no new metadata-log entry holds the new current "
+                f"snapshot {current_id}:\n{entry_report()}"
+            )
+        if entry_docs[introducing][1] - old_ids != all_new_ids:
+            raise GoldExportFailure(
+                f"DATA-6 D3: new snapshots were introduced by more than one "
+                f"metadata-log entry (entry {introducing} holds only part of "
+                f"{sorted(all_new_ids)}), so the replace was not one commit:\n"
+                f"{entry_report()}"
+            )
+        if introducing > 0 and entry_docs[introducing - 1][1] != old_ids:
+            raise GoldExportFailure(
+                f"DATA-6 D3: the entry before the replace is not the baseline "
+                f"metadata file (snapshot ids {sorted(old_ids)}):\n{entry_report()}"
+            )
+        # DATA-6 review R8: assert on the CURRENT snapshot's operation,
+        # not on a sorted list of every new snapshot id. After D11's expiry
+        # only the current snapshot survives, and PyIceberg stages a delete
+        # and an append in the one commit: sorting `["delete", "append"]`
+        # and comparing it to an unsorted tuple would refuse a correct
+        # replace. A writer that emits one `overwrite` snapshot is accepted
+        # too.
+        operation = str((current_snapshot.get("summary") or {}).get("operation") or "")
+        if operation not in ("append", "overwrite"):
+            raise GoldExportFailure(
+                f"DATA-6 D3: the replace's current snapshot has operation "
+                f"{operation!r}, expected 'append' or 'overwrite':\n{entry_report()}"
+            )
+        print(
+            f"[gold-export] DATA-6 D3: metadata log {len(log_before)} -> "
+            f"{len(log_after)}; one commit (entry {introducing}) introduced "
+            f"{sorted(all_new_ids)}; operation {operation}"
+        )
+
+        delay = time.time() - published_at
+        print(
+            f"[gold-export] the latest copy followed its publish by {delay:.1f}s "
+            "(the M1 limit, measured from the publish's answer)"
+        )
+        # Guarantee the reader samples the new state at least once before
+        # the thread stops — otherwise "not measured" below would be about
+        # this test's timing, not the table's consistency.
+        time.sleep(0.6)
+    finally:
+        stop.set()
+        reader.join(timeout=5)
+
+    if reader_errors:
+        raise GoldExportFailure(f"the reader thread failed: {reader_errors[:3]}")
+    if not samples:
+        raise GoldExportFailure("not measured: the reader thread took no sample")
+    for count, distinct in samples:
+        if distinct != 1:
+            raise GoldExportFailure(f"a reader saw a mix: count={count} distinct={distinct}")
+        if count not in (old_count, new_count):
+            raise GoldExportFailure(
+                f"a reader saw a partial copy: count={count}, expected {old_count} or {new_count}"
+            )
+    seen_counts = {count for count, _ in samples}
+    if seen_counts != {old_count, new_count}:
+        raise GoldExportFailure(
+            f"not measured: the reader only saw counts {sorted(seen_counts)}, "
+            f"expected both {old_count} and {new_count}"
+        )
+    print(
+        f"[gold-export] {len(samples)} continuous reads, every one a whole copy: "
+        f"counts seen {sorted(seen_counts)}"
+    )
+
+
+def step_a_mart_cannot_publish_into_a_latest_table() -> None:
+    """DATA-6 (AC3, D7): a mart whose own name is `<other>_latest` would
+    publish into another mart's latest-copy table. The export refuses
+    with the fixed sentence and a 422, and the latest table is
+    unchanged."""
+    # The mart must exist for the export to reach its catalog target —
+    # the source-table check runs first.
+    ch_query(f"DROP TABLE IF EXISTS {GOLD_SOURCE_SCHEMA}.`{MART_NAME}_latest`")
+    ch_query(
+        f"CREATE TABLE {GOLD_SOURCE_SCHEMA}.`{MART_NAME}_latest` ("
+        "region String, total_sales Float64, order_count UInt64, "
+        "updated_at DateTime, "
+        "units Decimal(9, 0), net_amount Decimal(12, 2), "
+        "fee Nullable(Decimal(38, 10))"
+        ") ENGINE = MergeTree ORDER BY region"
+    )
+    ch_query(
+        f"INSERT INTO {GOLD_SOURCE_SCHEMA}.`{MART_NAME}_latest` "
+        "(region, total_sales, order_count, updated_at, units, net_amount, fee) "
+        "VALUES ('a mart of its own', 1.0, 1, now(), toDecimal32('1', 0), "
+        "toDecimal64('1.00', 2), NULL)"
+    )
+    before = int(
+        ch_query(
+            f"SELECT count() FROM icecat_gold_export.`gold.{MART_NAME}_latest` "
+            "WHERE 1 FORMAT TabSeparated"
+        ).strip()
+    )
+    resp = API.post(f"{API_URL}/api/gold/export/{MART_NAME}_latest", timeout=30)
+    if resp.status_code != 422:
+        raise GoldExportFailure(
+            f"POST /api/gold/export/{MART_NAME}_latest answered {resp.status_code} "
+            f"(expected 422): {resp.text}"
+        )
+    message = resp.json().get("error", "")
+    if "latest-copy table" not in message:
+        raise GoldExportFailure(f"expected the fixed latest-copy sentence, got: {message}")
+    if MART_NAME not in message:
+        raise GoldExportFailure(f"the sentence must name the mart, got: {message}")
+    after = int(
+        ch_query(
+            f"SELECT count() FROM icecat_gold_export.`gold.{MART_NAME}_latest` "
+            "WHERE 1 FORMAT TabSeparated"
+        ).strip()
+    )
+    if after != before:
+        raise GoldExportFailure(
+            f"gold.{MART_NAME}_latest changed from {before} to {after} rows under a refused publish"
+        )
+    print(f"[gold-export] the export refused the latest-copy mart: 422 {message!r}")
+    ch_query(f"DROP TABLE {GOLD_SOURCE_SCHEMA}.`{MART_NAME}_latest`")
+
+
+def step_the_door_refuses_a_session_on_the_latest_table() -> None:
+    """DATA-6 (AC3, D14): the latest table is read through the door by a
+    service identity only. The logged-in human session is refused — the
+    same 403 ForbiddenException the door answers any non-service caller
+    with, on the latest table like on any other."""
+    wh_id = _warehouse_id()
+    url = f"{API_URL}/api/iceberg/v1/{wh_id}/namespaces/gold/tables/{MART_NAME}_latest"
+    resp = API.get(url, timeout=10)
+    if resp.status_code != 403:
+        raise GoldExportFailure(
+            f"the door answered a human session with {resp.status_code} "
+            f"(expected 403): {resp.text}"
+        )
+    body = resp.json()
+    if (body.get("error") or {}).get("type") != "ForbiddenException":
+        raise GoldExportFailure(f"expected the door's ForbiddenException shape, got: {body}")
+    print(
+        f"[gold-export] the door refused the human session on gold.{MART_NAME}_latest: "
+        f"{(body.get('error') or {}).get('message')}"
+    )
+
+
+def step_switching_off_stops_both_tables() -> None:
+    """DATA-6 (AC5): switching publishing off stops updates to BOTH
+    tables, and neither is dropped: a scheduled run with the mart off
+    publishes nothing, the latest table keeps its copy, and both tables
+    still load from the catalog."""
+    off = API.put(
+        f"{API_URL}/api/gold/export/{MART_NAME}/publication",
+        json={"enabled": False},
+        timeout=10,
+    )
+    if not off.ok:
+        raise GoldExportFailure(
+            f"PUT .../publication (enabled: false) failed: {off.status_code} {off.text}"
+        )
+
+    main_before = int(
+        ch_query(
+            f"SELECT toUnixTimestamp64Micro(max(_exported_at)) "
+            f"FROM icecat_gold_export.`gold.{MART_NAME}` WHERE 1 FORMAT TabSeparated"
+        ).strip()
+    )
+    latest_before = ch_query(
+        f"SELECT count(), toUnixTimestamp64Micro(max(_exported_at)) "
+        f"FROM icecat_gold_export.`gold.{MART_NAME}_latest` WHERE 1 FORMAT TabSeparated"
+    ).strip()
+
+    ch_query(
+        f"INSERT INTO {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` "
+        f"(region, total_sales, order_count, updated_at) "
+        "VALUES ('region-switched-off', 9.0, 1, now())"
+    )
+    trig = API.post(f"{API_URL}/api/pipelines/gold_export_job/trigger", timeout=10)
+    if not trig.ok:
+        raise GoldExportFailure(
+            f"POST /api/pipelines/gold_export_job/trigger failed: {trig.status_code} {trig.text}"
+        )
+    run_id = trig.json().get("id")
+    if not run_id:
+        raise GoldExportFailure(f"missing run id in trigger response: {trig.json()}")
+    _wait_for_dagster_run_success(run_id, "gold_export_job with publishing off", 90, interval_s=2.0)
+
+    main_after = int(
+        ch_query(
+            f"SELECT toUnixTimestamp64Micro(max(_exported_at)) "
+            f"FROM icecat_gold_export.`gold.{MART_NAME}` WHERE 1 FORMAT TabSeparated"
+        ).strip()
+    )
+    latest_after = ch_query(
+        f"SELECT count(), toUnixTimestamp64Micro(max(_exported_at)) "
+        f"FROM icecat_gold_export.`gold.{MART_NAME}_latest` WHERE 1 FORMAT TabSeparated"
+    ).strip()
+    if main_after != main_before:
+        raise GoldExportFailure(
+            f"gold.{MART_NAME} was published although publishing is off: "
+            f"max(_exported_at) moved from {main_before} to {main_after}"
+        )
+    if latest_after != latest_before:
+        raise GoldExportFailure(
+            f"gold.{MART_NAME}_latest changed although publishing is off: "
+            f"{latest_before} -> {latest_after}"
+        )
+    # D5: nothing in this feature drops a table — both still load.
+    _load_lakekeeper_metadata(MART_NAME)
+    _load_lakekeeper_metadata(f"{MART_NAME}_latest")
+    print(
+        "[gold-export] publishing off stopped both tables; both still load "
+        "from the catalog"
+    )
+
+
 def main() -> int:
     try:
         step_wait_for_services()
@@ -711,6 +1372,17 @@ def main() -> int:
         step_exchange_tables_same_rows_with_if_changed_skips()
         step_insert_row_with_if_changed_exports()
         step_job_export_9_copies_and_trim_to_7()
+        # DATA-6: the latest-copy table. AC1 (holds only the newest copy,
+        # readable through the door), AC2 (a reader during a publish never
+        # sees a mix, and the publish-to-update delay is measured), AC3
+        # (the Rust refusal of a mart named <other>_latest, and the door's
+        # refusal of a human session), AC5 (switching publishing off stops
+        # both tables and drops neither).
+        step_latest_copy_holds_only_the_newest_copy(tool_key)
+        step_a_reader_during_a_publish_never_sees_a_mix()
+        step_a_mart_cannot_publish_into_a_latest_table()
+        step_the_door_refuses_a_session_on_the_latest_table()
+        step_switching_off_stops_both_tables()
     except GoldExportFailure as exc:
         print(f"[gold-export] FAILED: {exc}", file=sys.stderr)
         return 1

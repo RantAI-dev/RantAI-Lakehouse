@@ -35,6 +35,17 @@ pub enum AuthError {
     /// unexpired session.
     #[error("session is invalid or expired")]
     SessionInvalid,
+    /// The identity provider did not confirm the token's email
+    /// (`email_verified: true`), and an account with that email already
+    /// exists, so the sign-in must not be joined to it (`SEC-65` D2).
+    ///
+    /// Carries no claim text — not the email, not the subject. The route
+    /// that answers this (`routes::auth::oidc_callback`) turns it into one
+    /// fixed notice code, and the refusal itself is audited where it is
+    /// decided (`OidcAuthenticator::provision_user`), which is the only
+    /// place the subject is known.
+    #[error("the identity provider did not confirm the email address")]
+    EmailNotVerified,
     /// The presented service token doesn't resolve to a live, unrevoked,
     /// unexpired service credential.
     #[error("service credential is invalid or expired")]
@@ -82,10 +93,15 @@ impl From<sqlx::Error> for AuthError {
 impl From<AuthError> for ApiError {
     fn from(err: AuthError) -> Self {
         match err {
-            AuthError::InvalidCredentials => Self::invalid_or_expired(),
-            AuthError::SessionInvalid | AuthError::ServiceCredentialInvalid => {
-                Self::invalid_or_expired()
-            }
+            // `SEC-65` D2: on the bearer-token path an unconfirmed email
+            // is the same "this token does not authenticate anyone here"
+            // refusal as an invalid signature (and as a dead session) — the
+            // browser sign-in path is the one that answers with a notice
+            // instead (`routes::auth::oidc_callback`).
+            AuthError::InvalidCredentials
+            | AuthError::EmailNotVerified
+            | AuthError::SessionInvalid
+            | AuthError::ServiceCredentialInvalid => Self::invalid_or_expired(),
             AuthError::UnsupportedCredential => Self::unauthorized(),
             AuthError::Conflict(message) => Self::Conflict(message),
             AuthError::NotFound => Self::NotFound("record not found".to_owned()),
@@ -121,6 +137,15 @@ mod tests {
     fn conflict_maps_to_409() {
         let api: ApiError = AuthError::Conflict("already linked".to_owned()).into();
         assert_eq!(api.status(), 409);
+    }
+
+    /// `SEC-65` D2: the refusal is a 401 like every other failed
+    /// authentication, and its rendered text names no address.
+    #[test]
+    fn email_not_verified_maps_to_401_and_names_no_address() {
+        let api: ApiError = AuthError::EmailNotVerified.into();
+        assert_eq!(api.status(), 401);
+        assert_eq!(api.to_string(), "invalid_or_expired");
     }
 
     #[test]

@@ -34,11 +34,11 @@ definition for.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | A metric's formula is written in the product's formula language (`BI-8`) and must be an aggregate | Planner default | Owner to confirm at QA |
-| 2 | A metric's own filters apply only to that metric's number, so a chart can show a filtered metric beside an unfiltered measure | Planner default | Owner to confirm at QA |
-| 3 | Defining and changing metrics and segments needs a new permission, `metric:write`; using them needs only to see the dashboard | Planner default | Owner to confirm at QA |
-| 4 | A metric or segment in use cannot be deleted; changing a metric shows the charts that use it first and then applies to all of them at once | Planner default | Owner to confirm at QA |
-| 5 | The built-in metric cards from the deployment file stay as they are | Planner default | Owner to confirm at QA |
+| 1 | A metric's formula is written in the product's formula language (`BI-8`) and must be an aggregate | Planner default | Owner, 2026-11-13 |
+| 2 | A metric's own filters apply only to that metric's number, so a chart can show a filtered metric beside an unfiltered measure | Planner default | Owner, 2026-11-13 |
+| 3 | Defining and changing metrics and segments needs a new permission, `metric:write`; using them needs only to see the dashboard | Planner default | Owner, 2026-11-13 |
+| 4 | A metric or segment in use cannot be deleted; changing a metric shows the charts that use it first and then applies to all of them at once | Planner default | Owner, 2026-11-13 |
+| 5 | The built-in metric cards from the deployment file stay as they are | Planner default | Owner, 2026-11-13 |
 | 6 | The assistant prefers a named metric when one matches the question and names it in its answer; when none matches it says so before writing a query | Spec (`AI-7`) | 2026-10-11 |
 
 ## Limits to tell a customer
@@ -47,6 +47,7 @@ definition for.
 - Comparisons need the metric's date column.
 - Certification is not available until `DATA-12`.
 - An alert rule on a metric is evaluated with the fixed viewer role that every alert rule runs with, not with the access of whoever wrote the rule (a rule has no owner); a metric that role cannot read makes the rule fail with a stated reason instead of firing.
+- A person without `metric:write` reads the list of metrics and segments; the buttons to define or change one are not shown to them.
 
 ## Acceptance checklist
 
@@ -57,3 +58,15 @@ definition for.
 - `BI-2-AC5` A user without `metric:write` cannot define a metric; a failure shows a plain message.
 - `BI-2-AC6` An alert rule "total visitors greater than 100,000" on the metric fires when the metric is above it and not when it is below; if the metric is deleted or cannot be read the rule is reported as failed with a reason, and a metric a rule watches cannot be deleted.
 - `AI-7-AC1` Asked for a number a metric defines, the assistant uses the metric and says which.
+
+## Acceptance run (2026-11-16)
+
+Run on the QA stack (main `0ea686e5` plus the open console pull requests) by browser automation and the API, with evidence kept by the planner. Accepted by the product owner on 2026-11-16.
+
+- `BI-2-AC1`: pass.
+- `BI-2-AC2`: pass.
+- `BI-2-AC3`: pass.
+- `BI-2-AC4`: pass.
+- `BI-2-AC5`: pass.
+- `BI-2-AC6`: pass.
+- `AI-7-AC1`: pass.

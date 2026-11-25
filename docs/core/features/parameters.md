@@ -30,12 +30,13 @@ visitors to revenue without an editor making a second chart.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | A parameter is defined once for the deployment and can be used on any dashboard, because formulas are shared across dashboards too (Tableau's model) | Planner default | Owner to confirm at QA |
-| 2 | Defining, changing and deleting a parameter needs `dashboard:write`; changing its value on a dashboard needs only to see the dashboard | Planner default | Owner to confirm at QA |
-| 3 | A parameter that a chart or formula uses cannot be deleted; the refusal names what uses it | Planner default | Owner to confirm at QA |
-| 4 | A dashboard shows a parameter's control when an editor adds it to that dashboard; charts that use a parameter not shown there take its default | Planner default | Owner to confirm at QA |
+| 1 | A parameter is defined once for the deployment and can be used on any dashboard, because formulas are shared across dashboards too (Tableau's model) | Planner default | Owner, 2026-11-13 |
+| 2 | Defining, changing and deleting a parameter needs `dashboard:write`; changing its value on a dashboard needs only to see the dashboard | Planner default | Owner, 2026-11-13 |
+| 3 | A parameter that a chart or formula uses cannot be deleted; the refusal names what uses it | Planner default | Owner, 2026-11-13 |
+| 4 | A dashboard shows a parameter's control when an editor adds it to that dashboard; charts that use a parameter not shown there take its default | Planner default | Owner, 2026-11-13 |
 | 5 | A parameter that switches a chart's column offers only the columns its editor listed; nothing else can be chosen, by any route | Security posture | 2026-10-11 |
-| 6 | A number parameter may carry a minimum and maximum; a value outside them is refused, not clamped silently | Planner default | Owner to confirm at QA |
+| 6 | A number parameter may carry a minimum and maximum; a value outside them is refused, not clamped silently | Planner default | Owner, 2026-11-13 |
+| 7 | A value in the dashboard's address that does not fit its parameter is refused for that parameter alone: the dashboard is drawn with the value the parameter has without it (the dashboard's saved value, else the default), the refusal is shown on the parameter's control, and the value is taken out of the address. A PDF, a scheduled report and an alert still refuse the whole read | Planner default (QA round, `BI-52`) | changed 2026-11-12 (`BI-52`), *(proposed, not yet signed)* |
 
 ## Limits to tell a customer
 
@@ -49,4 +50,14 @@ visitors to revenue without an editor making a second chart.
 - `BI-11-AC2` A list parameter switches a chart's measure between two columns.
 - `BI-11-AC3` A parameter as top-N changes how many bars show; a reference line follows a parameter.
 - `BI-11-AC4` A user without `dashboard:write` cannot define a parameter; a value outside its range or list is refused with a plain message.
-- `AI-6-AC1` (the `BI-11` part) "add a target parameter of 20,000 and draw it as a line on this chart" works.
+- `AI-6-AC1` (the `BI-11` part) "add a target parameter of 20,000 and draw it as a line on this chart" works. Accepted by the AI owner, 2026-11-14 (staging `240d2e62`)
+
+## Acceptance run (2026-11-16)
+
+Run on the QA stack (main `0ea686e5` plus the open console pull requests) by browser automation and the API, with evidence kept by the planner. Accepted by the product owner on 2026-11-16.
+
+- `BI-11-AC1`: pass.
+- `BI-11-AC2`: pass.
+- `BI-11-AC3`: pass.
+- `BI-11-AC4`: pass.
+- `AI-6-AC1` (BI-11 part): pass.

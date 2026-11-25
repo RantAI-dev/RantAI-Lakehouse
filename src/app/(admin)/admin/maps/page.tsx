@@ -1,8 +1,9 @@
-"use client"
+import { redirect } from "next/navigation"
 
-import { MapsPage } from "@/features/admin/maps-page"
-
-/** Thin App Router page for MapsPage (BI-16 part C2b). */
-export default function Page() {
-  return <MapsPage />
+/**
+ * Legacy route compatibility redirect (`WEB-3` S3-D6): Maps is a section of
+ * Settings now.
+ */
+export default function LegacyRedirect() {
+  redirect("/admin/settings?section=maps")
 }

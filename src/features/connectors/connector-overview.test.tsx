@@ -100,6 +100,14 @@ describe("recentProblems", () => {
     expect(recentProblems(null, runs).map((p) => p.message)).toEqual(["The last ingest run failed."])
   })
 
+  // SRC-39 (QA TC-1702): a run the time limit stopped is not "another reason".
+  it("says a last run stopped by the time limit was stopped for running too long", () => {
+    const runs = [run("r1", "failed", "2026-09-30T05:00:00.000Z", { endReason: "timed_out" })]
+    expect(recentProblems(null, runs).map((p) => p.message)).toEqual([
+      "The last ingest run did not finish within the time limit and was stopped.",
+    ])
+  })
+
   it("does not judge a run whose end was never reported, and a paused run is not a failure", () => {
     expect(recentProblems(null, [run("r1", "running", "2026-09-30T05:00:00.000Z")])).toEqual([])
     expect(recentProblems(null, [run("r1", "paused", "2026-09-30T05:00:00.000Z", { endReason: "connector_paused" })])).toEqual([])

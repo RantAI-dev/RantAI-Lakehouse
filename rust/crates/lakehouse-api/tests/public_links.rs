@@ -8,7 +8,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -561,6 +561,60 @@ async fn five_wrong_passwords_lock_the_link_and_a_locked_link_says_so() {
     .await
     .unwrap();
     assert_eq!(locks, 1);
+    // QA LH-SEC-2-06 (SEC-70): a visitor locking a public link is nobody the
+    // product signed in, so the row has no principal and names the link.
+    let (actor_label, principal_kind, principal_id): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT actor_label, principal_kind, principal_id FROM audit_event \
+         WHERE action = 'dashboard.public_link_locked'",
+    )
+    .fetch_one(&f.app.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        actor_label.as_deref(),
+        Some(lakehouse_store::audit::ACTOR_PUBLIC_LINK)
+    );
+    assert_eq!(principal_kind, None);
+    assert_eq!(principal_id, None);
+}
+
+/// `GOV-1`: opening a password-protected link is on the audit trail, as the
+/// link and not as a person, and the row never carries the token, the
+/// password or the ticket the visitor was given.
+#[tokio::test]
+async fn unlocking_a_link_writes_one_public_link_unlocked_row_without_the_token_or_the_password() {
+    let f = one_board().await;
+    let w = writer(&f).await;
+    let (_, made) = put(&f, &w, json!({ "password": "correct horse" })).await;
+    let token = made["link"]["token"].as_str().unwrap().to_owned();
+
+    let (status, body) = unlock(&f, &token, "correct horse").await;
+    assert_eq!(status, StatusCode::OK);
+    let ticket = json_of(&body)["ticket"].as_str().unwrap().to_owned();
+
+    let rows = common::audit_rows(&f.app.pool, "dashboard.public_link_unlocked").await;
+    assert_eq!(rows.len(), 1, "one unlock, one row: {rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["outcome"], "executed");
+    assert_eq!(
+        row["actor_label"],
+        lakehouse_store::audit::ACTOR_PUBLIC_LINK
+    );
+    assert!(row["principal_id"].is_null(), "nobody signed in: {row}");
+    assert!(row["principal_kind"].is_null(), "nobody signed in: {row}");
+    assert_eq!(row["resource_kind"], "dashboard");
+    assert_eq!(row["resource_id"], BOARD);
+    let text = row.to_string();
+    for forbidden in [token.as_str(), "correct horse", ticket.as_str()] {
+        assert!(
+            !text.contains(forbidden),
+            "the row must not carry {forbidden}: {text}"
+        );
+    }
 }
 
 #[tokio::test]

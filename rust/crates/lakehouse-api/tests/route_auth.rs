@@ -38,7 +38,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
@@ -167,6 +167,14 @@ async fn zero_permission_principal_is_denied_every_gated_route_and_let_past_auth
                     ));
                 }
             }
+            Policy::RequiresAnyPermission(perms) => {
+                if status != StatusCode::FORBIDDEN {
+                    failures.push(format!(
+                        "{method} {pattern}: a zero-permission principal must get 403 \
+                         (missing any of {perms:?}), got {status}"
+                    ));
+                }
+            }
             Policy::RequiresAuth => {
                 if status == StatusCode::UNAUTHORIZED {
                     failures.push(format!(
@@ -212,24 +220,70 @@ async fn platform_admin_principal_is_never_refused_by_the_auth_gate() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
+/// ADM-13 D4: every `Policy::RequiresAnyPermission` row allows a principal
+/// holding ANY ONE of the listed permissions alone (and neither 401 nor 403),
+/// and refuses a principal holding only an unrelated permission with 403.
+#[tokio::test]
+async fn requires_any_permission_rows_accept_each_permission_alone_and_refuse_unrelated() {
+    let TestApp { router, pool } = spin_up().await;
+
+    // A principal with only an unrelated permission: "settings:write" is
+    // unrelated to assistant (*:use/ask) and alerts (*:read/write).
+    let unrelated_user = create_principal_with_permissions(&pool, "settings:write").await;
+
+    let mut failures = Vec::new();
+    for (method, pattern, policy) in POLICY_TABLE {
+        let Policy::RequiresAnyPermission(perms) = policy else {
+            continue;
+        };
+
+        let path = concretize(pattern);
+
+        // 1. Unrelated permission -> 403
+        let unrelated_cookie = session_cookie_for_user(&pool, unrelated_user).await;
+        let resp = request_with_cookie(&router, method, &path, &unrelated_cookie).await;
+        if resp.status() != StatusCode::FORBIDDEN {
+            failures.push(format!(
+                "{method} {pattern}: principal with unrelated permission must get 403, got {}",
+                resp.status()
+            ));
+        }
+
+        // 2. Each listed permission alone -> not 401/403
+        for perm in *perms {
+            let user = create_principal_with_permissions(&pool, perm).await;
+            let cookie = session_cookie_for_user(&pool, user).await;
+            let resp = request_with_cookie(&router, method, &path, &cookie).await;
+            let status = resp.status();
+            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                failures.push(format!(
+                    "{method} {pattern}: principal with {perm} alone must pass auth gate, got {status}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
 /// A seeded Analyst (`sari@meridian.example` — `query:read, catalog:read,
 /// lineage:read`, no other grants) is a second, independently-seeded
 /// "real, under-permissioned" principal, spot-checked against one route
-/// from each of the four privilege-escalation-hardened permission
-/// families the module doc comment on `policy.rs` calls out by name
-/// (`identity:write`, `agent:manage`, `storage:restore`, `alert:write`):
-/// every one of them must refuse an Analyst exactly the same way the
-/// zero-permission principal is refused above, proving the 403 is about
-/// the SPECIFIC permission, not merely "this principal happens to hold
-/// nothing".
+/// from each of the privilege-escalation-hardened permission families the
+/// module doc comment on `policy.rs` calls out by name (`identity:write`,
+/// `storage:restore`): every one of them must refuse an
+/// Analyst exactly the same way the zero-permission principal is refused
+/// above, proving the 403 is about the SPECIFIC permission, not merely
+/// "this principal happens to hold nothing". WEB-4 retired the two
+/// `agent:manage`-gated examples this test used (employee creation and
+/// suspension), so that family has no policy-level route left to name;
+/// the permission itself is still checked by the headless-run handler.
 #[tokio::test]
-async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
+async fn a_seeded_analyst_is_denied_the_hardened_permission_families() {
     let TestApp { router, pool } = spin_up().await;
     let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
 
     for (method, path) in [
         ("POST", "/api/identity/roles"),
-        ("POST", "/api/agents/employees/x/suspend"),
         ("POST", "/api/storage/restore"),
     ] {
         let resp = request_with_cookie(&router, method, path, &cookie).await;
@@ -238,6 +292,54 @@ async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
             StatusCode::FORBIDDEN,
             "{method} {path}: a seeded Analyst must be denied"
         );
+    }
+}
+
+/// `GOV-7` D7: a role's table access is read with `identity:read` and changed
+/// with `identity:write` — both directions, with real principals. A holder of
+/// the read alone may look, never change; a holder of the write alone may
+/// change, never look; a seeded Analyst (neither) is refused both.
+#[tokio::test]
+async fn the_role_table_access_routes_split_read_from_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let role = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO role (id, name, permissions) VALUES ($1, 'Gov7 Route Role', 'query:read')",
+    )
+    .bind(role)
+    .execute(&pool)
+    .await
+    .expect("insert the role the route addresses");
+    let path = format!("/api/identity/roles/{role}/table-access");
+
+    let reader = create_principal_with_permissions(&pool, "identity:read").await;
+    let writer = create_principal_with_permissions(&pool, "identity:write").await;
+    let reader_cookie = session_cookie_for_user(&pool, reader).await;
+    let writer_cookie = session_cookie_for_user(&pool, writer).await;
+    let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    for (method, cookie, expect_forbidden) in [
+        ("GET", &reader_cookie, false),
+        ("PUT", &reader_cookie, true),
+        ("PUT", &writer_cookie, false),
+        ("GET", &writer_cookie, true),
+        ("GET", &analyst, true),
+        ("PUT", &analyst, true),
+    ] {
+        let resp = request_with_cookie(&router, method, &path, cookie).await;
+        let status = resp.status();
+        if expect_forbidden {
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {path}: this principal must be denied"
+            );
+        } else {
+            assert!(
+                !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+                "{method} {path}: this principal must pass the auth gate, got {status}"
+            );
+        }
     }
 }
 
@@ -619,6 +721,152 @@ async fn a_seeded_data_engineer_is_not_denied_catalog_annotation_write() {
     }
 }
 
+/// `ADM-7` plan D4: all three email-settings routes need `settings:write`,
+/// the `GET` included — a mail server's name and the account's user name
+/// are the deployment's own, not every signed-in person's. The table-driven
+/// loops above walk the new `POLICY_TABLE` rows both ways; this names the
+/// case the decision exists for.
+#[tokio::test]
+async fn the_email_settings_routes_are_refused_without_settings_write() {
+    let TestApp { router, pool } = spin_up().await;
+    // A seeded Analyst holds no `settings:write`.
+    let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+    for (method, path) in [
+        ("GET", "/api/settings/email"),
+        ("PUT", "/api/settings/email"),
+        ("POST", "/api/settings/email/test"),
+    ] {
+        let resp = request_with_cookie(&router, method, path, &analyst).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path} must need settings:write, reading included"
+        );
+    }
+}
+
+/// The other half of the same decision: a holder of `settings:write` is
+/// never refused by the gate.
+#[tokio::test]
+async fn a_platform_admin_is_not_refused_the_email_settings_routes() {
+    let TestApp { router, pool } = spin_up().await;
+    let admin = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    for (method, path) in [
+        ("GET", "/api/settings/email"),
+        ("PUT", "/api/settings/email"),
+        ("POST", "/api/settings/email/test"),
+    ] {
+        let resp = request_with_cookie(&router, method, path, &admin).await;
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+}
+
+/// `ADM-8`/`ADM-9` plan D4: the sign-in limits and the assistant's provider
+/// need `settings:write`, the `GET`s included — they are the deployment's
+/// own settings, not every signed-in person's.
+#[tokio::test]
+async fn the_sign_in_and_assistant_settings_routes_are_refused_without_settings_write() {
+    let TestApp { router, pool } = spin_up().await;
+    // A seeded Analyst holds no `settings:write`.
+    let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+    for (method, path) in [
+        ("GET", "/api/settings/sign-in"),
+        ("PUT", "/api/settings/sign-in"),
+        ("GET", "/api/settings/assistant"),
+        ("PUT", "/api/settings/assistant"),
+        ("POST", "/api/settings/assistant/test"),
+        ("GET", "/api/settings/sso"),
+        ("PUT", "/api/settings/sso"),
+        ("POST", "/api/settings/sso/test"),
+        (
+            "GET",
+            "/api/settings/sso/test/00000000-0000-0000-0000-000000000001",
+        ),
+        // `ADM-2`: the workspace's name and pictures, reading included.
+        ("GET", "/api/settings/general"),
+        ("PUT", "/api/settings/general"),
+        ("DELETE", "/api/settings/general"),
+        ("PUT", "/api/settings/general/images/logo"),
+        ("DELETE", "/api/settings/general/images/logo"),
+    ] {
+        let resp = request_with_cookie(&router, method, path, &analyst).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path} must need settings:write, reading included"
+        );
+    }
+}
+
+/// The other half of the same decision: a holder of `settings:write` is
+/// never refused by the gate.
+#[tokio::test]
+async fn a_platform_admin_is_not_refused_the_sign_in_and_assistant_settings_routes() {
+    let TestApp { router, pool } = spin_up().await;
+    let admin = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    for (method, path) in [
+        ("GET", "/api/settings/sign-in"),
+        ("PUT", "/api/settings/sign-in"),
+        ("GET", "/api/settings/assistant"),
+        ("PUT", "/api/settings/assistant"),
+        ("POST", "/api/settings/assistant/test"),
+        ("GET", "/api/settings/sso"),
+        ("PUT", "/api/settings/sso"),
+        ("POST", "/api/settings/sso/test"),
+        (
+            "GET",
+            "/api/settings/sso/test/00000000-0000-0000-0000-000000000001",
+        ),
+        // `ADM-2`: the workspace's name and pictures, reading included.
+        ("GET", "/api/settings/general"),
+        ("PUT", "/api/settings/general"),
+        ("DELETE", "/api/settings/general"),
+        ("PUT", "/api/settings/general/images/logo"),
+        ("DELETE", "/api/settings/general/images/logo"),
+    ] {
+        let resp = request_with_cookie(&router, method, path, &admin).await;
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+}
+
+/// `ADM-12` plan D5: a caller with `settings:write` alone (not `*:*`) may
+/// read `GET /api/settings/sso` (which reports `canEdit = false`), but is
+/// refused with 403 on `PUT /api/settings/sso`, `POST /api/settings/sso/test`,
+/// and `GET /api/settings/sso/test/{id}` — role mapping can grant Platform Admin.
+#[tokio::test]
+async fn sso_settings_write_alone_is_denied_put_and_test() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, user_id).await;
+
+    // GET /api/settings/sso succeeds and reports canEdit: false.
+    let get_resp = request_with_cookie(&router, "GET", "/api/settings/sso", &cookie).await;
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let bytes = to_bytes(get_resp.into_body(), 64 * 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["canEdit"], false);
+
+    // PUT /api/settings/sso is forbidden (403).
+    let put_resp = request_with_cookie(&router, "PUT", "/api/settings/sso", &cookie).await;
+    assert_eq!(put_resp.status(), StatusCode::FORBIDDEN);
+
+    // POST /api/settings/sso/test is forbidden (403).
+    let test_resp = request_with_cookie(&router, "POST", "/api/settings/sso/test", &cookie).await;
+    assert_eq!(test_resp.status(), StatusCode::FORBIDDEN);
+
+    // GET /api/settings/sso/test/{id} is forbidden (403).
+    let test_get_resp = request_with_cookie(
+        &router,
+        "GET",
+        "/api/settings/sso/test/00000000-0000-0000-0000-000000000001",
+        &cookie,
+    )
+    .await;
+    assert_eq!(test_get_resp.status(), StatusCode::FORBIDDEN);
+}
+
 /// `DATA-12` D1: `PUT /api/catalog/{id}/certification` needs
 /// `governance:write`. A seeded Data Engineer holds `catalog:write` (which
 /// edits the details) but not `governance:write`, so the permission
@@ -771,6 +1019,36 @@ async fn a_seeded_data_engineer_is_denied_the_undrop() {
         body.get("error").and_then(serde_json::Value::as_str),
         Some("permission_denied: governance:write"),
     );
+}
+
+/// `DATA-55` (QA `LH-DATA-15-06`, `TC-1731`): dropping a table needs
+/// `governance:write`, for the status read and for the drop alike *(proposed,
+/// not yet signed, D6)*. A seeded Data Engineer holds `catalog:write` but not
+/// `governance:write`, so the permission middleware refuses both with the
+/// permission named.
+#[tokio::test]
+async fn a_seeded_data_engineer_is_denied_the_drop_and_its_status() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+    for method in ["GET", "POST"] {
+        let resp = request_with_cookie(
+            &router,
+            method,
+            "/api/catalog/commerce_orders/drop",
+            &cookie,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method}");
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("permission_denied: governance:write"),
+            "{method}: the 403 must come from the permission middleware"
+        );
+    }
 }
 
 /// `DATA-15` F4: the restore status read is `catalog:read`, which a seeded
@@ -1036,9 +1314,11 @@ async fn seeded_data_engineer_may_get_and_put_ingest_spec() {
 }
 
 /// `SRC-11` decisions D9 and D11 at the route: leaving columns out is refused
-/// with a 422 for a source type that cannot list its columns (Oracle) and for a
-/// key column of a deduplicating table, and a malformed list is a 400. All
-/// three are refused before the address check or any write, so no connection
+/// with a 422 for the key column of a deduplicating table (on `PostgreSQL`, and
+/// on Oracle since `SRC-4` T1.2 made column choice available for it; the
+/// refusal for a source that cannot list its columns is the unit test
+/// `excluded_columns_are_accepted_only_for_sources_that_list_their_columns`),
+/// and a malformed list is a 400. All three are refused before the address check or any write, so no connection
 /// is made and nothing is stored.
 #[tokio::test]
 async fn ingest_spec_put_refuses_excluded_columns_the_source_cannot_honour() {
@@ -1068,7 +1348,8 @@ async fn ingest_spec_put_refuses_excluded_columns_the_source_cannot_honour() {
         (
             "oracle",
             serde_json::json!([{
-                "name": "APP.ORDERS", "target": "orders", "excludedColumns": ["NOTE"]
+                "name": "APP.ORDERS", "target": "orders", "loadMode": "replace_dedup",
+                "primaryKey": ["ID"], "excludedColumns": ["ID"]
             }]),
             StatusCode::UNPROCESSABLE_ENTITY,
         ),
@@ -1166,6 +1447,51 @@ async fn run_history_log_and_resume_need_connector_manage_and_run_reports_need_i
             "passed the gate, refused by the handler: {text}"
         );
     }
+}
+
+/// `SRC-4` slice 4: the lag limit is a person's (`connector:manage`); the capture
+/// observations are the orchestrator's (`ingest:read`, then the handler's
+/// service-identity check). Both ways: a `connector:manage`-only principal passes
+/// the gate of the limit route and is refused by the gate on the observations; an
+/// `ingest:read`-only principal is refused by the gate on the limit route and, on
+/// the observations, passes the gate and is refused by the handler (a user, not
+/// the service identity). The table-driven loops above cover the zero-permission
+/// and Platform-Admin directions for both entries.
+#[tokio::test]
+async fn the_lag_limit_needs_connector_manage_and_capture_observations_need_ingest_read() {
+    let TestApp { router, pool } = spin_up().await;
+    let manage = create_principal_with_permissions(&pool, "connector:manage").await;
+    let ingest = create_principal_with_permissions(&pool, "ingest:read").await;
+    let base = "/api/connectors/conn-pg-lakehouse";
+    let limit = ("PUT", format!("{base}/lag-limit"));
+    let observations = ("POST", format!("{base}/capture/observations"));
+
+    let cookie = session_cookie_for_user(&pool, manage).await;
+    let resp = request_with_cookie(&router, limit.0, &limit.1, &cookie).await;
+    assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{}", limit.1);
+    assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{}", limit.1);
+    let cookie = session_cookie_for_user(&pool, ingest).await;
+    let resp = request_with_cookie(&router, limit.0, &limit.1, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{}", limit.1);
+
+    let cookie = session_cookie_for_user(&pool, manage).await;
+    let resp = request_with_cookie(&router, observations.0, &observations.1, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+        .into_owned();
+    assert!(
+        text.contains("ingest:read"),
+        "the gate names the permission: {text}"
+    );
+    let cookie = session_cookie_for_user(&pool, ingest).await;
+    let resp = request_with_cookie(&router, observations.0, &observations.1, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+        .into_owned();
+    assert!(
+        text.contains("service identity"),
+        "passed the gate, refused by the handler: {text}"
+    );
 }
 
 /// `SRC-13` (decision D11): the discovery routes are a person's
@@ -1529,6 +1855,195 @@ async fn governance_write_only_principal_may_put_but_not_get_sla() {
     );
 }
 
+// ── Who reads the audit trail (`GOV-1`, feature page Decision 9) ─────────
+
+/// Every role holds `governance:read`, so that permission alone must not open
+/// the audit trail list: `Kind::Audit` also needs `audit:read`, with a fixed
+/// sentence that names it.
+#[tokio::test]
+async fn the_audit_list_needs_audit_read_and_a_governance_reader_without_it_is_refused() {
+    let TestApp { router, pool } = spin_up().await;
+    let analyst = create_principal_with_permissions(&pool, "query:read,governance:read").await;
+    let cookie = session_cookie_for_user(&pool, analyst).await;
+    let resp = request_with_cookie(&router, "GET", "/api/governance/audit", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    assert!(
+        body.contains("audit:read"),
+        "the refusal names the permission: {body}"
+    );
+
+    let auditor = create_principal_with_permissions(&pool, "governance:read,audit:read").await;
+    let cookie = session_cookie_for_user(&pool, auditor).await;
+    let resp = request_with_cookie(&router, "GET", "/api/governance/audit", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The other kinds keep `governance:read` alone.
+    let cookie = session_cookie_for_user(&pool, analyst).await;
+    let resp = request_with_cookie(&router, "GET", "/api/governance/residency", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// The audit trail's actor list — the person filter's source (`GOV-1`
+/// acceptance follow-up, D2) — is its own route with `audit:read` and nothing
+/// else, asserted both ways: no session is 401, a `governance:read` holder
+/// without `audit:read` is 403 with the permission named, and a holder gets
+/// in.
+#[tokio::test]
+async fn the_audit_actors_route_needs_audit_read_and_a_governance_reader_without_it_is_refused() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/governance/audit/actors";
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == uri)
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("audit:read")),
+    );
+
+    let none = request_with_cookie(&router, "GET", uri, "").await;
+    assert_eq!(none.status(), StatusCode::UNAUTHORIZED);
+
+    let analyst = create_principal_with_permissions(&pool, "query:read,governance:read").await;
+    let analyst_cookie = session_cookie_for_user(&pool, analyst).await;
+    let refused = request_with_cookie(&router, "GET", uri, &analyst_cookie).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let bytes = to_bytes(refused.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    assert!(
+        body.contains("audit:read"),
+        "the refusal names the permission: {body}"
+    );
+
+    let auditor = create_principal_with_permissions(&pool, "governance:read,audit:read").await;
+    let cookie = session_cookie_for_user(&pool, auditor).await;
+    let allowed = request_with_cookie(&router, "GET", uri, &cookie).await;
+    assert_eq!(allowed.status(), StatusCode::OK);
+}
+
+/// `SEC-66`: the Gold-export and agent-run GETs are no longer open to any
+/// signed-in user. A Dashboard Viewer is refused with 403 at the gate on
+/// every one of them; a holder of the new read permission (and, for Gold,
+/// the pre-existing `gold:export` holder) clears it. The bodies name the
+/// permission so the console can say what is missing. Downstream handlers
+/// are allowed to answer 5xx here — only 401/403 is an authz failure.
+/// WEB-4 retired the runs-LIST route, so only the retained `{id}` detail
+/// is probed for the agent-run read permission; the retired path's 404 is
+/// pinned by `web4_retired_paths_are_not_registered_and_kept_paths_are`.
+#[tokio::test]
+async fn sec66_read_routes_refuse_a_dashboard_viewer_and_accept_the_new_read_grants() {
+    let TestApp { router, pool } = spin_up().await;
+
+    let gold_gets = [
+        "/api/gold/export/mart_x",
+        "/api/gold/exports?mart=mart_x",
+        "/api/gold/export/mart_x/consumers",
+        "/api/gold/publications",
+        "/api/gold/export/mart_x/publication",
+    ];
+    // WEB-4 retired `GET /api/agents/runs` (list); only the detail route is
+    // mounted, so the SEC-66 read gate is checked on that one path.
+    let agent_gets = ["/api/agents/runs/run-x"];
+
+    let viewer = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let viewer_cookie = session_cookie_for_user(&pool, viewer).await;
+    for path in gold_gets.iter().chain(agent_gets.iter()) {
+        let refused = request_with_cookie(&router, "GET", path, &viewer_cookie).await;
+        assert_eq!(
+            refused.status(),
+            StatusCode::FORBIDDEN,
+            "a Dashboard Viewer must be refused on GET {path}"
+        );
+        let bytes = to_bytes(refused.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        let expected = if path.starts_with("/api/gold/") {
+            "gold:read"
+        } else {
+            "agent:read"
+        };
+        assert!(
+            body.contains(expected),
+            "the 403 for GET {path} must name {expected}: {body}"
+        );
+    }
+
+    for (path, permissions, label) in [
+        (gold_gets[0], "gold:read", "a gold:read holder"),
+        (gold_gets[1], "gold:export", "a gold:export holder"),
+        (gold_gets[2], "gold:read", "a gold:read holder"),
+        (gold_gets[3], "gold:read", "a gold:read holder"),
+        (gold_gets[4], "gold:export", "a gold:export holder"),
+        (agent_gets[0], "agent:read", "an agent:read holder"),
+    ] {
+        let user_id = create_principal_with_permissions(&pool, permissions).await;
+        let cookie = session_cookie_for_user(&pool, user_id).await;
+        let response = request_with_cookie(&router, "GET", path, &cookie).await;
+        assert!(
+            !matches!(
+                response.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ),
+            "{label} must clear the gate on GET {path}, got {}",
+            response.status()
+        );
+    }
+}
+
+/// `WEB-8` S2 T8 (D8): `GET /api/governance/row-filter-grammar` needs
+/// `policy:read` and nothing less, asserted both ways: no session is 401, a
+/// principal with another permission is 403, and a `policy:read` holder gets
+/// past the gate with the grammar's two lists.
+#[tokio::test]
+async fn row_filter_grammar_route_needs_policy_read_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/governance/row-filter-grammar";
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == uri)
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("policy:read")),
+    );
+
+    let none = request_with_cookie(&router, "GET", uri, "").await;
+    assert_eq!(none.status(), StatusCode::UNAUTHORIZED);
+
+    let analyst = create_principal_with_permissions(&pool, "query:read").await;
+    let analyst_cookie = session_cookie_for_user(&pool, analyst).await;
+    let refused = request_with_cookie(&router, "GET", uri, &analyst_cookie).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    let reader = create_principal_with_permissions(&pool, "policy:read").await;
+    let reader_cookie = session_cookie_for_user(&pool, reader).await;
+    let allowed = request_with_cookie(&router, "GET", uri, &reader_cookie).await;
+    assert_eq!(allowed.status(), StatusCode::OK);
+    let body = to_bytes(allowed.into_body(), usize::MAX)
+        .await
+        .expect("the grammar body reads");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("the body is JSON");
+    assert!(
+        body["functions"]
+            .as_array()
+            .is_some_and(|functions| !functions.is_empty()),
+        "the route answers its functions: {body}"
+    );
+    assert!(
+        body["operators"]
+            .as_array()
+            .is_some_and(|operators| !operators.is_empty()),
+        "the route answers its operators: {body}"
+    );
+    assert!(
+        body["forms"]
+            .as_array()
+            .is_some_and(|forms| !forms.is_empty()),
+        "the route answers its forms: {body}"
+    );
+}
+
 /// SEC-23 (F1/F2): a principal holding other write permissions but NOT
 /// `governance:write` is refused (403) when it adds a quality,
 /// classification or residency rule, and nothing is stored. The bodies are
@@ -1778,7 +2293,14 @@ fn policy_table_is_non_trivial_and_every_entry_is_walked_by_construction() {
         .iter()
         .filter(|(_, _, p)| matches!(p, Policy::RequiresPermission(_)))
         .count();
-    assert_eq!(public + auth_only + permissioned, POLICY_TABLE.len());
+    let any_permissioned = POLICY_TABLE
+        .iter()
+        .filter(|(_, _, p)| matches!(p, Policy::RequiresAnyPermission(_)))
+        .count();
+    assert_eq!(
+        public + auth_only + permissioned + any_permissioned,
+        POLICY_TABLE.len()
+    );
     assert!(
         POLICY_TABLE.len() > 50,
         "POLICY_TABLE looks suspiciously small ({}) for a ~30-route-module service",
@@ -2037,13 +2559,15 @@ async fn create_tenant_writes_an_audit_event_on_success() {
 #[tokio::test]
 async fn delete_session_writes_an_audit_event() {
     let TestApp { router, pool } = spin_up().await;
-    let user_id: Uuid =
-        sqlx::query_scalar("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
-            .bind("caller")
-            .bind("caller-audit-revoke@x.invalid")
-            .fetch_one(&pool)
-            .await
-            .expect("insert a caller");
+    let user_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind("caller")
+    .bind("caller-audit-revoke")
+    .bind("caller-audit-revoke@x.invalid")
+    .fetch_one(&pool)
+    .await
+    .expect("insert a caller");
 
     // Two sessions: one carries the cookie doing the DELETE, one is
     // the target. `revoke_session` checks ownership via the SQL
@@ -2244,6 +2768,71 @@ async fn quality_incident_routes_are_gated_in_both_directions() {
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// `GOV-11` (`DEC-20`; QA `LH-DATA-12-07` F2): after
+/// `0138_data_engineer_catalog_read.sql` the seeded Data Engineer — the role
+/// that edits catalog entries — can open the Catalog and a table's page. It
+/// still cannot create roles.
+#[tokio::test]
+async fn a_seeded_data_engineer_may_read_the_catalog() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+
+    for path in ["/api/catalog", "/api/lakehouse/tables"] {
+        let resp = request_with_cookie(&router, "GET", path, &cookie).await;
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+
+    let denied = request_with_cookie(&router, "POST", "/api/identity/roles", &cookie).await;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "catalog:read does not make the role an identity administrator"
+    );
+}
+
+/// `GOV-10` (`DEC-17`; QA `LH-DATA-14-04`, `TC-1728`): running an authored
+/// rule by hand needs `governance:write`. A principal holding `query:read`
+/// and `governance:read` is refused (403); one holding `governance:write`
+/// alone is past the gate and the unknown rule answers 404; no cookie at all
+/// answers 401.
+#[tokio::test]
+async fn running_a_quality_rule_by_hand_is_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    let run = "/api/governance/quality/00000000-0000-4000-8000-000000000000/run";
+
+    let viewer = create_principal_with_permissions(&pool, "query:read,governance:read").await;
+    let cookie = session_cookie_for_user(&pool, viewer).await;
+    let refused = request_with_cookie(&router, "POST", run, &cookie).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "a viewer may not run a rule by hand"
+    );
+
+    let admin = create_principal_with_permissions(&pool, "governance:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+    let allowed = request_with_cookie(&router, "POST", run, &cookie).await;
+    assert_eq!(
+        allowed.status(),
+        StatusCode::NOT_FOUND,
+        "past the gate, the rule does not exist"
+    );
+
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(run)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}
+
 /// `DATA-14` (F3): any login may read the schedules, and setting one needs
 /// `governance:write`. A principal without it is refused (403) and nothing is
 /// stored; one with it is past the gate (an empty body then answers 400).
@@ -2253,6 +2842,38 @@ async fn quality_schedule_routes_are_gated_in_both_directions() {
     let mut env = std::collections::HashMap::new();
     let catalog_tenant = "11111111-1111-4111-8111-000000000001";
     env.insert("CATALOG_TENANT_ID".to_owned(), catalog_tenant.to_owned());
+    // A schedule's table must be there (`SEC-80`): ClickHouse has `silver.orders`
+    // and no other table, so the reset of it reaches the handler's answer.
+    let ch = wiremock::MockServer::start().await;
+    // Every other lookup answers no columns; the table-specific answer below is
+    // mounted at a higher priority and wins for `silver.orders`.
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::body_string_contains("system.columns"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "name", "type": "String"}, {"name": "type", "type": "String"}],
+                "data": [],
+                "rows": 0,
+            })),
+        )
+        .mount(&ch)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::body_string_contains(
+            "database = 'silver'",
+        ))
+        .and(wiremock::matchers::body_string_contains("table = 'orders'"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "name", "type": "String"}, {"name": "type", "type": "String"}],
+                "data": [{"name": "id", "type": "String"}],
+                "rows": 1,
+            })),
+        )
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+    env.insert("CH_URL".to_owned(), ch.uri());
     let TestApp { router, pool } = common::spin_up_with_env(&env).await;
 
     let reader = create_principal_with_permissions(&pool, "catalog:read").await;
@@ -2287,6 +2908,13 @@ async fn quality_schedule_routes_are_gated_in_both_directions() {
         StatusCode::FORBIDDEN,
         "catalog:read alone must NOT be enough to set a schedule"
     );
+    // WEB-3 S3a-D3: resetting a schedule is the same write, both ways.
+    let refused_reset = request_with_cookie(&router, "DELETE", set, &reader_cookie).await;
+    assert_eq!(
+        refused_reset.status(),
+        StatusCode::FORBIDDEN,
+        "catalog:read alone must NOT be enough to reset a schedule"
+    );
 
     let admin_cookie = session_cookie_for_user(&pool, admin).await;
     let allowed = request_with_cookie(&router, "PUT", set, &admin_cookie).await;
@@ -2295,6 +2923,13 @@ async fn quality_schedule_routes_are_gated_in_both_directions() {
         allowed.status(),
         StatusCode::BAD_REQUEST,
         "governance:write must be enough to reach set handler which answers 400 on empty body"
+    );
+
+    let allowed_reset = request_with_cookie(&router, "DELETE", set, &admin_cookie).await;
+    assert_eq!(
+        allowed_reset.status(),
+        StatusCode::NO_CONTENT,
+        "governance:write must be enough to reset a schedule"
     );
 
     let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM quality_schedule")
@@ -2631,6 +3266,157 @@ async fn history_trash_personal_space_favourites_and_search_have_the_right_permi
             StatusCode::FORBIDDEN,
             "{method} {path} (neither)"
         );
+    }
+}
+
+/// `BI-18` part D (T1 and T2, feature R2 and `BI-18D-AC8`): reading reports (and their PDF) is
+/// "signed in" at the router and `dashboard:read` (or a rule) in the handler;
+/// writing them needs `dashboard:write` at the router. Asserted both ways for
+/// every route: the right principal gets past the gate, the one holding only
+/// the other permission is refused, and so is one holding neither.
+#[tokio::test]
+async fn report_routes_need_dashboard_read_to_read_and_dashboard_write_to_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let reader = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let reader = common::session_cookie_for_user(&pool, reader).await;
+    let writer = common::create_principal_with_permissions(&pool, "dashboard:write").await;
+    let writer = common::session_cookie_for_user(&pool, writer).await;
+    let neither = common::create_principal_with_permissions(&pool, "query:read").await;
+    let neither = common::session_cookie_for_user(&pool, neither).await;
+    let id = Uuid::new_v4();
+    for (method, pattern, uri, needs) in [
+        (
+            "GET",
+            "/api/dashboard/reports",
+            "/api/dashboard/reports".to_owned(),
+            "dashboard:read",
+        ),
+        (
+            "POST",
+            "/api/dashboard/reports",
+            "/api/dashboard/reports".to_owned(),
+            "dashboard:write",
+        ),
+        (
+            "GET",
+            "/api/dashboard/reports/{id}",
+            format!("/api/dashboard/reports/{id}"),
+            "dashboard:read",
+        ),
+        (
+            "PUT",
+            "/api/dashboard/reports/{id}",
+            format!("/api/dashboard/reports/{id}"),
+            "dashboard:write",
+        ),
+        (
+            "DELETE",
+            "/api/dashboard/reports/{id}",
+            format!("/api/dashboard/reports/{id}"),
+            "dashboard:write",
+        ),
+        (
+            "GET",
+            "/api/dashboard/reports/{id}/pdf",
+            format!("/api/dashboard/reports/{id}/pdf"),
+            "dashboard:read",
+        ),
+    ] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == pattern)
+                .map(|(_, _, policy)| *policy),
+            Some(if needs == "dashboard:read" {
+                Policy::RequiresAuth
+            } else {
+                Policy::RequiresPermission(needs)
+            }),
+            "{method} {pattern}"
+        );
+        let (allowed, other) = if needs == "dashboard:read" {
+            (&reader, &writer)
+        } else {
+            (&writer, &reader)
+        };
+        let resp = request_with_cookie(&router, method, &uri, allowed).await;
+        assert!(
+            resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+            "{method} {uri}: the right principal must get past the gate, got {}",
+            resp.status()
+        );
+        let resp = request_with_cookie(&router, method, &uri, other).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {uri} (other)"
+        );
+        let resp = request_with_cookie(&router, method, &uri, &neither).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {uri} (neither)"
+        );
+    }
+}
+
+/// `BI-18` part D (T3, feature T4 and `BI-18D-AC8`): every template route
+/// needs `dashboard:write`. Both ways: a writer gets past the gate, a reader
+/// with `dashboard:read` alone is refused with 403, and so is one with neither.
+#[tokio::test]
+async fn template_routes_need_dashboard_write_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let reader = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let reader = common::session_cookie_for_user(&pool, reader).await;
+    let writer = common::create_principal_with_permissions(&pool, "dashboard:write").await;
+    let writer = common::session_cookie_for_user(&pool, writer).await;
+    let neither = common::create_principal_with_permissions(&pool, "query:read").await;
+    let neither = common::session_cookie_for_user(&pool, neither).await;
+    let id = Uuid::new_v4();
+    for (method, pattern, uri) in [
+        (
+            "GET",
+            "/api/dashboard/templates",
+            "/api/dashboard/templates".to_owned(),
+        ),
+        (
+            "POST",
+            "/api/dashboard/templates",
+            "/api/dashboard/templates".to_owned(),
+        ),
+        (
+            "DELETE",
+            "/api/dashboard/templates/{id}",
+            format!("/api/dashboard/templates/{id}"),
+        ),
+        (
+            "POST",
+            "/api/dashboard/templates/{id}/use",
+            format!("/api/dashboard/templates/{id}/use"),
+        ),
+    ] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == pattern)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresPermission("dashboard:write")),
+            "{method} {pattern}"
+        );
+        let resp = request_with_cookie(&router, method, &uri, &writer).await;
+        assert!(
+            resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+            "{method} {uri}: a writer must get past the gate, got {}",
+            resp.status()
+        );
+        for (who, cookie) in [("reader", &reader), ("neither", &neither)] {
+            let resp = request_with_cookie(&router, method, &uri, cookie).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {uri} ({who})"
+            );
+        }
     }
 }
 
@@ -3293,6 +4079,52 @@ async fn the_embed_values_and_settings_routes_are_gated_in_both_directions() {
     );
 }
 
+/// `ADM-2` (decision 5): the two branding routes are public, because the
+/// sign-in page shows the name and the logo before any session exists. With no
+/// session they answer, never 401 or 403, and the five routes that change
+/// them are not public.
+#[tokio::test]
+async fn the_two_branding_routes_are_public_and_the_five_that_change_them_are_not() {
+    let TestApp { router, .. } = spin_up().await;
+    let policy_of = |method: &str, path: &str| {
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == method && *p == path)
+            .map(|(_, _, policy)| *policy)
+    };
+    for (pattern, path) in [
+        ("/api/branding", "/api/branding"),
+        ("/api/branding/images/{kind}", "/api/branding/images/logo"),
+    ] {
+        assert_eq!(policy_of("GET", pattern), Some(Policy::Public), "{pattern}");
+        let resp = request_with_cookie(&router, "GET", path, "").await;
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+    for (method, pattern) in [
+        ("GET", "/api/settings/general"),
+        ("PUT", "/api/settings/general"),
+        ("DELETE", "/api/settings/general"),
+        ("PUT", "/api/settings/general/images/{kind}"),
+        ("DELETE", "/api/settings/general/images/{kind}"),
+    ] {
+        assert_eq!(
+            policy_of(method, pattern),
+            Some(Policy::RequiresPermission("settings:write")),
+            "{method} {pattern}"
+        );
+    }
+    // With no session the five are refused at the gate.
+    for (method, path) in [
+        ("GET", "/api/settings/general"),
+        ("PUT", "/api/settings/general/images/logo"),
+        ("DELETE", "/api/settings/general"),
+    ] {
+        let resp = request_with_cookie(&router, method, path, "").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+    }
+}
+
 /// BI-19 B1 review R2/R9: `POST /api/dashboard/specs/preview` is "signed in"
 /// at the router. A drill goes through the resolved viewer (a rule is enough);
 /// any other preview reads any table and needs `dashboard:read` in the handler.
@@ -3458,6 +4290,10 @@ async fn the_public_map_boundary_routes_are_not_refused_by_the_auth_gate() {
             "/api/public/dashboard/tok/maps/m_0123456789ab/geojson",
         ),
         ("POST", "/api/embed/maps/m_0123456789ab/geojson"),
+        // BI-36: the print view's own route, behind the render token.
+        ("POST", "/api/render/maps/m_0123456789ab/geojson"),
+        // BI-42: the print view's image route, behind the render token.
+        ("GET", "/api/render/image"),
     ] {
         let resp = router
             .clone()
@@ -3633,7 +4469,12 @@ mod alert_test_fixture {
 }
 
 /// A test app whose `ClickHouse` serves [`alert_test_fixture::TwoRules`].
-async fn alert_test_app() -> TestApp {
+///
+/// The mock server is returned with the app: wiremock hands a dropped server
+/// back to a shared pool and resets it, so a server dropped here could be
+/// taken by another test while this app still dials its `CH_URL`. Bind it
+/// to a named variable for the whole test.
+async fn alert_test_app() -> (TestApp, wiremock::MockServer) {
     use std::collections::HashMap;
 
     use wiremock::matchers::method;
@@ -3651,7 +4492,7 @@ async fn alert_test_app() -> TestApp {
         .mount(&ch)
         .await;
     let env: HashMap<String, String> = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
-    spin_up_with_env(&env).await
+    (spin_up_with_env(&env).await, ch)
 }
 
 /// `BI-40` D2, both directions with real principals: no session is 401; the
@@ -3662,7 +4503,7 @@ async fn alert_test_app() -> TestApp {
 async fn testing_an_alert_is_signed_in_at_the_router_and_asks_for_alert_write() {
     use serde_json::json;
 
-    let TestApp { router, pool } = alert_test_app().await;
+    let (TestApp { router, pool }, _ch) = alert_test_app().await;
 
     assert_eq!(
         POLICY_TABLE
@@ -3725,7 +4566,7 @@ async fn testing_an_alert_is_signed_in_at_the_router_and_asks_for_alert_write() 
 /// door stays shut to one.
 #[tokio::test]
 async fn the_scheduler_run_door_stays_shut_to_a_person_when_the_test_door_is_open() {
-    let TestApp { router, pool } = alert_test_app().await;
+    let (TestApp { router, pool }, _ch) = alert_test_app().await;
     let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
 
     let scheduler = request_with_cookie(&router, "POST", "/api/alerts/run", &analyst).await;
@@ -3750,6 +4591,42 @@ async fn the_scheduler_run_door_stays_shut_to_a_person_when_the_test_door_is_ope
     );
 }
 
+/// `BI-43` D1, both directions: `GET /api/alerts/mine` is signed in at the
+/// router (no session is 401), and a Dashboard Viewer, who holds neither
+/// `alert:read` nor `alert:write`, is not refused: the person's own alerts are
+/// theirs to list. The same person is still refused `GET /api/alerts`.
+#[tokio::test]
+async fn listing_ones_own_chart_alerts_is_signed_in_at_the_router_and_needs_no_alert_permission() {
+    let (TestApp { router, pool }, _ch) = alert_test_app().await;
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == "/api/alerts/mine")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresAuth)
+    );
+
+    let no_session = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/alerts/mine?chart=c_kpi")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_session.status(), StatusCode::UNAUTHORIZED);
+
+    let viewer = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = session_cookie_for_user(&pool, viewer).await;
+    let own = request_with_cookie(&router, "GET", "/api/alerts/mine?chart=c_kpi", &cookie).await;
+    assert_eq!(own.status(), StatusCode::OK);
+    let list = request_with_cookie(&router, "GET", "/api/alerts", &cookie).await;
+    assert_eq!(list.status(), StatusCode::FORBIDDEN);
+}
+
 /// ADM-4 T1/T2: the four new identity write routes are in `POLICY_TABLE`
 /// as `identity:write`, and the gate agrees both ways: no session is 401,
 /// a principal without `identity:write` is 403, and one holding it gets
@@ -3763,6 +4640,7 @@ async fn the_adm_4_identity_write_routes_are_gated_in_both_directions() {
         ("DELETE", "/api/identity/users/{id}/tenants/{tenant_id}"),
         ("POST", "/api/identity/users/{id}/deactivate"),
         ("POST", "/api/identity/users/{id}/reactivate"),
+        ("PATCH", "/api/identity/users/{id}"),
     ] {
         assert_eq!(
             POLICY_TABLE
@@ -3795,4 +4673,551 @@ async fn the_adm_4_identity_write_routes_are_gated_in_both_directions() {
             allowed.status()
         );
     }
+}
+
+/// `WEB-3` S3a-D2: editing or removing a role needs `identity:write`, the
+/// permission creating one needs, and the gate agrees both ways. A reader
+/// is refused (403) and nothing changes; a writer gets the handler's own
+/// answer — here the built-in refusal for the seeded `Analyst` role — never
+/// 401 or 403, and the row stays.
+#[tokio::test]
+async fn role_edit_and_delete_are_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    // The seeded `Analyst` role (`0002_seed_identity.sql`).
+    let built_in = "22222222-2222-4222-8222-000000000001";
+    let url = format!("/api/identity/roles/{built_in}");
+
+    let members_before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM app_user_role WHERE role_id = $1")
+            .bind(Uuid::parse_str(built_in).expect("a uuid"))
+            .fetch_one(&pool)
+            .await
+            .expect("count the role's members");
+
+    for (method, path) in [
+        ("PUT", "/api/identity/roles/{id}"),
+        ("DELETE", "/api/identity/roles/{id}"),
+    ] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == path)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresPermission("identity:write")),
+            "{method} {path}"
+        );
+        let anonymous = request_with_cookie(&router, method, &url, "").await;
+        assert_eq!(
+            anonymous.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}"
+        );
+        let reader = create_principal_with_permissions(&pool, "identity:read").await;
+        let cookie = session_cookie_for_user(&pool, reader).await;
+        let refused = request_with_cookie(&router, method, &url, &cookie).await;
+        assert_eq!(
+            refused.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path}: identity:read alone must not change a role"
+        );
+    }
+
+    assert_eq!(
+        sqlx::query_as::<_, (String, String)>("SELECT name, permissions FROM role WHERE id = $1")
+            .bind(Uuid::parse_str(built_in).expect("a uuid"))
+            .fetch_one(&pool)
+            .await
+            .expect("read the role"),
+        (
+            "Analyst".to_owned(),
+            // SEC-66: 0153 appends the two read grants to every working
+            // built-in role; the refused caller must not rewrite any of it.
+            "query:read, catalog:read, lineage:read,assistant:use,ops:read,alert:read,governance:read,gold:read,agent:read".to_owned()
+        ),
+        "a refused caller must not rewrite the role"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM app_user_role WHERE role_id = $1")
+            .bind(Uuid::parse_str(built_in).expect("a uuid"))
+            .fetch_one(&pool)
+            .await
+            .expect("count the role's members"),
+        members_before,
+        "a refused caller must not change who holds the role"
+    );
+
+    let writer = create_principal_with_permissions(&pool, "identity:write").await;
+    let cookie = session_cookie_for_user(&pool, writer).await;
+    let allowed = request_with_cookie(&router, "DELETE", &url, &cookie).await;
+    assert_eq!(
+        allowed.status(),
+        StatusCode::CONFLICT,
+        "identity:write reaches the delete handler, which refuses a built-in role"
+    );
+    let body = to_bytes(allowed.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("the body is JSON");
+    assert_eq!(
+        body["error"],
+        serde_json::json!("A built-in role cannot be deleted.")
+    );
+
+    let blank =
+        request_with_cookie_and_body(&router, "PUT", &url, &cookie, br#"{"name":"   "}"#.to_vec())
+            .await;
+    assert_eq!(
+        blank.status(),
+        StatusCode::BAD_REQUEST,
+        "identity:write reaches the update handler, which refuses a blank name"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT name FROM role WHERE id = $1")
+            .bind(Uuid::parse_str(built_in).expect("a uuid"))
+            .fetch_one(&pool)
+            .await
+            .expect("read the role"),
+        "Analyst",
+        "a refused update leaves the role alone"
+    );
+}
+
+/// `WEB-8` D4: GET /api/identity/permissions requires identity:read both ways.
+#[tokio::test]
+async fn permissions_route_is_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == "/api/identity/permissions")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("identity:read")),
+    );
+    let anonymous = request_with_cookie(&router, "GET", "/api/identity/permissions", "").await;
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let plain = create_principal_with_permissions(&pool, "query:read").await;
+    let cookie = session_cookie_for_user(&pool, plain).await;
+    let refused = request_with_cookie(&router, "GET", "/api/identity/permissions", &cookie).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    let reader = create_principal_with_permissions(&pool, "identity:read").await;
+    let cookie = session_cookie_for_user(&pool, reader).await;
+    let allowed = request_with_cookie(&router, "GET", "/api/identity/permissions", &cookie).await;
+    assert_eq!(allowed.status(), StatusCode::OK);
+}
+
+/// `GOV-11` (`DEC-20`; QA `LH-DATA-15-03` F2): the table's page takes
+/// `catalog:read`, or a `query:read` grant made from exactly that asset. On
+/// its own, `query:read` is not enough — a role permission is not a grant on
+/// a table — and neither is no session at all.
+#[tokio::test]
+async fn the_asset_page_route_is_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    let asset = "/api/catalog/silver.orders";
+
+    let reader = create_principal_with_permissions(&pool, "catalog:read").await;
+    let cookie = session_cookie_for_user(&pool, reader).await;
+    let allowed = request_with_cookie(&router, "GET", asset, &cookie).await;
+    assert_ne!(allowed.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(allowed.status(), StatusCode::FORBIDDEN);
+
+    let nobody = create_zero_permission_principal(&pool).await;
+    let cookie = session_cookie_for_user(&pool, nobody).await;
+    let refused = request_with_cookie(&router, "GET", asset, &cookie).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    let querier = create_principal_with_permissions(&pool, "query:read").await;
+    let cookie = session_cookie_for_user(&pool, querier).await;
+    let refused = request_with_cookie(&router, "GET", asset, &cookie).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "query:read without a grant on the table is not enough"
+    );
+    let bytes = to_bytes(refused.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
+    assert_eq!(
+        body["error"],
+        serde_json::json!("permission_denied: catalog:read")
+    );
+
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(asset)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// ADM-13 (D10.2), ADM-13 review round 1, B3:
+/// `GET /api/notifications` is `RequiresAuth`, but a `dashboard:read`-only principal
+/// gets empty `openAlerts` and `pendingApprovals` without error.
+#[tokio::test]
+async fn notifications_returns_empty_alerts_and_approvals_for_dashboard_read_principal() {
+    let TestApp { router, pool } = spin_up().await;
+    let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = session_cookie_for_user(&pool, viewer).await;
+
+    let resp = request_with_cookie(&router, "GET", "/api/notifications", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
+    assert_eq!(body["supported"], serde_json::json!(true));
+    assert_eq!(body["openAlerts"], serde_json::json!([]));
+    assert_eq!(body["pendingApprovals"], serde_json::json!([]));
+}
+
+/// ADM-13 (D10.3), ADM-13 review round 1, B3:
+/// `GET /api/overview/alerts` requires alert:read or alert:write; a dashboard:read-only
+/// principal gets 403, and an alert:read principal gets past the gate.
+#[tokio::test]
+async fn overview_alerts_refuses_dashboard_read_principal() {
+    let TestApp { router, pool } = spin_up().await;
+    let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = session_cookie_for_user(&pool, viewer).await;
+
+    let resp = request_with_cookie(&router, "GET", "/api/overview/alerts", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let reader = common::create_principal_with_permissions(&pool, "alert:read").await;
+    let cookie = session_cookie_for_user(&pool, reader).await;
+    let allowed = request_with_cookie(&router, "GET", "/api/overview/alerts", &cookie).await;
+    assert_ne!(allowed.status(), StatusCode::FORBIDDEN);
+    assert_ne!(allowed.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// SEC-67: the three overview alert state-change routes are `alert:write`
+/// writes, while the list above stays readable with `alert:read` alone. Pin
+/// the table rows and both sides of the gate on each route: no session is
+/// 401, an `alert:read`-only principal is 403, and an `alert:write` principal
+/// gets past the gate (the handler then returns 404 for the unknown id).
+#[tokio::test]
+async fn overview_alert_state_change_routes_require_alert_write() {
+    let TestApp { router, pool } = spin_up().await;
+
+    for (pattern, action) in [
+        ("/api/overview/alerts/{id}/acknowledge", "acknowledge"),
+        ("/api/overview/alerts/{id}/resolve", "resolve"),
+        ("/api/overview/alerts/{id}/silence", "silence"),
+    ] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == "POST" && *p == pattern)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresPermission("alert:write")),
+            "POST {pattern}"
+        );
+
+        let path = format!("/api/overview/alerts/sec67-unknown-id/{action}");
+
+        // No session -> 401.
+        let anonymous = request_with_cookie(&router, "POST", &path, "").await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{path}");
+
+        // `alert:read` may see the list but not change it -> 403.
+        let reader = create_principal_with_permissions(&pool, "alert:read").await;
+        let reader_cookie = session_cookie_for_user(&pool, reader).await;
+        let denied = request_with_cookie(&router, "POST", &path, &reader_cookie).await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN, "{path}");
+
+        // `alert:write` gets past auth/authz. Silence needs a JSON body; the
+        // unknown alert id then makes the handler answer 404.
+        let writer = create_principal_with_permissions(&pool, "alert:write").await;
+        let writer_cookie = session_cookie_for_user(&pool, writer).await;
+        let allowed = if action == "silence" {
+            request_with_cookie_and_body(
+                &router,
+                "POST",
+                &path,
+                &writer_cookie,
+                br#"{"untilMinutes":60}"#.to_vec(),
+            )
+            .await
+        } else {
+            request_with_cookie(&router, "POST", &path, &writer_cookie).await
+        };
+        let status = allowed.status();
+        assert!(
+            status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+            "{path}: an alert:write principal must get past the gate, got {status}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{path}: the handler returns 404 for an unknown alert id"
+        );
+    }
+}
+
+/// BLD-1 part 1 / D8: the run route that replaced `.../enforce` is in
+/// `POLICY_TABLE` as `pipeline:read`, the old path is gone from the table, and
+/// the gate answers both ways: no session is 401, `query:read` alone is 403,
+/// and `pipeline:read` gets past authentication (the handler then refuses a
+/// caller who is neither a service identity nor a Platform Admin).
+#[tokio::test]
+async fn the_pipeline_compile_route_authorization_is_asserted_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/pipelines/runnable/pl-test/compile";
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "POST" && *p == "/api/pipelines/runnable/{id}/compile")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("pipeline:read")),
+    );
+    assert!(
+        !POLICY_TABLE
+            .iter()
+            .any(|(_, path, _)| *path == "/api/pipelines/runnable/{id}/enforce"),
+        "the enforce route is gone in BLD-1 part 1 (D8); `tests/route_walk.rs` \
+         would otherwise still find it registered"
+    );
+
+    // The handler refuses anyone who is neither a service identity nor a
+    // Platform Admin (D8's caller rule), so the principal that gets past the
+    // permission floor is the seeded admin; the floor itself is what the two
+    // refusals above this line prove.
+    let reader_cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let refused_user = common::create_principal_with_permissions(&pool, "query:read").await;
+    let refused = common::session_cookie_for_user(&pool, refused_user).await;
+
+    let none = request_with_cookie(&router, "POST", uri, "").await;
+    assert_eq!(none.status(), StatusCode::UNAUTHORIZED);
+    let denied = request_with_cookie(&router, "POST", uri, &refused).await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let through = request_with_cookie(&router, "POST", uri, &reader_cookie).await;
+    assert!(
+        through.status() != StatusCode::UNAUTHORIZED && through.status() != StatusCode::FORBIDDEN,
+        "a Platform Admin must get past the gate, got {}",
+        through.status()
+    );
+}
+
+/// QA `LH-BI-13-02`, `LH-BLD-2-03`, `LH-DATA-14-04`, `LH-RPT-1-11`;
+/// `SEC-72` decision `DEC-19`: a signed-in caller gets the same 405 and 404
+/// answers an anonymous one does. Both used to be 500 — the gate answered
+/// `route_policy_unclassified` for a method no route had, and the router
+/// answered "No matched path found" for an address no route matched — so
+/// neither status depended on who was asking. A fresh session per request,
+/// because one of the paths is a logout in other tests' sweeps.
+#[tokio::test]
+async fn a_signed_in_person_gets_405_for_a_method_no_route_has_and_404_for_an_unknown_address() {
+    let TestApp { router, pool } = spin_up().await;
+    let admin = platform_admin_user_id(&pool).await;
+
+    let method_not_allowed =
+        serde_json::json!({ "error": "This method is not allowed on this address." });
+    for (method, path) in [
+        ("DELETE", "/health"),
+        ("POST", "/api/dashboard"),
+        ("GET", "/api/pipelines/x/target-lag"),
+        ("DELETE", "/api/pipelines/x/target-lag"),
+        ("POST", "/api/governance/quality/incidents"),
+        ("PATCH", "/api/reports/subscriptions/x"),
+    ] {
+        let cookie = session_cookie_for_user(&pool, admin).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {path} has no handler"
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
+        assert_eq!(body, method_not_allowed, "{method} {path}");
+    }
+
+    let no_such_address = serde_json::json!({ "error": "No such address." });
+    for (method, path) in [
+        ("GET", "/api/never-existed"),
+        ("PATCH", "/api/governance/quality/incidents/x"),
+        ("PUT", "/api/governance/quality/incidents/x"),
+    ] {
+        let cookie = session_cookie_for_user(&pool, admin).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {path}");
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
+        assert_eq!(body, no_such_address, "{method} {path}");
+    }
+}
+
+/// BLD-1 part 1 / D16: the pipeline preview is in `POLICY_TABLE` as
+/// `pipeline:write`, and the gate answers both ways: no session is 401,
+/// `query:read` alone is 403, and a `pipeline:write` holder gets past
+/// authentication (the handler then refuses the empty body it was sent with a
+/// 400, which is not an authorization answer).
+#[tokio::test]
+async fn the_pipeline_preview_route_authorization_is_asserted_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/pipelines/preview";
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "POST" && *p == "/api/pipelines/preview")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("pipeline:write")),
+    );
+
+    let reader = create_principal_with_permissions(&pool, "query:read").await;
+    let refused = session_cookie_for_user(&pool, reader).await;
+    let writer = create_principal_with_permissions(&pool, "pipeline:write").await;
+    let allowed = session_cookie_for_user(&pool, writer).await;
+
+    let none = request_with_cookie(&router, "POST", uri, "").await;
+    assert_eq!(none.status(), StatusCode::UNAUTHORIZED);
+    let denied = request_with_cookie(&router, "POST", uri, &refused).await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let through = request_with_cookie(&router, "POST", uri, &allowed).await;
+    assert!(
+        through.status() != StatusCode::UNAUTHORIZED && through.status() != StatusCode::FORBIDDEN,
+        "a pipeline:write holder must get past the gate, got {}",
+        through.status()
+    );
+}
+
+/// BLD-16 / J6: the step-SQL route is in `POLICY_TABLE` as `pipeline:write`,
+/// and the gate answers both ways: no session is 401, `query:read` alone is
+/// 403, and a `pipeline:write` holder gets past authentication (the handler
+/// then refuses the empty body it was sent with a 400, which is not an
+/// authorization answer).
+#[tokio::test]
+async fn the_pipeline_step_sql_route_authorization_is_asserted_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/pipelines/step-sql";
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "POST" && *p == "/api/pipelines/step-sql")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("pipeline:write")),
+    );
+
+    let reader = create_principal_with_permissions(&pool, "query:read").await;
+    let refused = session_cookie_for_user(&pool, reader).await;
+    let writer = create_principal_with_permissions(&pool, "pipeline:write").await;
+    let allowed = session_cookie_for_user(&pool, writer).await;
+
+    let none = request_with_cookie(&router, "POST", uri, "").await;
+    assert_eq!(none.status(), StatusCode::UNAUTHORIZED);
+    let denied = request_with_cookie(&router, "POST", uri, &refused).await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let through = request_with_cookie(&router, "POST", uri, &allowed).await;
+    assert!(
+        through.status() != StatusCode::UNAUTHORIZED && through.status() != StatusCode::FORBIDDEN,
+        "a pipeline:write holder must get past the gate, got {}",
+        through.status()
+    );
+}
+
+/// WEB-4 (regression): the routes the audit found no caller for are gone;
+/// the three employee routes and the run detail that DO have live callers
+/// are still mounted. With no credentials the gate answers 401 for a
+/// registered route, while the router's fallback — set after the gate —
+/// answers 404 for a path with no route at all. That difference is the
+/// clean "is it mounted?" probe this test asserts.
+#[tokio::test]
+async fn web4_retired_paths_are_not_registered_and_kept_paths_are() {
+    // A real harness: with no Postgres the auth extractor itself is
+    // unavailable (503), which would mask the 401-vs-404 probe below.
+    let TestApp { router, pool: _ } = spin_up().await;
+
+    for (method, path) in [
+        ("GET", "/api/agents/workflows"),
+        ("POST", "/api/agents/workflows"),
+        ("POST", "/api/agents/employees/emp-x/suspend"),
+        ("POST", "/api/agents/employees/emp-x/resume"),
+        ("POST", "/api/agents/employees/emp-x/revoke"),
+        ("GET", "/api/agents/runs"),
+    ] {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {path}");
+    }
+
+    // `POST /api/agents/employees` is a method gone from a path that is
+    // still registered for GET (Dagster's schedule factory reads it), so
+    // axum correctly answers 405 — not the 404 an unregistered path gets.
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/agents/employees")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+    // These have live consumers: Dagster's schedule factory and job
+    // (list + run), the retained run-detail page (detail + run), approvals
+    // (run detail), and the assistant's `list_workloads` (`ops/workloads`).
+    for (method, path) in [
+        ("GET", "/api/agents/employees"),
+        ("GET", "/api/agents/employees/emp-x"),
+        ("POST", "/api/agents/employees/emp-x/run"),
+        ("GET", "/api/agents/runs/run-x"),
+        ("GET", "/api/agents/approvals"),
+        ("GET", "/api/ops/workloads"),
+        ("GET", "/api/ops/services"),
+    ] {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+    }
+}
+
+/// WEB-4: `/api/ops/observability` still matches the `{kind}` dispatcher
+/// that serves `workloads`/`services`, so it needs a signed-in caller to
+/// reach the handler. There it is 404, distinct from a never-known kind's
+/// 400 (which the parity corpus pins).
+#[tokio::test]
+async fn web4_retired_observability_kind_answers_404_to_a_signed_in_caller() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let retired = request_with_cookie(&router, "GET", "/api/ops/observability", &cookie).await;
+    assert_eq!(retired.status(), StatusCode::NOT_FOUND);
+
+    let unknown = request_with_cookie(&router, "GET", "/api/ops/bogus-kind", &cookie).await;
+    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
 }

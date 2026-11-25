@@ -7,6 +7,7 @@ import * as React from "react";
 import { useDebouncedCallback } from "@/hooks/use-debounced-callback";
 import { getDefaultFilterOperator } from "@/lib/data-table";
 import { getFiltersStateParser } from "@/lib/parsers";
+import { newRunId } from "@/lib/run-id";
 import type { ExtendedColumnFilter, JoinOperator } from "@/types/data-table";
 
 const DEFAULT_DEBOUNCE_MS = 300;
@@ -93,7 +94,8 @@ export function useDataTableFilters<TData>(
           operator: getDefaultFilterOperator(
             target.columnDef.meta?.variant ?? "text"
           ),
-          filterId: crypto.randomUUID().slice(0, 8),
+          // QA LH-DATA-11-08: no `crypto.randomUUID` over plain http, `newRunId` has a fallback.
+          filterId: newRunId().slice(0, 8),
         },
       ]);
     },
@@ -155,7 +157,8 @@ export function useDataTableFilters<TData>(
         operator: getDefaultFilterOperator(
           column.columnDef.meta?.variant ?? "text"
         ),
-        filterId: crypto.randomUUID().slice(0, 8),
+        // QA LH-DATA-11-08: no `crypto.randomUUID` over plain http, `newRunId` has a fallback.
+        filterId: newRunId().slice(0, 8),
       };
 
       setFiltersAndResetPage([...filters, nextFilter]);

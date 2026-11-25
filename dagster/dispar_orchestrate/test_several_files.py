@@ -244,6 +244,8 @@ def test_the_op_config_takes_a_list_of_keys_and_the_params_keep_their_order():
         "header_row": 0,
         "columns": [],
         "on_bad_value": "stop",
+        # `DATA-52`: who started the load, on every run config the API sends.
+        "author": "Rina Wijaya (file upload)",
     }
     params = FileIngestParams.from_op_config(config)
     assert params.storage_keys == (_key(1), _key(2), _key(3))

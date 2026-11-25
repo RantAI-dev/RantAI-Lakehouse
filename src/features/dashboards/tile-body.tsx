@@ -8,8 +8,9 @@ import { ErrorWithReference } from "@/components/error-reference";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import { MiniMarkdown } from "@/features/copilot/mini-markdown";
 import { EChart } from "./echart";
+import { thumbnailOption } from "@/lib/thumbnail-option";
 import { buildOption, clusterNote, fmtInt, forecastNote, withReferenceLines } from "./chart-option";
-import { buildCombinedOption, cutLayers, failedLayers } from "./combined-option";
+import { NOT_AVAILABLE_WITH_YOUR_ACCESS, buildCombinedOption, cutLayers, failedLayers, unavailableLayers } from "./combined-option";
 import { takesLayers, type LayerDef } from "@/lib/chart-layers";
 import { GeoChart } from "./geo-chart";
 import type { MapLoader } from "./echarts-maps";
@@ -24,8 +25,8 @@ import type { StyleFields } from "@/lib/chart-style";
 import { formatAxisValue, formatValue, withMetricFormats } from "@/lib/value-format";
 import { styleOption, seriesColumns } from "./style-option";
 import type { ColumnSetting, TableDefFields } from "@/lib/table-types";
-import type { FilterDef } from "@/services/clients/bi-store";
-import { bucketLabel, calendarFirstDay, isGrain } from "@/lib/time-grain";
+import type { FilterDef } from "@/services";
+import { bucketLabel, calendarFirstDay, isGrain, labelSeriesBuckets } from "@/lib/time-grain";
 import { binsOfTile, relabelBins } from "@/lib/chart-bins";
 import { labelOtherRows, tileMeasureLabels, visibleColumns, withResolvedSlots, type ShapeDefFields } from "@/lib/chart-shape";
 import type { Rows } from "./tile-dialogs";
@@ -39,6 +40,19 @@ import { limitSentence } from "@/lib/query-limits";
 import { dataFromLabel } from "@/lib/result-cache";
 
 type Cell = Rows | TileFailure;
+
+/**
+ * Owner QA 2026-11-14, gallery pictures centred: inside a gallery picture every chart this body draws
+ * gets `thumbnailOption` (equal margins, no axes, legend or colour bar), so it sits centred in its
+ * card. The chart-type gallery provides it; everywhere else it is off and nothing changes.
+ */
+export const ThumbnailContext = React.createContext(false);
+
+/** The chart, as the gallery's picture when inside one. */
+function ChartView(props: React.ComponentProps<typeof EChart>) {
+  const thumbnail = React.useContext(ThumbnailContext);
+  return <EChart {...props} option={thumbnail ? thumbnailOption(props.option) : props.option} />;
+}
 function hasRows(c: Cell | undefined): c is Rows {
   return !!c && "rows" in c;
 }
@@ -56,6 +70,12 @@ type TileBodyProps = {
    * names each series.
    */
   hideLegend?: boolean;
+  /**
+   * The chart stays on screen while its data changes (the sign-in page's
+   * sample dashboard): it morphs to new values instead of redrawing. Only
+   * the plain bar/line/area path uses it.
+   */
+  live?: boolean;
   /**
    * A raw table can page and sort through the records route with these
    * filters. Absent (an embed, a public link, a preview): it shows its first
@@ -95,7 +115,7 @@ export function TileBody(props: TileBodyProps) {
 }
 
 function TileBodyOf({
-  spec, cell, dark, loading, onDataClick, hideLegend, paging, onTableSort, loadMap,
+  spec, cell, dark, loading, onDataClick, hideLegend, live, paging, onTableSort, loadMap,
 }: TileBodyProps) {
   const reporting = useReporting();
   // `def` is the stored definition (typed `unknown` on the shared spec): the
@@ -194,7 +214,11 @@ function TileBodyOf({
     const rawRows = cell.rows;
     const grain = isGrain(cell.grain) ? cell.grain : null;
     const grained = grain ? rawRows.map((r) => ({ ...r, [spec.x]: bucketLabel(grain, r[spec.x]) })) : rawRows;
-    const bucketed = relabelBins(grained, bins);
+    // `BI-46`: the buckets of a grained breakdown are labelled like the axis,
+    // so the legend and the tooltip read "Mar 2026", not the raw date.
+    const seriesGrain = def && isGrain(def.breakdownGrain) ? def.breakdownGrain : null;
+    const withSeries = seriesGrain && spec.series ? labelSeriesBuckets(grained, spec.series, seriesGrain) : grained;
+    const bucketed = relabelBins(withSeries, bins);
     // BI-6: the computed "Other" group is drawn last and is never a value to
     // click; a real value that is also called "Other" stays apart from it.
     const { rows, otherLabels } = labelOtherRows(bucketed, spec.x);
@@ -224,7 +248,8 @@ function TileBodyOf({
     // BI-17 part B: what the chart says under itself about a forecast or about clusters.
     const forecastSentence = forecastNote(cell.referenceLines, lineCtx, spec.kind === "hbar") ?? clusterNote(spec, rows, style);
     const chart = (
-      <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%"
+      <ChartView option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%" live={live}
+        optionDeps={[style, locale, decimals, dark, reporting.timeZone, reporting.companyPalette, cell.referenceLines, measureLabels, cell.truncated]}
         onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: rawRows, labelledRows: rows, grain: grain ?? undefined, otherLabels, bin: bins[spec.x] }) : undefined} />
     );
     if (!styled.hiddenNotes && !forecastSentence) return chart;
@@ -284,7 +309,7 @@ function TypeBBody({
     // A result as long as the server's cap may have been cut (a narrow width over a wide column); say so, as a cut-off chart does.
     return (
       <div className="flex h-full min-h-0 flex-col">
-        <div className="min-h-0 flex-1"><EChart option={drawn.option} height="100%" /></div>
+        <div className="min-h-0 flex-1"><ChartView option={drawn.option} height="100%" optionDeps={[style, locale, decimals, dark, color, def?.labels?.show, bins]} /></div>
         {cell.rows.length >= HISTOGRAM_ROW_CAP ? (
           <p className="px-1 pt-1 text-[11px] text-muted-foreground">Only the first {HISTOGRAM_ROW_CAP} ranges are shown; choose a wider width.</p>
         ) : null}
@@ -313,7 +338,7 @@ function TypeBBody({
   }
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="min-h-0 flex-1"><EChart option={drawn.option} height="100%" /></div>
+      <div className="min-h-0 flex-1"><ChartView option={drawn.option} height="100%" optionDeps={[style, locale, decimals, dark, color, measureLabels]} /></div>
       {drawn.more > 0 ? (
         <p className="px-1 pt-1 text-[11px] text-muted-foreground">{drawn.more} more not shown (the first {MAX_BULLETS} are drawn)</p>
       ) : null}
@@ -346,7 +371,7 @@ function GanttBody({
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="min-h-0 flex-1">
-        <EChart option={drawn.option} height="100%" onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: cell.rows }) : undefined} />
+        <ChartView option={drawn.option} height="100%" optionDeps={[reporting.timeZone, def?.todayLine, dark]} onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: cell.rows }) : undefined} />
       </div>
       {drawn.notes.map((note) => <p key={note} className="px-1 pt-1 text-[11px] text-muted-foreground">{note}.</p>)}
     </div>
@@ -403,6 +428,10 @@ function CombinedBody({
   const option = withReferenceLines(styled.option, cell.referenceLines, false, dark);
   const failed = failedLayers(layers);
   const cut = cutLayers(layers);
+  // BI-51 (QA LH-BI-13-03): the questions the viewer's access does not cover,
+  // in one muted line the legend cannot replace (it can be hidden and read
+  // with a pointer only).
+  const unavailable = unavailableLayers(layers);
   const click = onDataClick
     ? (hit: Parameters<ChartClickHandler>[0], pos: { x: number; y: number }) => {
         const owner = combined.owners[hit.seriesIndex ?? -1] ?? -1;
@@ -411,13 +440,20 @@ function CombinedBody({
         const rows = combined.keys.map((k) => ({ [spec.x]: k }));
         const labelledRows = combined.labels.map((l) => ({ [spec.x]: l }));
         const layer = owner >= 0 && own ? { index: owner, mart: own.mart ?? "", sqlSource: own.sqlSource, dimension: own.dimension } : undefined;
-        onDataClick(hit, pos, { rows, labelledRows, grain: grain ?? undefined, layer });
+        // QA LH-BI-13-04 (BI-55, D9): the records panel names the question the
+        // mark belongs to — the other question's label, or, for the chart's
+        // own question, the name of the clicked series.
+        const series = Array.isArray(combined.option.series) ? combined.option.series : [];
+        const ownSeries = series[hit.seriesIndex ?? -1] as { name?: string } | undefined;
+        const question = owner >= 0 ? layers[owner]?.label : ownSeries?.name;
+        onDataClick(hit, pos, { rows, labelledRows, grain: grain ?? undefined, layer, question });
       }
     : undefined;
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="min-h-0 flex-1">
-        <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%" onDataClick={click} />
+        <ChartView option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%" onDataClick={click}
+          optionDeps={[style, locale, decimals, dark, reporting.companyPalette, cell.referenceLines]} />
       </div>
       {styled.hiddenNotes ? (
         <p className="px-1 pt-1 text-[11px] text-muted-foreground">
@@ -427,6 +463,15 @@ function CombinedBody({
       {cut.length ? (
         <p className="px-1 pt-1 text-[11px] text-muted-foreground" aria-label="Questions that were cut off">
           {cut.map((label) => `${label}: not every value is shown`).join(" · ")}
+        </p>
+      ) : null}
+      {unavailable.length ? (
+        <p
+          className="truncate px-1 pt-1 text-[11px] text-muted-foreground"
+          aria-label="Questions not available with your access"
+          title={`${NOT_AVAILABLE_WITH_YOUR_ACCESS}: ${unavailable.join(", ")}`}
+        >
+          {NOT_AVAILABLE_WITH_YOUR_ACCESS}: {unavailable.join(", ")}
         </p>
       ) : null}
       {failed.length ? (

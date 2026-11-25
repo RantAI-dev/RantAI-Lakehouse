@@ -17,6 +17,7 @@ compares every score with the values the code printed before the change
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import sys
@@ -526,6 +527,38 @@ class CleanupPlanTests(unittest.TestCase):
             ],
         )
 
+    def test_a_report_and_a_template_are_deleted_by_the_id_in_the_path(self) -> None:
+        # BI-18 part D: their routes take the id in the path, not in `?id=`, and
+        # a report goes before the charts it places, a template after the boards.
+        cfg = make_cfg()
+        session = FakeSession()
+        created = [
+            {"kind": "template", "id": "t1"},
+            {"kind": "board", "id": "b1"},
+            {"kind": "chart", "id": "c1"},
+            {"kind": "report", "id": "r1"},
+        ]
+        self.assertEqual(m.run_cleanup(cfg, session, created), [])
+        self.assertEqual(
+            [url for _, url, _ in session.calls],
+            [
+                "http://api.test/api/dashboard/reports/r1",
+                "http://api.test/api/dashboard/specs?id=c1",
+                "http://api.test/api/dashboard/boards?id=b1",
+                "http://api.test/api/dashboard/templates/t1",
+            ],
+        )
+
+    def test_the_report_and_the_board_a_template_made_are_collected_for_the_cleanup(self) -> None:
+        traces = [[
+            {"tool": "create_report", "result": {"ok": True, "report": {"id": "r1", "title": "X"}}},
+            {"tool": "create_dashboard_from_template", "result": {"ok": True, "board": {"id": "b9"}}},
+            # A refused or pending call made nothing.
+            {"tool": "create_report", "result": {"status": "needs_confirmation"}},
+        ]]
+        found = m.collect_created([], traces, [])
+        self.assertEqual(found, [{"kind": "report", "id": "r1"}, {"kind": "board", "id": "b9"}])
+
     def test_a_failed_delete_is_a_problem_not_a_crash(self) -> None:
         cfg = make_cfg()
         session = FakeSession({("DELETE", "/api/dashboard/specs"): FakeResponse(409, {"error": "in use"})})
@@ -757,6 +790,31 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(names, {"b": "b-123"})
         self.assertEqual(created, [{"kind": "board", "id": "b-123"}])
 
+    def test_the_run_id_makes_an_invite_unique_per_run_without_becoming_a_saved_name(self) -> None:
+        # AI-29..31 review R2: no API deletes an invited user, so the case's
+        # username AND email must be unique per run or the second setup fails.
+        cfg = make_cfg()
+        session = FakeSession({
+            ("POST", "/api/identity/users"): {"id": "u-1", "name": "Eval Colleague"},
+        })
+        setup = [{
+            "name": "colleague_name", "method": "POST", "path": "/api/identity/users",
+            "body": {"name": "Eval Colleague", "username": "eval_colleague_{run_id}",
+                     "email": "eval.colleague.{run_id}@example.com"},
+            "id_at": "name",
+        }]
+        names, created = m.run_setup(cfg, session, setup)
+        self.assertEqual(names, {"colleague_name": "Eval Colleague"})
+        self.assertEqual(created, [], "no API deletes a user")
+        first = session.calls[0][2]
+        self.assertTrue(first["username"].startswith("eval_colleague_"))
+        self.assertNotIn("{run_id}", first["username"])
+        self.assertIn(first["username"][len("eval_colleague_"):], first["email"])
+        m.run_setup(cfg, session, setup)
+        second = session.calls[1][2]
+        self.assertNotEqual(first["username"], second["username"])
+        self.assertNotEqual(first["email"], second["email"])
+
     def test_the_kind_of_a_setup_object_comes_from_its_route(self) -> None:
         self.assertEqual(m.kind_of_path("/api/dashboard/specs"), "chart")
         self.assertEqual(m.kind_of_path("/api/dashboard/boards"), "board")
@@ -956,12 +1014,41 @@ class WhereMatchTests(unittest.TestCase):
         self.assertTrue(m.where_matches(REAL_SPEC_ITEM, {"def.measures": "jumlah"}))
         self.assertFalse(m.where_matches(REAL_SPEC_ITEM, {"def.measures": "other"}))
 
+    def test_a_measure_written_as_an_object_matches_by_its_column(self) -> None:
+        # The model writes a measure as `{"column": ..., "aggregate": ...}`,
+        # so a where value that names the column must still match it.
+        item = {"def": {"measures": [{"column": "per_event", "aggregate": "sum"}]}}
+        self.assertTrue(m.where_matches(item, {"def.measures": "per_event"}))
+
+    def test_a_measure_object_does_not_match_another_name_or_its_aggregate(self) -> None:
+        # Only the column names the measure; an aggregate is not a column.
+        item = {"def": {"measures": [{"column": "per_event", "aggregate": "sum"}]}}
+        self.assertFalse(m.where_matches(item, {"def.measures": "other"}))
+        self.assertFalse(m.where_matches(item, {"def.measures": "sum"}))
+
+    def test_a_list_that_mixes_a_string_and_a_measure_object_matches_either_name(self) -> None:
+        item = {"def": {"measures": ["jumlah", {"column": "per_event", "aggregate": "sum"}]}}
+        self.assertTrue(m.where_matches(item, {"def.measures": "jumlah"}))
+        self.assertTrue(m.where_matches(item, {"def.measures": "per_event"}))
+
     def test_a_state_check_with_a_dotted_key_counts_matching_charts(self) -> None:
         cfg = make_cfg()
         session = FakeSession({("GET", "/api/dashboard/specs"): {"charts": [REAL_SPEC_ITEM]}})
         check = {"path": "/api/dashboard/specs", "list": "charts",
                  "where": {"kind": "line", "def.grain": "month"}, "count": 1}
         self.assertEqual(m.expect_state_problems(cfg, session, check, own_ids={"c-real"}), [])
+
+    def test_a_state_check_counts_a_chart_whose_measure_is_written_as_an_object(self) -> None:
+        # The `calc_then_chart` case checks `{"mart": ..., "def.measures":
+        # "per_event"}`, and the model writes the measure as an object.
+        chart = {"id": "c-1", "mart": "mart_event",
+                 "def": {"mart": "mart_event",
+                         "measures": [{"column": "per_event", "aggregate": "sum"}]}}
+        cfg = make_cfg()
+        session = FakeSession({("GET", "/api/dashboard/specs"): {"charts": [chart]}})
+        check = {"path": "/api/dashboard/specs", "list": "charts",
+                 "where": {"mart": "mart_event", "def.measures": "per_event"}, "count": 1}
+        self.assertEqual(m.expect_state_problems(cfg, session, check, own_ids={"c-1"}), [])
 
     def test_a_path_with_an_index_reads_the_element_at_that_place_in_a_list(self) -> None:
         # `tabs[0].title` is the first tab's title, so a case can check the
@@ -1450,6 +1537,53 @@ class ExitCodeTests(unittest.TestCase):
         path.write_text(json.dumps(cases))
         return path
 
+    def test_main_an_excluded_case_is_not_run_not_counted_and_cannot_fail_the_set(self) -> None:
+        self.cases_path = self.write_cases([{"id": "kept", "turns": ["t"]}, {"id": "broken", "turns": ["t"]}])
+        # The script hands out results in call order: the second one is the
+        # failing result the excluded case would produce if it ran.
+        runs = [self.scored(False) | {"id": "kept"}, self.scored(True) | {"id": "broken"}]
+        code, doc = self.run_main(["--exclude", "broken"], runs)
+        self.assertEqual(code, 0)
+        self.assertEqual([r["id"] for r in doc["results"]], ["kept"])
+        self.assertEqual(doc["verdict"]["total"], 1)
+
+    def test_main_an_excluded_id_that_names_no_case_is_a_setup_error(self) -> None:
+        self.cases_path = self.write_cases([{"id": "kept", "turns": ["t"]}])
+        out = Path(tempfile.mkdtemp()) / "out.json"
+        argv = ["ai_eval.py", "--cases", str(self.cases_path), "--out", str(out), "--exclude", "nope"]
+        env = {"AI_EVAL_EMAIL": "e@example.com", "AI_EVAL_PASSWORD": "p", "AI_EVAL_API_URL": "http://api.test"}
+        stderr = io.StringIO()
+
+        # A login that succeeds, so an exit 2 can only come from the unknown
+        # id and never from an unreachable stack; and no network call is made.
+        def login_ok(_self: Any, url: str, **_k: Any) -> FakeResponse:
+            return FakeResponse(200, {"ok": True})
+
+        with mock.patch.dict("os.environ", env, clear=False), mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(m.requests.Session, "post", login_ok), \
+                mock.patch.object(m, "run_case") as run_case, mock.patch("sys.stderr", stderr):
+            self.assertEqual(m.main(), 2)
+        self.assertIn("--exclude names no case: nope", stderr.getvalue())
+        run_case.assert_not_called()
+        self.assertFalse(out.exists())
+
+    def test_main_the_result_document_lists_the_excluded_ids(self) -> None:
+        self.cases_path = self.write_cases([{"id": "a", "turns": ["t"]}, {"id": "b", "turns": ["t"]},
+                                            {"id": "c", "turns": ["t"]}])
+        _code, doc = self.run_main(["--exclude", "b,c"], [self.scored(False) | {"id": "a"}])
+        self.assertEqual(doc["excluded"], ["b", "c"])
+
+    def test_main_an_exclusion_applies_after_only(self) -> None:
+        self.cases_path = self.write_cases([{"id": "a", "turns": ["t"]}, {"id": "b", "turns": ["t"]},
+                                            {"id": "c", "turns": ["t"]}])
+        _code, doc = self.run_main(["--only", "a,b", "--exclude", "b"], [self.scored(False) | {"id": "a"}])
+        self.assertEqual([r["id"] for r in doc["results"]], ["a"])
+
+    def test_main_a_run_with_no_exclusion_lists_none(self) -> None:
+        self.cases_path = self.write_cases([{"id": "a", "turns": ["t"]}])
+        _code, doc = self.run_main([], [self.scored(False) | {"id": "a"}])
+        self.assertEqual(doc["excluded"], [])
+
     def test_the_output_keeps_the_old_keys_and_adds_verdict_and_runs(self) -> None:
         cases = [{"id": "a", "runs": [{"problems": [], "missing": [], "overall": 1.0}], "passed": True,
                   "completeness": 1.0, "accuracy": 1.0, "experience": 1.0, "overall": 1.0}]
@@ -1756,6 +1890,60 @@ class DashboardCasesTests(unittest.TestCase):
         self.assertGreaterEqual(len(cases), 30)
         self.assertEqual(len({c["id"] for c in cases}), len(cases))
 
+    def test_mode_switch_asks_for_a_bar_so_a_line_is_not_a_fair_answer(self) -> None:
+        # "a chart of events per year" let the model pick a line, and the case
+        # then failed on a kind it never asked for.
+        case = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}["mode_switch"]
+        self.assertEqual(case["turns"][0], "Make a bar chart of events per year.")
+        self.assertEqual(case["expect_state"][0]["where"]["kind"], "bar")
+
+    def test_the_top_n_case_checks_the_limit_and_the_dimension_the_chart_was_saved_with(self) -> None:
+        # A chart that shows every country while the answer says "top 5" is the
+        # claim this case catches: the saved definition must carry the limit.
+        case = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}["chart_top_n_claimed"]
+        self.assertIs(case.get("confirm"), True)
+        self.assertEqual(
+            case["expect_state"][0]["where"],
+            {"mart": "mart_wisman", "kind": "bar", "def.dimension": "negara", "def.limit": 5},
+        )
+        self.assertEqual(case["expect_tool"]["args_contains"]["limit"], 5)
+
+    def test_the_bin_case_saves_no_chart_and_forbids_a_claim_that_the_text_column_was_binned(self) -> None:
+        case = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}[
+            "chart_bin_text_column_asks"
+        ]
+        self.assertEqual(case["expect_no_tool"], ["create_chart"])
+        self.assertIn("pintu_masuk", case["turns"][0])
+        claims = case["forbid"]
+
+        def claimed(answer: str) -> bool:
+            return any(re.search(pattern, answer, re.IGNORECASE) for pattern in claims)
+
+        self.assertTrue(claimed("Done, the entry points are binned in bands of 500."))
+        self.assertTrue(claimed("I grouped pintu_masuk into bins of 500 and drew the chart."))
+        # A plain refusal may repeat the phrase of the request.
+        self.assertFalse(claimed("pintu_masuk is text, so it cannot be binned in bands of 500."))
+        self.assertFalse(claimed("The entry points are not binned into bins of 500 because they are names."))
+        self.assertFalse(claimed("Which column do you want in bins of 500?"))
+        # The answer is not normalised, so a curly apostrophe must negate too.
+        self.assertFalse(claimed("The entry points aren\u2019t binned in bands of 500, they are names."))
+        self.assertFalse(claimed("pintu_masuk isn\u2019t binned into bins of 500 because it is text."))
+
+    def test_the_bin_case_passes_an_ask_or_a_plain_refusal_and_fails_a_false_claim_or_an_irrelevant_answer(self) -> None:
+        case = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}[
+            "chart_bin_text_column_asks"
+        ]
+
+        def passes(answer: str) -> bool:
+            scored = m.score_case(make_cfg(), None, case, [ScoreCaseTests.body(answer)])
+            return m.run_passed(scored)
+
+        self.assertTrue(passes("pintu_masuk holds names. Which number column should I put in bins of 500?"))
+        self.assertTrue(passes("pintu_masuk is a text column, so it cannot be binned in bands of 500."))
+        self.assertTrue(passes("Entry points are text, so that column can\u2019t be binned. Pick a number column."))
+        self.assertFalse(passes("Done. I binned pintu_masuk in bands of 500 and saved the chart."))
+        self.assertFalse(passes("Here are the foreign visitors for 2024."))
+
     def test_the_new_chart_fresh_case_checks_the_created_chart(self) -> None:
         # `BI-41` T1: the request drafts a chart and then changes it, so the
         # case confirms the draft and expects the rule on the chart the
@@ -1839,6 +2027,16 @@ class DashboardCasesTests(unittest.TestCase):
         )
         # The tab is named in the request, so the check can name it too.
         self.assertIn("called Maps", case["turns"][0])
+        # `BI-33`: with only the map chart on the board, a sloppy "move every
+        # chart" passed, and the case failed when the assistant was right in
+        # reading "the map charts" as one of two. A second chart is in the setup
+        # and must stay off the tab.
+        self.assertEqual([s["name"] for s in case["setup"]], ["board", "map_chart", "other_chart"])
+        self.assertIn(
+            {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}"},
+             "tile_on_tab": {"chart": "{other_chart}", "tab_title": "Maps"}, "count": 0},
+            case["expect_state"],
+        )
 
     def test_the_move_tab_case_checks_the_order_the_tabs_are_in(self) -> None:
         # Two tabs and a move: the order is the result, so it is checked
@@ -1911,6 +2109,46 @@ class DashboardCasesTests(unittest.TestCase):
         # name in `set_board_view_filters`.
         cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
         case = cases["view_filter_year"]
+        self.assertIn("{board}", case.get("context", ""))
+
+    def test_the_two_value_view_filter_case_narrows_the_view_in_build_mode(self) -> None:
+        # "show only 2024 and only Malaysia" is one request for two filters,
+        # not a request for a chart. The case runs in build mode, because that
+        # is the mode where the model drafted a chart instead, and it checks
+        # that the board's saved filters stay empty and that no chart was made.
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        case = cases["view_filter_two_values_build"]
+        self.assertEqual(case["mode"], "build")
+        # The tool is a read on the view, so the case waits for no confirm.
+        self.assertNotIn("confirm", case)
+        self.assertIn("{board}", case.get("context", ""))
+        self.assertEqual(
+            case["expect_tool"],
+            {"name": "set_board_view_filters", "args_contains": {"board": "{board}", "filters": "tahun"}},
+        )
+        self.assertEqual(case["expect_no_tool"], ["create_chart"])
+        self.assertIn(
+            {"path": "/api/dashboard/boards", "list": "boards",
+             "where": {"id": "{board}", "filters[].column": "tahun"}, "count": 0},
+            case["expect_state"],
+        )
+        self.assertIn(
+            {"path": "/api/dashboard/specs", "list": "charts",
+             "where": {"board": "{board}"}, "count": 1},
+            case["expect_state"],
+        )
+        # The mart carries both a year column and a country column, so one
+        # page can be narrowed by both.
+        setup = {step["name"]: step for step in case["setup"]}
+        self.assertEqual(setup["chart"]["body"]["mart"], "mart_wisman")
+        self.assertIn("Malaysia", case["turns"][0])
+
+    def test_the_save_filters_case_tells_the_assistant_which_board_to_save(self) -> None:
+        # The console always sends the open dashboard with its board id; a
+        # case without that context never tells the assistant whose default
+        # filters "Save this filter as the default for everyone" saves.
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        case = cases["save_filters_only_when_asked"]
         self.assertIn("{board}", case.get("context", ""))
 
 

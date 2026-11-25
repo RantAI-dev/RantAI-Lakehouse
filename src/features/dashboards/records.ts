@@ -1,5 +1,5 @@
 import { normalizeFilters } from "@/lib/dashboard-filter-state";
-import type { FilterDef, FilterSkip } from "@/services/clients/bi-store";
+import type { FilterDef, FilterSkip } from "@/services";
 import { apiFetch } from "@/services/http";
 
 /**
@@ -32,6 +32,11 @@ export type RecordsRequest = {
   chart?: string;
   /** BI-13: with `chart`, the index (from 0) of one of its other questions; the list is that question's own rows. */
   layer?: number;
+  /**
+   * BI-55 (QA `LH-BI-13-04`): the question the records belong to, shown under
+   * the panel's title. Display only: `recordsQuery` never sends it.
+   */
+  question?: string;
   /**
    * A raw table (BI-16 part A): list these columns of the whole tile, in this
    * order, sorted by `sortColumn`. Not combined with `column` and `value`.

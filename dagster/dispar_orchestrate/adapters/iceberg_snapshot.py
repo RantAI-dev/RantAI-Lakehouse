@@ -120,10 +120,13 @@ def write_one_snapshot(
 
     `snapshot_properties` are the summary entries the ONE snapshot carries (`DATA-15` F5's
     `rantai.author` is the one the console reads). They are what the load carried before:
-    ONE set, on the ONE snapshot. The load paths that write through here carry none today
-    -- `dlt`'s own commits do not (`sink.SinkConfig`'s note) -- so the default is the
-    empty set, and the paths that carry an author (`history.write_versions`) keep their
-    own.
+    ONE set, on the ONE snapshot. Review round 1 R6: the only callers are
+    `sink.py::_replace_changing_types` and `iceberg_stream.py`'s streamed write of a
+    `replace` or an `append`, and both carry the `author` of their `SinkConfig`
+    (`DATA-52`). The other paths record the author through their own calls: the history
+    mode through `history.write_versions`, emptying a table through
+    `iceberg_table.delete`. A merge load is `dlt`'s own write, does not come through here,
+    and records none. Without an author the properties are the empty set.
 
     # Errors
 

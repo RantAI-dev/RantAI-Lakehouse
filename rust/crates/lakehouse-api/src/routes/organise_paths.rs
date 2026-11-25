@@ -197,6 +197,7 @@ async fn payload_result(
         params: None,
         fresh: None,
         only: None,
+        strict_params: false,
     };
     let state = crate::state::AppState::without_a_database();
     get_body(
@@ -443,6 +444,7 @@ async fn the_filter_values_of_a_board_come_only_from_charts_the_caller_may_see()
     let _ = values_for_roles(
         &ch,
         query,
+        &[],
         (&roles, &viewer),
         &PlaceholderValues::none(),
         &obligations,

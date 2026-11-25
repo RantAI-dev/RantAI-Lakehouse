@@ -245,6 +245,8 @@ measurements. The preview decodes at most the first 2,000 rows and shows 20.
   100 are listed, and the load either stops or writes them as empty, as the
   person chose (`DATA-18`, #186, merged 2026-10-26; `upload-column-types.md`).
   A load that sends no column list stores every column as text.
+- The Upload file page shows a table's name twice: `bronze.<table>` as the Catalog lists it, and `iceberg.bronze.<table>`, the name Query Studio reads on the Trino engine (`DATA-53`).
+- A file named like a format the upload reads that does not open as one is refused as a file that could not be opened, not as a format that is not read (`DATA-51`).
 - Adding a file to a table that exists keeps that table's names and types.
   Replacing a table may change its types, and a pipeline that reads the table
   fails on its next run and says why.
@@ -254,6 +256,9 @@ measurements. The preview decodes at most the first 2,000 rows and shows 20.
   Until that pipeline exists, the table can be explored and queried.
 - The original file is kept until someone deletes the upload, so storage
   grows with every upload.
+- Deleting an upload never drops its table. A table an upload made is dropped
+  from the table's page in the Catalog (`DATA-55`, `asset-page-depth.md`), and
+  while it can still be restored a file cannot be loaded into its name.
 - Adding the same file to a table twice doubles its rows. The console warns
   about a repeated file; it does not stop it.
 - Replacing a table with a file whose columns differ keeps the old
@@ -278,6 +283,10 @@ measurements. The preview decodes at most the first 2,000 rows and shows 20.
   again."
 - In an install with several tenants, the table an upload creates appears in
   the shared catalog, which only the tenant that owns the catalog sees.
+- A file load is not re-run from the Pipelines page; that page answers "A file
+  load is not re-run from Pipelines. Load the file again from the "Uploaded
+  files" tab of Sources, which checks the table first." Changed 2026-11-13
+  (`DATA-61`), *(proposed, not yet signed)*.
 
 ## Acceptance checklist
 

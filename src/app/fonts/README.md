@@ -80,6 +80,17 @@ The CSS requests that produced these `latin` blocks:
 - `https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@100..800&display=swap`
 - `https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@1&display=swap`
 
+## Inter Tight (`WEB-15`)
+
+`inter-tight/InterTight-wght-latin.woff2` is the sign-in page's display face
+(the title only), loaded by `src/features/auth/login-fonts.ts`. It is the
+landing site's own file (`site/src/fonts/inter-tight/`, added with `WEB-5`),
+byte for byte: SHA-256
+`77fefe8ca19b9f69b5284832c519e0493127c1f091f0a8936884be7721c4e618`, a
+`Web Open Font Format (Version 2)` variable font, `wght` 100–900, `latin`
+block. `inter-tight/OFL.txt` is the family's SIL Open Font License 1.1
+("Copyright 2022 The Inter Project Authors"), from the same place.
+
 ## Weights (decision D4)
 
 No weight the old code asked for is dropped, and no axis is added that the old

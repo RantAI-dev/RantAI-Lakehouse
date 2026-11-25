@@ -6,12 +6,12 @@
 | Backlog | `QS-1` |
 | Kind | Feature |
 | Spec | `docs/core/specs/qs-1.md` (one *(proposed)* number, the 200 ms suggestion time, is decision 2) |
-| Status | Building |
+| Status | Released: accepted by the product owner on 2026-11-14 (every row Pass; AC5 retested on 240d2e62 on the #491 text; AC13 passed on 240d2e62 with no case) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
 | Started | 2026-10-23; also in `BACKLOG.md` Dates |
-| Shipped | Not yet |
+| Shipped | 2026-10-23; fixes 2026-11-06 (#403) |
 | Evidence | |
 | Plan | Plan files are not kept in the repository. |
 
@@ -44,6 +44,7 @@ comment toggling, bracket matching or folding in this editor.
 8. Use find and replace, toggle a comment, see the matching bracket, fold a
    block, and open a list of the keyboard shortcuts.
 9. Reload the page and find unsaved text where it was.
+10. Write `{{name}}` in the SQL to get a field for it under the editor, and type `{{` to complete the names the tab defines. See [`query-parameters.md`](query-parameters.md).
 
 ## Not included
 
@@ -67,28 +68,39 @@ and the last result) keeps working, and follows the active query tab.
 | 2 | Suggestions show within 200 ms of a keystroke once the table's columns are loaded *(proposed in the spec)*. The first time a table is named, its columns may take one request longer, and the list says it is loading them | 200 ms | Owner, 2026-10-23 |
 | 3 | Run all sends the statements one after another, as separate requests, in the order written. It stops at the first failure, and the statements after it show "Not run" in their tabs. The server keeps its one-statement rule | Stop at the first failure | Owner, 2026-10-23 |
 | 4 | Run all runs at most 20 statements; more is refused with a message before anything runs *(proposed)* | 20 | Owner, 2026-10-23 |
-| 5 | Query tabs are stored in this browser (`localStorage`), not on the server: each tab keeps its name, SQL and engine, not its result. At most 20 tabs *(proposed)* | Browser only, 20 tabs | Owner, 2026-10-23 |
+| 5 | Query tabs are stored in this browser (`localStorage`), not on the server, under a key of the signed-in person and their active tenant: each tab keeps its name, SQL and engine, not its result. A person never sees another person's tabs on the same browser; signing out keeps their tabs for their next sign-in on that browser. The entry every person shared before `QS-8` is removed, not migrated. At most 20 tabs *(proposed)* | Browser only, 20 tabs | Owner, 2026-10-23; changed 2026-11-12 (`QS-8`), *(proposed, not yet signed)* |
 | 6 | ⌘/Ctrl+Enter runs the selection when there is one, and otherwise the whole tab (Run all). Today it runs the whole buffer | Selection, else all | Owner, 2026-10-23 |
 | 7 | Format keeps this repository's small formatter and adds two settings, kept in this browser: keyword case (upper, lower, as typed) and indent (none, 2 or 4 spaces). Indent puts each clause's body on the line after its keyword, indented by that width; none is today's output. No new dependency | Upper case, no indent (today's output) | Owner, 2026-10-23; indent default corrected by the planner the same day, because today's formatter does not indent and a 2-space default would change everyone's output |
 | 8 | Find and replace, comment toggling, bracket matching and folding come from the editor component already installed; the work is to check each one and add the shortcut list | none | Owner, 2026-10-23 |
-| 9 | The schema browser sits beside the editor and can be closed; it lists only the tables the catalog shows this user | Open on wide screens, closed on narrow ones | Owner, 2026-10-23 |
+| 9 | The schema browser sits beside the editor and can be closed; it lists only the tables the catalog shows this user. A Bronze entry is insertable on a `Trino` tab only once its `Iceberg` table is proven to exist, through the same table-detail read the catalog page makes (`lakehouseService.getTableDetail` on the `bronze` namespace); on a Trino tab the read is made once per Bronze asset when the asset list loads, at most four reads at a time, and kept for the session, so a proven row inserts without being expanded. When the read has finished and found no table, the entry is disabled, shows no columns, and its reason is "No readable table for this asset yet."; while the read is still running, the entry stays disabled with the name-unknown reason it already shows. | Open on wide screens, closed on narrow ones | Owner, 2026-10-23; changed: Owner, 2026-11-09; changed: Planner's choice, 2026-11-12 |
 | 10 | The Natural language and SQL tabs stay. Query tabs live inside the SQL tab | none | Owner, 2026-10-23 |
 | 11 | No on/off switch. This is the editor itself, and every part degrades on its own: without column data the editor still runs SQL | none | Owner, 2026-10-23 |
 | 12 | Explain, Fix with AI, Estimate, Save query and Save as SQL source work on one statement: the selection when there is one, else the whole tab when it holds one statement. With several statements and no selection they are disabled, and the button's title says to select one statement. A saved query or SQL source with several statements would fail where it is run later (the server runs one statement per request) | none | Planner's choice, 2026-10-23 |
-| 13 | Fix with AI is offered on a failed statement's result tab and proposes a fix for that statement; Accept replaces that statement's text in the editor and nothing else | none | Planner's choice, 2026-10-23 |
+| 13 | Fix with AI is offered on a failed statement's result tab and proposes a fix for that statement; Accept replaces that statement's text in the editor and nothing else. Since `QS-11` it is offered only when the failure is a statement error (`invalid_request`, the server's 400/422): a permission refusal, a hidden table, an outage or a rate limit get no button, because changing the SQL cannot help | none | Planner's choice, 2026-10-23; changed: Planner's choice, 2026-11-20 (QS-11) |
+| 14 | On a Trino tab, Estimate sends no request. The panel says "No pre-run estimate for Trino queries." in place of every other state, because the estimate route explains ClickHouse statements only. A Trino `EXPLAIN` route is not built | none | Planner's choice, 2026-11-12 |
+| 15 | An engine failure in Query Studio, on a run or on the cost estimate, shows a fixed sentence for its cause followed by ` Reference: <id>`, never the engine's own text. The raw text goes to the log under the same reference. Outages, timeouts and Stop keep their own fixed sentences. The sentences for each cause are the ones the query history keeps (`query-history.md`, decision 3) | none | Owner, 2026-11-12, LH-QS-2-08 |
+| 16 | `QS-11` editor limits and hints are said where the person is: a new tab's document is empty and "Write SQL here, or generate it from a question" is a grey placeholder, never text a run could send (a stored tab holding exactly the old starter text reads back as empty). At 20 query tabs "+" is disabled with a sentence beside it; a batch over 20 statements is refused with an alert under Run that stays until the SQL changes or another tab opens — no toasts *(planner default, owner may change: the placement)*. The schema browser has a "Search tables" field that filters the listed tables by a case-insensitive contains-match on the table's label and SQL reference; a layer with no match is not drawn, and no match at all says so. The search is not stored. The QA report that a click on `select` inserted a table was reproduced first on 2026-11-20: the keyword was first and applying it inserted the keyword. The separate ranking decision (D8) was applied after review R1: outside `FROM`/`JOIN` and qualifiers tables and columns carry no boost, so a keyword that matches what was typed ranks by the editor's own match score; after `FROM`/`JOIN` and a qualifier they keep their boosts | none | Planner's choice, 2026-11-20 (QS-11), *(proposed, not yet signed)*; changed: Planner's choice, 2026-11-20 (QS round review R1) |
 
 ## Limits to tell a customer
 
 - Query tabs are kept in the browser they were opened in. Clearing the
-  browser's site data removes them; saved queries are not affected.
+  browser's site data removes them; saved queries are not affected. They are
+  kept per signed-in person and tenant; an administrator cannot read or move
+  them.
 - Run all is not a transaction. A statement that ran before a failure is not
   undone (the editor runs read-only statements, so nothing was written).
 - Autocomplete and the schema browser know only the tables the catalog shows
   you. A table you can query but the catalog does not list gets no column
-  suggestions. A Bronze table's SQL name is known once its detail is loaded:
-  expand it in the schema browser, or write its `namespace.name` in the
-  statement. A name only Trino serves is offered on a Trino tab only.
-- Run all takes at most 20 statements, and a browser keeps at most 20 tabs.
+  suggestions. A Bronze table's SQL name is known once its table is proven to
+  exist. On a Trino tab that check runs when the asset list loads; expanding
+  the table, or writing its `namespace.name` in the statement, reads it too.
+  A name only Trino serves is offered on a Trino tab only.
+- On a Trino tab, Estimate makes no estimate. Only ClickHouse statements get one.
+- Run all takes at most 20 statements, and a browser keeps at most 20 tabs. Both
+  limits are said on the page when they are reached.
+- The schema browser's search matches a table's label and its SQL reference
+  only. It does not search inside a table's columns, and it is not kept between
+  visits.
 
 ## Acceptance checklist
 
@@ -97,29 +109,32 @@ a pass.
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `QS-1-AC1` | In the SQL tab, type `SELECT o. FROM <a Silver or Gold table, or a Bronze one whose detail is loaded> o` and put the cursor after `o.` | The list shows that table's columns | Not run |
-| `QS-1-AC2` | Write three statements separated by `;` and press Run all | Three result tabs, one per statement, in order | Not run |
-| `QS-1-AC3` | Open three query tabs with different SQL, close the browser, open Query Studio again | The three tabs are back with their names and SQL | Not run |
-| `QS-1-AC4` | Sign in as a user without `query:read`, open Query Studio and press Run all | Every statement is refused with a permission message, and nothing runs on the engine (`POST /api/query/run` needs `query:read`, `policy.rs:412`) | Not run |
-| `QS-1-AC5` | Write three statements where the second fails, press Run all | Tab 1 shows rows, tab 2 shows the engine's error as the console reports it today, tab 3 says "Not run" | Not run |
-| `QS-1-AC6` | Select the second of three statements and press ⌘/Ctrl+Enter | Only that statement runs | Not run |
-| `QS-1-AC7` | In the schema browser, expand a layer, a table, and click a column | The column name is inserted at the cursor; each column shows its type | Not run |
-| `QS-1-AC8` | Set keyword case to lower and indent to 4, press Format, reload, press Format again | Both times keywords are lower case and indented by 4 | Not run |
-| `QS-1-AC9` | Use find and replace, toggle a comment, fold a block, and open the shortcut list | Each works, and the shortcut list names the keys used | Not run |
-| `QS-1-AC10` | (operator) Make the catalog's table detail fail for one table, then type its alias and a dot | The list says the columns could not be loaded; the query still runs | Not run |
-| `QS-1-AC11` | Sign in as a user without `catalog:read` but with `query:read` | The schema browser says it needs catalog access; the editor still runs SQL | Not run |
-| `QS-1-AC12` | Paste 21 statements and press Run all | Refused before anything runs, with a message naming the limit of 20 | Not run |
+| `QS-1-AC1` | In the SQL tab, type `SELECT o. FROM <a Silver or Gold table, or a Bronze one whose detail is loaded> o` and put the cursor after `o.` | The list shows that table's columns | Pass (2026-11-04, f3cee927, LH-QS-1-01). Bronze on the Trino tab: Pass (2026-11-13, 8b9c297c, LH-QS-4-08) |
+| `QS-1-AC2` | Write three statements separated by `;` and press Run all | Three result tabs, one per statement, in order | Pass (2026-11-04, f3cee927, LH-QS-1-02) |
+| `QS-1-AC3` | Open three query tabs with different SQL, close the browser, open Query Studio again | The three tabs are back with their names and SQL | Pass (2026-11-05, 3409d743, LH-QS-1-03) |
+| `QS-1-AC4` | Sign in as a user without `query:read`, open Query Studio and press Run all | Every statement is refused with a permission message, and nothing runs on the engine (`POST /api/query/run` needs `query:read`, `policy.rs:412`) | Pass (2026-11-04, f3cee927, LH-QS-1-04) |
+| `QS-1-AC5` | Write three statements where the second fails, press Run all | Tab 1 shows rows, tab 2 shows a fixed sentence for the failure and a reference (for a missing table: "This query reads a table that does not exist or that you cannot read. Reference: …"), with no engine text (`Code:`, `DB::Exception`), and tab 3 says "Not run" | Pass (2026-11-14, 240d2e62, LH-QS-1-05), retested on the #491 text |
+| `QS-1-AC6` | Select the second of three statements and press ⌘/Ctrl+Enter | Only that statement runs | Pass (2026-11-04, f3cee927, LH-QS-1-06) |
+| `QS-1-AC7` | In the schema browser, expand a layer, a table, and click a column | The column name is inserted at the cursor; each column shows its type | Pass (2026-11-04, f3cee927, LH-QS-1-07) |
+| `QS-1-AC8` | Set keyword case to lower and indent to 4, press Format, reload, press Format again | Both times keywords are lower case and indented by 4 | Pass (2026-11-04, f3cee927, LH-QS-1-08) |
+| `QS-1-AC9` | Use find and replace, toggle a comment, fold a block, and open the shortcut list | Each works, and the shortcut list names the keys used | Pass (2026-11-12, 3cdd8332, LH-QS-1-09) |
+| `QS-1-AC10` | (operator) Make the catalog's table detail fail for one table, then type its alias and a dot | The list says the columns could not be loaded; the query still runs | Pass (2026-11-12, 3cdd8332, LH-QS-1-10) |
+| `QS-1-AC11` | Sign in as a user without `catalog:read` but with `query:read` | The schema browser says it needs catalog access; the editor still runs SQL | Pass (2026-11-04, f3cee927, LH-QS-1-11) |
+| `QS-1-AC12` | Paste 21 statements and press Run all | Refused before anything runs, with a message naming the limit of 20 | Pass (2026-11-04, f3cee927, LH-QS-1-12) |
+| `QS-1-AC13` | Sign in as one person, write SQL in two tabs, sign out, sign in as a second person on the same browser, open Query Studio; then sign in as the first person again | The second person sees one empty tab and none of the first person's SQL; the first person finds their two tabs | Pass (2026-11-14, 240d2e62, no case) |
 
-**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): product owner (recorded in the base) **Date:** 2026-11-14 **Build:** 240d2e62
 
 Exceptions, each with an owner and a date:
+
+None.
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
-- [ ] `BACKLOG.md` Dates has the Shipped date
-- [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
+- [x] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
+- [x] `BACKLOG.md` Dates has the Shipped date
+- [x] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base (done by the auditor)
 - [ ] `CHANGELOG.md` entry a customer can read
 
 ## QA-1 decisions (product owner, 2026-11-02)

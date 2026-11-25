@@ -2,12 +2,13 @@
 
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::sync::Arc;
 
 use lakehouse_bi::builder::{FilteredSql, RelationColumns};
 use lakehouse_bi::filters::ColumnKind;
 use lakehouse_bi::specs::ChartSource;
 use lakehouse_bi::store;
-use lakehouse_clickhouse::{ChClient, ChError};
+use lakehouse_clickhouse::{ChClient, ChError, ChResult};
 use serde_json::{Map, Value, json};
 
 use crate::upstream_error;
@@ -256,7 +257,9 @@ pub(crate) async fn run_spec_sql(
 #[derive(Debug)]
 pub(crate) enum SpecRunFailure {
     /// Refused by the policy rewrite before any query ran; the text is fixed.
-    Refused(&'static str),
+    /// A `String` because a `GOV-7` refusal names the table (the caller's
+    /// own SQL) with `SEC-20`'s sentence.
+    Refused(String),
     /// `SEC-50` slice 2 M3: refused by the tenant gate before the rewrite
     /// and before the engine.
     ///
@@ -283,6 +286,54 @@ pub(crate) enum SpecRunFailure {
 /// for the security team.
 pub(crate) const REGION_OF_REFUSED: &str = "RegionOf is not available to you: your role has a data policy, and the region lookup cannot be checked against it yet. Ask an administrator, or use a column that already holds the region.";
 
+/// The `{{principal_id}}`/`{{principal_tenant_ids}}` values the policy rewrite
+/// expands for `principal` — one function, because the dashboard preview and
+/// the pipeline preview (BLD-1 part 1 / D16) rewrite a caller's statement with
+/// the same placeholder set and a third copy would be the drift `AGENTS.md`
+/// rule 4 names.
+#[must_use]
+pub(crate) fn placeholders_for(
+    principal: &lakehouse_auth::Principal,
+) -> crate::sql_rewrite::PlaceholderValues {
+    crate::sql_rewrite::PlaceholderValues {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_tenant_ids: principal
+            .tenant_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    }
+}
+
+/// The columns `rewritten` returns, via `DESCRIBE` — no rows are read.
+///
+/// The column probe the dashboard preview owns and the pipeline preview
+/// reuses (BLD-1 part 1 / D16), rather than a second `DESCRIBE` written for the
+/// new route. A `ClickHouse` failure comes back as the engine's own
+/// [`ChError`], because the two callers answer it differently: the dashboard
+/// preview fixes the sentence, the pipeline preview reports it the way Query
+/// Studio does.
+///
+/// # Errors
+///
+/// The engine's own [`ChError`] from the `DESCRIBE`.
+pub(crate) async fn describe_columns(
+    ch: &ChClient,
+    rewritten: &str,
+) -> Result<Vec<lakehouse_bi::sources::SourceColumn>, ChError> {
+    let sql = format!("DESCRIBE (SELECT * FROM (\n{rewritten}\n))");
+    let rows = ch.rows(&sql, None).await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            Some(lakehouse_bi::sources::SourceColumn {
+                name: row.get("name")?.as_str()?.to_owned(),
+                ty: row.get("type")?.as_str()?.to_owned(),
+            })
+        })
+        .collect())
+}
+
 /// [`crate::policy_engine::enforcement_error_message`], with the sentence
 /// above for a refused `dictGet*` call in a statement that does a `RegionOf`
 /// lookup (it names a `console.geo_dict_` dictionary); every other refusal
@@ -290,7 +341,7 @@ pub(crate) const REGION_OF_REFUSED: &str = "RegionOf is not available to you: yo
 pub(crate) fn enforcement_message_for(
     sql: &str,
     err: &crate::policy_engine::EnforcementError,
-) -> &'static str {
+) -> String {
     let denied = matches!(
         err,
         crate::policy_engine::EnforcementError::Rewrite(
@@ -298,9 +349,37 @@ pub(crate) fn enforcement_message_for(
         )
     );
     if denied && sql.contains("console.geo_dict_m_") {
-        REGION_OF_REFUSED
+        REGION_OF_REFUSED.to_owned()
     } else {
         crate::policy_engine::enforcement_error_message(err)
+    }
+}
+
+/// The ONE mapping from a policy-rewrite refusal to the answer a caller gets
+/// (`GOV-7` D5): every governed read path that builds an `ApiError` from an
+/// `EnforcementError` calls this, so a table a role may not read is answered
+/// with `SEC-20`'s own 404 and sentence (`D2`) and a narrowed principal's
+/// listing with `SEC-20`'s 422 sentence — never "forbidden", and never a
+/// second copy of either sentence.
+///
+/// `sql` is only read for the `RegionOf` sentence above; the table named in a
+/// refusal is the caller's own SQL, never upstream text.
+pub(crate) fn enforcement_refusal(
+    sql: &str,
+    err: &crate::policy_engine::EnforcementError,
+) -> lakehouse_core::ApiError {
+    match err {
+        crate::policy_engine::EnforcementError::TableNotReadable(table) => {
+            lakehouse_core::ApiError::NotFound(crate::policy_engine::table_not_available_message(
+                table,
+            ))
+        }
+        crate::policy_engine::EnforcementError::Unresolvable => {
+            lakehouse_core::ApiError::Unprocessable(
+                crate::policy_engine::LISTING_NOT_AVAILABLE.to_owned(),
+            )
+        }
+        _ => lakehouse_core::ApiError::Unprocessable(enforcement_message_for(sql, err)),
     }
 }
 
@@ -348,43 +427,18 @@ pub(crate) async fn try_run_spec_sql(
     // the same numbers travel as URL settings, with the query id a Stop finds
     // it by. One row more than the cap is asked for, so a cut is told from an
     // exact fit.
-    let run = crate::query_limits::QueryRun::current_or_detached();
-    let limits = run.limits().await.map_err(|err| {
-        tracing::error!(error = %err, "the query limits could not be read");
-        SpecRunFailure::Refused("The query limits could not be read.")
-    })?;
-    let seconds = u32::try_from(limits.timeout_seconds()).unwrap_or(u32::MAX);
+    let run = LimitedRun::current().await?;
     // BI-4 part B: the tables are named on the rewritten statement (after the
-    // masks wrapped the governed ones), the one the engine would run.
+    // masks wrapped the governed ones), the one the engine would run. Before
+    // the settings swap: the swap only rewrites the trailing `SETTINGS` text.
     let tables = crate::sql_rewrite::referenced_tables(
         &rewritten,
         &sqlparser::dialect::ClickHouseDialect {},
     );
-    let rewritten = lakehouse_bi::builder::with_run_settings(
-        &rewritten,
-        limits.chart_rows.saturating_add(1),
-        seconds,
-    );
-    // BI-5 review B1: a point map reads up to the map limit and a pivot up to
-    // its own cap, set around the tile by `with_tile_rows`; every other kind
-    // stays at the chart row limit. Only the outer cap moves: the SQL-source
-    // `SETTINGS` text above keeps the chart row limit.
-    let rows_cap = limits
-        .chart_rows
-        .max(crate::query_limits::row_cap_override().unwrap_or(0));
+    let rewritten = run.statement(&rewritten);
+    let rows_cap = run.rows_cap();
     let execute = || async {
-        // BI-5 review S2: Stop was pressed on this run while the tile waited
-        // for its round; it asks the engine nothing.
-        if run.is_stopped() {
-            return Err(SpecRunFailure::Tile(
-                json!({ "error": crate::query_limits::STOPPED_SENTENCE }),
-            ));
-        }
-        let options = run.options(&limits, rows_cap);
-        let mut r = ch
-            .query_with_options(&rewritten, &options, None)
-            .await
-            .map_err(|err| tile_failure(err, &limits))?;
+        let mut r = run.send(ch, &rewritten, rows_cap).await?;
         let columns: Vec<String> = r.meta.iter().map(|m| m.name.clone()).collect();
         // The engine was asked for `chart_rows + 1` rows and `break`s at the
         // end of a block, so a result of more than `chart_rows + 1` rows was
@@ -399,7 +453,7 @@ pub(crate) async fn try_run_spec_sql(
         }
         let mut out = json!({ "columns": columns, "rows": r.data });
         if cut {
-            out["limitHit"] = limits.rows_limit_json(rows_cap);
+            out["limitHit"] = run.limits().rows_limit_json(rows_cap);
         }
         Ok::<_, SpecRunFailure>(crate::result_cache::Computed {
             value: out,
@@ -417,7 +471,7 @@ pub(crate) async fn try_run_spec_sql(
     let settings = [
         (
             "max_execution_time",
-            u64::try_from(limits.timeout.as_millis()).unwrap_or(u64::MAX),
+            u64::try_from(run.limits().timeout.as_millis()).unwrap_or(u64::MAX),
         ),
         ("max_result_rows", u64::from(rows_cap) + 1),
     ];
@@ -454,6 +508,187 @@ fn tile_failure(err: ChError, limits: &crate::query_limits::TileLimits) -> SpecR
         SpecRunFailure::Tile(json!({ "error": crate::query_limits::STOPPED_SENTENCE }))
     } else {
         SpecRunFailure::Clickhouse(err)
+    }
+}
+
+/// The one sender of a statement that runs under the caller's limits
+/// (`BI-45`, plan D4; QA `LH-BI-5-01`).
+///
+/// A tile, a chart preview, a save's own check and the SQL source preview's
+/// row read all reach `ClickHouse` through here. Four steps happen in one
+/// place, so no caller can have two of them and miss the others: the limits of
+/// the request's run (`QueryRun::current_or_detached().limits()`), the
+/// SQL-source `SETTINGS` text swapped for the administrator's numbers
+/// (`with_run_settings`), the run's options (time limit, row cap plus one, a
+/// query id) sent as URL settings, and the engine's answer mapped by
+/// [`tile_failure`] — so a limit the engine enforced is the limit's sentence
+/// and never the engine's text (AGENTS.md principle 4).
+pub(crate) struct LimitedRun {
+    run: Arc<crate::query_limits::QueryRun>,
+    limits: crate::query_limits::TileLimits,
+}
+
+impl LimitedRun {
+    /// The run of the request being served (or a detached one) and its limits.
+    ///
+    /// # Errors
+    ///
+    /// [`SpecRunFailure::Refused`] when the limits cannot be read; nothing is
+    /// sent in that case.
+    pub(crate) async fn current() -> Result<Self, SpecRunFailure> {
+        let run = crate::query_limits::QueryRun::current_or_detached();
+        let limits = run.limits().await.map_err(|err| {
+            tracing::error!(error = %err, "the query limits could not be read");
+            SpecRunFailure::Refused("The query limits could not be read.".to_owned())
+        })?;
+        Ok(Self { run, limits })
+    }
+
+    /// The limits every statement of this run is sent under.
+    pub(crate) fn limits(&self) -> &crate::query_limits::TileLimits {
+        &self.limits
+    }
+
+    /// `sql` with its SQL-source cap swapped for the configured numbers: the
+    /// chart row limit plus one (so a cut is told from an exact fit) and the
+    /// time limit in whole seconds.
+    pub(crate) fn statement(&self, sql: &str) -> String {
+        let seconds = u32::try_from(self.limits.timeout_seconds()).unwrap_or(u32::MAX);
+        lakehouse_bi::builder::with_run_settings(
+            sql,
+            self.limits.chart_rows.saturating_add(1),
+            seconds,
+        )
+    }
+
+    /// The rows a statement may read: `BI-5` review B1 — a point map reads up
+    /// to the map limit and a pivot up to its own cap, set around the tile by
+    /// [`with_tile_rows`]; every other kind stays at the chart row limit. Only
+    /// the outer cap moves: the SQL-source `SETTINGS` text keeps the chart row
+    /// limit.
+    pub(crate) fn rows_cap(&self) -> u32 {
+        self.limits
+            .chart_rows
+            .max(crate::query_limits::row_cap_override().unwrap_or(0))
+    }
+
+    /// Send `statement` under this run's limits with `rows_cap` rows.
+    ///
+    /// # Errors
+    ///
+    /// [`SpecRunFailure::Tile`] when Stop was pressed on this run before the
+    /// query went out, or when the engine stopped the query at the time limit
+    /// or with a `KILL QUERY`; [`SpecRunFailure::Clickhouse`] for every other
+    /// engine failure, for the caller to classify (its text never reaches a
+    /// response).
+    pub(crate) async fn send(
+        &self,
+        ch: &ChClient,
+        statement: &str,
+        rows_cap: u32,
+    ) -> Result<ChResult, SpecRunFailure> {
+        // BI-5 review S2: Stop was pressed on this run while the tile waited
+        // for its round; it asks the engine nothing.
+        if self.run.is_stopped() {
+            return Err(SpecRunFailure::Tile(
+                json!({ "error": crate::query_limits::STOPPED_SENTENCE }),
+            ));
+        }
+        let options = self.run.options(&self.limits, rows_cap);
+        ch.query_with_options(statement, &options, None)
+            .await
+            .map_err(|err| tile_failure(err, &self.limits))
+    }
+}
+
+/// Run `sql` once under the caller's limits (`BI-45`, plan D4): the limits,
+/// the settings swap, the run's options and the failure mapping all come from
+/// [`LimitedRun`]. For a statement that is not a tile — a save's own check and
+/// the SQL source preview's row read — whose rows the caller does not keep.
+///
+/// # Errors
+///
+/// As [`LimitedRun::current`] and [`LimitedRun::send`].
+pub(crate) async fn run_statement_limited(
+    ch: &ChClient,
+    sql: &str,
+) -> Result<ChResult, SpecRunFailure> {
+    let run = LimitedRun::current().await?;
+    let statement = run.statement(sql);
+    run.send(ch, &statement, run.rows_cap()).await
+}
+
+/// [`SpecRunFailure`] as the answer of a console route (`BI-45`, plan D6/D5;
+/// QA `LH-BI-5-01`): a limit or a Stop is a 422 with the fixed sentence the
+/// sender built, a refused rewrite is its own 422, the gate keeps its 404/422,
+/// and an engine failure goes through the caller's own mapping — so a route
+/// that saves or previews a statement keeps the status it always answered
+/// with, never the engine's text (AGENTS.md principle 4).
+pub(crate) fn failure_as_api_error(
+    failure: SpecRunFailure,
+    on_engine: impl FnOnce(&ChError) -> lakehouse_core::ApiError,
+) -> lakehouse_core::ApiError {
+    let not_finished =
+        || lakehouse_core::ApiError::Unprocessable("The query did not finish.".to_owned());
+    match failure {
+        SpecRunFailure::Tile(answer) => {
+            match answer.get("error").and_then(serde_json::Value::as_str) {
+                Some(sentence) => lakehouse_core::ApiError::Unprocessable(sentence.to_owned()),
+                None => not_finished(),
+            }
+        }
+        SpecRunFailure::Refused(message) => lakehouse_core::ApiError::Unprocessable(message),
+        SpecRunFailure::Gated(err) => err,
+        SpecRunFailure::Clickhouse(err) => on_engine(&err),
+    }
+}
+
+/// Save `spec` from the console, its own statement checked under the caller's
+/// limit first (`BI-45`, plan D5; QA `LH-BI-5-01`).
+///
+/// The statement is run AS STORED, not rewritten for roles: a save keeps
+/// today's meaning, "does this statement execute", and only gains the time
+/// limit, the row cap and the query id — a chart a role's masks would change
+/// is saved as its author wrote it, and the mask is applied when someone reads
+/// it. The import of a dashboard file, the version revert and Duplicate of a
+/// whole dashboard still call [`store::smoke_test_chart`]: they check up to
+/// 200 charts in one request and need their own rule for a chart the limit
+/// ends (plan §4).
+///
+/// # Errors
+///
+/// [`SpecRunFailure::Tile`] when the limit or a Stop ended the statement (the
+/// answer carries the limit's sentence), [`SpecRunFailure::Refused`] when the
+/// limits cannot be read, or [`SpecRunFailure::Clickhouse`] when the engine
+/// failed or the row could not be written; nothing is stored in any of those
+/// cases.
+pub(crate) async fn insert_chart_checked(
+    ch: &ChClient,
+    spec: &store::StoredChartSpec,
+) -> Result<(), SpecRunFailure> {
+    if !spec.spec.sql.is_empty() {
+        // The rows are dropped: a save asks whether the statement executes
+        // under the limit, not what it returns.
+        run_statement_limited(ch, &spec.spec.sql).await?;
+    }
+    store::insert_chart_unchecked(ch, spec)
+        .await
+        .map_err(SpecRunFailure::Clickhouse)
+}
+
+/// [`SpecRunFailure`] as an assistant tool's reply (`BI-45`, plan D5): the
+/// tile's own answer { "error": <sentence>, "limit": {..} } for a limit or a
+/// Stop, so the model can say the limit; a refused rewrite or the gate's own
+/// answer as `{ "error": <sentence> }`; an engine failure through
+/// [`upstream_error::report_ch`] under a reference id, never its text.
+pub(crate) fn failure_as_tool_reply(failure: SpecRunFailure) -> Value {
+    match failure {
+        SpecRunFailure::Tile(answer) => answer,
+        SpecRunFailure::Refused(message) => json!({ "error": message }),
+        SpecRunFailure::Gated(err) => json!({ "error": err.to_string() }),
+        SpecRunFailure::Clickhouse(err) => {
+            upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()
+        }
     }
 }
 
@@ -743,14 +978,18 @@ pub(crate) fn annotate_saved_grain(tile: &mut Value, chart: &store::StoredChartS
     else {
         return;
     };
-    let order = chart.def.order.as_deref().unwrap_or("none");
     let filtered = FilteredSql {
         sql: String::new(),
         skipped: Vec::new(),
         grain_skipped: None,
         grain: Some(grain),
         grain_column: None,
-        latest_limit: lakehouse_bi::grain::cuts_to_latest(grain, order)
+        // `BI-46` (plan D12): a chart with a breakdown keeps every bucket, so
+        // the surplus-bucket annotation is the builder's own rule — one place,
+        // never a second copy that could disagree with it.
+        latest_limit: chart
+            .def
+            .keeps_latest_buckets(grain)
             .then(|| lakehouse_bi::grain::clamp_limit(chart.def.kind, chart.def.limit_value())),
         table: None,
         bins: Vec::new(),
@@ -803,13 +1042,61 @@ pub(crate) fn annotate_grain(
     }
 }
 
+/// QA `LH-BI-9-05` (`BI-50`, plan D10, D12): while a dashboard grain is applied
+/// (`requested`), the tile of a stored chart the grain did not change carries
+/// `grainNotApplied`, one of the four reasons [`lakehouse_bi::grain::switch_skip`]
+/// names: the chart's type takes no date grouping, it groups by a part of the
+/// date, its dimension is not a date, or it has no date grouping of its own.
+///
+/// Nothing is added when the control changed the chart, when the chart already
+/// had that grain, or when it kept its own grain because the new one does not
+/// fit its column: that last case keeps `grainSkipped`. A chart this read could
+/// not rebuild (`built` is `None`) but whose definition has its own grain kept
+/// its stored statement, so the switch never decided its grain: it is left
+/// alone rather than told a reason the switch did not find (R5, rule 14). The
+/// dimension's kind is read from the columns this read already loaded, so a
+/// joined column, a calculated field or a pivot's field is not among them and
+/// the reason is the general `no_grain`. A tile that is not an object, or that
+/// carries no `rows` (it says its own error), is left alone.
+pub(crate) fn annotate_grain_switch(
+    tile: &mut Value,
+    chart: &store::StoredChartSpec,
+    built: Option<lakehouse_bi::grain::Grain>,
+    requested: Option<lakehouse_bi::grain::Grain>,
+    columns: SourceColumns<'_>,
+) {
+    let Value::Object(tile) = tile else {
+        return;
+    };
+    if !tile.contains_key("rows") {
+        return;
+    }
+    // R5 (rule 14): a chart that fell back to its stored statement was not
+    // rebuilt at this read, so the switch never saw its grain; "no date
+    // grouping of its own" would be a reason that is not true.
+    if built.is_none() && chart.def.grain.is_some() {
+        return;
+    }
+    let column = own_columns(chart, columns.0, columns.1)
+        .and_then(|cols| cols.get(&chart.def.dimension).copied());
+    if let Some(reason) =
+        lakehouse_bi::grain::switch_skip(chart.spec.kind, built, column, requested)
+    {
+        tile.insert("grainNotApplied".to_owned(), json!(reason));
+    }
+}
+
 /// `BI-10`: what the tile of a binned chart carries so the console can label
-/// its bins: `bins: { <column>: { mode, width, min, max } }`, read by the
-/// statements the builder made over the same filtered relation as the bins,
+/// its bins: `bins: { <column>: { mode, width, min, max, whole? } }`, read by
+/// the statements the builder made over the same filtered relation as the bins,
 /// through the same role rewrite as the tile (the width of a viewer whose role
-/// filters rows comes from the rows that role may see). A read that fails or is
-/// refused leaves its column out: the tile then shows the bin's lower edges
-/// as plain numbers, and the failure is only logged under a reference id.
+/// filters rows comes from the rows that role may see). `whole` (`BI-57`, QA
+/// `LH-BI-2-02`) says every value of the column is a whole number, so a bin of
+/// width 1 reads as its one value; it is left out when the read did not answer
+/// it (an older statement, a mock), and the console then labels a range. A
+/// read that fails or is refused leaves its column out: the tile then shows the
+/// bin's lower edges as plain numbers, and the failure is only logged under a
+/// reference id.
 pub(crate) async fn annotate_bins(
     ch: &ChClient,
     gate: &crate::routes::query::StatementGate<'_>,
@@ -845,15 +1132,20 @@ async fn add_bins(
         match try_run_spec_sql(ch, gate, &read.sql, roles, placeholders, obligations).await {
             Ok(result) => {
                 let row = &result["rows"][0];
-                out.insert(
-                    read.column.clone(),
-                    json!({
-                        "mode": read.mode,
-                        "width": row["width"],
-                        "min": row["min"],
-                        "max": row["max"],
-                    }),
-                );
+                let mut entry = json!({
+                    "mode": read.mode,
+                    "width": row["width"],
+                    "min": row["min"],
+                    "max": row["max"],
+                });
+                // QA LH-BI-2-02 (BI-57, D6): every value of the column is a
+                // whole number, so a bin of width 1 reads as its one value.
+                // A read that answers no `whole` adds no key, and an existing
+                // assertion on `bins` is unchanged.
+                if !row["whole"].is_null() {
+                    entry["whole"] = row["whole"].clone();
+                }
+                out.insert(read.column.clone(), entry);
             }
             Err(SpecRunFailure::Clickhouse(err)) => {
                 let _logged = upstream_error::report_ch(&upstream_error::TILE, &err);
@@ -1269,6 +1561,318 @@ mod tests {
     }
 }
 
+/// `BI-45` (plan T2, T4 and T5): the one sender of a statement that runs
+/// under the caller's limits, the checked save, and the assistant's reply for
+/// a save the limit ended. A wiremock `ClickHouse` only: no Postgres, so no
+/// policy row applies and nothing reaches the chart store.
+#[cfg(test)]
+mod limited_run {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const TIMEOUT_BODY: &str =
+        "Code: 159. DB::Exception: planted-marker Timeout exceeded (TIMEOUT_EXCEEDED)";
+
+    fn clickhouse(server: &MockServer) -> ChClient {
+        ChClient::new(server.uri(), "default".to_owned(), String::new())
+    }
+
+    fn url_settings(request: &wiremock::Request) -> HashMap<String, String> {
+        request.url.query_pairs().into_owned().collect()
+    }
+
+    /// `BI-45` plan D4 (QA `LH-BI-5-01`): one call sends the caller's time
+    /// limit, the row cap plus one and a query id as URL settings, and an
+    /// engine that stopped the statement at the limit comes back as the
+    /// limit's sentence with its `limit` object, never the engine's text.
+    #[tokio::test]
+    async fn a_statement_run_under_limits_sends_the_time_limit_and_says_the_limit_sentence_when_the_engine_stops_it()
+     {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(TIMEOUT_BODY))
+            .mount(&server)
+            .await;
+        let ch = clickhouse(&server);
+
+        let Err(err) = run_statement_limited(&ch, "SELECT 1").await else {
+            panic!("a statement the engine stopped is a failure");
+        };
+
+        let SpecRunFailure::Tile(answer) = err else {
+            panic!("a limit the engine enforced is the tile's answer, not {err:?}");
+        };
+        // A test runs outside a request, so the limits are the defaults.
+        assert_eq!(
+            answer["error"], "This chart stopped after 60 seconds, the limit for this install.",
+            "{answer}"
+        );
+        assert_eq!(answer["limit"]["kind"], "time", "{answer}");
+        assert!(
+            !answer.to_string().contains("planted-marker"),
+            "the engine's text reached the answer: {answer}"
+        );
+        let requests = server.received_requests().await.unwrap();
+        let settings = url_settings(&requests[0]);
+        assert_eq!(settings["max_execution_time"], "60");
+        assert_eq!(settings["max_result_rows"], "2001");
+        assert!(settings.contains_key("query_id"), "{settings:?}");
+    }
+
+    /// A stored chart whose statement is `sql`, on `mart_x` (the shape
+    /// `store::spec_from_input` returns, without reading a mart).
+    fn stored_chart(sql: &str) -> store::StoredChartSpec {
+        let def: store::ChartInput = serde_json::from_value(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "d",
+            "measures": ["v"],
+        }))
+        .expect("a bar chart definition");
+        store::StoredChartSpec {
+            spec: store::ChartSpec {
+                id: "u_1".to_owned(),
+                title: "Visitors".to_owned(),
+                subtitle: None,
+                kind: lakehouse_bi::specs::ChartKind::Bar,
+                mart: "mart_x".to_owned(),
+                sql_source: None,
+                sql: sql.to_owned(),
+                x: "d".to_owned(),
+                y: lakehouse_bi::specs::ChartY::Single("v".to_owned()),
+                series: None,
+                map: None,
+                lat: None,
+                lon: None,
+                format: None,
+                span: None,
+                text: None,
+                caption: None,
+                target: None,
+                click: None,
+            },
+            source: ChartSource::Ui,
+            board: "b1".to_owned(),
+            def,
+            has_year: false,
+            created_by: Some("ui".to_owned()),
+            created_at: None,
+        }
+    }
+
+    /// QA `LH-BI-5-01` (`BI-45`, plan D5): a chart whose statement the limit
+    /// ended is not saved, and the failure is the limit's sentence — the same
+    /// words Query Studio uses for its own limit.
+    #[tokio::test]
+    async fn a_chart_whose_statement_hits_the_time_limit_is_not_saved_and_the_failure_is_the_limit_sentence()
+     {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(TIMEOUT_BODY))
+            .mount(&server)
+            .await;
+        let ch = clickhouse(&server);
+
+        let Err(err) = insert_chart_checked(&ch, &stored_chart("SELECT 1 AS n")).await else {
+            panic!("a statement the limit ended must not be saved");
+        };
+
+        let SpecRunFailure::Tile(answer) = err else {
+            panic!("the limit's answer, not {err:?}");
+        };
+        assert_eq!(
+            answer["error"], "This chart stopped after 60 seconds, the limit for this install.",
+            "{answer}"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| !String::from_utf8_lossy(&r.body).contains("INSERT INTO console.bi_chart")),
+            "a chart the limit ended was written anyway"
+        );
+    }
+
+    /// `BI-45` plan D5: a save runs its statement once, under the caller's
+    /// limit, and only then writes the row.
+    #[tokio::test]
+    async fn a_chart_whose_statement_runs_is_saved_after_one_limited_run() {
+        let server = MockServer::start().await;
+        // The statement, the bootstrap's DDL and the `INSERT` all answer the
+        // engine's "Ok."; what the test reads is the order and the settings.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+            .mount(&server)
+            .await;
+        let ch = clickhouse(&server);
+
+        insert_chart_checked(&ch, &stored_chart("SELECT 1 AS n"))
+            .await
+            .expect("a statement that runs is saved");
+
+        let requests = server.received_requests().await.unwrap();
+        let bodies: Vec<String> = requests
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        let select = requests
+            .iter()
+            .position(|r| String::from_utf8_lossy(&r.body).contains("SELECT 1 AS n"))
+            .expect("the chart's statement ran");
+        assert_eq!(url_settings(&requests[select])["max_execution_time"], "60");
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|b| b.contains("INSERT INTO console.bi_chart"))
+                .count(),
+            1,
+            "one row is written, once"
+        );
+        assert!(
+            select
+                < bodies
+                    .iter()
+                    .position(|b| b.contains("INSERT INTO console.bi_chart"))
+                    .expect("the row was written"),
+            "the statement runs before the row is written"
+        );
+    }
+
+    /// `BI-45` plan D5/D6: the one mapping from a failed limited statement to
+    /// a console answer — the limit's sentence as a 422, and an engine failure
+    /// through the caller's own mapping (never its text).
+    #[test]
+    fn a_limit_failure_becomes_a_422_with_the_sentence_and_an_engine_failure_keeps_the_callers_mapping()
+     {
+        let limit = json!({
+            "error": "This chart stopped after 5 seconds, the limit for your role.",
+            "limit": {"kind": "time", "value": 5, "source": {"kind": "role", "name": "Analyst"}},
+        });
+        let err = failure_as_api_error(SpecRunFailure::Tile(limit), |_err| {
+            lakehouse_core::ApiError::Internal("the engine's own answer".to_owned())
+        });
+        assert!(
+            matches!(
+                &err,
+                lakehouse_core::ApiError::Unprocessable(message)
+                    if message == "This chart stopped after 5 seconds, the limit for your role."
+            ),
+            "{err:?}"
+        );
+        // A tile answer without a sentence still says something fixed.
+        let err = failure_as_api_error(SpecRunFailure::Tile(json!({ "limit": {} })), |_err| {
+            lakehouse_core::ApiError::Internal("unused".to_owned())
+        });
+        assert!(
+            matches!(
+                &err,
+                lakehouse_core::ApiError::Unprocessable(message) if message == "The query did not finish."
+            ),
+            "{err:?}"
+        );
+        let err = failure_as_api_error(
+            SpecRunFailure::Refused("The query limits could not be read.".to_owned()),
+            |_err| lakehouse_core::ApiError::Internal("unused".to_owned()),
+        );
+        assert!(
+            matches!(
+                &err,
+                lakehouse_core::ApiError::Unprocessable(message)
+                    if message == "The query limits could not be read."
+            ),
+            "{err:?}"
+        );
+        let err = failure_as_api_error(
+            SpecRunFailure::Gated(lakehouse_core::ApiError::NotFound(
+                "Gold mart 'x' not found in serving.".to_owned(),
+            )),
+            |_err| lakehouse_core::ApiError::Internal("unused".to_owned()),
+        );
+        assert!(
+            matches!(&err, lakehouse_core::ApiError::NotFound(_)),
+            "the gate keeps its own answer: {err:?}"
+        );
+        let err = failure_as_api_error(
+            SpecRunFailure::Clickhouse(ChError::Server(
+                "Code: 62. DB::Exception: planted-marker".to_owned(),
+            )),
+            |err| {
+                upstream_error::ch_error_as(
+                    &upstream_error::DATABASE,
+                    err,
+                    upstream_error::FailedAs::BadRequest,
+                )
+            },
+        );
+        assert!(
+            !format!("{err:?}").contains("planted-marker"),
+            "the engine's text reached the answer: {err:?}"
+        );
+        assert!(
+            // The console's save keeps its own status for an engine failure:
+            // `FailedAs::BadRequest`, with the fixed database sentence.
+            matches!(
+                &err,
+                lakehouse_core::ApiError::BadRequest(message)
+                    if message.starts_with("The database request failed.")
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// `BI-45` plan D5 (`LH-BI-5-01`): an assistant's save that the limit
+    /// ended answers the tile's own sentence with its `limit`, so the model
+    /// can say it; a refused rewrite and the gate keep their sentence; an
+    /// engine failure is the fixed reply under a reference id and never the
+    /// engine's text.
+    #[test]
+    fn a_tool_reply_for_a_save_the_limit_ended_is_the_sentence_with_its_limit() {
+        let tile = json!({
+            "error": "This chart stopped after 60 seconds, the limit for this install.",
+            "limit": {"kind": "time", "value": 60, "source": {"kind": "install"}},
+        });
+        assert_eq!(
+            failure_as_tool_reply(SpecRunFailure::Tile(tile.clone())),
+            tile,
+            "the tile's answer comes back as it is"
+        );
+        assert_eq!(
+            failure_as_tool_reply(SpecRunFailure::Refused(
+                "The query limits could not be read.".to_owned()
+            )),
+            json!({ "error": "The query limits could not be read." })
+        );
+        assert_eq!(
+            failure_as_tool_reply(SpecRunFailure::Gated(lakehouse_core::ApiError::NotFound(
+                "Gold mart 'x' not found in serving.".to_owned()
+            ))),
+            json!({ "error": "Gold mart 'x' not found in serving." })
+        );
+        let reply = failure_as_tool_reply(SpecRunFailure::Clickhouse(ChError::Server(
+            "Code: 62. DB::Exception: planted-marker".to_owned(),
+        )));
+        assert!(
+            reply["error"]
+                .as_str()
+                .is_some_and(|e| !e.contains("planted-marker")),
+            "the engine's text reached the tool's reply: {reply}"
+        );
+        assert!(
+            reply["error"]
+                .as_str()
+                .is_some_and(|e| !e.contains("planted-marker"))
+                && reply["errorId"].as_str().is_some_and(|id| id.len() == 10),
+            "the engine's text reached the tool's reply: {reply}"
+        );
+    }
+}
+
 // ── WS7 item D1: `run_spec_sql` goes through the same
 //    `policy_engine::rewrite_sql_for_roles` Query Studio uses ──────────────
 #[cfg(test)]
@@ -1432,6 +2036,16 @@ mod run_spec_sql_enforcement {
         .expect("seeding the governing policy must succeed");
         let analyst = vec!["Analyst".to_owned()];
         let admin = vec!["Admin".to_owned()];
+        // GOV-7 D4: a role name is resolved against `role` BY NAME, and a name
+        // with no row contributes nothing (it is not "all"). This fixture
+        // names a role the seed migrations do not create, so the fixture
+        // creates it with the migration's default `read_scope = 'all'` — the
+        // assertion below is unchanged and D4 is not loosened. Production
+        // never sees this: every name in `principal.role_names` came from a
+        // `role` row.
+        sqlx::query("INSERT INTO role (name, permissions) VALUES ('Admin', '') ON CONFLICT (name) DO NOTHING")
+            .execute(&pool)
+            .await?;
         for order in [[&analyst, &admin], [&admin, &analyst]] {
             let server = MockServer::start().await;
             // Nothing in `system.parts`: the table is not watched, which is

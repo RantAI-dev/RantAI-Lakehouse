@@ -642,6 +642,27 @@ pub fn covers_key(right_key: &[String], right_columns: &[&str]) -> bool {
             .all(|k| right_columns.contains(&k.as_str()))
 }
 
+/// The label of a flat joined column in a downloaded file's header:
+/// `<table>.<column>` (`capacity2.rooms`), feature decision 3 of
+/// `docs/core/features/joins-without-sql.md`. The twin of `displayColumnFull`
+/// in `src/lib/chart-joins.ts`; QA `LH-BI-7-04` (`BI-55`).
+///
+/// The name in SQL and in a stored definition stays `<alias>__<column>`: it is
+/// an identifier (`{a}.{c} AS {alias}__{c}` in `chart_relation`), and a dot
+/// inside an identifier would read as a table qualifier. A name the server
+/// made for itself (`__…`) and any name without two non-empty sides are left
+/// alone.
+#[must_use]
+pub fn display_name(name: &str) -> String {
+    if name.starts_with("__") {
+        return name.to_owned();
+    }
+    match name.split_once("__") {
+        Some((left, right)) if !left.is_empty() && !right.is_empty() => format!("{left}.{right}"),
+        _ => name.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -689,6 +710,18 @@ mod tests {
 
     fn sql(joins: &[JoinSpec]) -> String {
         plan("visits", joins, &lookup()).unwrap().from.render()
+    }
+
+    // QA LH-BI-7-04 (BI-55, D10): a downloaded header names a joined column
+    // `table.column`, and leaves every other name alone.
+    #[test]
+    fn a_joined_column_reads_table_dot_column_and_any_other_name_is_left_alone() {
+        assert_eq!(display_name("mart_y__email"), "mart_y.email");
+        assert_eq!(display_name("capacity2__rooms"), "capacity2.rooms");
+        assert_eq!(display_name("email"), "email");
+        assert_eq!(display_name("__other"), "__other");
+        assert_eq!(display_name("x__"), "x__");
+        assert_eq!(display_name("a___b"), "a._b");
     }
 
     #[test]

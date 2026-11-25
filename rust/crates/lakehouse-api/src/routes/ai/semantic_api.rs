@@ -46,7 +46,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::data_map::{
-    COLUMN_TEXT_CHARS, Live, MAX_SYNONYMS, ROLES, SYNONYM_CHARS, TABLE_TEXT_CHARS, clear_cache,
+    COLUMN_TEXT_CHARS, Live, MAX_SYNONYMS, ROLES, SYNONYM_CHARS, TABLE_TEXT_CHARS,
 };
 use crate::error::ApiResult;
 use crate::json::ApiJson;
@@ -131,8 +131,11 @@ pub async fn list(
         return Ok(refused(reason));
     }
     let entries = semantic::list_all(pool(&state)?).await?;
+    // GOV-7 D6: a table the caller's roles hide is not described here either.
+    let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
     let entries: Vec<EntryView> = entries
         .into_iter()
+        .filter(|e| access.is_all() || access.allows_key(&e.asset))
         .map(|e| EntryView::new(e, None))
         .collect();
     Ok(ApiJson(json!({ "entries": entries })))
@@ -155,7 +158,14 @@ pub async fn get_asset(
     if let Some(reason) = catalog_tenant_refusal(&state, &principal, &headers).await? {
         return Ok(refused(reason));
     }
-    let entries = semantic::list_for_asset(pool(&state)?, &asset).await?;
+    // GOV-7 D6: a hidden table answers exactly like one with no entries, so
+    // the route is not an oracle for a table the caller may not read.
+    let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
+    let entries = if access.is_all() || access.allows_key(&asset) {
+        semantic::list_for_asset(pool(&state)?, &asset).await?
+    } else {
+        Vec::new()
+    };
     // No entry, nothing to mark: skip the `ClickHouse` read.
     let live = if entries.is_empty() {
         Vec::new()
@@ -208,8 +218,9 @@ pub async fn put_entry(
     let pool = pool(&state)?;
     check_live(&state, &input).await?;
     semantic::confirm(pool, &input, principal.id.uuid()).await?;
-    // The chat's DATA MAP is cached; show the person's text at once.
-    clear_cache().await;
+    // The chat's DATA MAP is cached in this state; show the person's text at
+    // once (OPS-36: the cache is per state, not a process-wide static).
+    state.data_map_cache.clear().await;
     // Best-effort, like every other audit write: it never fails the edit it
     // records.
     let _ = lakehouse_store::audit::insert(
@@ -347,7 +358,6 @@ mod tests {
     use wiremock::matchers::{body_string_contains, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::super::data_map::{CACHE_TEST_LOCK, cache_is_empty_for_test, seed_cache_for_test};
     use super::*;
     use crate::config::Config;
 
@@ -405,14 +415,13 @@ mod tests {
     /// to its time to live.
     #[sqlx::test(migrations = "../../migrations")]
     async fn a_confirmation_drops_the_cached_data_map(pool: PgPool) {
-        let _serial = CACHE_TEST_LOCK.lock().await;
         let ch = clickhouse().await;
         let state = state_for(&pool, &ch);
-        seed_cache_for_test().await;
+        state.data_map_cache.seed_for_test().await;
         let body = Bytes::from(json!({ "description": "Orders placed online." }).to_string());
 
         let reply = put_entry(
-            State(state),
+            State(state.clone()),
             Extension(admin()),
             HeaderMap::new(),
             Path("serving.orders".to_owned()),
@@ -426,6 +435,6 @@ mod tests {
             "the write must not be refused: {}",
             reply.0
         );
-        assert!(cache_is_empty_for_test().await);
+        assert!(state.data_map_cache.is_empty_for_test().await);
     }
 }

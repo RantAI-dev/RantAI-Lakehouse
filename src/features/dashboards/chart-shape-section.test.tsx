@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import { ChartFilters, GroupingsEditor, MeasureRows, PreviewRowsTable, StepsEditor } from "./chart-shape-section"
 import { OwnFiltersMarker } from "./filters/own-filters-marker"
@@ -37,18 +37,18 @@ describe("MeasureRows", () => {
   it("adds an empty measure up to the maximum and removes none below the minimum", () => {
     const onChange = mock<(rows: MeasureRow[]) => void>(() => {})
     const { rerender } = render(<MeasureRows {...baseProps} rows={rows3} onChange={onChange} />)
-    fireEvent.click(screen.getByText("Add measure"))
+    fireEvent.click(screen.getByText("Add value"))
     expect(onChange.mock.calls[0][0]).toHaveLength(4)
     expect(onChange.mock.calls[0][0][3]).toEqual({ column: "", aggregate: "" })
     rerender(<MeasureRows {...baseProps} rows={[...rows3, { column: "x", aggregate: "" }]} onChange={onChange} />)
-    expect(screen.queryByText("Add measure")).toBeNull()
+    expect(screen.queryByText("Add value")).toBeNull()
     rerender(<MeasureRows {...baseProps} rows={[rows3[0]]} onChange={onChange} />)
     expect((screen.getByLabelText("Remove measure 1") as HTMLButtonElement).disabled).toBe(true)
   })
 
   it("shows no add, move or remove for a fixed number of measures", () => {
     render(<MeasureRows {...baseProps} min={2} max={2} rows={rows3.slice(0, 2)} onChange={() => {}} />)
-    expect(screen.queryByText("Add measure")).toBeNull()
+    expect(screen.queryByText("Add value")).toBeNull()
     expect(screen.queryByLabelText("Remove measure 1")).toBeNull()
   })
 
@@ -103,10 +103,33 @@ describe("ChartFilters", () => {
   const columns = [{ name: "category", kind: "text" as const }, { name: "visitors", kind: "number" as const }]
   it("lists each filter like a dashboard chip and removes one", () => {
     const onChange = mock<(filters: unknown[]) => void>(() => {})
-    render(<ChartFilters value={[{ column: "category", values: ["Office"] }]} onChange={onChange} columns={columns} disabled={false} />)
+    render(<ChartFilters value={[{ column: "category", values: ["Office"] }]} onChange={onChange} columns={columns} disabled={false} source={{ mart: "mart_x" }} />)
     expect(screen.getByText("category is Office")).toBeTruthy()
     fireEvent.click(screen.getByLabelText("Remove category filter"))
     expect(onChange.mock.calls[0][0]).toEqual([])
+  })
+
+  /** `BI-47` (QA `LH-BI-6-01`): a chart filter's values come from the chart's own mart, not from every mart. */
+  it("reads the value list of a chart filter from the mart it was given and names no board", async () => {
+    const originalFetch = global.fetch
+    const calls: string[] = []
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      calls.push(String(input))
+      return new Response(JSON.stringify({ values: ["Office"] }), { status: 200, headers: { "Content-Type": "application/json" } })
+    }) as unknown as typeof fetch
+    try {
+      render(<ChartFilters value={[{ column: "category", values: ["Office"] }]} onChange={() => {}} columns={columns} disabled={false} source={{ mart: "mart_x" }} />)
+      // The chip opens the filter's editor, whose value list is the request.
+      fireEvent.click(screen.getByText("category is Office"))
+      await waitFor(() => expect(calls.length).toBeGreaterThan(0))
+      const url = new URL(calls[0], "http://console.invalid")
+      expect(url.pathname).toBe("/api/dashboard/values")
+      expect(url.searchParams.get("column")).toBe("category")
+      expect(url.searchParams.get("mart")).toBe("mart_x")
+      expect(url.searchParams.has("board")).toBe(false)
+    } finally {
+      global.fetch = originalFetch
+    }
   })
 })
 
@@ -115,15 +138,15 @@ describe("ChartFilters with segments (BI-2)", () => {
   const segments = [{ name: "domestic", label: "Domestic visitors" }, { name: "foreign", label: "Foreign visitors" }]
   it("adds a segment as a reference by name and lists it as a chip that can be removed", () => {
     const onChange = mock<(filters: unknown[]) => void>(() => {})
-    const { rerender } = render(<ChartFilters value={[]} onChange={onChange} columns={columns} disabled={false} segments={segments} />)
+    const { rerender } = render(<ChartFilters value={[]} onChange={onChange} columns={columns} disabled={false} segments={segments} source={{ mart: "mart_x" }} />)
     expect(screen.getByLabelText("Add a segment")).toBeTruthy()
-    rerender(<ChartFilters value={[{ column: "", values: [], segment: "domestic" }]} onChange={onChange} columns={columns} disabled={false} segments={segments} />)
+    rerender(<ChartFilters value={[{ column: "", values: [], segment: "domestic" }]} onChange={onChange} columns={columns} disabled={false} segments={segments} source={{ mart: "mart_x" }} />)
     expect(screen.getByText("Segment: Domestic visitors")).toBeTruthy()
     fireEvent.click(screen.getByLabelText("Remove segment domestic"))
     expect(onChange.mock.calls[0][0]).toEqual([])
   })
   it("offers no segment picker when the table has none", () => {
-    render(<ChartFilters value={[]} onChange={() => {}} columns={columns} disabled={false} />)
+    render(<ChartFilters value={[]} onChange={() => {}} columns={columns} disabled={false} source={{ mart: "mart_x" }} />)
     expect(screen.queryByLabelText("Add a segment")).toBeNull()
   })
 })
@@ -270,6 +293,15 @@ describe("PreviewRowsTable and the internal columns", () => {
     expect(screen.queryByText("sum_visitors")).toBeNull()
   })
 
+  // QA LH-BI-6-38 (BI-55, D8): the preview's own Rows table names a missing
+  // and an empty category as the chart does.
+  it("the Rows table under the preview names a missing and an empty category", () => {
+    const rows = [{ a: null, n: 1 }, { a: "", n: 2 }, { a: "Bali", n: 3 }]
+    render(<PreviewRowsTable open data={{ columns: ["a", "n"], rows, truncated: false, limit: 2000 }} />)
+    expect(screen.getByText("(No value)")).toBeTruthy()
+    expect(screen.getByText("(Empty)")).toBeTruthy()
+  })
+
   it("gives a step filter's value input room to show a few digits (phase 2 QA R12)", () => {
     const base = { columns: ["provinsi"], groups: [{ name: "provinsi", kind: "text" as const }], measures: ["visitors"], labels: { visitors: "visitors" } }
     render(<StepsEditor value={[{ filter: [{ column: "visitors", op: "gt", value: "1000" }] }]} onChange={() => {}} base={base as never} disabled={false} />)
@@ -292,5 +324,52 @@ describe("PreviewRowsTable and the internal columns", () => {
     }
     expect(saved.join("")).not.toContain("__other")
     expect(saved.join("")).toContain("kab,v")
+  })
+})
+
+/** UX-1-R11: the shared CSS ::before marker, not a literal text star. */
+function sharedMarker(el: HTMLElement | null): boolean {
+  return Boolean(el?.querySelector('span[aria-hidden="true"][class*="before:content-"]'))
+}
+
+describe("chart field required markers share the marker and their semantics (UX-1-R11)", () => {
+  it("marks only the required measure rows with the shared marker and combobox semantics", () => {
+    render(
+      <MeasureRows
+        rows={rows3}
+        onChange={() => {}}
+        labels={(i) => `Measure ${i + 1}`}
+        min={1}
+        max={4}
+        own
+        columns={["visitors", "stay", "orders"]}
+        defaultAggregate="sum"
+        disabled={false}
+        placeholder="pick"
+        wholeMeasure={new Set<string>()}
+        fieldLabel={noLabel}
+      />
+    )
+    const first = screen.getByText("Measure 1")
+    expect(sharedMarker(first.closest("label"))).toBe(true)
+    expect(screen.getByRole("combobox", { name: "Measure 1" }).getAttribute("aria-required")).toBe("true")
+    const second = screen.getByText("Measure 2")
+    expect(sharedMarker(second.closest("label"))).toBe(false)
+    expect(screen.getByRole("combobox", { name: "Measure 2" }).getAttribute("aria-required")).toBe("false")
+  })
+
+  it("shares the marker on Group by and requires its add combobox", () => {
+    render(
+      <GroupingsEditor
+        value={[]}
+        onChange={() => {}}
+        columns={[{ name: "kab", kind: "text" }]}
+        disabled={false}
+        placeholder="pick"
+        fieldLabel={noLabel}
+      />
+    )
+    expect(sharedMarker(screen.getByText(/Group by/).closest("label"))).toBe(true)
+    expect(screen.getByRole("combobox", { name: "Group by" }).getAttribute("aria-required")).toBe("true")
   })
 })

@@ -109,7 +109,10 @@ async fn save((state, principal): Who<'_>, board: &str, changes: Value, ok: Valu
     ok
 }
 
-fn tabs_of(board: &Board) -> Vec<Tab> {
+/// The tabs of a board, or none when it has none. The board tools settle a
+/// layout against them (`boards.rs`), so they are shared rather than read a
+/// second time (`AGENTS.md` rule 4: one fallback, not two).
+pub(super) fn tabs_of(board: &Board) -> Vec<Tab> {
     board.tabs.clone().unwrap_or_default()
 }
 

@@ -70,12 +70,12 @@ The harness must normalize these rather than compare them by value:
   `ops-workloads.workloads[].elapsedMs` (an in-flight query's live elapsed
   time).
 - **Live cluster aggregates** — `system.query_log` rollups in `ops-usage`,
-  `ops-observability`, `overview-get`, `storage-get`; `ops-workloads` reads
-  `system.processes` and is empty on a quiet cluster. Also normalized for the
-  same reason: `ops-observability.slos[].current` (a live SLO snapshot
-  embedded in a string, e.g. `"1233ms"`, so the generic numeric-leaf rule
-  can't catch it) and `ops-usage.tenants[].computeUnits`/`.budgetSpent` (a
-  per-tenant echo of the same live `computeUnits7d` aggregate).
+  `overview-get`, `storage-get`; `ops-workloads` reads `system.processes`
+  and is empty on a quiet cluster. WEB-4 retired `ops-observability` (and
+  its `slos[].current` string snapshot), so its corpus entry is gone.
+  Also normalized for the same reason:
+  `ops-usage.tenants[].computeUnits`/`.budgetSpent` (a per-tenant echo of the
+  same live `computeUnits7d` aggregate).
 - **Row counts** — `catalog-list` per-dataset `rows` change after each sync.
 - **Unordered catalog listing** — `catalog-list`'s `assets` and `namespaces`
   come from `SELECT ... FROM bronze_meta.dataset_catalog UNION ALL SELECT
@@ -132,6 +132,19 @@ broken.
   lacks fails loudly rather than being silently tolerated, which is the
   correct behavior for any future accidental field removal — this one just
   happens to be intentional.
+
+- **`gov-audit` no longer returns `tenant`.** Every row of the audit trail
+  carried a `tenant` field that read the deployment's own hard-coded tenant
+  id (`dispar-dki` in the capture), whatever organisation the row's actor
+  belonged to — so it said nothing true about the row and looked like a
+  tenancy the reader could trust. The trail holds no tenant column at all
+  (it is append-only, `0142_audit_event_append_only.sql`), and a row's
+  tenant is read from its actor, at read time, so a row of another
+  organisation's is not returned to a reader of this one
+  (`SEC-20`, plan 100). The field is gone from `corpus/gov-audit.json` — the
+  key is simply absent, not normalized — and the row shapes the harness
+  compares (`gov-audit.audit` is compared by element shape) are the live
+  ones again.
 
 ## Deliberate omissions
 

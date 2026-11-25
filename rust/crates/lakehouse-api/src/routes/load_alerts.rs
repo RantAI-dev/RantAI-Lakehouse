@@ -69,6 +69,7 @@ use lakehouse_alerts::{AlertKind, AlertRule, RuleDelivery, SilenceSource};
 use lakehouse_core::ApiError;
 use lakehouse_notify::{DeliverResult, EmailSender};
 use lakehouse_store::PgPool;
+use lakehouse_store::alert_delivery;
 use lakehouse_store::connector_run;
 use lakehouse_store::connectors::{self, REPEATED_FAILURE_STREAK};
 use lakehouse_store::overview::{self, DeliveryRecord, FiredRule};
@@ -78,7 +79,7 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 
 use super::pipelines::RunFailedBody;
-use crate::routes::alerts::{ApiSilenceSource, smtp_config};
+use crate::routes::alerts::ApiSilenceSource;
 use crate::routes::{connectors as connector_routes, uploads as upload_routes};
 use crate::state::AppState;
 
@@ -131,6 +132,46 @@ impl Outcome {
             Self::Success => "SUCCESS",
         }
     }
+
+    /// The final status the run record is closed with. The sensors only post
+    /// a `FAILURE` or a `SUCCESS`, so those are the two this mapping has.
+    const fn final_status(self) -> FinalStatus {
+        match self {
+            Self::Failure => FinalStatus::Failure,
+            Self::Success => FinalStatus::Success,
+        }
+    }
+}
+
+/// A `Dagster` run status that ends a run, as the run record records it
+/// (`SRC-43` D11).
+///
+/// Only these three words are an end. `QUEUED`, `NOT_STARTED`, `STARTING`,
+/// `STARTED`, `MANAGED` and `CANCELING` are not: a run that is still being
+/// cancelled has not ended. [`lakehouse_dagster::map_run_status`] is not used
+/// here because it folds `CANCELING` into `cancelled`, and any word this
+/// build does not know is not an end either (nothing is guessed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FinalStatus {
+    /// The orchestrator says `SUCCESS`.
+    Success,
+    /// The orchestrator says `FAILURE`.
+    Failure,
+    /// The orchestrator says `CANCELED`.
+    Canceled,
+}
+
+impl FinalStatus {
+    /// The final status a `Dagster` status word is, or `None` when the word
+    /// does not end a run (see the type's doc).
+    pub(super) fn of(dagster_status: &str) -> Option<Self> {
+        match dagster_status {
+            "SUCCESS" => Some(Self::Success),
+            "FAILURE" => Some(Self::Failure),
+            "CANCELED" => Some(Self::Canceled),
+            _ => None,
+        }
+    }
 }
 
 /// Where a run's dedupe, summary and alerts hang: a connector that exists.
@@ -173,6 +214,70 @@ fn run_end(end_time: Option<f64>) -> OffsetDateTime {
     end_time
         .and_then(|secs| OffsetDateTime::from_unix_timestamp(secs as i64).ok())
         .unwrap_or_else(OffsetDateTime::now_utc)
+}
+
+/// Whether a run ran for its limit or longer (`SRC-39`, QA `TC-1702`). A run
+/// with either time missing was not measured, so it is never called timed
+/// out: the orchestrator's own report is the only thing that may say it
+/// outlived its limit, and a guess here would record a wrong reason.
+fn ran_at_least(start: Option<f64>, end: Option<f64>, limit_seconds: u32) -> bool {
+    match (start, end) {
+        (Some(start), Some(end)) => end - start >= f64::from(limit_seconds),
+        _ => false,
+    }
+}
+
+/// Close a run's record from the orchestrator's own final status, once.
+///
+/// One mapping, used by the sensor's report and by the read of a connector's
+/// run list (`SRC-43` D12): a run that ended as `FAILURE` or `CANCELED` and
+/// ran for its limit or longer closes as `failed` with `timed_out` and a last
+/// line that names the limit; otherwise `SUCCESS` closes as succeeded and
+/// `FAILURE` as a failed table, and a `CANCELED` run that was stopped before
+/// its limit (by something other than "Run now", which cancels only a run
+/// already past its limit and so closes as `timed_out`) closes as failed with
+/// the reason `other`. Every close changes only a record that still says
+/// `running`, so a record that already ended keeps its own end and a second
+/// call writes nothing.
+///
+/// # Errors
+///
+/// [`lakehouse_store::StoreError::Database`] on a failed statement.
+pub(super) async fn close_run_record(
+    state: &AppState,
+    pool: &PgPool,
+    connector_id: &str,
+    run_id: &str,
+    ended: FinalStatus,
+    info: &lakehouse_dagster::RunStatusInfo,
+) -> Result<(), lakehouse_store::StoreError> {
+    let at = run_end(info.end_time);
+    let limit = state.config.ingest_run_max_runtime_seconds;
+    // QA TC-1702 (SRC-39): a run the orchestrator ended after it outlived the
+    // limit closes with its own word (`timed_out`, D11), not "a table failed".
+    // The count, the streak and the alerts are unchanged: it is a failed run
+    // like any other (D12, D14).
+    if ended != FinalStatus::Success && ran_at_least(info.start_time, info.end_time, limit) {
+        connector_run::end_timed_out_run(pool, connector_id, run_id, i64::from(limit), at).await?;
+    }
+    // `SRC-11` D7: close the run record from the orchestrator's own final
+    // status when its end report never came (a killed run, an orchestrator
+    // that could not reach this API). Idempotent, and a no-op for a run with
+    // no record or one that already ended.
+    match ended {
+        FinalStatus::Success => {
+            connector_run::settle_run(pool, connector_id, run_id, true, at).await
+        }
+        FinalStatus::Failure => {
+            connector_run::settle_run(pool, connector_id, run_id, false, at).await
+        }
+        // SRC-43 (#485 review, round 2 (R2)): a run cancelled before its limit
+        // is recorded as failed with the reason `other`; the record has no word
+        // for cancelled and `table_failed` would invent a cause.
+        FinalStatus::Canceled => {
+            connector_run::settle_cancelled_run(pool, connector_id, run_id, at).await
+        }
+    }
 }
 
 /// Read the connector a run belongs to from the run's config, and check it
@@ -248,9 +353,9 @@ pub(super) async fn confirm_status(
     Ok(info)
 }
 
-/// Send one event to the rules of `kind` and record an `alert_instance` for
-/// each rule a delivery was attempted for (when `persist_as` names a source),
-/// with how that delivery ended (`SRC-17` F1).
+/// Send one event to the rules of `kind` and record how each attempted
+/// delivery ended: an `alert_instance` row when `persist_as` names a source
+/// (`SRC-17` F1), the rule's latest delivery when it is `None` (`SRC-40` D5).
 /// `scope_id` is the connector id, or the upload id for `upload_failure`; it is
 /// also the instance's `affected`.
 ///
@@ -292,6 +397,12 @@ pub(crate) async fn read_rules(state: &AppState) -> Result<Vec<AlertRule>, ApiEr
 /// [`deliver_event`] over rules already read. It cannot fail on the rule
 /// store, which is the point of reading them first (`SRC-17` F2). Returns how
 /// many deliveries were attempted.
+///
+/// Every attempted delivery leaves a record of its outcome: an
+/// `alert_instance` when `persist_as` names a source, the rule's latest
+/// delivery (`lakehouse_store::alert_delivery`) when it is `None`. `None` is
+/// passed by the success event only (`SRC-40` D5): a "run succeeded" alert
+/// opens no incident, so its outcome is kept on the rule.
 async fn deliver_with_rules(
     state: &AppState,
     pool: &PgPool,
@@ -305,7 +416,7 @@ async fn deliver_with_rules(
     // same address-checking sender as every other alert delivery, never a
     // bare `reqwest` client.
     let http = state.webhook_sender();
-    let email = EmailSender::new(smtp_config(&state.config));
+    let email = EmailSender::new(crate::runtime_settings::email(state).await.smtp());
     let silence = ApiSilenceSource { pg: pool };
     let attempted = lakehouse_alerts::deliver_connector_event_to(
         rules,
@@ -320,6 +431,8 @@ async fn deliver_with_rules(
     .await;
     if let Some(source) = persist_as {
         persist_instances(pool, &attempted, source, scope_id, text).await;
+    } else {
+        record_last_deliveries(pool, &attempted).await;
     }
     attempted.len()
 }
@@ -340,7 +453,7 @@ pub(crate) async fn deliver_quality_incident_with_rules(
     text: &str,
 ) -> usize {
     let http = state.webhook_sender();
-    let email = EmailSender::new(smtp_config(&state.config));
+    let email = EmailSender::new(crate::runtime_settings::email(state).await.smtp());
     let silence = ApiSilenceSource { pg: pool };
     let attempted = lakehouse_alerts::deliver_quality_incident_to(
         rules,
@@ -404,6 +517,24 @@ async fn persist_instances(
     }
 }
 
+/// Best-effort `alert_rule_delivery` rows for the rules a delivery was
+/// attempted for, when no incident records it (`SRC-40` D5): the rule's latest
+/// attempt, when it happened and, failed, its fixed reason. Best effort like
+/// [`persist_instances`]: a Postgres failure is logged and does not turn a
+/// delivered alert into an error. A failure with no reason writes nothing
+/// (`delivery_record` answers `None`, never an invented reason).
+async fn record_last_deliveries(pool: &PgPool, attempted: &[RuleDelivery]) {
+    let now = OffsetDateTime::now_utc();
+    for RuleDelivery { rule, result } in attempted {
+        let Some(record) = delivery_record(result) else {
+            continue;
+        };
+        if let Err(err) = alert_delivery::record(pool, &rule.id, record, now).await {
+            tracing::warn!(%err, rule_id = %rule.id, "failed to record a rule's last delivery (the delivery already happened)");
+        }
+    }
+}
+
 /// A connector run reported by a run sensor (`ingest_job`): record it on the
 /// connector and deliver `connector_failure`, and `connector_repeated_failure`
 /// when the failure is the third in a row, or `connector_success`.
@@ -437,16 +568,13 @@ pub(super) async fn connector_run_event(
         return Ok(skipped("a paused run loads nothing"));
     }
     let info = confirm_status(state, &req.run_id, outcome).await?;
-    // `SRC-11` D7: close the run record from the orchestrator's own final
-    // status when its end report never came (a killed run, an orchestrator
-    // that could not reach this API). Idempotent, and a no-op for a run with
-    // no record or one that already ended.
-    connector_run::settle_run(
+    close_run_record(
+        state,
         pool,
         &connector.id,
         &req.run_id,
-        outcome == Outcome::Success,
-        run_end(info.end_time),
+        outcome.final_status(),
+        &info,
     )
     .await?;
     // Count the run once, with its streak kept for a retry (`SRC-17` F2).
@@ -486,6 +614,9 @@ pub(super) async fn connector_run_event(
         }
         Outcome::Success => {
             let text = format!("{who} run {} succeeded. View: {link}", req.run_id);
+            // QA TC-1695 (SRC-40): a success opens no incident, so `None`
+            // sends its delivery outcome to the rule's latest delivery rather
+            // than to `alert_instance` (D4, D5).
             matched += deliver_with_rules(
                 state,
                 pool,
@@ -555,6 +686,9 @@ async fn deliver_failure_alerts(
     // rule-store failure on this report still delivers on the retry,
     // and no other run delivers it.
     if recorded.auto_disabled {
+        // `SRC-4` slice 2: the pause also stops a change-capture connector's
+        // worker (best effort, see `cdc_lifecycle`).
+        crate::cdc_lifecycle::sync_pause_state(state, &connector.id).await;
         let text = format!(
             "{who} was paused after {} failed runs in a row; the latest is run {}. \
              Resume it from its page once the cause is fixed. View: {link}",
@@ -1255,6 +1389,100 @@ mod tests {
         assert_eq!(h.posts_to("al-other").await, [] as [std::string::String; 0]);
     }
 
+    /// `SRC-40` D4/D5 (`TC-1695`): a "run succeeded" alert is delivered, opens
+    /// no incident (the Rules list shows the delivery instead), and leaves the
+    /// rule's latest delivery as delivered with no reason. Fails if the
+    /// `else` branch of `deliver_with_rules` is removed, or if the success arm
+    /// is given a source, which would list an incident.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_success_alert_is_recorded_as_the_rules_last_delivery_and_opens_no_incident(
+        pool: sqlx::PgPool,
+    ) {
+        let h = harness(&pool, &[("al-s", "connector_success", CONNECTOR)]).await;
+        h.knows_run("run-1", Some(CONNECTOR), "SUCCESS").await;
+
+        let resp = run_finished_event(
+            State(h.state.clone()),
+            Extension(service()),
+            body("run-1", "ingest_job"),
+        )
+        .await
+        .expect("accepted")
+        .0;
+        assert_eq!(resp["matched"], 1);
+
+        let rows = lakehouse_store::alert_delivery::last_for(&pool, &["al-s".to_owned()])
+            .await
+            .unwrap();
+        let row = rows.get("al-s").expect("the delivered success is recorded");
+        assert!(row.delivered);
+        assert_eq!(row.reason, None);
+        let listed = lakehouse_store::overview::list_alerts(&pool).await.unwrap();
+        assert_eq!(listed.len(), 0, "a success opens no incident");
+    }
+
+    /// `SRC-40` D5 (`TC-1695`): a success alert whose webhook answers 500 is
+    /// recorded as not delivered, with the API's fixed reason and nothing of
+    /// what the server said — and still opens no incident.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_success_alert_whose_webhook_answers_an_error_is_recorded_as_not_delivered(
+        pool: sqlx::PgPool,
+    ) {
+        let h = harness(&pool, &[("al-s", "connector_success", CONNECTOR)]).await;
+        // Higher priority than the harness's catch-all 200.
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path("/al-s"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upstream-secret-detail"))
+            .with_priority(1)
+            .mount(&h.webhook)
+            .await;
+        h.knows_run("run-1", Some(CONNECTOR), "SUCCESS").await;
+
+        let resp = run_finished_event(
+            State(h.state.clone()),
+            Extension(service()),
+            body("run-1", "ingest_job"),
+        )
+        .await
+        .expect("accepted")
+        .0;
+        assert_eq!(resp["matched"], 1);
+
+        let rows = lakehouse_store::alert_delivery::last_for(&pool, &["al-s".to_owned()])
+            .await
+            .unwrap();
+        let row = rows.get("al-s").expect("the failed delivery is recorded");
+        assert!(!row.delivered);
+        assert_eq!(
+            row.reason.as_deref(),
+            Some("the webhook server answered with an error")
+        );
+        let json = serde_json::to_value(row).unwrap();
+        assert!(!json.to_string().contains("upstream-secret-detail"));
+        let listed = lakehouse_store::overview::list_alerts(&pool).await.unwrap();
+        assert_eq!(listed.len(), 0, "a success opens no incident");
+    }
+
+    /// `SRC-40` D5: a failed run still opens its incident and records no
+    /// latest delivery for the rule — the new branch runs for the success kind
+    /// only. Fails if it also runs when `persist_as` names a source.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_failed_run_still_opens_an_incident_and_records_no_last_delivery(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[("al-f", "connector_failure", CONNECTOR)]).await;
+        h.knows_run("run-1", Some(CONNECTOR), "FAILURE").await;
+
+        let resp = h.failed("run-1").await;
+        assert_eq!(resp["matched"], 1);
+
+        let listed = lakehouse_store::overview::list_alerts(&pool).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].rule_id.as_deref(), Some("al-f"));
+        let rows = lakehouse_store::alert_delivery::last_for(&pool, &["al-f".to_owned()])
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
     /// `SRC-10` decision 5: a clear loads nothing, so its run is neither a
     /// success nor a failure of a load. Whatever the orchestrator says about it,
     /// the connector's health and failure streak are left alone, no alert is
@@ -1814,5 +2042,92 @@ mod tests {
                 .as_deref(),
             Some("failed")
         );
+    }
+
+    /// QA `TC-1702` (`SRC-39`): the orchestrator's monitoring fails a run
+    /// that outlived its limit; the record closes as `timed_out` and the run
+    /// is counted as a failure, as any other failed run (D11, D12).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_failed_run_that_ran_past_the_limit_closes_its_record_as_timed_out(
+        pool: sqlx::PgPool,
+    ) {
+        use lakehouse_store::connector_run::{RunTrigger, list_runs, start_run};
+        let h = harness(&pool, &[("al-t", "connector_failure", CONNECTOR)]).await;
+        let now = OffsetDateTime::now_utc();
+        start_run(
+            &pool,
+            CONNECTOR,
+            "run-long",
+            RunTrigger::Schedule,
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+        // The orchestrator says it started at 1000.0 and ended 21601 s later.
+        h.knows_run_at("run-long", Some(CONNECTOR), "FAILURE", 1000.0 + 21_601.0)
+            .await;
+        h.failed("run-long").await;
+
+        let runs = list_runs(&pool, CONNECTOR, 50).await.unwrap();
+        assert_eq!(runs[0].status, "failed");
+        assert_eq!(runs[0].end_reason.as_deref(), Some("timed_out"));
+        assert_eq!(streak(&pool).await, ("degraded".to_owned(), 1));
+    }
+
+    /// A failed run inside the limit keeps "a table failed".
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_failed_run_inside_the_limit_still_ends_as_a_failed_table(pool: sqlx::PgPool) {
+        use lakehouse_store::connector_run::{RunTrigger, list_runs, start_run};
+        let h = harness(&pool, &[("al-t", "connector_failure", CONNECTOR)]).await;
+        let now = OffsetDateTime::now_utc();
+        start_run(
+            &pool,
+            CONNECTOR,
+            "run-short",
+            RunTrigger::Schedule,
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+        h.knows_run("run-short", Some(CONNECTOR), "FAILURE").await;
+        h.failed("run-short").await;
+
+        let runs = list_runs(&pool, CONNECTOR, 50).await.unwrap();
+        assert_eq!(runs[0].end_reason.as_deref(), Some("table_failed"));
+    }
+
+    /// A time the orchestrator did not give is never read as "past the
+    /// limit" (fail closed: the run keeps its ordinary end).
+    #[test]
+    fn a_run_with_a_missing_time_is_never_called_timed_out() {
+        assert!(!ran_at_least(None, Some(21_601.0), 21_600));
+        assert!(!ran_at_least(Some(1000.0), None, 21_600));
+        assert!(!ran_at_least(None, None, 21_600));
+        assert!(ran_at_least(Some(1000.0), Some(22_600.0), 21_600));
+        assert!(!ran_at_least(Some(1000.0), Some(22_599.0), 21_600));
+    }
+
+    /// `SRC-43` D11: only the three words that end a run are an end. A run
+    /// being cancelled (`CANCELING`) has not ended, and an unknown word is
+    /// not guessed at.
+    #[test]
+    fn only_success_failure_and_canceled_end_a_run_and_a_run_being_cancelled_has_not_ended() {
+        assert_eq!(FinalStatus::of("SUCCESS"), Some(FinalStatus::Success));
+        assert_eq!(FinalStatus::of("FAILURE"), Some(FinalStatus::Failure));
+        assert_eq!(FinalStatus::of("CANCELED"), Some(FinalStatus::Canceled));
+        for word in [
+            "QUEUED",
+            "NOT_STARTED",
+            "STARTING",
+            "STARTED",
+            "MANAGED",
+            "CANCELING",
+            "unknown",
+            "",
+        ] {
+            assert_eq!(FinalStatus::of(word), None, "{word} does not end a run");
+        }
     }
 }

@@ -52,7 +52,7 @@ function useSignInRefused(connectorId: string, reloadKey: number): boolean {
   const refused = useService(
     async (signal) => {
       const runs = await connectorService.listConnectorRuns(connectorId, signal)
-      const newest = runs[0]
+      const newest = runs.runs[0]
       if (!newest || newest.status !== "failed") return false
       const log = await connectorService.getConnectorRunLog(connectorId, newest.runId, signal)
       return log.attempts.some((attempt) => attempt.errorClass === "sign_in_refused")

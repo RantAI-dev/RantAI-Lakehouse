@@ -3,14 +3,16 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use common::{TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up};
+use common::{
+    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
+};
 
 async fn call(
     router: &axum::Router,
@@ -40,9 +42,48 @@ async fn call(
     )
 }
 
+/// A deployment whose `ClickHouse` has the `silver.` tables named in `tables`
+/// and no others. A `system.columns` lookup for one of them answers one
+/// column, so the table is there; a lookup for any other table answers no
+/// columns, so it is not (`SEC-80`: a schedule's table must exist).
+async fn spin_up_with_silver_tables(tables: &[&str]) -> (TestApp, wiremock::MockServer) {
+    let ch = wiremock::MockServer::start().await;
+    // Mounted first with the default priority: the table-specific answers
+    // below are mounted after it at a higher priority and win.
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::body_string_contains("system.columns"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [{"name": "name", "type": "String"}, {"name": "type", "type": "String"}],
+            "data": [],
+            "rows": 0,
+        })))
+        .mount(&ch)
+        .await;
+    for table in tables {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains(
+                "database = 'silver'",
+            ))
+            .and(wiremock::matchers::body_string_contains(format!(
+                "table = '{table}'"
+            )))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [{"name": "name", "type": "String"}, {"name": "type", "type": "String"}],
+                "data": [{"name": "id", "type": "String"}],
+                "rows": 1,
+            })))
+            .with_priority(1)
+            .mount(&ch)
+            .await;
+    }
+    let mut env = std::collections::HashMap::new();
+    env.insert("CH_URL".to_owned(), ch.uri());
+    (spin_up_with_env(&env).await, ch)
+}
+
 #[tokio::test]
 async fn a_table_can_be_scheduled_every_n_minutes_or_on_every_load() {
-    let TestApp { router, pool } = spin_up().await;
+    let (TestApp { router, pool }, _ch) = spin_up_with_silver_tables(&["orders"]).await;
     // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4: *:* passes catalog tenant gate
     let user = create_principal_with_permissions(&pool, "*:*,governance:write").await;
     let cookie = session_cookie_for_user(&pool, user).await;
@@ -109,7 +150,7 @@ async fn a_table_can_be_scheduled_every_n_minutes_or_on_every_load() {
 /// nothing is stored.
 #[tokio::test]
 async fn a_bad_schedule_is_refused_and_stores_nothing() {
-    let TestApp { router, pool } = spin_up().await;
+    let (TestApp { router, pool }, _ch) = spin_up_with_silver_tables(&["orders"]).await;
     // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4: *:* passes catalog tenant gate
     let user = create_principal_with_permissions(&pool, "*:*,governance:write").await;
     let cookie = session_cookie_for_user(&pool, user).await;
@@ -163,4 +204,70 @@ async fn a_bad_schedule_is_refused_and_stores_nothing() {
         .await
         .unwrap();
     assert_eq!(stored, 0);
+}
+
+/// `WEB-3` S3a-D3: a table goes back to the default schedule by removing
+/// its row, which is what `GET` then shows (no row for it, 60 minutes for
+/// every table). Resetting a table that has no row is not an error.
+#[tokio::test]
+async fn a_schedule_can_go_back_to_the_default() {
+    let (TestApp { router, pool }, _ch) = spin_up_with_silver_tables(&["orders"]).await;
+    let user = create_principal_with_permissions(&pool, "*:*,governance:write").await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+    let set = "/api/governance/quality/schedules/silver.orders";
+
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "PUT",
+        set,
+        Some(json!({ "mode": "interval", "intervalMinutes": 120 })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let (_, listed) = call(
+        &router,
+        &cookie,
+        "GET",
+        "/api/governance/quality/schedules",
+        None,
+    )
+    .await;
+    assert_eq!(listed["schedules"][0]["asset"], json!("silver.orders"));
+
+    let (code, body) = call(&router, &cookie, "DELETE", set, None).await;
+    assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
+    let (_, listed) = call(
+        &router,
+        &cookie,
+        "GET",
+        "/api/governance/quality/schedules",
+        None,
+    )
+    .await;
+    assert_eq!(listed["schedules"], json!([]), "back on the default");
+    assert_eq!(listed["defaultIntervalMinutes"], 60);
+
+    // The outcome already holds, so asking again is not an error.
+    let (code, _) = call(&router, &cookie, "DELETE", set, None).await;
+    assert_eq!(code, StatusCode::NO_CONTENT);
+
+    // A table that is not zone.table is a 400, and nothing is audited.
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        "/api/governance/quality/schedules/orders",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{body}");
+
+    let actions: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_event WHERE action = 'quality.schedule_reset'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read the audit rows");
+    assert_eq!(actions.len(), 2, "each reset is audited: {actions:?}");
 }

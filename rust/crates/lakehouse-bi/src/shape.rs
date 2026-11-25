@@ -519,6 +519,16 @@ pub struct ShapeFields {
         default
     )]
     pub breakdown_bin: Option<BinSpec>,
+    /// The period a date or timestamp `breakdown` is grouped by (`BI-46`, plan
+    /// D13; QA `LH-BI-6-01`): `day`, `week`, `month`, `quarter` or `year`, for
+    /// a bar, hbar, line or area chart. Read back through
+    /// [`crate::grain::Grain::parse`]; never set together with a bin.
+    #[serde(
+        rename = "breakdownGrain",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub breakdown_grain: Option<String>,
     /// `pointmap`, `geoheat`: group the points by grid cell (`BI-10`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub grid: Option<GridSpec>,
@@ -613,6 +623,7 @@ impl ShapeFields {
             || !self.joins_list().is_empty()
             || self.bin.is_some()
             || self.breakdown_bin.is_some()
+            || self.breakdown_grain.is_some()
             || self.grid.is_some()
             || self.resolved_params
             || self.layer_query
@@ -757,8 +768,40 @@ pub fn check_kind_fields(
         return Err("groupings are only for a grouped table.".to_owned());
     }
     check_joins_kind(shape, kind)?;
+    check_breakdown_grain_kind(shape, kind)?;
     check_bins_kind(shape, kind, rows_mode)?;
     check_steps_kind(shape, kind, rows_mode)
+}
+
+/// `BI-46` (plan D13): a grain on a breakdown is for the four kinds whose
+/// second column is a series, names one of the five periods, and is not
+/// combined with a bin on the same column (the grain and the bin would both
+/// group it).
+fn check_breakdown_grain_kind(shape: &ShapeFields, kind: ChartKind) -> Result<(), String> {
+    let Some(raw) = &shape.breakdown_grain else {
+        return Ok(());
+    };
+    if !kind.breakdown_is_series() {
+        return Err("a breakdown grain is for bar, hbar, line and area charts.".to_owned());
+    }
+    if !matches!(
+        crate::grain::Grain::parse(raw),
+        Some(
+            crate::grain::Grain::Day
+                | crate::grain::Grain::Week
+                | crate::grain::Grain::Month
+                | crate::grain::Grain::Quarter
+                | crate::grain::Grain::Year
+        )
+    ) {
+        return Err(format!(
+            "invalid breakdown grain '{raw}': use day, week, month, quarter or year."
+        ));
+    }
+    if shape.bin.is_some() || shape.breakdown_bin.is_some() {
+        return Err("a chart groups by a grain or by bins, not both.".to_owned());
+    }
+    Ok(())
 }
 
 /// Kinds whose dimension (and breakdown) can be binned: the charts that list
@@ -937,6 +980,17 @@ pub fn check_against_relation(
     }
     check_groupings(shape, cols, kinds)?;
     check_bins_against_relation(shape, check)?;
+    // `BI-46` (plan D13): a grain on the breakdown needs that column, and a
+    // date or timestamp to cut — the same call a grouping's grain makes.
+    if let Some(raw) = &shape.breakdown_grain {
+        if check.breakdown.is_empty() {
+            return Err("a breakdown grain needs a breakdown column.".to_owned());
+        }
+        let grain = crate::grain::Grain::parse(raw).ok_or_else(|| {
+            format!("invalid breakdown grain '{raw}': use day, week, month, quarter or year.")
+        })?;
+        grain.validate_column(kinds.get(check.breakdown).copied())?;
+    }
     let has_table_calc = resolved
         .iter()
         .any(|m| from.table_calc(m.column.as_str()).is_some());
@@ -1018,7 +1072,8 @@ fn check_bins_against_relation(
         }
         if !number(column) {
             return Err(format!(
-                "'{column}' is not a number column; bins are for numbers (a date has a grain)."
+                "'{column}' is not a number column; bins are for numbers (a date has a grain). {}",
+                number_columns_sentence(check.kinds)
             ));
         }
     }
@@ -1026,6 +1081,36 @@ fn check_bins_against_relation(
         return Err("a chart groups by a grain or by bins, not both.".to_owned());
     }
     Ok(())
+}
+
+/// How many number columns [`number_columns_sentence`] names.
+const MAX_LISTED_NUMBER_COLUMNS: usize = 8;
+
+/// What follows a refused bin: the number columns the source has, so the
+/// caller can ask the person which one to bin instead of guessing one. The
+/// columns are sorted before the cut, because a map has no order and the
+/// same refusal must name the same columns every time.
+fn number_columns_sentence(kinds: &HashMap<String, ColumnKind>) -> String {
+    let mut numbers: Vec<&str> = kinds
+        .iter()
+        .filter(|(_, kind)| **kind == ColumnKind::Number)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    numbers.sort_unstable();
+    if numbers.is_empty() {
+        return "The source has no number column to bin.".to_owned();
+    }
+    let listed = numbers
+        .iter()
+        .take(MAX_LISTED_NUMBER_COLUMNS)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = match numbers.len().saturating_sub(MAX_LISTED_NUMBER_COLUMNS) {
+        0 => String::new(),
+        n => format!(", and {n} more"),
+    };
+    format!("The source's number columns are: {listed}{more}. Ask the person which one to bin.")
 }
 
 /// No two measures share a result name, and none takes the name of the
@@ -1478,6 +1563,83 @@ mod tests {
         assert_eq!(err, "invalid aggregate: median");
     }
 
+    /// `BI-46` (plan D13; QA `LH-BI-6-01`): a breakdown grain is for the four
+    /// kinds whose second column is a series, names one of the five periods, is
+    /// not combined with a bin, and needs a date or timestamp breakdown to cut.
+    #[test]
+    fn a_breakdown_grain_is_refused_without_a_breakdown_on_a_text_column_on_a_pie_and_beside_a_bin()
+    {
+        let shape = |json: &str| -> ShapeFields { serde_json::from_str(json).unwrap() };
+        let list = measures(r#"["x"]"#);
+        let err = check_kind_fields(
+            &list,
+            &shape(r#"{"breakdownGrain":"month"}"#),
+            ChartKind::Pie,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "a breakdown grain is for bar, hbar, line and area charts."
+        );
+        let err = check_kind_fields(
+            &list,
+            &shape(r#"{"breakdownGrain":"fortnight"}"#),
+            ChartKind::Bar,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "invalid breakdown grain 'fortnight': use day, week, month, quarter or year."
+        );
+        let err = check_kind_fields(
+            &list,
+            &shape(r#"{"breakdownGrain":"month","breakdownBin":{"mode":"width","width":10}}"#),
+            ChartKind::Bar,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err, "a chart groups by a grain or by bins, not both.");
+        let c = cols(&[("d", ColumnKind::Date), ("x", ColumnKind::Number)]);
+        let from = Relation::Mart(Ident::new("m").unwrap());
+        let t = time();
+        let err = check_against_relation(
+            &list,
+            &shape(r#"{"breakdownGrain":"month"}"#),
+            &relation_check(&c, &from, &t, "d"),
+        )
+        .unwrap_err();
+        assert_eq!(err, "a breakdown grain needs a breakdown column.");
+        let c = cols(&[
+            ("d", ColumnKind::Date),
+            ("p", ColumnKind::Text),
+            ("x", ColumnKind::Number),
+        ]);
+        let mut check = relation_check(&c, &from, &t, "d");
+        check.breakdown = "p";
+        let err = check_against_relation(&list, &shape(r#"{"breakdownGrain":"month"}"#), &check)
+            .unwrap_err();
+        assert_eq!(err, "a grain needs a date or timestamp column.");
+    }
+
+    /// `BI-46` (plan D13): the grain is written back as it was saved, and only
+    /// when it is set.
+    #[test]
+    fn a_breakdown_grain_reads_back_as_it_was_saved() {
+        let shape: ShapeFields = serde_json::from_str(r#"{"breakdownGrain":"month"}"#).unwrap();
+        assert_eq!(shape.breakdown_grain.as_deref(), Some("month"));
+        assert!(shape.is_used());
+        assert_eq!(
+            serde_json::to_string(&shape).unwrap(),
+            r#"{"breakdownGrain":"month"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ShapeFields::default()).unwrap(),
+            "{}"
+        );
+    }
+
     #[test]
     fn a_chart_filter_on_a_missing_column_is_refused_without_its_value() {
         let c = cols(&[("p", ColumnKind::Text), ("x", ColumnKind::Number)]);
@@ -1656,5 +1818,64 @@ mod tests {
         assert!(
             check_against_relation(&list, &width, &relation_check(&c, &sql, &t, "stay")).is_ok()
         );
+    }
+
+    /// A refused bin names the number columns of the source, so the assistant
+    /// can ask which one to bin (and not turn the text column into a number).
+    #[test]
+    fn a_bin_on_a_text_column_is_refused_and_names_the_sources_number_columns() {
+        let c = cols(&[
+            ("p", ColumnKind::Text),
+            ("stay", ColumnKind::Number),
+            ("w", ColumnKind::Number),
+        ]);
+        let t = time();
+        let mart = Relation::Mart(Ident::new("m").unwrap());
+        let list = measures(r#"["w"]"#);
+        let width = shape_of(r#"{"bin":{"mode":"width","width":500}}"#);
+        let err =
+            check_against_relation(&list, &width, &relation_check(&c, &mart, &t, "p")).unwrap_err();
+        assert!(err.starts_with("'p' is not a number column;"), "{err}");
+        assert!(
+            err.contains("The source's number columns are: stay, w."),
+            "{err}"
+        );
+        assert!(err.contains("Ask the person which one to bin."), "{err}");
+    }
+
+    #[test]
+    fn a_bin_on_a_source_with_no_number_column_says_so() {
+        let c = cols(&[("p", ColumnKind::Text), ("d", ColumnKind::Date)]);
+        let t = time();
+        let mart = Relation::Mart(Ident::new("m").unwrap());
+        let list = measures(r#"["d"]"#);
+        let width = shape_of(r#"{"bin":{"mode":"width","width":500}}"#);
+        let err =
+            check_against_relation(&list, &width, &relation_check(&c, &mart, &t, "p")).unwrap_err();
+        assert!(
+            err.contains("The source has no number column to bin."),
+            "{err}"
+        );
+    }
+
+    /// Eight at most, sorted: a map has no order, so the cut must not depend
+    /// on it.
+    #[test]
+    fn a_refused_bin_lists_eight_number_columns_in_order_and_counts_the_rest() {
+        let mut columns = vec![("p", ColumnKind::Text)];
+        let names: Vec<String> = (1..=10).rev().map(|i| format!("n{i:02}")).collect();
+        columns.extend(names.iter().map(|n| (n.as_str(), ColumnKind::Number)));
+        let c = cols(&columns);
+        let t = time();
+        let mart = Relation::Mart(Ident::new("m").unwrap());
+        let list = measures(r#"["n01"]"#);
+        let width = shape_of(r#"{"bin":{"mode":"width","width":500}}"#);
+        let err =
+            check_against_relation(&list, &width, &relation_check(&c, &mart, &t, "p")).unwrap_err();
+        assert!(
+            err.contains("are: n01, n02, n03, n04, n05, n06, n07, n08, and 2 more."),
+            "{err}"
+        );
+        assert!(!err.contains("n09"), "{err}");
     }
 }

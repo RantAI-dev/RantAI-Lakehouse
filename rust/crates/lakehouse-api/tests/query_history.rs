@@ -40,7 +40,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+// OPS-32 D4: this file reaches the shared harness as `crate::common::…` from
+// inside each of its modules (a `use` in one module is not visible in
+// another), so it has no file-level import to keep.
 
 /// What the route does with the caller's text before the store sees it.
 mod filters {
@@ -58,6 +60,9 @@ mod filters {
     /// What a query string the route cannot read is told — the route's own
     /// sentence, byte for byte.
     const QUERY_UNREADABLE: &str = "The query string could not be read.";
+
+    /// What a `page` that is not a whole number from 1 is told.
+    const PAGE_REFUSAL: &str = "page must be a whole number of 1 or more";
 
     /// One recorded run for the pass-through test, written the way `run`
     /// writes them — the caller is the owner, the status is whatever the run
@@ -89,6 +94,7 @@ mod filters {
                 cache_assisted: false,
                 tables_read: &tables,
                 message,
+                tenant_id: None,
             },
         )
         .await
@@ -96,7 +102,11 @@ mod filters {
     }
 
     /// `GET /api/query/history?query` as the principal's cookie carries it.
-    async fn get_history(app: &TestApp, cookie: &str, query: &str) -> (StatusCode, Value) {
+    pub(crate) async fn get_history(
+        app: &TestApp,
+        cookie: &str,
+        query: &str,
+    ) -> (StatusCode, Value) {
         let uri = if query.is_empty() {
             "/api/query/history".to_owned()
         } else {
@@ -138,7 +148,7 @@ mod filters {
         for (query, fixed) in [
             (
                 "status=yesterday",
-                "status must be one of completed, failed, cancelled, blocked",
+                "status must be one of completed, failed, stopped, blocked",
             ),
             ("engine=presto", "engine must be one of clickhouse, trino"),
             (
@@ -146,10 +156,10 @@ mod filters {
                 "minDurationMs must be a non-negative whole number of milliseconds",
             ),
             ("from=not-a-time", "from must be an RFC 3339 time"),
-            (
-                "before=2026-10-20T00:00:00Z",
-                "before must be <at>,<id>: the at and the id of the last row you have seen",
-            ),
+            ("page=0", PAGE_REFUSAL),
+            ("page=abc", PAGE_REFUSAL),
+            ("page=-2", PAGE_REFUSAL),
+            ("page=1.5", PAGE_REFUSAL),
         ] {
             let (status, body) = get_history(&app, &cookie, query).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
@@ -181,6 +191,61 @@ mod filters {
             !rendered.contains("duplicate field") && !rendered.contains("serde"),
             "the response carries a library error: {rendered}"
         );
+    }
+
+    /// QS-12 (LH-QS-4-07): `?id=` answers that one run, with the true total —
+    /// the console opens a run by its id, not by its SQL text.
+    #[tokio::test]
+    async fn the_id_filter_answers_that_run_alone() {
+        let app = common::spin_up().await;
+        let user = create_principal_with_permissions(&app.pool, "query:read").await;
+        let cookie = session_cookie_for_user(&app.pool, user).await;
+        for (id, sql) in [("q-100", "SELECT 11"), ("q-200", "SELECT 22")] {
+            record_history(
+                &app.pool,
+                &RecordHistoryInput {
+                    id,
+                    sql,
+                    user: &user.to_string(),
+                    owner_id: Some(user),
+                    status: "completed",
+                    duration_ms: 10,
+                    scanned_bytes: 1,
+                    cost_units: 0.1,
+                    workload_class: "hot-analytics",
+                    engine: "clickhouse",
+                    cache_assisted: false,
+                    tables_read: &[],
+                    message: None,
+                    tenant_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let (status, body) = get_history(&app, &cookie, "id=q-100").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total"], json!(1), "{body}");
+        let runs = body["runs"].as_array().expect("runs");
+        assert_eq!(runs.len(), 1, "{body}");
+        assert_eq!(runs[0]["id"], json!("q-100"));
+        assert_eq!(runs[0]["sql"], json!("SELECT 11"));
+    }
+
+    /// QS-12 (LH-QS-4-07): a non-empty `id` that is not a history id is a 400
+    /// with the route's fixed sentence, not a silent empty page.
+    #[tokio::test]
+    async fn a_bad_history_id_is_a_400_with_the_fixed_message() {
+        let app = common::spin_up().await;
+        let user = create_principal_with_permissions(&app.pool, "query:read").await;
+        let cookie = session_cookie_for_user(&app.pool, user).await;
+
+        let (status, body) = get_history(&app, &cookie, "id=x'1").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "id must be a query history id", "{body}");
     }
 
     /// The parsed filters reach the rows: the endpoint answers the page's
@@ -228,7 +293,7 @@ mod filters {
 
         let (status, body) = get_history(&app, &cookie, "").await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let ids: Vec<&str> = body
+        let ids: Vec<&str> = body["runs"]
             .as_array()
             .unwrap()
             .iter()
@@ -238,30 +303,149 @@ mod filters {
 
         let (status, body) = get_history(&app, &cookie, "status=failed").await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body.as_array().unwrap().len(), 1);
-        assert_eq!(body[0]["id"], "q-b");
-        assert_eq!(body[0]["message"], "Arrow table is missing");
-        assert_eq!(body[0]["tablesRead"], json!(["bronze.orders"]));
+        let runs = &body["runs"];
+        assert_eq!(runs.as_array().unwrap().len(), 1);
+        assert_eq!(body["total"], 1);
+        assert_eq!(runs[0]["id"], "q-b");
+        assert_eq!(runs[0]["message"], "Arrow table is missing");
+        assert_eq!(runs[0]["tablesRead"], json!(["bronze.orders"]));
 
         let (status, body) = get_history(&app, &cookie, "table=orders").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
-            body.as_array().unwrap().len(),
+            body["runs"].as_array().unwrap().len(),
             2,
             "any element of tablesRead"
         );
+        assert_eq!(body["total"], 2);
 
         let (status, body) = get_history(&app, &cookie, "minDurationMs=1000").await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body.as_array().unwrap().len(), 2);
+        assert_eq!(body["runs"].as_array().unwrap().len(), 2);
+        assert_eq!(body["total"], 2);
 
         let (_, body) = get_history(&app, &cookie, "status=completed").await;
-        assert_eq!(body[0]["id"], "q-a");
+        let runs = &body["runs"];
+        assert_eq!(runs[0]["id"], "q-a");
         assert!(
-            body[0].get("message").is_none(),
+            runs[0].get("message").is_none(),
             "a completed run has nothing to say, and the key is omitted: {body}"
         );
-        assert_eq!(body[0]["tablesRead"], json!(["marts.retails"]));
+        assert_eq!(runs[0]["tablesRead"], json!(["marts.retails"]));
+    }
+
+    /// The answer is an envelope, not a bare list (`QS-4` QA of 2026-11-05):
+    /// `runs` is one page of 50, `total` counts every row the filters keep,
+    /// and `page` and `pageSize` say which slice this is.
+    #[tokio::test]
+    async fn the_answer_is_an_envelope_of_one_page_and_the_true_total() {
+        let app = common::spin_up().await;
+        let user = create_principal_with_permissions(&app.pool, "query:read").await;
+        let cookie = session_cookie_for_user(&app.pool, user).await;
+        for i in 0..55 {
+            let status = if i % 5 == 0 { "stopped" } else { "completed" };
+            insert_row(
+                &app.pool,
+                &format!("q-{i:02}"),
+                user,
+                status,
+                "clickhouse",
+                1,
+                &[],
+                None,
+            )
+            .await;
+        }
+
+        let (status, body) = get_history(&app, &cookie, "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["page", "pageSize", "runs", "total"], "{body}");
+        assert_eq!(body["runs"].as_array().unwrap().len(), 50);
+        assert_eq!(body["runs"][0]["id"], "q-54");
+        assert_eq!(body["total"], 55);
+        assert_eq!(body["page"], 1);
+        assert_eq!(body["pageSize"], 50);
+
+        let (_, body) = get_history(&app, &cookie, "page=2").await;
+        let ids: Vec<&str> = body["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["q-04", "q-03", "q-02", "q-01", "q-00"]);
+        assert_eq!(body["total"], 55);
+        assert_eq!(body["page"], 2);
+
+        // The status filter reaches both the rows and the total.
+        let (_, body) = get_history(&app, &cookie, "status=stopped").await;
+        assert_eq!(body["total"], 11, "{body}");
+        let runs = body["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 11);
+        assert!(runs.iter().all(|r| r["status"] == "stopped"), "{body}");
+        let (_, body) = get_history(&app, &cookie, "status=completed&page=2").await;
+        assert_eq!(body["total"], 44, "{body}");
+        assert_eq!(body["runs"], json!([]), "44 rows fit on page 1");
+    }
+
+    /// A page past the end is an empty `runs` with the true `total`; a page
+    /// no table could hold (more digits than a 64-bit number) is the same
+    /// empty page, not a 400 or a 500.
+    #[tokio::test]
+    async fn a_page_past_the_end_is_empty_with_the_true_total() {
+        let app = common::spin_up().await;
+        let user = create_principal_with_permissions(&app.pool, "query:read").await;
+        let cookie = session_cookie_for_user(&app.pool, user).await;
+        for i in 0..3 {
+            insert_row(
+                &app.pool,
+                &format!("q-{i}"),
+                user,
+                "completed",
+                "clickhouse",
+                1,
+                &[],
+                None,
+            )
+            .await;
+        }
+        for page in ["2", "999", "99999999999999999999999999"] {
+            let (status, body) = get_history(&app, &cookie, &format!("page={page}")).await;
+            assert_eq!(status, StatusCode::OK, "page={page}: {body}");
+            assert_eq!(body["runs"], json!([]), "page={page}");
+            assert_eq!(body["total"], 3, "page={page}");
+        }
+    }
+
+    /// A `before=` an old cached client still sends is ignored, like every
+    /// unknown key (the cursor it carried is gone): the first page answers.
+    #[tokio::test]
+    async fn a_leftover_before_cursor_is_ignored() {
+        let app = common::spin_up().await;
+        let user = create_principal_with_permissions(&app.pool, "query:read").await;
+        let cookie = session_cookie_for_user(&app.pool, user).await;
+        insert_row(
+            &app.pool,
+            "q-a",
+            user,
+            "completed",
+            "clickhouse",
+            1,
+            &[],
+            None,
+        )
+        .await;
+
+        let (status, body) = get_history(&app, &cookie, "before=2020-01-01T00:00:00Z,q-zzz").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["runs"][0]["id"], "q-a", "{body}");
     }
 }
 
@@ -292,11 +476,23 @@ mod recording {
         "Table not found or not available to your organisation: bronze.group_orders";
     /// The policy refusal's fixed sentence, as `policy_engine::refusal_message`
     /// words the rewrite's sensitive-system-table rule.
-    const POLICY_REFUSAL: &str =
-        "Tabel sistem ini tidak bisa dibaca dari sini; gunakan halaman Audit.";
+    const POLICY_REFUSAL: &str = "This system table cannot be read from here. Use the Audit page.";
     /// Text only the fake engine's failure body carries. It must appear in
     /// neither the response nor the history row.
     const ENGINE_MARKER: &str = "TANGERINE-PANEL-NINE";
+    /// A `ClickHouse` statement error as the engine words it: the code, a
+    /// catalog name and the version suffix. The response may show the author
+    /// this; the History row must not keep any of it.
+    const UNKNOWN_TABLE_ERROR: &str = "Code: 60. DB::Exception: Unknown table expression identifier 'icecat_api.x' in scope SELECT * FROM icecat_api.x. (UNKNOWN_TABLE) (version 25.8.1.3 (official build))";
+    /// What History keeps for that error: the cause, with no engine text.
+    const UNKNOWN_TABLE_SENTENCE: &str =
+        "This query reads a table that does not exist or that you cannot read.";
+    /// The engine's answer to a query a Stop killed (`QUERY_WAS_CANCELLED`).
+    const KILLED_ERROR: &str =
+        "Code: 394. DB::Exception: Query was cancelled. (QUERY_WAS_CANCELLED) (version 25.8.1.3)";
+    /// The engine's answer to a query that ran past its time limit
+    /// (`TIMEOUT_EXCEEDED`).
+    const TIMEOUT_ERROR: &str = "Code: 159. DB::Exception: Timeout exceeded: elapsed 6.2 seconds, maximum: 5. (TIMEOUT_EXCEEDED) (version 25.8.1.3)";
     /// The read-only guard's fixed sentence.
     const READ_ONLY_REFUSAL: &str =
         "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio.";
@@ -354,6 +550,16 @@ mod recording {
         mount_prefetch_ok(ch).await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(500).set_body_string(ENGINE_MARKER))
+            .mount(ch)
+            .await;
+    }
+
+    /// The engine answers every run with `status` and `body`, as a real
+    /// `ClickHouse` words a failed statement.
+    async fn mount_prefetch_ok_and_engine_answer(ch: &MockServer, status: u16, body: &str) {
+        mount_prefetch_ok(ch).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
             .mount(ch)
             .await;
     }
@@ -546,6 +752,113 @@ mod recording {
         );
     }
 
+    /// `QS-4` QA (2026-11-05, owner's decision 1) and owner 2026-11-12,
+    /// LH-QS-2-08: the response, History and the history API all carry the
+    /// classified sentence with the same reference id, and no engine text and
+    /// no catalog name. (The response used to show the engine's diagnosis,
+    /// `QS-1-AC5`.)
+    #[tokio::test]
+    async fn a_failed_statement_answers_and_records_the_same_classified_sentence() {
+        let ch = MockServer::start().await;
+        mount_prefetch_ok_and_engine_answer(&ch, 404, UNKNOWN_TABLE_ERROR).await;
+        let app = spin_up_with_clickhouse(&ch.uri()).await;
+        let cookie = session_cookie_for_seeded_user(&app.pool, "rina@meridian.example").await;
+
+        let (status, body) = post_sql(&app.router, &cookie, "SELECT * FROM icecat_api.x").await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let shown = body["error"].as_str().expect("the failure's sentence");
+        for gone in ["Code:", "DB::Exception", "icecat_api", "UNKNOWN_TABLE"] {
+            assert!(
+                !shown.contains(gone),
+                "the response carries no engine text: {gone} in {shown}"
+            );
+        }
+        let (_, reference) = shown
+            .rsplit_once("Reference: ")
+            .expect("the sentence ends with its reference");
+        let expected = format!("{UNKNOWN_TABLE_SENTENCE} Reference: {reference}");
+        assert_eq!(
+            shown, expected,
+            "the response says what the History row keeps"
+        );
+
+        let (recorded_status, message, _) =
+            the_recorded_run(&app.pool, "rina@meridian.example").await;
+        assert_eq!(recorded_status, "failed");
+        assert_eq!(
+            message.as_deref(),
+            Some(expected.as_str()),
+            "the row keeps the cause as a fixed sentence and the same reference"
+        );
+
+        // OPS-32: as a module of `tests/it.rs`, `crate` is the `it` crate root
+        // now, so the path goes through this file's own module.
+        let (status, body) = crate::query_history::filters::get_history(&app, &cookie, "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let runs = &body["runs"];
+        assert_eq!(runs[0]["message"], expected.as_str(), "{runs}");
+        // The run's own `sql` and `tablesRead` name the table: the person
+        // wrote that. The message is the engine's side.
+        let listed = runs[0]["message"].as_str().expect("a failed row has one");
+        for gone in ["Code:", "DB::Exception", "icecat_api", "UNKNOWN_TABLE"] {
+            assert!(
+                !listed.contains(gone),
+                "the history API's message carries no engine text: {gone} in {listed}"
+            );
+        }
+    }
+
+    /// `QS-4` QA, owner's decision 3: a run Stop ended is `stopped`, with the
+    /// sentence the caller was told, and the History filter finds it.
+    #[tokio::test]
+    async fn a_run_ended_with_stop_records_stopped() {
+        let ch = MockServer::start().await;
+        mount_prefetch_ok_and_engine_answer(&ch, 500, KILLED_ERROR).await;
+        let app = spin_up_with_clickhouse(&ch.uri()).await;
+        let cookie = session_cookie_for_seeded_user(&app.pool, "rina@meridian.example").await;
+
+        let (status, body) = post_sql(&app.router, &cookie, "SELECT 1").await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"], "Stopped", "{body}");
+        let (recorded_status, message, _) =
+            the_recorded_run(&app.pool, "rina@meridian.example").await;
+        assert_eq!(recorded_status, "stopped");
+        assert_eq!(message.as_deref(), Some("Stopped"));
+
+        let (status, body) =
+            crate::query_history::filters::get_history(&app, &cookie, "status=stopped").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["runs"][0]["status"], "stopped", "{body}");
+        assert_eq!(body["total"], 1, "{body}");
+        let (status, body) =
+            crate::query_history::filters::get_history(&app, &cookie, "status=failed").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["runs"], json!([]), "a stopped run is not a failed one");
+        assert_eq!(body["total"], 0, "{body}");
+    }
+
+    /// A run the time limit ended stays `failed` with the limit's own
+    /// sentence: it is the limit's doing, not the person's.
+    #[tokio::test]
+    async fn a_run_ended_by_the_time_limit_stays_failed() {
+        let ch = MockServer::start().await;
+        mount_prefetch_ok_and_engine_answer(&ch, 500, TIMEOUT_ERROR).await;
+        let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+        let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+        let (status, body) = post_sql(&router, &cookie, "SELECT 1").await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let sentence = body["error"].as_str().expect("the limit's sentence");
+        assert_ne!(sentence, "Stopped", "{body}");
+        let (recorded_status, message, _) = the_recorded_run(&pool, "rina@meridian.example").await;
+        assert_eq!(recorded_status, "failed");
+        assert_eq!(message.as_deref(), Some(sentence));
+        assert!(!sentence.contains("Code:"), "{sentence}");
+    }
+
     #[tokio::test]
     async fn a_policy_refusal_records_blocked_and_the_statement_never_runs() {
         let ch = MockServer::start().await;
@@ -631,6 +944,38 @@ mod recording {
             tables_read.is_empty(),
             "a refused write is not a query, so it names no table: {tables_read:?}"
         );
+    }
+
+    /// QS-14: a typo in the first word and a curly quote are refused
+    /// with a sentence of their own, and the History row carries the same
+    /// sentence the caller was told.
+    #[tokio::test]
+    async fn a_typo_or_a_curly_quote_records_blocked_with_its_own_sentence() {
+        for (sql, sentence) in [
+            (
+                "SELEC 1",
+                "Query Studio runs only statements that start with SELECT, WITH, SHOW, DESCRIBE or EXPLAIN. Check the first word for a typo.",
+            ),
+            (
+                "\u{2018}SELECT\u{2019} 1",
+                "The query has a character Query Studio cannot read safely, such as a curly quote (\u{2018} \u{2019} \u{201C} \u{201D}) or a `$$` sequence. Type straight quotes (' or \") and run it again.",
+            ),
+            ("DROP TABLE t", READ_ONLY_REFUSAL),
+        ] {
+            let ch = MockServer::start().await;
+            let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+            let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+            let (status, body) = post_sql(&router, &cookie, sql).await;
+
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{sql}: {body}");
+            assert_eq!(body["error"], sentence, "{sql}: {body}");
+            assert_eq!(engine_requests(&ch).await, 0, "{sql}");
+            let (recorded_status, message, _) =
+                the_recorded_run(&pool, "rina@meridian.example").await;
+            assert_eq!(recorded_status, "blocked", "{sql}");
+            assert_eq!(message.as_deref(), Some(sentence), "{sql}");
+        }
     }
 
     /// A past version by its id runs on `Trino` now (`DATA-21` D4), so
@@ -840,6 +1185,74 @@ mod recording {
         );
     }
 
+    /// QA `LH-QS-2-06` (`QS-9`): a person whose every role is switched off
+    /// from downloading gets `canDownload: false` on the run's own answer, so
+    /// the console turns Download and "Copy as TSV" off. The download route
+    /// refuses on its own either way.
+    #[tokio::test]
+    async fn a_run_by_a_person_whose_every_role_is_switched_off_carries_can_download_false() {
+        let ch = MockServer::start().await;
+        mount_prefetch_ok_and_engine_answer(
+            &ch,
+            200,
+            r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[{"n":1}],"rows":1}"#,
+        )
+        .await;
+        let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+        // Every role the caller holds is switched off: the rule is about the
+        // roles a person has, not about one of them (`BI-1` D7).
+        let roles: Vec<String> = sqlx::query_scalar(
+            "SELECT r.name FROM app_user_role ur JOIN role r ON r.id = ur.role_id \
+             JOIN app_user u ON u.id = ur.user_id WHERE u.email = 'rina@meridian.example'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(!roles.is_empty(), "the seeded user holds at least one role");
+        sqlx::query(
+            "INSERT INTO reporting_settings (singleton, time_zone, week_start, download_denied_roles) \
+             VALUES (TRUE, 'UTC', 'monday', $1)",
+        )
+        .bind(&roles)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+        let (status, body) = post_sql(&router, &cookie, "SELECT 1 AS n").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["canDownload"], json!(false), "{body}");
+    }
+
+    /// Review round 1, R4 (`QS-9`, D9): the flag fails closed when the
+    /// settings cannot be read. Without this test, `map_or(true, ..)` in
+    /// place of `is_ok_and` kept every other test green and the console would
+    /// offer Download and "Copy as TSV" whenever the switch is unknown.
+    #[tokio::test]
+    async fn a_run_carries_can_download_false_when_the_settings_cannot_be_read() {
+        let ch = MockServer::start().await;
+        mount_prefetch_ok_and_engine_answer(
+            &ch,
+            200,
+            r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[{"n":1}],"rows":1}"#,
+        )
+        .await;
+        let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+        let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+        // The read fails after the session exists, so what the run meets is
+        // the unreadable settings switch and not a broken sign-in.
+        sqlx::query("ALTER TABLE reporting_settings RENAME TO reporting_settings_gone")
+            .execute(&pool)
+            .await
+            .expect("hide the settings table");
+
+        let (status, body) = post_sql(&router, &cookie, "SELECT 1 AS n").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["canDownload"], json!(false), "{body}");
+    }
+
     #[tokio::test]
     async fn a_completed_run_records_the_tables_its_statement_names() {
         let ch = MockServer::start().await;
@@ -860,6 +1273,65 @@ mod recording {
             vec!["bronze.group_orders".to_owned()],
             "{tables_read:?}"
         );
+    }
+
+    /// `QS-4` QA (case QS-4-01, 2026-11-05): a statement that names a silver
+    /// table with backticks is a completed run, and the table is listed in
+    /// `tablesRead` as `silver.<name>`, not dropped for its quoting.
+    #[tokio::test]
+    async fn a_completed_run_on_a_backtick_quoted_silver_table_records_the_table() {
+        let ch = MockServer::start().await;
+        mount_engine(&ch).await;
+        let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+        let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+        let (status, body) = post_sql(
+            &router,
+            &cookie,
+            "SELECT * FROM silver.`g9_upload_0ed99141_clean`",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (recorded_status, _, tables_read) =
+            the_recorded_run(&pool, "rina@meridian.example").await;
+        assert_eq!(recorded_status, "completed");
+        assert_eq!(
+            tables_read,
+            vec!["silver.g9_upload_0ed99141_clean".to_owned()],
+            "{tables_read:?}"
+        );
+    }
+
+    /// `QS-4` QA, found beside QS-4-01: `DESCRIBE` and `SHOW COLUMNS FROM`
+    /// name a table the tenant gate checks, so History lists it too instead
+    /// of recording `[]`. `SHOW TABLES` names none and stays empty.
+    #[tokio::test]
+    async fn a_statement_that_describes_a_table_records_that_table() {
+        let ch = MockServer::start().await;
+        mount_engine(&ch).await;
+        let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+        let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+        for (sql, tables) in [
+            ("DESCRIBE bronze.group_orders", vec!["bronze.group_orders"]),
+            (
+                "SHOW COLUMNS FROM bronze.group_orders",
+                vec!["bronze.group_orders"],
+            ),
+            ("SHOW TABLES", vec![]),
+        ] {
+            sqlx::query("DELETE FROM query_history")
+                .execute(&pool)
+                .await
+                .expect("start from an empty history");
+            let (status, body) = post_sql(&router, &cookie, sql).await;
+            assert_eq!(status, StatusCode::OK, "{sql}: {body}");
+            let (recorded_status, _, tables_read) =
+                the_recorded_run(&pool, "rina@meridian.example").await;
+            assert_eq!(recorded_status, "completed", "{sql}");
+            assert_eq!(tables_read, tables, "{sql}");
+        }
     }
 
     /// `DATA-29`: a `NULL` cell and an empty cell in the same row are told
@@ -946,6 +1418,165 @@ mod recording {
             history_rows(&pool).await,
             0,
             "nothing to record: no statement, no run"
+        );
+    }
+
+    /// QS-11 (LH-QS-4-02), D6: a statement the parser cannot read is a syntax
+    /// error from the first word to the last — never a policy or access-rule
+    /// problem. Same sentence the engine's own syntax error keeps in History.
+    #[tokio::test]
+    async fn a_statement_that_does_not_parse_is_refused_as_a_syntax_error() {
+        let ch = MockServer::start().await;
+        let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+        let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+        let (status, body) = post_sql(&router, &cookie, "SELECT FROM WHERE").await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let error = body["error"].as_str().expect("the fixed syntax sentence");
+        assert_eq!(
+            error,
+            lakehouse_api::upstream_error::SYNTAX_SENTENCE,
+            "{body}"
+        );
+        assert!(!error.contains("policy"), "{error}");
+        assert!(!error.contains("access rules"), "{error}");
+    }
+}
+
+/// What the migration does to the rows already stored (`QS-2` and `QS-4` QA
+/// of 2026-11-04/05).
+mod migration {
+    use lakehouse_store::queries::{RecordHistoryInput, record_history};
+    use uuid::Uuid;
+
+    use crate::common;
+
+    /// The migration file itself, run again over a migrated database: its
+    /// statements are written to be re-run, so the test exercises the real
+    /// SQL and not a copy of it.
+    const MIGRATION: &str = include_str!("../../../migrations/0127_query_history_stopped.sql");
+
+    async fn seed(
+        pool: &sqlx::PgPool,
+        owner: Uuid,
+        (id, status, message): (&str, &str, Option<&str>),
+    ) {
+        record_history(
+            pool,
+            &RecordHistoryInput {
+                id,
+                sql: "SELECT 1",
+                user: &owner.to_string(),
+                owner_id: Some(owner),
+                status,
+                duration_ms: 1,
+                scanned_bytes: 0,
+                cost_units: 0.0,
+                workload_class: "hot-analytics",
+                engine: "clickhouse",
+                cache_assisted: false,
+                tables_read: &[],
+                message,
+                tenant_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn stored(pool: &sqlx::PgPool, id: &str) -> (String, Option<String>) {
+        sqlx::query_as("SELECT status, message FROM query_history WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stopped_rows_become_stopped_and_stored_engine_text_becomes_a_sentence() {
+        let app = common::spin_up().await;
+        let owner = Uuid::new_v4();
+        let engine_text = "Code: 60. DB::Exception: Unknown table expression identifier 'icecat_api.x' in scope SELECT * FROM icecat_api.x. (UNKNOWN_TABLE) Reference: 0a1b2c3d4e";
+        let trino_text = "line 1:15: Table 'icecat.api.x' does not exist Reference: 0a1b2c3d4f";
+        for row in [
+            ("old-stop", "failed", Some("Stopped")),
+            ("old-engine", "failed", Some(engine_text)),
+            (
+                "old-engine-no-ref",
+                "failed",
+                Some("Code: 47. DB::Exception: x"),
+            ),
+            ("old-trino", "failed", Some(trino_text)),
+            (
+                "old-near-stop",
+                "failed",
+                Some("Stopped by the administrator"),
+            ),
+            (
+                "old-time",
+                "failed",
+                Some("This query ran longer than 5 seconds."),
+            ),
+            ("old-refused", "blocked", Some("Stopped")),
+            ("old-cancelled", "cancelled", Some("Stopped")),
+            ("old-done", "completed", None),
+        ] {
+            seed(&app.pool, owner, row).await;
+        }
+
+        sqlx::raw_sql(MIGRATION).execute(&app.pool).await.unwrap();
+
+        assert_eq!(
+            stored(&app.pool, "old-stop").await,
+            ("stopped".to_owned(), Some("Stopped".to_owned()))
+        );
+        assert_eq!(
+            stored(&app.pool, "old-engine").await,
+            (
+                "failed".to_owned(),
+                Some("The engine could not run this statement. Reference: 0a1b2c3d4e".to_owned())
+            ),
+            "the engine's text goes, the reference to the log stays"
+        );
+        assert_eq!(
+            stored(&app.pool, "old-engine-no-ref").await,
+            (
+                "failed".to_owned(),
+                Some("The engine could not run this statement.".to_owned())
+            )
+        );
+        for (id, status, message) in [
+            ("old-trino", "failed", Some(trino_text)),
+            (
+                "old-near-stop",
+                "failed",
+                Some("Stopped by the administrator"),
+            ),
+            (
+                "old-time",
+                "failed",
+                Some("This query ran longer than 5 seconds."),
+            ),
+            ("old-refused", "blocked", Some("Stopped")),
+            ("old-cancelled", "cancelled", Some("Stopped")),
+            ("old-done", "completed", None),
+        ] {
+            assert_eq!(
+                stored(&app.pool, id).await,
+                (status.to_owned(), message.map(str::to_owned)),
+                "{id} is not the migration's to change"
+            );
+        }
+        // The check accepts the new status and still refuses an unknown one.
+        seed(&app.pool, owner, ("new-stop", "stopped", Some("Stopped"))).await;
+        let refused =
+            sqlx::query("UPDATE query_history SET status = 'paused' WHERE id = 'new-stop'")
+                .execute(&app.pool)
+                .await;
+        assert!(
+            refused.is_err(),
+            "the status check still refuses a stranger"
         );
     }
 }

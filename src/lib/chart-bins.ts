@@ -108,10 +108,10 @@ export function gridPayload(choice: string): GridDef | undefined {
 // ── what comes back ──────────────────────────────────────────────────────
 
 /** What a tile says of one binned column (`bins` on the payload). */
-export type BinMeta = { mode?: string; width?: unknown; min?: unknown; max?: unknown }
+export type BinMeta = { mode?: string; width?: unknown; min?: unknown; max?: unknown; whole?: unknown }
 
-/** A bin as the tile knows it: the width, and the data's maximum when the server said. */
-export type BinInfo = { width: number; max?: number }
+/** A bin as the tile knows it: the width, the data's maximum when the server said, and whether every value of the column is a whole number (`BI-57`). */
+export type BinInfo = { width: number; max?: number; whole?: boolean }
 
 const finite = (v: unknown): number | null => {
   const n = typeof v === "string" ? Number(v) : v
@@ -132,7 +132,12 @@ export function binsOfTile(
     const width = finite(m.width)
     if (width !== null && width > 0) {
       const max = finite(m.max)
-      out[column] = max === null ? { width } : { width, max }
+      // BI-57 (QA LH-BI-2-02, D6): every value of the column is a whole number,
+      // as the server said it on the range read. An older server, or a read the
+      // engine answered without a value, says nothing and the label stays a range.
+      const whole = m.whole === true || finite(m.whole) === 1
+      const info: BinInfo = max === null ? { width } : { width, max }
+      out[column] = whole ? { ...info, whole: true } : info
     }
   }
   const fixed: [string | undefined, BinDef | undefined][] = [
@@ -148,8 +153,15 @@ export function binsOfTile(
   return out
 }
 
-/** "500 – 1,000": the lower edge to the upper, with as many decimals as the edges need. */
-export function binLabel(lower: number, width: number): string {
+/**
+ * "500 – 1,000": the lower edge to the upper, with as many decimals as the
+ * edges need. A bin of exactly one value over a whole-number column reads as
+ * that value, with no separator ("2020"), as an unbinned number category does
+ * (`BI-57`, QA `LH-BI-2-02`).
+ */
+export function binLabel(lower: number, width: number, whole = false): string {
+  // QA LH-BI-2-02 (BI-57, D5): a bin of one whole value reads as that value.
+  if (whole && width === 1 && Number.isInteger(lower)) return String(lower)
   const upper = Math.round((lower + width) * 1e10) / 1e10
   const decimals = Math.max(decimalsFor([lower, upper]), decimalsOf(lower), decimalsOf(upper))
   return `${formatNumber(lower, decimals)} – ${formatNumber(upper, decimals)}`
@@ -170,15 +182,22 @@ export function relabelBins<R extends Record<string, unknown>>(rows: readonly R[
     for (const column of columns) {
       const lower = finite(row[column])
       if (lower !== null && row[column] !== "" && row[column] !== null) {
-        next = { ...next, [column]: binLabel(lower, bins[column].width) }
+        next = { ...next, [column]: binLabel(lower, bins[column].width, bins[column].whole) }
       }
     }
     return next
   })
 }
 
-/** Whether the bin starting at `lower` is the last one: it holds the data's maximum (the maximum is in the last bin, not in one of its own). */
-export function isLastBin(lower: number, width: number, max: number | undefined): boolean {
+/**
+ * Whether the bin starting at `lower` is the last one: it holds the data's
+ * maximum (the maximum is in the last bin, not in one of its own). Over a
+ * whole-number column in bins of 1 the maximum has a bin of its own, so no bin
+ * is closed above (`BI-57`, QA `LH-BI-2-02`).
+ */
+export function isLastBin(lower: number, width: number, max: number | undefined, whole = false): boolean {
+  // BI-57 (D3): the maximum has a bin of its own, so no bin is closed above.
+  if (whole && width === 1) return false
   if (max === undefined) return false
   const upper = lower + width
   return max < upper || Math.abs(max - upper) < width * 1e-9

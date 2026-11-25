@@ -58,8 +58,41 @@ jobs:
       # still needs `zstd ^0.13.3`. None of the four affected functions is
       # reachable from this tree (see rust/deny.toml for the reachability
       # result and the drop condition).
+      #
+      # RUSTSEC-2026-0459 (`libsqlite3-sys` 0.30.1 bundles a C SQLite with
+      # CVE-2026-119375, medium; fixed in `libsqlite3-sys` >= 0.39.0) cannot
+      # reach a binary of this workspace. The crate is in `rust/Cargo.lock`
+      # only through `sqlx-sqlite`, and no crate enables the `sqlite` feature
+      # of `sqlx` (`git grep -n sqlite -- '*Cargo.toml'` prints nothing), so
+      # `cargo tree --locked --workspace --target all -e normal,build -i
+      # libsqlite3-sys` prints "nothing to print". `cargo deny` does not
+      # flag it, so `rust/deny.toml` carries no entry. No upgrade exists:
+      # the newest `sqlx-sqlite` (0.9.0) requires `libsqlite3-sys >=0.30.1,
+      # <0.38.0`. The next step fails the job if the crate ever enters the
+      # build graph, which is what makes this waiver safe to keep. Drop the
+      # ignore when a `sqlx` release allows `libsqlite3-sys` >= 0.39, then
+      # `cargo update` (backlog `SEC-63`).
+      - name: libsqlite3-sys stays out of the build (RUSTSEC-2026-0459 waiver)
+        run: |
+          # `cargo tree -i` exits 0 and prints only a stderr warning ("nothing
+          # to print") when the package is not in the graph; any stdout line
+          # starting with the crate name means it is. The output goes to a
+          # variable first so a cargo failure (for example a lockfile that
+          # `--locked` refuses after a feature change) fails the step with
+          # cargo's own message and `grep` never closes the pipe early.
+          tree="$(cargo tree --locked --workspace --target all -e normal,build -i libsqlite3-sys)"
+          if printf '%s\n' "$tree" | grep '^libsqlite3-sys'; then
+            echo "::error::libsqlite3-sys is in the build graph: RUSTSEC-2026-0459 is reachable, so the cargo audit waiver no longer holds"
+            exit 1
+          fi
+        working-directory: rust
+
+      # RUSTSEC-2026-0543 (`chrono` is unmaintained) and RUSTSEC-2026-0542
+      # (`humantime` is unmaintained): `INFO` advisories issued 2026-11-17, no
+      # CVE and no patched version, because the crates are no longer
+      # maintained. See rust/deny.toml for the full justification.
       - name: cargo audit
-        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0391 --ignore RUSTSEC-2026-0398 --ignore RUSTSEC-2026-0403 --ignore RUSTSEC-2026-0410
+        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0391 --ignore RUSTSEC-2026-0398 --ignore RUSTSEC-2026-0403 --ignore RUSTSEC-2026-0410 --ignore RUSTSEC-2026-0459 --ignore RUSTSEC-2026-0542 --ignore RUSTSEC-2026-0543
         working-directory: rust
 
   cargo-deny:
@@ -70,17 +103,39 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Setup Rust
+        # `cargo-deny` shells out to `cargo metadata`; the Docker action used
+        # to carry its own toolchain, so make that dependency explicit now.
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
           cache-targets: false
 
+      # OPS-18: cargo-deny-action@v2 downloads the pinned release binary with
+      # `curl | tar` and no retry, so the 2026-11-08 release-asset outage
+      # failed this job before it checked anything. Install the SAME binary
+      # version the action used (0.22.0) through the bounded retry helper, then
+      # run the same check: the action's inputs resolved to
+      # `cargo-deny --manifest-path rust/Cargo.toml --all-features check all`
+      # (it also passed `--log-level warn`, cargo-deny's default).
+      - name: Install cargo-deny
+        env:
+          CARGO_DENY_VERSION: "0.22.0"
+        run: |
+          bash ./scripts/ci/retry_download.sh \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            "$RUNNER_TEMP/cargo-deny.tar.gz"
+          tar -xz -C /usr/local/bin --strip-components=1 \
+            -f "$RUNNER_TEMP/cargo-deny.tar.gz" \
+            "cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny"
+          rm -f "$RUNNER_TEMP/cargo-deny.tar.gz"
+          cargo-deny --version
+
       - name: cargo deny check
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          manifest-path: rust/Cargo.toml
-          command: check all
+        run: cargo-deny --manifest-path rust/Cargo.toml --all-features check all
 
   # Working-tree secret scan: guards against a *new* secret being
   # committed. Configured with `--no-git` so it scans files on disk, not
@@ -101,8 +156,14 @@ jobs:
         env:
           GITLEAKS_VERSION: "8.30.1"
         run: |
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
-            | tar -xz -C /usr/local/bin gitleaks
+          # OPS-18: retry the release download (a GitHub release-asset outage
+          # failed this job before it scanned anything), then extract once
+          # from the complete archive.
+          bash ./scripts/ci/retry_download.sh \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            "$RUNNER_TEMP/gitleaks.tar.gz"
+          tar -xz -C /usr/local/bin -f "$RUNNER_TEMP/gitleaks.tar.gz" gitleaks
+          rm -f "$RUNNER_TEMP/gitleaks.tar.gz"
           gitleaks version
 
       - name: gitleaks detect (working tree only, --no-git)
@@ -169,8 +230,14 @@ jobs:
         env:
           GITLEAKS_VERSION: "8.30.1"
         run: |
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
-            | tar -xz -C /usr/local/bin gitleaks
+          # OPS-18: retry the release download (a GitHub release-asset outage
+          # failed this job before it scanned anything), then extract once
+          # from the complete archive.
+          bash ./scripts/ci/retry_download.sh \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            "$RUNNER_TEMP/gitleaks.tar.gz"
+          tar -xz -C /usr/local/bin -f "$RUNNER_TEMP/gitleaks.tar.gz" gitleaks
+          rm -f "$RUNNER_TEMP/gitleaks.tar.gz"
           gitleaks version
 
       # Same .gitleaks.toml as the working-tree job (only excludes the two

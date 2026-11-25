@@ -7,7 +7,8 @@ export interface DataTableInfiniteState {
   onLoadMore: () => void;
   hasNextPage: boolean;
   isFetchingNextPage: boolean;
-  totalItems: number;
+  /** Left out when the server gives no total: the footer then names no total. */
+  totalItems?: number;
   loadedCount: number;
 }
 
@@ -24,7 +25,13 @@ export function DataTableInfiniteFooter({
   ...props
 }: DataTableInfiniteFooterProps) {
   const { loadedCount, totalItems, isFetchingNextPage, hasNextPage } = infinite;
-  const showCount = loadedCount > 0 || totalItems > 0;
+  const showCount = loadedCount > 0 || (totalItems ?? 0) > 0;
+  // GOV-1 review T-3: with no total the footer counts what is loaded and
+  // says whether more can be loaded; it never invents a total.
+  const countText =
+    totalItems === undefined
+      ? `${loadedCount.toLocaleString()}${hasNextPage ? " so far" : ""}`
+      : `${loadedCount.toLocaleString()} of ${totalItems.toLocaleString()}`;
 
   if (!showCount && !isFetchingNextPage) return null;
 
@@ -41,14 +48,14 @@ export function DataTableInfiniteFooter({
         <span>Loading more…</span>
       ) : showCount ? (
         <span>
-          Showing {loadedCount.toLocaleString()} of {totalItems.toLocaleString()}
+          Showing {countText}
           {!hasNextPage && loadedCount > 0 ? " · End of list" : null}
           {selectedCount > 0 ? ` · ${selectedCount.toLocaleString()} selected` : null}
         </span>
       ) : null}
       {isFetchingNextPage && showCount ? (
         <span className="text-muted-foreground/80">
-          · {loadedCount.toLocaleString()} of {totalItems.toLocaleString()}
+          · {countText}
           {selectedCount > 0 ? ` · ${selectedCount.toLocaleString()} selected` : null}
         </span>
       ) : null}

@@ -3,12 +3,12 @@
 //! stand-ins for `ClickHouse` and `Dagster`.
 //!
 //! The record has two halves with a run in between. The orchestrator posts
-//! the SELECT it will run to `.../enforce`, and the API keeps it in Postgres
+//! `.../compile` for the statement it will run, and the API keeps it in Postgres
 //! (not in memory: it can restart before the run ends). When Dagster's
 //! sensor reports the run `SUCCESS`, the API maps the kept SQL and writes the
 //! pipeline's rows. A run that did not succeed writes nothing.
 //!
-//! `SEC-50` puts the tenant gate in front of `.../enforce`: a pipeline acts
+//! `SEC-50` puts the tenant gate in front of `.../compile`: a pipeline acts
 //! as its OWN tenant (`pipeline_definition.tenant_id`), and a pipeline with
 //! no tenant reaches nothing. So the fixtures below give every pipeline a
 //! tenant and the deployment a catalog tenant, because that is what a
@@ -19,7 +19,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
@@ -38,7 +38,7 @@ use common::{TestApp, session_cookie_for_seeded_user, spin_up_with_env};
 /// reads it as ``<catalog db>.`bronze.<table>` ``): one copy, one rename and
 /// one cast.
 const SQL: &str = "SELECT id, amount AS amt, CAST(price AS Float64) AS price_f \
-                   FROM icecat.`bronze.orders`";
+                   FROM icecat_api.`bronze.orders`";
 
 /// `SEC-50`: the tenant that owns the shared catalog in these tests —
 /// Meridian Group, the tenant the seeded identity migration gives `yoga`
@@ -104,6 +104,9 @@ async fn app(run_status: &str) -> (axum::Router, PgPool, String, (MockServer, Mo
     // these tests read (`bronze.orders`) is a table no upload claimed, so
     // only that tenant may read it.
     overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    // BLD-1 part 1 / D4: the pipeline reads Bronze, so the compiler names the
+    // catalog database (R1-CI2: not in the shared harness).
+    overrides.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
     let TestApp { router, pool } = spin_up_with_env(&overrides).await;
     let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
     (router, pool, cookie, (ch, dagster))
@@ -120,12 +123,30 @@ async fn seeded_user_id(pool: &PgPool, email: &str) -> Uuid {
 /// A runnable pipeline `bronze.orders -> silver.orders_clean`.
 ///
 /// `SEC-50`: the pipeline carries a tenant of its own, because that is the
-/// tenant the enforce route's gate measures the statement against.
+/// tenant the compile route's gate measures the statement against.
 async fn seed_pipeline(pool: &PgPool, run_as: Option<Uuid>, tenant_id: Option<Uuid>) -> String {
+    // BLD-1 part 1 / D1: today's shape, written as one input and one
+    // `transform` step. Under D4a it compiles to exactly `SQL`, which is the
+    // statement the lineage mapper reads.
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
-            name: "lineage-probe".to_owned(),
+            inputs: vec![pipelines::PipelineInput {
+                name: "orders".to_owned(),
+                zone: "bronze".to_owned(),
+                table: "orders".to_owned(),
+            }],
+            steps: vec![pipelines::PipelineStep::Transform {
+                name: "transformed".to_owned(),
+                reads: "orders".to_owned(),
+                transforms: vec![
+                    "select(id,amount,price)".to_owned(),
+                    "rename(amount,amt)".to_owned(),
+                    "rename(price,price_f)".to_owned(),
+                    "cast(price,Float64)".to_owned(),
+                ],
+            }],
+            name: format!("lineage-probe-{}", Uuid::new_v4()),
             kind: "batch".to_owned(),
             source_zone: "bronze".to_owned(),
             source_table: "orders".to_owned(),
@@ -156,6 +177,86 @@ async fn seed_pipeline(pool: &PgPool, run_as: Option<Uuid>, tenant_id: Option<Uu
         .await
         .unwrap();
     created.id
+}
+
+/// Create a runnable pipeline from a caller's inputs and steps, authored by
+/// a user in the catalog tenant. `DATA-57` T5: three tests below share this
+/// `create_pipeline` + `ready` block.
+async fn seed_pipeline_with(
+    pool: &PgPool,
+    author: Uuid,
+    inputs: Vec<pipelines::PipelineInput>,
+    steps: Vec<pipelines::PipelineStep>,
+) -> String {
+    let created = pipelines::create_pipeline(
+        pool,
+        &CreatePipelineInput {
+            inputs,
+            steps,
+            name: format!("lineage-probe-{}", Uuid::new_v4()),
+            kind: "batch".to_owned(),
+            source_zone: "bronze".to_owned(),
+            source_table: "orders".to_owned(),
+            target_zone: "silver".to_owned(),
+            target_table: "orders_clean".to_owned(),
+            schedule: "0 3 * * *".to_owned(),
+            description: None,
+            incremental_column: None,
+            transforms: Vec::new(),
+            fbic_enabled: false,
+            max_retries: None,
+            owner: None,
+            tenant_id: Some(catalog_tenant()),
+            depends_on: Vec::new(),
+            connector_id: None,
+            id: None,
+            run_as: Some(author),
+            target_lag: None,
+        },
+        Some(author),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE pipeline_definition SET status = 'ready' WHERE id = $1")
+        .bind(&created.id)
+        .execute(pool)
+        .await
+        .unwrap();
+    created.id
+}
+
+/// The rows this pipeline wrote to its target, sorted. A tuple is
+/// `(from_table, from_column, to_column, transform, partial, reason)`.
+async fn rows_for_pipeline(
+    pool: &PgPool,
+    id: &str,
+) -> Vec<(
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    bool,
+    Option<String>,
+)> {
+    let mut rows: Vec<_> =
+        column_lineage::touching_table(pool, "silver.orders_clean", everything())
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.producer_ref == id)
+            .map(|row| {
+                (
+                    row.from_table,
+                    row.from_column,
+                    row.to_column,
+                    row.transform,
+                    row.partial,
+                    row.reason,
+                )
+            })
+            .collect();
+    rows.sort();
+    rows
 }
 
 fn job_name(id: &str) -> String {
@@ -194,12 +295,14 @@ async fn post(router: &axum::Router, cookie: &str, uri: &str, body: Value) -> (S
     )
 }
 
-async fn enforce(router: &axum::Router, cookie: &str, id: &str) -> (StatusCode, Value) {
+/// BLD-1 part 1 / D8: the route takes no body — the API compiles the stored
+/// definition itself, and under D4a that is exactly [`SQL`].
+async fn compile(router: &axum::Router, cookie: &str, id: &str) -> (StatusCode, Value) {
     post(
         router,
         cookie,
-        &format!("/api/pipelines/runnable/{id}/enforce"),
-        json!({ "sql": SQL }),
+        &format!("/api/pipelines/runnable/{id}/compile"),
+        Value::Null,
     )
     .await
 }
@@ -228,22 +331,22 @@ async fn pending(pool: &PgPool, id: &str) -> Option<String> {
 }
 
 #[tokio::test]
-async fn the_enforce_call_keeps_the_submitted_sql_in_postgres() {
+async fn the_compile_call_keeps_the_compiled_sql_in_postgres() {
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
     let id = seed_pipeline(&pool, Some(author), Some(catalog_tenant())).await;
 
-    let (status, body) = enforce(&router, &cookie, &id).await;
+    let (status, body) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(pending(&pool, &id).await.as_deref(), Some(SQL));
 }
 
 #[tokio::test]
-async fn a_refused_enforce_keeps_nothing() {
+async fn a_refused_compile_keeps_nothing() {
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
     let id = seed_pipeline(&pool, None, Some(catalog_tenant())).await;
 
-    let (status, _) = enforce(&router, &cookie, &id).await;
+    let (status, _) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(pending(&pool, &id).await, None);
 }
@@ -253,10 +356,10 @@ async fn a_successful_run_writes_the_pipelines_mappings_and_clears_the_pending_s
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
     let id = seed_pipeline(&pool, Some(author), Some(catalog_tenant())).await;
-    // Enforce through the route, then report the run: the pending row is the
+    // Compile through the route, then report the run: the pending row is the
     // only thing carried from one request to the other. A restart of the
     // API between the two loses nothing, because nothing is in memory.
-    let (status, body) = enforce(&router, &cookie, &id).await;
+    let (status, body) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
     let (status, body) = run_finished(&router, &cookie, &id).await;
@@ -307,7 +410,7 @@ async fn a_successful_run_writes_the_pipelines_mappings_and_clears_the_pending_s
 #[tokio::test]
 async fn pending_sql_left_by_an_earlier_process_is_mapped_by_the_next_success() {
     // The "restart": the row was written by a process that no longer
-    // exists; this app instance never saw the enforce call.
+    // exists; this app instance never saw the compile call.
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
     let id = seed_pipeline(&pool, None, Some(catalog_tenant())).await;
     column_lineage::put_pending(&pool, &id, SQL).await.unwrap();
@@ -325,7 +428,7 @@ async fn a_run_that_did_not_succeed_writes_nothing() {
     let (router, pool, cookie, _servers) = app("FAILURE").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
     let id = seed_pipeline(&pool, Some(author), Some(catalog_tenant())).await;
-    let (status, _) = enforce(&router, &cookie, &id).await;
+    let (status, _) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK);
 
     let (status, _) = run_finished(&router, &cookie, &id).await;
@@ -341,7 +444,7 @@ async fn a_repeated_success_event_leaves_the_rows_as_they_were() {
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
     let id = seed_pipeline(&pool, Some(author), Some(catalog_tenant())).await;
-    enforce(&router, &cookie, &id).await;
+    compile(&router, &cookie, &id).await;
     run_finished(&router, &cookie, &id).await;
     let (status, _) = run_finished(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK);
@@ -349,4 +452,281 @@ async fn a_repeated_success_event_leaves_the_rows_as_they_were() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 3, "nothing pending, so nothing was rewritten");
+}
+
+// DATA-57 T5 (rule 2): `a_pipeline_with_a_sql_step_writes_no_column_lineage_row`
+// asserted the D4b gate this change removes, so it is replaced by the three
+// tests below. The mapper now reads a `WITH`; what it cannot prove is a
+// partial row with a reason, never a silent absence.
+
+#[tokio::test]
+async fn a_pipeline_with_a_sql_step_records_its_columns_through_the_with() {
+    let (router, pool, cookie, _servers) = app("SUCCESS").await;
+    let author = seeded_user_id(&pool, "yoga@meridian.example").await;
+    let id = seed_pipeline_with(
+        &pool,
+        author,
+        vec![pipelines::PipelineInput {
+            name: "orders".to_owned(),
+            zone: "bronze".to_owned(),
+            table: "orders".to_owned(),
+        }],
+        vec![pipelines::PipelineStep::Sql {
+            name: "projected".to_owned(),
+            sql: "SELECT id, amount AS amt FROM orders".to_owned(),
+        }],
+    )
+    .await;
+
+    let (status, body) = compile(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(pending(&pool, &id).await.is_some(), "the WITH was noted");
+
+    let (status, body) = run_finished(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = rows_for_pipeline(&pool, &id).await;
+    assert_eq!(
+        rows,
+        vec![
+            (
+                Some("bronze.orders".to_owned()),
+                Some("amount".to_owned()),
+                "amt".to_owned(),
+                "copy".to_owned(),
+                false,
+                None,
+            ),
+            (
+                Some("bronze.orders".to_owned()),
+                Some("id".to_owned()),
+                "id".to_owned(),
+                "copy".to_owned(),
+                false,
+                None,
+            ),
+        ]
+    );
+    assert_eq!(pending(&pool, &id).await, None, "the pending SQL is spent");
+}
+
+#[tokio::test]
+async fn a_pipeline_with_two_inputs_and_two_steps_maps_each_column_to_its_input() {
+    let (router, pool, cookie, _servers) = app("SUCCESS").await;
+    let author = seeded_user_id(&pool, "yoga@meridian.example").await;
+    let id = seed_pipeline_with(
+        &pool,
+        author,
+        vec![
+            pipelines::PipelineInput {
+                name: "orders".to_owned(),
+                zone: "bronze".to_owned(),
+                table: "orders".to_owned(),
+            },
+            pipelines::PipelineInput {
+                name: "customers".to_owned(),
+                zone: "bronze".to_owned(),
+                table: "customers".to_owned(),
+            },
+        ],
+        vec![
+            pipelines::PipelineStep::Sql {
+                name: "joined".to_owned(),
+                sql: "SELECT o.id AS id, c.price AS price FROM orders AS o \
+                      JOIN customers AS c ON o.id = c.id"
+                    .to_owned(),
+            },
+            pipelines::PipelineStep::Sql {
+                name: "scaled".to_owned(),
+                sql: "SELECT id, price * 2 AS price2 FROM joined".to_owned(),
+            },
+        ],
+    )
+    .await;
+
+    let (status, body) = compile(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(pending(&pool, &id).await.is_some(), "the WITH was noted");
+
+    let (status, body) = run_finished(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = rows_for_pipeline(&pool, &id).await;
+    assert_eq!(
+        rows,
+        vec![
+            (
+                Some("bronze.customers".to_owned()),
+                Some("price".to_owned()),
+                "price2".to_owned(),
+                "expression".to_owned(),
+                false,
+                None,
+            ),
+            (
+                Some("bronze.orders".to_owned()),
+                Some("id".to_owned()),
+                "id".to_owned(),
+                "copy".to_owned(),
+                false,
+                None,
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_pipeline_whose_step_is_a_union_records_no_edge() {
+    let (router, pool, cookie, _servers) = app("SUCCESS").await;
+    let author = seeded_user_id(&pool, "yoga@meridian.example").await;
+    let id = seed_pipeline_with(
+        &pool,
+        author,
+        vec![pipelines::PipelineInput {
+            name: "orders".to_owned(),
+            zone: "bronze".to_owned(),
+            table: "orders".to_owned(),
+        }],
+        vec![pipelines::PipelineStep::Sql {
+            name: "both".to_owned(),
+            sql: "SELECT id FROM orders UNION ALL SELECT id FROM orders".to_owned(),
+        }],
+    )
+    .await;
+
+    let (status, body) = compile(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(pending(&pool, &id).await.is_some(), "the WITH was noted");
+
+    let (status, body) = run_finished(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = rows_for_pipeline(&pool, &id).await;
+    assert_eq!(rows.len(), 1, "one partial row, no edge: {rows:#?}");
+    assert_eq!(rows[0].0, None, "a UNION has no from_table");
+    assert_eq!(rows[0].2, "id");
+    assert!(rows[0].4, "the row is partial");
+    assert_eq!(
+        rows[0].5.as_deref(),
+        Some("built with UNION, INTERSECT or EXCEPT; the branches are not traced")
+    );
+}
+
+// DATA-57 T6: the form steps of #619, built exactly as #619's own tests do,
+// recorded through the routes now that D9 notes every compiled statement.
+
+/// A join, an aggregate and a filter, built exactly as #619's own tests do.
+fn form_steps() -> Vec<pipelines::PipelineStep> {
+    vec![
+        pipelines::PipelineStep::Join {
+            name: "joined".to_owned(),
+            left: "orders".to_owned(),
+            right: "customers".to_owned(),
+            join_type: "inner".to_owned(),
+            on: vec![pipelines::JoinPair {
+                left: "id".to_owned(),
+                right: "id".to_owned(),
+            }],
+            columns: vec![
+                pipelines::JoinColumn {
+                    side: "left".to_owned(),
+                    column: "id".to_owned(),
+                    name: String::new(),
+                },
+                pipelines::JoinColumn {
+                    side: "left".to_owned(),
+                    column: "amount".to_owned(),
+                    name: String::new(),
+                },
+                pipelines::JoinColumn {
+                    side: "right".to_owned(),
+                    column: "price".to_owned(),
+                    name: "unit_price".to_owned(),
+                },
+            ],
+        },
+        pipelines::PipelineStep::Aggregate {
+            name: "by_id".to_owned(),
+            reads: "joined".to_owned(),
+            group_by: vec!["id".to_owned()],
+            measures: vec![
+                pipelines::Measure {
+                    function: "sum".to_owned(),
+                    column: "amount".to_owned(),
+                    name: "total".to_owned(),
+                },
+                pipelines::Measure {
+                    function: "count".to_owned(),
+                    column: String::new(),
+                    name: "n".to_owned(),
+                },
+            ],
+            having_match: String::new(),
+            having: Vec::new(),
+        },
+        pipelines::PipelineStep::Filter {
+            name: "big".to_owned(),
+            reads: "by_id".to_owned(),
+            match_mode: "all".to_owned(),
+            conditions: vec![pipelines::StepCondition {
+                column: "total".to_owned(),
+                operator: ">".to_owned(),
+                value: "0".to_owned(),
+            }],
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_pipeline_of_form_steps_records_its_columns() {
+    let (router, pool, cookie, _servers) = app("SUCCESS").await;
+    let author = seeded_user_id(&pool, "yoga@meridian.example").await;
+    let id = seed_pipeline_with(
+        &pool,
+        author,
+        vec![
+            pipelines::PipelineInput {
+                name: "orders".to_owned(),
+                zone: "bronze".to_owned(),
+                table: "orders".to_owned(),
+            },
+            pipelines::PipelineInput {
+                name: "customers".to_owned(),
+                zone: "bronze".to_owned(),
+                table: "customers".to_owned(),
+            },
+        ],
+        form_steps(),
+    )
+    .await;
+
+    let (status, body) = compile(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        pending(&pool, &id).await.is_some(),
+        "the form steps were noted"
+    );
+
+    let (status, body) = run_finished(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = rows_for_pipeline(&pool, &id).await;
+    assert_eq!(
+        rows,
+        vec![
+            (
+                Some("bronze.orders".to_owned()),
+                Some("amount".to_owned()),
+                "total".to_owned(),
+                "expression".to_owned(),
+                false,
+                None,
+            ),
+            (
+                Some("bronze.orders".to_owned()),
+                Some("id".to_owned()),
+                "id".to_owned(),
+                "copy".to_owned(),
+                false,
+                None,
+            ),
+        ],
+        "`n` is a constant and `unit_price` is dropped by the aggregate"
+    );
 }

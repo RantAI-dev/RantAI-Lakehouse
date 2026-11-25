@@ -319,7 +319,7 @@ def build_clickhouse_backup_sql(
     timestamp come from `BackupConfig` and this job's own clock. Every
     string is rendered through `bronze_catalog._sql_string_literal`, so a
     quote or backslash in a credential cannot break out of its literal
-    (reused from `authored_transforms.py`'s precedent)."""
+    (the same non-trust-by-default posture every SQL builder here takes)."""
     s3_url = (
         f"{endpoint.rstrip('/')}/{bucket.strip('/')}/clickhouse/"
         f"{quote(timestamp, safe='')}/{quote(db_name, safe='')}/"

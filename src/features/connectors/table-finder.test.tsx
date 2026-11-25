@@ -85,6 +85,8 @@ describe("finderKind", () => {
       expect(finderKind(adapter, {})).toBe(adapter as never)
     }
     expect(finderKind("sheets", {})).toBeNull()
+    // Oracle change capture lists nothing (Amendment 10, S10-c): its tables are typed by hand.
+    expect(finderKind("cdc", { driver: "oracle" })).toBeNull()
   })
 })
 
@@ -405,5 +407,35 @@ describe("TableFinder, the columns of a listed object (D6)", () => {
     await waitFor(() => expect(screen.getByRole("group", { name: "Columns of b" })).toBeDefined())
     await screen.findByText("Nothing to sample yet, so there are no columns to show.")
     expect(overlap).toBe(false)
+  })
+})
+
+// QA LH-SRC-6-50/LH-SRC-6-55 (SRC-41 D18): a count of one is singular.
+describe("the finder counts one thing in the singular (LH-SRC-6-50)", () => {
+  const one = [{ name: "sales/a.csv", kind: "file" }]
+
+  it("says one file found and two files found", async () => {
+    stub((c) => (c.url === LIST ? json({ kind: "list", state: "done", objects: one }) : undefined))
+    render(<Harness adapter="files" dial={{ protocol: "s3", bucket: "b", endpoint: "http://s3.example" }} />)
+    fireEvent.click(screen.getByRole("button", { name: "Find files" }))
+    expect(await screen.findByText("1 file found")).toBeDefined()
+
+    cleanup()
+    stub((c) =>
+      c.url === LIST
+        ? json({ kind: "list", state: "done", objects: [...one, { name: "sales/b.csv", kind: "file" }] })
+        : undefined
+    )
+    render(<Harness adapter="files" dial={{ protocol: "s3", bucket: "b", endpoint: "http://s3.example" }} />)
+    fireEvent.click(screen.getByRole("button", { name: "Find files" }))
+    expect(await screen.findByText("2 files found")).toBeDefined()
+
+    cleanup()
+    stub((c) =>
+      c.url === LIST ? json({ kind: "list", state: "done", objects: [{ name: "/orders", kind: "endpoint" }] }) : undefined
+    )
+    render(<Harness adapter="rest" dial={{ baseUrl: "https://api.example.com", endpoints: [{ path: "/orders", method: "GET" }] }} />)
+    fireEvent.click(screen.getByRole("button", { name: "Find endpoints" }))
+    expect(await screen.findByText("1 endpoint found")).toBeDefined()
   })
 })

@@ -30,9 +30,12 @@
 //! # The access lists
 //!
 //! The last surface here is the sharing one: who has what on a saved query
-//! or on a folder (`QS-3`). The list is read with **manage**, because
-//! managing an item includes sharing it: a person who may only see a query
-//! has no business seeing who else sees it. The list answers with the
+//! or on a folder (`QS-3`). A query's list is read with **manage**,
+//! because managing a query includes sharing it: a person who may only see
+//! a query has no business seeing who else sees it. A folder's list is
+//! read with **edit**, so a person who may save or move a query into a
+//! folder sees who the folder is shared with before they do. Changing
+//! either list needs **manage**. A list answers with the
 //! item's own rules and the rules it inherits from the folders above it,
 //! and the grantee search answers with the people and the roles of the
 //! caller's organisation — the two halves of one question, "who may I
@@ -40,7 +43,7 @@
 //! is refused before anything is written, so a refused change leaves the
 //! old rules exactly as they were.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use axum::Extension;
 use axum::body::Bytes;
@@ -67,9 +70,11 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::QUERY_STRING_UNREADABLE;
 use crate::routes::quality::pool;
-use crate::routes::query::{saved_query_scope, saved_query_viewer};
-use crate::sql_guard::is_read_only;
+use crate::routes::query::{checked_saved_definitions, saved_query_scope, saved_query_viewer};
+use crate::sql_guard::{ReadOnlyVerdict, not_read_only_message, read_only_verdict};
+use crate::sql_rewrite::Engine;
 use crate::state::AppState;
+use crate::upstream_error;
 
 // ── The fixed sentences ──────────────────────────────────────────────────
 //
@@ -93,6 +98,34 @@ pub(crate) const QUERY_FORBIDDEN: &str = "You do not have permission to change t
 
 /// The sentence a caller that may not change a folder is told.
 pub(crate) const FOLDER_FORBIDDEN: &str = "You do not have permission to change this folder.";
+
+/// The sentence a caller that may not read a folder's access list is told.
+///
+/// It is not the sentence of a refusal to change ([`FOLDER_FORBIDDEN`]):
+/// this route changes nothing, and it says what the caller would need to
+/// see the list. `#416`.
+pub(crate) const FOLDER_ACCESS_FORBIDDEN: &str =
+    "Only someone who can edit this folder can see who it is shared with.";
+
+/// The sentence a move at a level below manage is refused with: the same
+/// sentence for a query move and for a folder move, and the sentence the
+/// store's own refusal carries (`StoreError::NotAllowed`, and
+/// `FolderError::MoveNeedsManage` through [`folder_failure`]), so every
+/// refused move reads alike (`QS-3` review of #382: a move needs manage).
+pub(crate) const MOVE_NEEDS_MANAGE: &str = "Only someone who manages this can move it.";
+
+/// The sentence a rule on a personal space itself is refused with: a
+/// personal space is shared through a query or a folder inside it, and the
+/// resolver ignores a rule stored on the space (`QS-3` review of #382).
+pub(crate) const PERSONAL_SPACE_NOT_SHARED: &str =
+    "A personal space is not shared: share a query or a folder inside it.";
+
+/// The sentence a share of a folder is refused with when the caller does
+/// not manage everything in it: a rule on a folder covers every sub-folder
+/// and every query under it, so sharing it is held to the bar of a move
+/// (`QS-3` review of #393).
+pub(crate) const SHARE_NEEDS_MANAGE_OF_CONTENTS: &str =
+    "Only someone who manages everything in this folder can share it.";
 
 /// The sentence a folder that still holds queries is refused with.
 pub(crate) const FOLDER_HOLDS_QUERIES: &str =
@@ -128,6 +161,28 @@ pub(crate) const FOLDER_ID_INVALID: &str = "A folder must be an id or \"root\"."
 /// cannot be saved cannot be changed into one that can.
 pub(crate) const NOT_READ_ONLY: &str =
     "only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) can be saved";
+
+/// Refuses a statement a saved query may not hold, with the sentence of its
+/// cause (QS-14).
+///
+/// A write keeps [`NOT_READ_ONLY`]. A curly quote and a typo in the first
+/// word get the sentences Query Studio's run gives
+/// ([`not_read_only_message`]), so the person sees what to change. A saved
+/// query records no engine, so the guard reads the statement with the
+/// `ClickHouse` rules, as every store path did before.
+///
+/// # Errors
+///
+/// [`ApiError::Unprocessable`] (422) when the statement is not a read.
+pub(crate) fn refuse_unless_storable(sql: &str) -> Result<(), ApiError> {
+    match read_only_verdict(sql, Engine::ClickHouse) {
+        ReadOnlyVerdict::Read => Ok(()),
+        ReadOnlyVerdict::Writes => Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned())),
+        refused @ (ReadOnlyVerdict::Unreadable | ReadOnlyVerdict::NotARead) => Err(
+            ApiError::Unprocessable(not_read_only_message(refused).to_owned()),
+        ),
+    }
+}
 
 /// The sentence a saved query without a title or without a statement is
 /// refused with.
@@ -304,6 +359,12 @@ pub struct AccessRuleWire {
     pub user_id: Option<String>,
     /// The role the rule names; `None` when the rule names a person.
     pub role_id: Option<String>,
+    /// The name of the person or the role the rule names; `None` (sent as
+    /// `null`) when the grantee is not found in the caller's organisation.
+    pub grantee_name: Option<String>,
+    /// The email of the person the rule names; `None` (sent as `null`) for
+    /// a role, and for a person not found in the caller's organisation.
+    pub grantee_email: Option<String>,
     /// What the rule gives: "view", "edit" or "manage".
     pub level: String,
     /// Who wrote the rule; `None` when nobody is recorded.
@@ -313,12 +374,15 @@ pub struct AccessRuleWire {
 }
 
 impl AccessRuleWire {
-    /// The wire shape of a stored rule.
-    fn of(rule: &ItemRule) -> Self {
+    /// The wire shape of a stored rule, with its grantee named from `names`.
+    fn of(rule: &ItemRule, names: &GranteeNames) -> Self {
+        let (grantee_name, grantee_email) = names.of(rule);
         Self {
             id: rule.id.to_string(),
             user_id: rule.user_id.map(|id| id.to_string()),
             role_id: rule.role_id.map(|id| id.to_string()),
+            grantee_name,
+            grantee_email,
             level: rule.level.as_str().to_owned(),
             granted_by: rule.granted_by.map(|id| id.to_string()),
             granted_at: granted_at_of(rule.granted_at),
@@ -338,16 +402,24 @@ pub struct InheritedRuleWire {
     pub user_id: Option<String>,
     /// The role the rule names; `None` when the rule names a person.
     pub role_id: Option<String>,
+    /// The name of the person or the role the rule names; `None` (sent as
+    /// `null`) when the grantee is not found in the caller's organisation.
+    pub grantee_name: Option<String>,
+    /// The email of the person the rule names; `None` (sent as `null`) for
+    /// a role, and for a person not found in the caller's organisation.
+    pub grantee_email: Option<String>,
     /// What the rule gives: "view", "edit" or "manage".
     pub level: String,
 }
 
 impl InheritedRuleWire {
-    /// The wire shape of a rule inherited from the folder `folder_id`.
+    /// The wire shape of a rule inherited from the folder `folder_id`, with
+    /// its grantee named from `names`.
     ///
     /// The folder's name is read from the same map the chain came from,
     /// so the list names the folder the way the tree does.
-    fn of(rule: &ItemRule, folder_id: Uuid, map: &FolderMap) -> Self {
+    fn of(rule: &ItemRule, folder_id: Uuid, map: &FolderMap, names: &GranteeNames) -> Self {
+        let (grantee_name, grantee_email) = names.of(rule);
         Self {
             folder_id: folder_id.to_string(),
             folder_name: map
@@ -355,8 +427,38 @@ impl InheritedRuleWire {
                 .map_or_else(String::new, |folder| folder.name.clone()),
             user_id: rule.user_id.map(|id| id.to_string()),
             role_id: rule.role_id.map(|id| id.to_string()),
+            grantee_name,
+            grantee_email,
             level: rule.level.as_str().to_owned(),
         }
+    }
+}
+
+/// The names of the people and roles an access list's rules name, read in
+/// one lookup for the whole list ([`saved_query_access::grantee_labels`]).
+///
+/// A grantee the lookup did not find is not here, so its rule is sent with
+/// `null` for the name and the email: the list never makes a name up.
+struct GranteeNames {
+    /// The people found in the caller's tenant, by id.
+    people: HashMap<Uuid, GranteePerson>,
+    /// The roles found, by id.
+    roles: HashMap<Uuid, GranteeRole>,
+}
+
+impl GranteeNames {
+    /// The name and the email of the grantee `rule` names: both for a person
+    /// found, the name alone for a role found, neither otherwise.
+    fn of(&self, rule: &ItemRule) -> (Option<String>, Option<String>) {
+        if let Some(person) = rule.user_id.and_then(|id| self.people.get(&id)) {
+            // ADM-11 D1: a person's email is itself optional now, so the
+            // clone carries the option, not a nested one.
+            return (Some(person.name.clone()), person.email.clone());
+        }
+        if let Some(role) = rule.role_id.and_then(|id| self.roles.get(&id)) {
+            return (Some(role.name.clone()), None);
+        }
+        (None, None)
     }
 }
 
@@ -385,8 +487,9 @@ pub struct GranteePersonWire {
     pub id: String,
     /// The person's display name.
     pub name: String,
-    /// The person's email address.
-    pub email: String,
+    /// The person's email address; `None` when the account has none
+    /// (ADM-11 D1), sent as `null`.
+    pub email: Option<String>,
 }
 
 impl GranteePersonWire {
@@ -482,6 +585,30 @@ fn level_of(level: &str) -> Level {
     Level::parse(level).unwrap_or(Level::View)
 }
 
+/// The folder and the level the caller holds on it, or a 404 when the
+/// folder is not theirs to see.
+///
+/// [`folder_level`] answers with the level alone; this returns the folder
+/// with it, for the handlers that need the folder itself — where it sits
+/// now, and whether it is a personal space — so they ask the database
+/// once, not twice.
+///
+/// # Errors
+///
+/// 404 with the fixed sentence of [`FOLDER_NOT_FOUND`] for a folder the
+/// caller may not see; 500 on a database failure.
+async fn folder_with_level(
+    pool: &PgPool,
+    viewer: &queries::SavedQueryViewer,
+    id: Uuid,
+) -> Result<(FolderNode, Level), ApiError> {
+    let folders = saved_query_access::folders_with_levels(pool, viewer).await?;
+    folders
+        .into_iter()
+        .find(|(folder, _level)| folder.id == id)
+        .ok_or_else(|| ApiError::NotFound(FOLDER_NOT_FOUND.to_owned()))
+}
+
 /// The level the caller holds on a folder, or a 404 when the folder is
 /// not theirs to see.
 ///
@@ -499,12 +626,9 @@ async fn folder_level(
     viewer: &queries::SavedQueryViewer,
     id: Uuid,
 ) -> Result<Level, ApiError> {
-    let folders = saved_query_access::folders_with_levels(pool, viewer).await?;
-    folders
-        .into_iter()
-        .find(|(folder, _level)| folder.id == id)
+    folder_with_level(pool, viewer, id)
+        .await
         .map(|(_folder, level)| level)
-        .ok_or_else(|| ApiError::NotFound(FOLDER_NOT_FOUND.to_owned()))
 }
 
 /// The route's own answer to a folder write the store refused.
@@ -524,7 +648,21 @@ fn folder_failure(failure: FolderError) -> ApiError {
         FolderError::TooDeep => ApiError::BadRequest(FOLDER_TOO_DEEP.to_owned()),
         FolderError::Cycle => ApiError::BadRequest(FOLDER_CYCLE.to_owned()),
         FolderError::PersonalSpace => ApiError::PermissionDenied(FOLDER_FORBIDDEN.to_owned()),
-        FolderError::Database(_database) => ApiError::Internal("database error".to_owned()),
+        FolderError::MoveNeedsManage => ApiError::PermissionDenied(MOVE_NEEDS_MANAGE.to_owned()),
+        FolderError::Database(store_error) => {
+            // A failure of the database is logged under a reference id and
+            // answers with the fixed message and that id, at 503 when the
+            // database cannot be reached (AGENTS.md principle 4; `QS-3`
+            // review of #382, NOTE 7). The store's own fixed sentences
+            // (a store with no pool, a row that is not there) keep their
+            // own status through `ApiError::from`.
+            match upstream_error::store(&upstream_error::STORE, &store_error) {
+                upstream_error::Reported::Upstream(failure) => {
+                    failure.into_api_error(upstream_error::FailedAs::Internal)
+                }
+                upstream_error::Reported::Own(_fixed) => ApiError::from(store_error),
+            }
+        }
     }
 }
 
@@ -671,6 +809,10 @@ impl AccessItem {
 /// parents; a folder inherits from its parents only, because its own
 /// rules are its own and sit in the list beside them.
 ///
+/// A personal space is left out of the chain: the resolver ignores a rule
+/// stored on one (`resolve_level`, `QS-3` review of #382), so listing it
+/// would show access that grants nothing (`QS-3` review of #382, follow-up).
+///
 /// A chain that cannot be built is corrupt data, and corrupt data
 /// inherits nothing.
 fn chain_of(map: &FolderMap, item: AccessItem) -> Vec<Uuid> {
@@ -686,21 +828,29 @@ fn chain_of(map: &FolderMap, item: AccessItem) -> Vec<Uuid> {
     let Some(chain) = map.chain(folder_id) else {
         return Vec::new();
     };
-    let chain: Vec<Uuid> = chain.iter().map(|folder| folder.id).collect();
-    match item {
-        // The folder's own rules are its own: only its parents are
-        // inherited.
-        AccessItem::Folder { .. } => chain.into_iter().skip(1).collect(),
-        AccessItem::Query { .. } => chain,
-    }
+    // The folder's own rules are its own: only its parents are inherited.
+    // The folder itself is skipped before the personal spaces are filtered,
+    // so the chain's first folder is never mistaken for a parent.
+    let skip = match item {
+        AccessItem::Folder { .. } => 1,
+        AccessItem::Query { .. } => 0,
+    };
+    chain
+        .iter()
+        .skip(skip)
+        .filter(|folder| !folder.is_personal)
+        .map(|folder| folder.id)
+        .collect()
 }
 
 /// The access list of one item: its own rules, the rules it inherits
 /// from the folders above it, and the level the caller holds on it.
 ///
 /// The folders are read with the viewer's own tenant, so the chain is the
-/// chain the resolver used to decide the level: the list cannot name a
-/// folder the level did not come from.
+/// chain the resolver used to decide the level. The list names a folder
+/// only when the resolver reads its rules: a rule stored on a personal
+/// space grants nothing, so it is listed neither as inherited nor as the
+/// space's own (`QS-3` review of #382, follow-up).
 async fn access_list(
     pool: &PgPool,
     viewer: &queries::SavedQueryViewer,
@@ -710,18 +860,61 @@ async fn access_list(
     let folders = saved_query_access::list_folders(pool, viewer.tenant_id).await?;
     let map = FolderMap::new(folders);
     let chain = chain_of(&map, item);
-    let own = saved_query_access::rules_for_item(pool, item.query_id(), item.folder_id()).await?;
+    // The resolver ignores a rule stored on a personal space, so the space
+    // lists none of its own.
+    let own = if item
+        .folder_id()
+        .and_then(|id| map.get(id))
+        .is_some_and(|folder| folder.is_personal)
+    {
+        Vec::new()
+    } else {
+        saved_query_access::rules_for_item(pool, item.query_id(), item.folder_id()).await?
+    };
     let inherited = saved_query_access::rules_for_folders(pool, &chain).await?;
+    // One lookup names the grantees of the own and the inherited rules
+    // together, whatever their number: a list is never a query per rule.
+    let mut user_ids: Vec<Uuid> = own
+        .iter()
+        .chain(&inherited)
+        .filter_map(|rule| rule.user_id)
+        .collect();
+    let mut role_ids: Vec<Uuid> = own
+        .iter()
+        .chain(&inherited)
+        .filter_map(|rule| rule.role_id)
+        .collect();
+    user_ids.sort_unstable();
+    user_ids.dedup();
+    role_ids.sort_unstable();
+    role_ids.dedup();
+    let labels =
+        saved_query_access::grantee_labels(pool, viewer.tenant_id, &user_ids, &role_ids).await?;
+    let names = GranteeNames {
+        people: labels
+            .people
+            .into_iter()
+            .map(|person| (person.id, person))
+            .collect(),
+        roles: labels
+            .roles
+            .into_iter()
+            .map(|role| (role.id, role))
+            .collect(),
+    };
     Ok(AccessListWire {
         item_type: item.item_type().to_owned(),
         item_id: item.id().to_string(),
         your_level: your_level.as_str().to_owned(),
-        rules: own.iter().map(AccessRuleWire::of).collect(),
+        rules: own
+            .iter()
+            .map(|rule| AccessRuleWire::of(rule, &names))
+            .collect(),
         inherited: inherited
             .iter()
             .filter_map(|rule| {
                 rule.folder_id
-                    .map(|folder_id| InheritedRuleWire::of(rule, folder_id, &map))
+                    .map(|folder_id| InheritedRuleWire::of(rule, folder_id, &map, &names))
             })
             .collect(),
     })
@@ -854,23 +1047,44 @@ pub struct PatchSavedQueryBody {
     /// or absent to leave it where it is.
     #[serde(default)]
     pub folder_id: FolderField,
+    /// New parameter definitions (`QS-5`), the whole list; absent leaves
+    /// them as they are, `[]` clears them. Raw JSON so a list of the wrong
+    /// shape is refused with a fixed sentence.
+    #[serde(default)]
+    pub parameters: Option<Value>,
 }
 
 /// `PATCH /api/query/saved/{id}` — change a saved query.
 ///
-/// The caller must hold **edit** on the query: `edit` changes the SQL,
-/// the title, the tags and the folder, `view` may do neither. A statement
-/// that is not read-only is refused the same way the save route refuses
-/// it, so nothing that can never run is ever stored.
+/// The caller must hold **edit** on the query: `edit` changes the SQL, the
+/// title and the tags, `view` may change nothing. A move to another folder,
+/// or to the shared root, also needs **manage** on the query and edit on
+/// the target folder: a move changes who sees the query, so edit alone does
+/// not move it. The store asks the manage level before any write, so a
+/// refused PATCH writes nothing, not the title or the SQL in the same body
+/// (`QS-3` review of #382), and the route holds no copy of the rule. A
+/// statement that is not read-only is refused the same way the save route
+/// refuses it, so nothing that can never run is ever stored.
+///
+/// A change of the SQL or of the parameters is checked as a pair
+/// (`QS-5`): the definitions of the body, or the stored ones, against the
+/// SQL of the body, or the stored SQL. A patch that touches neither does not
+/// read the SQL again, so a query saved before `QS-5` still renames. A
+/// change of the parameters alone writes a version, like a change of the
+/// SQL.
 ///
 /// # Errors
 ///
-/// 400 for a malformed body or a blank title; 404 with the fixed sentence
+/// 400 for a malformed body, a blank title or parameters that do not fit
+/// the SQL (the sentence of [`crate::query_params::ParamError`], or the
+/// fixed shape sentence for a list of the wrong shape); 404 with the fixed sentence
 /// of [`QUERY_NOT_FOUND`] for a query the caller may not see; 403 with the
 /// fixed sentence of [`QUERY_FORBIDDEN`] for a query the caller may see
-/// but not change, and for a folder the caller may see but not fill; 422
-/// with the fixed sentence of [`NOT_READ_ONLY`] for a statement that is
-/// not read-only; 500 on a database failure.
+/// but not change, and for a folder the caller may see but not fill; 403
+/// with the fixed sentence of [`MOVE_NEEDS_MANAGE`] for a move the caller
+/// does not manage the query for; 422 with the fixed sentence of
+/// [`NOT_READ_ONLY`] for a statement that is not read-only; 500 on a
+/// database failure.
 pub async fn patch_saved(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -892,7 +1106,9 @@ pub async fn patch_saved(
     // The body is read only now: a query the caller may not see is a 404
     // and a query it may not change is a 403, whatever the body holds.
     let body: PatchSavedQueryBody = serde_json::from_slice(&body).map_err(|_err| {
-        ApiError::BadRequest("Body must be JSON {title?, sql?, tags?, folderId?}.".to_owned())
+        ApiError::BadRequest(
+            "Body must be JSON {title?, sql?, tags?, folderId?, parameters?}.".to_owned(),
+        )
     })?;
     let title = body.title.map(|title| title.trim().to_owned());
     if title.as_deref().is_some_and(str::is_empty) {
@@ -903,12 +1119,24 @@ pub async fn patch_saved(
         return Err(ApiError::BadRequest(TITLE_AND_SQL_REQUIRED.to_owned()).into());
     }
     // Every path that stores a statement goes through the same read-only
-    // guard the save route uses.
-    if let Some(statement) = sql.as_deref()
-        && !is_read_only(statement)
-    {
-        return Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned()).into());
+    // guard the save route uses. A saved query records no engine, so the
+    // guard reads the statement with the `ClickHouse` rules; a run that
+    // names `Trino` reads it with the `Trino` rules.
+    if let Some(statement) = sql.as_deref() {
+        refuse_unless_storable(statement)?;
     }
+    // The SQL and the definitions travel as a pair: when either changes,
+    // the pair the query will hold is checked.
+    let parameters = if sql.is_some() || body.parameters.is_some() {
+        let final_sql = sql.as_deref().unwrap_or(&saved.sql);
+        let final_definitions = body.parameters.unwrap_or_else(|| saved.parameters.clone());
+        Some(checked_saved_definitions(
+            final_sql,
+            Some(final_definitions),
+        )?)
+    } else {
+        None
+    };
     let folder = match parse_folder_reference(body.folder_id)? {
         FolderReference::Absent => None,
         FolderReference::SharedSpace => Some(FolderMove::Root),
@@ -920,11 +1148,16 @@ pub async fn patch_saved(
             Some(FolderMove::Into(folder_id))
         }
     };
+    // A move needs manage on the query, and the store asks that before it
+    // writes anything (`QS-3` review of #382): the route holds no second
+    // copy of the rule, so a refused PATCH writes nothing and the rule has
+    // one owner. The level checks above and on the target folder stay here.
     let patch = SavedQueryPatch {
         title,
         sql,
         tags: body.tags,
         folder,
+        parameters,
     };
     let saved = queries::update_saved_query(pool(&state)?, &viewer, &id, &patch)
         .await
@@ -934,9 +1167,10 @@ pub async fn patch_saved(
 
 /// `DELETE /api/query/saved/{id}` — move a saved query to the trash.
 ///
-/// The caller must hold **manage** on the query: only then may it be
-/// deleted. The query waits in the trash until it is restored or swept
-/// away; it is not gone yet.
+/// The caller must hold **edit** on the query: decision 6 (plan 55 D5)
+/// puts deleting a query beside changing it, because a person who may
+/// rewrite its SQL may take it to the trash too. The query waits in the
+/// trash until it is restored or swept away; it is not gone yet.
 ///
 /// # Errors
 ///
@@ -957,7 +1191,9 @@ pub async fn delete_saved(
     let saved = queries::get_saved(pool(&state)?, &id, &scope)
         .await?
         .ok_or_else(|| ApiError::NotFound(QUERY_NOT_FOUND.to_owned()))?;
-    if level_of(&saved.level) < Level::Manage {
+    // Edit may delete a query (decision 6, plan 55 D5); the store
+    // re-checks the same level on the write.
+    if level_of(&saved.level) < Level::Edit {
         return Err(ApiError::PermissionDenied(QUERY_FORBIDDEN.to_owned()).into());
     }
     queries::trash_saved_query(pool(&state)?, &viewer, &id)
@@ -992,10 +1228,9 @@ pub async fn duplicate_saved(
     let source = queries::get_saved(pool(&state)?, &id, &scope)
         .await?
         .ok_or_else(|| ApiError::NotFound(QUERY_NOT_FOUND.to_owned()))?;
-    // The copy stores the same statement, so it meets the same guard.
-    if !is_read_only(&source.sql) {
-        return Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned()).into());
-    }
+    // The copy stores the same statement, so it meets the same guard: a
+    // saved query records no engine, so the `ClickHouse` rules apply.
+    refuse_unless_storable(&source.sql)?;
     // The copy is a new row, so it belongs to the tenant the request acts
     // as — not to the reach the read above used. The reach of a
     // deployment with a single tenant names no tenant at all, and a row
@@ -1009,11 +1244,12 @@ pub async fn duplicate_saved(
         crate::tenant_scope::resolve(&principal, &headers)?,
     );
     let owner = principal.display_name.clone();
-    let copy = queries::create_saved_query_at(
+    let copy = queries::create_saved_query_with_parameters(
         pool(&state)?,
         &viewer,
         &source.title,
         &source.sql,
+        &source.parameters,
         &owner,
         &source.tags,
         SavedQueryPlacement::PersonalSpace,
@@ -1026,7 +1262,8 @@ pub async fn duplicate_saved(
 /// trash.
 ///
 /// The query comes back in the folder it was in. The caller must hold
-/// **manage** on it: the trash entry is part of managing a query.
+/// **edit** on it: whoever may delete a query may bring it back
+/// (decision 6, plan 55 D5).
 ///
 /// # Errors
 ///
@@ -1044,12 +1281,14 @@ pub async fn restore_saved(
     let Some(viewer) = scope.effective_viewer() else {
         return Err(ApiError::NotFound(QUERY_NOT_FOUND.to_owned()).into());
     };
-    // The trash entry is part of managing a query, so it is found with the
-    // same scope and the same resolver the trash list uses.
+    // A trashed query is found with the same scope and the same resolver
+    // the trash list uses: what the list shows is what restore acts on.
     let saved = queries::get_saved_including_trash(pool(&state)?, &id, &scope)
         .await?
         .ok_or_else(|| ApiError::NotFound(QUERY_NOT_FOUND.to_owned()))?;
-    if level_of(&saved.level) < Level::Manage {
+    // Edit may restore a query (decision 6, plan 55 D5); the store
+    // re-checks the same level on the write.
+    if level_of(&saved.level) < Level::Edit {
         return Err(ApiError::PermissionDenied(QUERY_FORBIDDEN.to_owned()).into());
     }
     let restored = queries::restore_saved_query(pool(&state)?, &viewer, &id)
@@ -1060,9 +1299,10 @@ pub async fn restore_saved(
 
 /// `GET /api/query/saved-trash` — the queries waiting in the trash.
 ///
-/// The trash holds what the caller may **manage**: the entry in the trash
-/// is part of managing a query, and a caller that may only see a query
-/// has no business seeing where it waits.
+/// The trash holds what the caller may **edit** (decision 6, plan 55
+/// D5): a query they may delete and restore is theirs to see waiting,
+/// and a caller that may only view a query has no business seeing where
+/// it waits.
 ///
 /// # Errors
 ///
@@ -1152,15 +1392,14 @@ pub async fn revert_version(
         .parse()
         .map_err(|_err| ApiError::NotFound(QUERY_NOT_FOUND.to_owned()))?;
     // The statement the version holds is about to be stored again, so it
-    // meets the same guard as any other statement that is stored.
+    // meets the same guard as any other statement that is stored: a saved
+    // query records no engine, so the `ClickHouse` rules apply.
     let versions = queries::list_versions(pool(&state)?, query_id).await?;
     let wanted = versions
         .iter()
         .find(|candidate| candidate.version == version)
         .ok_or_else(|| ApiError::NotFound(QUERY_NOT_FOUND.to_owned()))?;
-    if !is_read_only(&wanted.sql) {
-        return Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned()).into());
-    }
+    refuse_unless_storable(&wanted.sql)?;
     let reverted = queries::revert_to_version(pool(&state)?, &viewer, query_id, version)
         .await
         .map_err(query_failure)?;
@@ -1283,16 +1522,28 @@ pub struct PatchFolderBody {
 
 /// `PATCH /api/query/folders/{id}` — rename a folder or move it.
 ///
-/// The caller must hold **edit** on the folder: renaming it and moving it
-/// are changes to the tree the folder sits in. A **personal** space may be
-/// neither renamed nor moved — it is one person's own space, and moving
-/// it would move their private queries with it.
+/// The caller must hold **edit** on the folder to rename it or to move it,
+/// and edit on the folder it moves under. A move also needs **manage** on
+/// the folder and on every folder and query inside it, the ones in the
+/// trash included: it changes which rules cover all of them, so the store
+/// asks it before it writes (`QS-3` review of #382) and the route holds no
+/// copy of that rule. A **personal** space may be neither renamed nor
+/// moved — it is one person's own space, and moving it would move their
+/// private queries with it.
 ///
-/// A body that carries both a name and a parent renames the folder first
-/// and moves it second. The two are two writes and there is no
-/// transaction across them, so a rename that is refused leaves the folder
-/// where it was; a move that is refused leaves the renamed folder where it
-/// was. The answer is the folder as it is after both writes.
+/// A body that carries both a name and a parent moves the folder first and
+/// renames it second, after the route has checked the name with the
+/// store's placement rule at the folder's new place. Everything that can
+/// refuse is settled before the first write, so a refused PATCH changes
+/// nothing (`QS-3` review of #382, SHOULD-FIX 2). There is no transaction
+/// across the two writes, so two things between them leave the folder moved
+/// and not renamed: a database failure, and a concurrent request that
+/// creates or renames a sibling to the same name, which makes the rename
+/// answer 409 (`QS-3` review of #382, follow-up). The store judges the move by the
+/// folder's current name, so a body that moves a folder under a sibling of
+/// its current name and renames it to a free one at the same time is
+/// refused as a duplicate; two requests do it. The answer is the folder as
+/// it is after both writes.
 ///
 /// # Errors
 ///
@@ -1301,9 +1552,11 @@ pub struct PatchFolderBody {
 /// 404 with the fixed sentence of [`FOLDER_NOT_FOUND`] for a folder the
 /// caller may not see and for a parent that does not exist; 403 with the
 /// fixed sentence of [`FOLDER_FORBIDDEN`] for a folder the caller may see
-/// but not change; 409 with the fixed sentence of
-/// [`FOLDER_DUPLICATE_NAME`] for a name a sibling already carries; 500 on
-/// a database failure.
+/// but not change; 403 with the fixed sentence of [`MOVE_NEEDS_MANAGE`]
+/// for a move of something the caller does not manage, and of anything
+/// inside it; 409 with the fixed sentence of [`FOLDER_DUPLICATE_NAME`] for
+/// a name a sibling already carries; 500, or 503 when the database cannot
+/// be reached, with a reference id on a database failure.
 pub async fn patch_folder(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1316,7 +1569,10 @@ pub async fn patch_folder(
         return Err(ApiError::NotFound(FOLDER_NOT_FOUND.to_owned()).into());
     };
     let folder_id = folder_id_of(&id)?;
-    let level = folder_level(pool(&state)?, &viewer, folder_id).await?;
+    // The node is kept, not only the level: the name check reads where the
+    // folder sits now, and this is the same read the level check needs
+    // anyway.
+    let (current, level) = folder_with_level(pool(&state)?, &viewer, folder_id).await?;
     if level < Level::Edit {
         return Err(ApiError::PermissionDenied(FOLDER_FORBIDDEN.to_owned()).into());
     }
@@ -1325,35 +1581,63 @@ pub async fn patch_folder(
     // holds.
     let body: PatchFolderBody = serde_json::from_slice(&body)
         .map_err(|_err| ApiError::BadRequest("Body must be JSON {name?, parentId?}.".to_owned()))?;
+    // Everything that can refuse is settled before the first write, so a
+    // refused PATCH changes nothing (`QS-3` review of #382, SHOULD-FIX 2).
+    // The parent comes first: it needs edit on the target folder.
+    let moves = !matches!(body.parent_id, FolderField::Absent);
+    let new_parent = if moves {
+        match parse_folder_reference(body.parent_id)? {
+            FolderReference::Absent | FolderReference::SharedSpace => None,
+            FolderReference::Folder(parent_id) => {
+                let level = folder_level(pool(&state)?, &viewer, parent_id).await?;
+                if level < Level::Edit {
+                    return Err(ApiError::PermissionDenied(FOLDER_FORBIDDEN.to_owned()).into());
+                }
+                Some(parent_id)
+            }
+        }
+    } else {
+        None
+    };
+    if body.name.is_none() && !moves {
+        return Err(ApiError::BadRequest("nothing to change.".to_owned()).into());
+    }
+    // The name is checked with the store's own placement rule, at the place
+    // the folder will be in: the move may be allowed while the name is
+    // refused there, and the folder must not be left moved by then. A
+    // personal space is skipped here: the store refuses it with its own
+    // answer on either write.
+    if let Some(name) = body.name.as_deref()
+        && !current.is_personal
+    {
+        let folders =
+            saved_query_access::list_folders(pool(&state)?, Some(current.tenant_id)).await?;
+        let place = if moves { new_parent } else { current.parent_id };
+        saved_query_access::check_placement(&folders, Some(folder_id), name, place)
+            .map_err(|rule| folder_failure(FolderError::from(rule)))?;
+    }
+    // The move goes first: the store asks manage on the folder and on
+    // everything in it before it writes, and a refusal there leaves the
+    // name as it was. The rename after it was checked above.
     let mut folder = None;
+    if moves {
+        folder = Some(
+            saved_query_access::move_folder_for_viewer(
+                pool(&state)?,
+                &viewer,
+                folder_id,
+                new_parent,
+            )
+            .await
+            .map_err(folder_failure)?,
+        );
+    }
     if let Some(name) = body.name.as_deref() {
         folder = Some(
             saved_query_access::rename_folder(pool(&state)?, folder_id, name)
                 .await
                 .map_err(folder_failure)?,
         );
-    }
-    match body.parent_id {
-        FolderField::Absent => {
-            // The body does not name a parent: the folder stays where it is.
-        }
-        reference => {
-            let parent_id = match parse_folder_reference(reference)? {
-                FolderReference::Absent | FolderReference::SharedSpace => None,
-                FolderReference::Folder(parent_id) => {
-                    let level = folder_level(pool(&state)?, &viewer, parent_id).await?;
-                    if level < Level::Edit {
-                        return Err(ApiError::PermissionDenied(FOLDER_FORBIDDEN.to_owned()).into());
-                    }
-                    Some(parent_id)
-                }
-            };
-            folder = Some(
-                saved_query_access::move_folder(pool(&state)?, folder_id, parent_id)
-                    .await
-                    .map_err(folder_failure)?,
-            );
-        }
     }
     let folder = folder.ok_or_else(|| ApiError::BadRequest("nothing to change.".to_owned()))?;
     let level = folder_level(pool(&state)?, &viewer, folder.id).await?;
@@ -1365,6 +1649,8 @@ pub async fn patch_folder(
 /// A folder is deleted only when it holds nothing: no live query, no
 /// query in the trash and no folder of its own. The caller must hold
 /// **manage** on it, and a **personal** space may not be deleted at all.
+/// Manage, not edit: decision 6 lifted only a query's delete and
+/// restore to edit, and a folder is not a query (plan 55 D5).
 ///
 /// # Errors
 ///
@@ -1402,7 +1688,9 @@ pub async fn delete_folder(
 // who may be given a rule at all. Every route here needs **manage** on
 // the item, and every route reads the item first — a 404 for what the
 // caller may not see, a 403 for what it may see but not manage, and only
-// then the body.
+// then the body. Manage stays the bar here even though decision 6
+// lifted a query's delete and restore to edit (plan 55 D5): sharing is
+// not changing, and edit must not reach it.
 
 /// `GET /api/query/saved/{id}/access` — who has what on one saved query.
 ///
@@ -1509,12 +1797,25 @@ pub async fn put_query_access(
 /// A rule on a folder covers everything inside it, so the list of a
 /// folder is the list of the space it holds.
 ///
+/// The list is read from edit up and changed with manage
+/// ([`put_folder_access`]): a person who may save or move a query into a
+/// folder is told who that folder is shared with before they do (`QS-3`,
+/// folder sharing warning).
+///
 /// # Errors
 ///
 /// 404 with the fixed sentence of [`FOLDER_NOT_FOUND`] for a folder the
-/// caller may not see; 403 with the fixed sentence of [`FOLDER_FORBIDDEN`]
-/// for a folder the caller may see but not manage; 500 on a database
-/// failure.
+/// caller may not see, for an id that is not a UUID and for a caller that
+/// acts for no organisation; 404 for an `X-Tenant` header that names a
+/// tenant the caller does not belong to; 403 with the fixed sentence of
+/// [`FOLDER_ACCESS_FORBIDDEN`] — "Only someone who can edit this folder can
+/// see who it is shared with." — for a folder the caller may see but only
+/// view; 503 when no database pool is configured, which `pool` raises
+/// before any store call, or when the tenant scope cannot verify the
+/// deployment's tenant count; 500 with the fixed sentence `database error`
+/// on a database failure inside a store call, through
+/// `From<StoreError> for ApiError`. This route does not use
+/// `folder_failure`, which only the writes use.
 pub async fn get_folder_access(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1528,8 +1829,13 @@ pub async fn get_folder_access(
     };
     let folder_id = folder_id_of(&id)?;
     let level = folder_level(pool(&state)?, &viewer, folder_id).await?;
-    if level < Level::Manage {
-        return Err(ApiError::PermissionDenied(FOLDER_FORBIDDEN.to_owned()).into());
+    // Edit reads the list, manage changes it (`QS-3`, folder sharing
+    // warning): a person who may save or move a query into a folder is
+    // told who that folder is shared with before they do. The refusal
+    // names the level the list is read at, not a change the caller never
+    // asked for (`#416`).
+    if level < Level::Edit {
+        return Err(ApiError::PermissionDenied(FOLDER_ACCESS_FORBIDDEN.to_owned()).into());
     }
     let item = AccessItem::Folder { id: folder_id };
     Ok(ApiJson(
@@ -1549,10 +1855,15 @@ pub async fn get_folder_access(
 ///
 /// 404 with the fixed sentence of [`FOLDER_NOT_FOUND`] for a folder the
 /// caller may not see; 403 with the fixed sentence of [`FOLDER_FORBIDDEN`]
-/// for a folder the caller may see but not manage; 400 for a body of
-/// another shape, for a rule that names two grantees or none, for a
-/// grantee that is listed twice and for a grantee that is not of the
-/// caller's organisation; 500 on a database failure.
+/// for a folder the caller may see but not manage; 403 with the fixed
+/// sentence of [`PERSONAL_SPACE_NOT_SHARED`] for a personal space; 403 with
+/// the fixed sentence of [`SHARE_NEEDS_MANAGE_OF_CONTENTS`] for a folder
+/// whose sub-folders or queries the caller does not all manage; 400 for
+/// a body of another shape, for a rule that names two grantees or none,
+/// for a grantee that is listed twice and for a grantee that is not of the
+/// caller's organisation; 503 with a reference id when the database cannot
+/// be reached, which `folder_failure` answers for the check of what the
+/// caller manages in the folder; 500 on any other database failure.
 pub async fn put_folder_access(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1565,9 +1876,26 @@ pub async fn put_folder_access(
         return Err(ApiError::NotFound(FOLDER_NOT_FOUND.to_owned()).into());
     };
     let folder_id = folder_id_of(&id)?;
-    let level = folder_level(pool(&state)?, &viewer, folder_id).await?;
+    let (folder, level) = folder_with_level(pool(&state)?, &viewer, folder_id).await?;
     if level < Level::Manage {
         return Err(ApiError::PermissionDenied(FOLDER_FORBIDDEN.to_owned()).into());
+    }
+    // A personal space is shared through a query or a folder inside it,
+    // never as a whole (`QS-3` review of #382). Asked after the 404 and the
+    // manage check, so a person who may not see the space learns nothing.
+    if folder.is_personal {
+        return Err(ApiError::PermissionDenied(PERSONAL_SPACE_NOT_SHARED.to_owned()).into());
+    }
+    // A rule on a folder covers what is inside it, so the caller manages
+    // the folder and everything under it, the trash included, or shares
+    // nothing: a PUT that only removes rules is a share too (`QS-3` review
+    // of #393). Asked before the body is read, so a refused PUT writes
+    // nothing.
+    if !saved_query_access::manages_folder_and_contents(pool(&state)?, &viewer, folder_id)
+        .await
+        .map_err(folder_failure)?
+    {
+        return Err(ApiError::PermissionDenied(SHARE_NEEDS_MANAGE_OF_CONTENTS.to_owned()).into());
     }
     // The body is read only now: a folder the caller may not see is a
     // 404 and a folder it may not manage is a 403, whatever the body
@@ -1648,16 +1976,16 @@ mod tests {
     //! any other, so the personal space has to be a wall for it too: a
     //! personal query of one person is never in the answer about another.
     //!
-    //! The test lives HERE, and not in `routes/catalog_governance.rs`,
-    //! because that file is held by an open pull request and this step
-    //! does not touch it. `dependents` is `pub(crate)`, so a unit test in
-    //! this crate can call it directly — and the catalog's own detail
-    //! route needs `ClickHouse`, which this test does not.
+    //! The tests live HERE, and not in `routes/catalog_governance.rs`,
+    //! because `dependents` is `pub(crate)`, so a unit test in this crate
+    //! can call it directly — and the catalog's own detail route needs
+    //! `ClickHouse`, which these tests do not.
 
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::collections::HashMap;
 
+    use axum::http::HeaderMap;
     use lakehouse_auth::{PermissionSet, Principal, PrincipalId};
     use lakehouse_store::PgPool;
     use lakehouse_store::queries::{
@@ -1707,6 +2035,11 @@ mod tests {
     /// Meridian Group, the tenant both of them act for.
     fn group_tenant() -> Uuid {
         Uuid::parse_str("11111111-1111-4111-8111-000000000001").expect("the group tenant id")
+    }
+
+    /// Meridian Retail, the seeded second tenant of the same organisation.
+    fn retail_tenant() -> Uuid {
+        Uuid::parse_str("11111111-1111-4111-8111-000000000002").expect("the retail tenant id")
     }
 
     /// One query in the author's personal space and one in the shared
@@ -1771,9 +2104,13 @@ mod tests {
             role_names: Vec::new(),
         };
 
-        let listed =
-            crate::routes::catalog_governance::dependents(&state, &principal, &[TABLE.to_owned()])
-                .await;
+        let listed = crate::routes::catalog_governance::dependents(
+            &state,
+            &principal,
+            &HeaderMap::new(),
+            &[TABLE.to_owned()],
+        )
+        .await;
 
         assert!(
             !listed.iter().any(|entry| entry["id"] == personal_id),
@@ -1784,5 +2121,182 @@ mod tests {
             "CONTROL: the shared space is a dependent: {listed:?}"
         );
         Ok(())
+    }
+
+    /// `SEC-54`: the catalog's "used by" list is scoped to the tenant the
+    /// caller selected with `X-Tenant`, not to their first tenant. A member
+    /// of two tenants must be able to see the second tenant's saved query.
+    ///
+    /// CONTROL: without a header the first tenant's query is listed, so the
+    /// test cannot pass by an empty list. A tenant the caller does not
+    /// belong to is refused by the same resolver and lists nothing.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_catalogs_used_by_follows_the_tenant_the_header_selects(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let group = group_tenant();
+        let retail = retail_tenant();
+        let group_viewer = SavedQueryViewer {
+            id: Some(rina()),
+            role_names: Vec::new(),
+            tenant_id: Some(group),
+            all: false,
+        };
+        let retail_viewer = SavedQueryViewer {
+            id: Some(rina()),
+            role_names: Vec::new(),
+            tenant_id: Some(retail),
+            all: false,
+        };
+        let group_query = create_saved_query_at(
+            &pool,
+            &group_viewer,
+            "Group's read",
+            "SELECT * FROM silver.orders",
+            "Rina Wijaya",
+            &[],
+            SavedQueryPlacement::SharedSpace,
+        )
+        .await
+        .expect("the group tenant's query is written");
+        let retail_query = create_saved_query_at(
+            &pool,
+            &retail_viewer,
+            "Retail's read",
+            "SELECT * FROM silver.orders",
+            "Rina Wijaya",
+            &[],
+            SavedQueryPlacement::SharedSpace,
+        )
+        .await
+        .expect("the retail tenant's query is written");
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("CH_URL".to_owned(), "http://127.0.0.1:1".to_owned());
+        let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+
+        // The caller belongs to both; group is first, retail is second.
+        let principal = Principal {
+            id: PrincipalId::User(rina()),
+            tenant_ids: vec![group, retail],
+            display_name: "Rina Wijaya".to_owned(),
+            permissions: PermissionSet::parse("query:read"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
+
+        let first = crate::routes::catalog_governance::dependents(
+            &state,
+            &principal,
+            &HeaderMap::new(),
+            &[TABLE.to_owned()],
+        )
+        .await;
+        assert!(
+            first.iter().any(|e| e["id"] == group_query.id),
+            "CONTROL: no header lists the first tenant's query: {first:?}"
+        );
+        assert!(
+            !first.iter().any(|e| e["id"] == retail_query.id),
+            "no header does not list the second tenant's query: {first:?}"
+        );
+
+        let selected_headers = crate::tenant_scope::headers_for_tenant(retail)
+            .expect("a tenant id is a valid header value");
+        let selected = crate::routes::catalog_governance::dependents(
+            &state,
+            &principal,
+            &selected_headers,
+            &[TABLE.to_owned()],
+        )
+        .await;
+        assert!(
+            selected.iter().any(|e| e["id"] == retail_query.id),
+            "X-Tenant lists the second tenant's query: {selected:?}"
+        );
+        assert!(
+            !selected.iter().any(|e| e["id"] == group_query.id),
+            "X-Tenant does not list the first tenant's query: {selected:?}"
+        );
+
+        let foreign_headers = crate::tenant_scope::headers_for_tenant(Uuid::new_v4())
+            .expect("a tenant id is a valid header value");
+        let refused = crate::routes::catalog_governance::dependents(
+            &state,
+            &principal,
+            &foreign_headers,
+            &[TABLE.to_owned()],
+        )
+        .await;
+        assert!(
+            refused.is_empty(),
+            "a tenant the caller does not belong to lists nothing: {refused:?}"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod folder_failure_tests {
+    //! How a refused folder write is answered: the fixed sentence of the
+    //! move rule, and a database failure that carries a reference id and
+    //! never the failure's own text.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_core::ApiError;
+    use lakehouse_store::StoreError;
+    use lakehouse_store::saved_query_access::FolderError;
+
+    use super::{MOVE_NEEDS_MANAGE, folder_failure};
+
+    /// The one sentence a refused move carries is written twice, here and
+    /// in the store's `NotAllowed`; the two must read the same, so a query
+    /// move and a folder move answer identically.
+    #[test]
+    fn the_move_sentence_is_the_same_for_a_query_and_for_a_folder() {
+        assert_eq!(StoreError::NotAllowed.to_string(), MOVE_NEEDS_MANAGE);
+        let folder = folder_failure(FolderError::MoveNeedsManage);
+        assert_eq!(folder.status(), 403);
+        assert_eq!(
+            folder.to_string(),
+            ApiError::from(StoreError::NotAllowed).to_string()
+        );
+        assert_eq!(
+            folder.to_string(),
+            format!("permission_denied: {MOVE_NEEDS_MANAGE}")
+        );
+    }
+
+    /// A database failure answers with the fixed message and the reference
+    /// the cause was logged under, and nothing of the cause itself.
+    #[test]
+    fn a_database_failure_answers_with_a_reference_and_not_its_text() {
+        let cause = sqlx::Error::Protocol("relation saved_query_folder is broken".to_owned());
+        let answer = folder_failure(FolderError::Database(StoreError::Database(cause)));
+        assert_eq!(answer.status(), 500);
+        let text = answer.to_string();
+        assert!(text.contains("Reference: "), "{text}");
+        assert!(!text.contains("saved_query_folder"), "{text}");
+    }
+
+    /// A pool that cannot be reached answers 503, like every other store
+    /// route does, with a reference to find the log line by.
+    #[test]
+    fn an_unreachable_database_answers_503_with_a_reference() {
+        let answer = folder_failure(FolderError::Database(StoreError::Database(
+            sqlx::Error::PoolTimedOut,
+        )));
+        assert_eq!(answer.status(), 503);
+        assert!(answer.to_string().contains("Reference: "), "{answer}");
+    }
+
+    /// No pool at all is the store's own 503, not a 500.
+    #[test]
+    fn a_store_without_a_pool_answers_503() {
+        let answer = folder_failure(FolderError::Database(StoreError::Unavailable));
+        assert_eq!(answer.status(), 503);
     }
 }

@@ -2,11 +2,12 @@
 
 import * as React from "react"
 import { createPortal } from "react-dom"
-import Image from "next/image"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { CircleUserRound, ChevronRight } from "lucide-react"
+import { BrandPicture } from "@/components/brand-picture"
 import { useAuth } from "@/features/auth/auth-provider"
+import { useBranding, type BrandingView } from "@/hooks/use-branding"
 import { rememberTableHref } from "@/hooks/use-table-memory"
 import {
   Sidebar,
@@ -25,15 +26,28 @@ import {
 } from "@/components/ui/sidebar"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useSidebarGroups } from "@/hooks/use-sidebar-groups"
+import { PRODUCT_LOGO_DARK, PRODUCT_LOGO_LIGHT } from "@/lib/product-branding"
 import { cn } from "@/lib/utils"
-import { NAV_GROUPS, activeNavHref, type NavGroup, type NavItem } from "./nav-config"
+import { NAV_GROUPS, activeNavHref, canOpen, type NavGroup, type NavItem } from "./nav-config"
 
-function BrandLogo() {
+function BrandLogo({ branding }: { branding: BrandingView }) {
   // Logo follows the theme: navy for a light sidebar, white for a dark one.
+  // The workspace's own logos come from `GET /api/branding`; the product's
+  // own files stand in for the ones it did not set.
   return (
     <div className="relative size-8 shrink-0" aria-hidden>
-      <Image src="/logo-light.png" alt="Rantai Lake" fill sizes="32px" className="object-contain dark:hidden" priority />
-      <Image src="/logo-dark.png" alt="" fill sizes="32px" className="hidden object-contain dark:block" priority />
+      <BrandPicture
+        src={branding.logoSrc}
+        alt={branding.name}
+        fallbackSrc={PRODUCT_LOGO_LIGHT}
+        className="size-8 object-contain dark:hidden"
+      />
+      <BrandPicture
+        src={branding.logoDarkSrc}
+        alt={branding.name}
+        fallbackSrc={PRODUCT_LOGO_DARK}
+        className="hidden size-8 object-contain dark:block"
+      />
     </div>
   )
 }
@@ -56,10 +70,18 @@ export function AppSidebar() {
   const router = useRouter()
   const pathname = usePathname()
   const activeHref = activeNavHref(pathname)
-  const groups = NAV_GROUPS
   const { state } = useSidebar()
   const iconMode = state === "collapsed"
-  const { user } = useAuth()
+  const { user, hasPermission } = useAuth()
+  // The workspace's own name and logo (`ADM-2`); the product's own stand
+  // in for whatever it did not set.
+  const branding = useBranding()
+  const groups = React.useMemo(() => {
+    return NAV_GROUPS.map((g) => ({
+      ...g,
+      items: g.items.filter((it) => canOpen(it.href, hasPermission)),
+    })).filter((g) => g.items.length > 0)
+  }, [hasPermission])
   const activeGroup = groups.find((g) => g.items.some((it) => it.href === activeHref))
   const defaultOpenLabels = React.useMemo(
     () => groups.filter((g) => g.defaultOpen).map((g) => g.label),
@@ -287,11 +309,11 @@ export function AppSidebar() {
           pertemuan sidebar dengan konten. */}
       <SidebarHeader className="flex h-16 shrink-0 flex-col justify-center border-b border-sidebar-border px-3 py-0 group-data-[collapsible=icon]:px-2">
         <div className="flex min-w-0 items-center justify-start gap-2 group-data-[collapsible=icon]:justify-center">
-          <BrandLogo />
-          <div className="grid min-w-0 flex-1 gap-0.5 leading-none group-data-[collapsible=icon]:hidden">
-            <span className="text-sm font-semibold tracking-[-0.084px] text-sidebar-foreground">Rantai Lake</span>
-            <span className="text-[11px] font-normal tracking-[-0.04px] text-sidebar-foreground/60">Enterprise Lakehouse Console</span>
-          </div>
+          <BrandLogo branding={branding} />
+          {/* Owner QA 2026-11-14, sidebar width: at 14rem the name stands alone, on one line. */}
+          <span className="min-w-0 flex-1 text-sm leading-none font-semibold tracking-[-0.084px] whitespace-nowrap text-sidebar-foreground group-data-[collapsible=icon]:hidden">
+            {branding.name}
+          </span>
         </div>
       </SidebarHeader>
 

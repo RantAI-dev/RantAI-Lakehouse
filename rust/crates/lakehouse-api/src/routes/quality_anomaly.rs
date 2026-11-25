@@ -365,25 +365,49 @@ pub(crate) async fn tick(state: &AppState) {
 /// # Errors
 ///
 /// `400` when the table is not `bronze.`/`silver.`/`serving.` plus a plain
-/// name; `503`/`500` on a store failure.
+/// name; `404` for a table outside the caller's reach; `503`/`500` on a store
+/// or table-access failure. A table the caller's role may not read reads as a
+/// table with no load history — the same empty answer a table nobody has
+/// loaded gets — and its load history is never queried (GOV-16).
 pub async fn learning_status(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     headers: HeaderMap,
     Path(asset): Path<String>,
 ) -> ApiResult<ApiJson<Value>> {
-    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4
-    if let Some(reason) =
-        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await?
-    {
-        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
-    }
+    // GOV-16: the one GOV-15 gate — catalog tenant first, role table access
+    // second — before the asset is looked up.
+    let access =
+        crate::routes::quality::quality_table_access(&state, Some(&principal), &headers).await?;
     let key = table_key(&asset).ok_or_else(|| {
         ApiError::BadRequest(
             "Name the table as bronze.<table>, silver.<table> or serving.<table>.".to_owned(),
         )
     })?;
-    let summary = quality::load_summary(pool(&state)?, &key).await?;
+    // GOV-16: a table the role hides is answered as a table with no load
+    // history — the empty answer this endpoint gives a table that was never
+    // loaded — and no row of that table is read. "Not there" and "not yours"
+    // are one answer, so the response says nothing about what the deployment
+    // holds for the hidden table.
+    let summary = if crate::routes::quality::asset_readable(&access, Some(&key)) {
+        // `SEC-20` (plan ai-118): the learning status of a table is what the
+        // deployment holds about that table, so a table outside the caller's
+        // reach is not there for this caller — the reach Query Studio keeps
+        // (`crate::routes::query::resolve_reach` and
+        // `crate::routes::query::reachable_names`).
+        let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
+        let readable =
+            crate::routes::query::reachable_names(&state, reach, std::slice::from_ref(&key))
+                .await?;
+        if !readable.contains(&key) {
+            return Err(
+                ApiError::NotFound(crate::policy_engine::table_not_available_message(&key)).into(),
+            );
+        }
+        quality::load_summary(pool(&state)?, &key).await?
+    } else {
+        None
+    };
     let now = OffsetDateTime::now_utc();
     let (state_now, first, last, loads) = match &summary {
         Some(s) => (

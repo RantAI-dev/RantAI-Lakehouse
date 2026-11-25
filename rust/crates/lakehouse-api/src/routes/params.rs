@@ -17,7 +17,10 @@
 //! - [`load`] is the one place a read turns a request's `params` into values.
 //!   A store that cannot be read does not fail the read: the values are empty,
 //!   so a chart that names a parameter shows its own plain sentence and every
-//!   other tile is untouched (fail closed on data, degrade per tile).
+//!   other tile is untouched (fail closed on data, degrade per tile). A value
+//!   that does not fit is a 400 for every read but the dashboard page's own
+//!   ([`OnRefusal::Fail`]); that one keeps the value in force and lists the
+//!   refusal ([`OnRefusal::Report`], `BI-52`).
 
 use axum::Extension;
 use axum::body::Bytes;
@@ -45,38 +48,78 @@ pub(crate) struct Loaded {
     pub defs: Vec<ParamDef>,
     /// The value each has for this read.
     pub values: ParamValues,
+    /// The parameters whose requested value did not fit (`BI-52`, plan D26):
+    /// empty unless the read was loaded with [`OnRefusal::Report`].
+    pub refused: Vec<params::RefusedParam>,
     /// The classified message of a failed read of the definitions, for the
     /// payload's `storeError`.
     pub store_error: Option<String>,
 }
 
+/// What a read does with a parameter value that does not fit its definition
+/// (`BI-52`, plan D23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnRefusal {
+    /// Refuse the whole read with a 400: a document that silently used another
+    /// value would be a different document, and a read that decides something
+    /// from the numbers must not decide from a value nobody asked for.
+    Fail,
+    /// Keep the read: the parameter takes the value it has without the
+    /// request, and the refusal is listed in [`Loaded::refused`] so the page
+    /// can say why and draw the rest.
+    Report,
+}
+
 /// The parameter values of one read: the request's `params` (JSON text),
 /// else the board's saved values, else each default.
 ///
+/// `on_refusal` decides what a value that does not fit does: a 400 for the
+/// whole read, or the value in force plus an entry in [`Loaded::refused`]
+/// (`BI-52`, QA `LH-BI-11-05`, plan D23–D26). A name no definition has is a
+/// 400 for a strict read and ignored for a reported one (plan D25).
+///
 /// # Errors
 ///
-/// 400 with a fixed sentence when `request` is not a JSON object, names a
-/// parameter that does not exist, or carries a value that does not fit its
-/// definition (the sentence names the parameter, never repeats the value).
+/// 400 with a fixed sentence when `request` is not a JSON object, and when a
+/// value does not fit its definition, or a name no definition has, while
+/// `on_refusal` is [`OnRefusal::Fail`] (the sentence names the parameter,
+/// never repeats the value).
 pub(crate) async fn load(
     ch: &ChClient,
     saved: &[BoardParam],
     request: Option<&str>,
+    on_refusal: OnRefusal,
 ) -> Result<Loaded, ApiError> {
     let sent = params::parse_request(request).map_err(ApiError::BadRequest)?;
     match params::list_params(ch).await {
-        Ok(defs) => {
-            let values =
-                ParamValues::resolve(&defs, saved, sent.as_ref()).map_err(ApiError::BadRequest)?;
-            Ok(Loaded {
-                defs,
-                values,
-                store_error: None,
-            })
-        }
+        Ok(defs) => match on_refusal {
+            OnRefusal::Fail => {
+                let values = ParamValues::resolve(&defs, saved, sent.as_ref())
+                    .map_err(ApiError::BadRequest)?;
+                Ok(Loaded {
+                    defs,
+                    values,
+                    refused: Vec::new(),
+                    store_error: None,
+                })
+            }
+            OnRefusal::Report => {
+                let outcome = ParamValues::resolve_each(&defs, saved, sent.as_ref());
+                // A name no definition has (a link kept after a parameter was
+                // deleted) is ignored here, as decision D25 says: the address
+                // is not a request the person meant to make a claim with.
+                Ok(Loaded {
+                    defs,
+                    values: outcome.values,
+                    refused: outcome.refused,
+                    store_error: None,
+                })
+            }
+        },
         Err(err) => Ok(Loaded {
             defs: Vec::new(),
             values: ParamValues::default(),
+            refused: Vec::new(),
             store_error: Some(
                 upstream_error::report_ch(&upstream_error::DATABASE, &err).to_string(),
             ),

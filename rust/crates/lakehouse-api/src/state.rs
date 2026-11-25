@@ -3,13 +3,12 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use lakehouse_auth::openfga::LakekeeperAdminClient;
 use lakehouse_auth::throttle::ThrottlePolicy;
 use lakehouse_auth::{
-    LocalPasswordAuthenticator, OidcAuthenticator, OidcConfig, Secret, ServiceTokenAuthenticator,
-    SessionAuthenticator,
+    LocalPasswordAuthenticator, Secret, ServiceTokenAuthenticator, SessionAuthenticator,
 };
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::secret::{
@@ -18,10 +17,8 @@ use lakehouse_core::secret::{
 };
 use lakehouse_dagster::DgClient;
 use lakehouse_iceberg::IcebergClient;
-use lakehouse_llm::LlmClient;
 use lakehouse_store::PgPool;
 use lakehouse_trino::{TrinoClient, TrinoConfig};
-use time::Duration;
 use tokio::sync::RwLock;
 
 use crate::bronze_stats_cache::BronzeStatsCache;
@@ -29,6 +26,7 @@ use crate::catalog_search_cache::SearchSnapshotCache;
 use crate::config::Config;
 use crate::connector_secret_store::{ConnectorSecretStore, SharedKeyring};
 use crate::gold_lock::MartLocks;
+use crate::routes::ai::data_map::DataMapCache;
 use crate::secret_crypto::{CryptoError, Keyring, MANAGED_FILE_PREFIX};
 use crate::secret_manager::{ManagerResolver, SecretManagerKind, SecretManagerSettings};
 use crate::upload_convert::ConversionRunner;
@@ -55,13 +53,39 @@ pub struct AuthState {
     pub session: Arc<SessionAuthenticator>,
     /// Verifies the opaque `Authorization: Bearer` service token.
     pub service: Arc<ServiceTokenAuthenticator>,
-    /// Verifies a `JWT` `Authorization: Bearer` id token against a
-    /// configured `OIDC` provider's `JWKS` (Task 3.5). `None` when
-    /// `OIDC_ISSUER`/`OIDC_CLIENT_ID` are not both set — see
-    /// [`AppState::new`]. When `None`, `crate::auth`'s bearer dispatch
-    /// simply never tries the `OIDC` path, which is exactly what "OIDC
-    /// unconfigured behaves like today" requires.
-    pub oidc: Option<Arc<OidcAuthenticator>>,
+}
+
+/// What a process has learned about its application database since it
+/// started (`OPS-4`, `GOV-1`).
+///
+/// One struct behind one `Arc`, not one field per fact: a new field in
+/// [`AppState`] grows every future that holds a copy of the state, and
+/// `routes::ai::chat` and its streaming twin already sit at clippy's
+/// 16384-byte limit for a future (`large_futures`, in the unit-test build,
+/// whose [`AppState`] also carries the two test seams), so one more pointer
+/// there is a lint failure in a file the assistant's team owns.
+#[derive(Debug, Default)]
+pub struct DatabaseStatus {
+    /// Whether the start-up step has confirmed the application database is
+    /// usable at this build's schema version (`OPS-4`, `main::
+    /// bring_database_up`). Starts `false`: nothing has proven the schema
+    /// yet, so `GET /health` reports the database as unavailable until
+    /// migrations applied or a later retry succeeded (fail closed,
+    /// AGENTS.md principle 3).
+    ///
+    /// Not a live probe: this is the last answer the start-up step or its
+    /// retry loop gave, so a database lost AFTER boot keeps answering
+    /// `ok` here until the process restarts. A per-request probe would
+    /// have to be a bounded `SELECT 1` on its own short timeout — `GET
+    /// /health` is polled by the ops gates, and a probe that waits on a
+    /// dead database's default 30 s acquire timeout would stall them.
+    /// `docs/OPERATIONS.md` records that limit.
+    pub ready: AtomicBool,
+    /// How many audit rows could not be written since this process started
+    /// (`GOV-1`, feature page Decision 4): the change they record stood, the
+    /// row did not. Counted by [`crate::audit_coverage::record_best_effort`];
+    /// it starts at zero on every start and says nothing about earlier runs.
+    pub audit_write_failures: AtomicU64,
 }
 
 /// State shared across all route handlers.
@@ -81,7 +105,17 @@ pub struct AppState {
     /// `Dagster` GraphQL client.
     pub dagster: Arc<DgClient>,
     /// `OpenAI`-compatible chat-completions client.
-    pub llm: Arc<LlmClient>,
+    ///
+    /// Swappable (`ADM-9`): the resolver in `crate::runtime_settings`
+    /// rebuilds it when the effective provider settings change, so a save in
+    /// the console takes effect on the next message with no restart. A
+    /// `RwLock` over an `Arc`, so a reader takes the client out and never
+    /// holds the lock across a model call.
+    pub llm: Arc<RwLock<Arc<crate::runtime_settings::AssistantClient>>>,
+    /// Swappable `OIDC` authenticator (`ADM-12` plan D4): a save in the console
+    /// takes effect on the next sign-in with no restart. Cached beside its
+    /// effective settings and cleared on save.
+    pub oidc: Arc<RwLock<Option<crate::runtime_settings::SwappableOidc>>>,
     /// Phase 2 OLTP pool (`lakehouse-store`).
     ///
     /// `Option`, not a bare `Arc<PgPool>`: `lakehouse_store::connect_lazy`
@@ -94,21 +128,12 @@ pub struct AppState {
     /// see `routes::identity::pool`, the first (and so far only) reader of
     /// this field.
     pub pg: Option<Arc<PgPool>>,
-    /// Whether the start-up step has confirmed the application database is
-    /// usable at this build's schema version (`OPS-4`, `main::
-    /// bring_database_up`). Starts `false`: nothing has proven the schema
-    /// yet, so `GET /health` reports the database as unavailable until
-    /// migrations applied or a later retry succeeded (fail closed,
-    /// AGENTS.md principle 3).
-    ///
-    /// Not a live probe: this is the last answer the start-up step or its
-    /// retry loop gave, so a database lost AFTER boot keeps answering
-    /// `ok` here until the process restarts. A per-request probe would
-    /// have to be a bounded `SELECT 1` on its own short timeout — `GET
-    /// /health` is polled by the ops gates, and a probe that waits on a
-    /// dead database's default 30 s acquire timeout would stall them.
-    /// `docs/OPERATIONS.md` records that limit.
-    pub db_ready: Arc<AtomicBool>,
+    /// What this process knows about its application database since it
+    /// started: whether the start-up step confirmed the schema
+    /// ([`DatabaseStatus::ready`]) and how many audit rows could not be
+    /// written ([`DatabaseStatus::audit_write_failures`]). Shared across
+    /// clones.
+    pub db_status: Arc<DatabaseStatus>,
     /// Resolves a connector's `secretRef` to an actual credential value —
     /// [`crate::connector_probe`]'s only source of one, per ADR 0002 (see
     /// its "Restricting connector secretRefs" addendum). **Deliberately
@@ -167,6 +192,11 @@ pub struct AppState {
     /// populated, like [`Self::bronze_stats_cache`]; holds nothing per
     /// caller.
     pub catalog_search_cache: Arc<SearchSnapshotCache>,
+    /// The copilot's DATA MAP cache (OPS-36). Held here, not in a process-wide
+    /// `static`, so each app — and each deployment instance — builds and
+    /// reuses its own map: a chat in one test app can no longer read the map
+    /// another app's `ClickHouse` mock built and change the system prompt.
+    pub(crate) data_map_cache: Arc<DataMapCache>,
     /// `Trino` `/v1/statement` client for `routes::query::run`'s
     /// `engine: "trino"` path (WS2 §4). Always present, like
     /// [`Self::clickhouse`], never `Option` — the `trino` compose profile
@@ -200,12 +230,12 @@ pub struct AppState {
     pub pipeline_source_allowlist: Arc<crate::pipeline_source::SourceAllowlist>,
     /// Ring buffer of the last [`POLICY_DECISION_LATENCY_CAP`]
     /// `sql_rewrite::enforce` prefetch+rewrite durations (WS7 item C2) —
-    /// `routes::query::run` records one sample per call, refused or not;
-    /// `GET /api/ops/observability`'s `policyDecisionP95Ms` computes a
-    /// real p95 from it instead of the literal `null` WS1's honesty pass
-    /// left in place. Always populated (same pattern as
-    /// [`Self::gold_export_locks`]/[`Self::bronze_stats_cache`]): needs no
-    /// external dependency, just an in-process buffer.
+    /// `routes::query::run` records one sample per call, refused or not.
+    /// `GET /api/ops/observability` used to compute a real p95 from it;
+    /// WEB-4 retired that view (no caller), so the buffer is written but
+    /// read only by its own tests until another consumer needs it. It is
+    /// kept, not dropped, because it costs no external dependency (same
+    /// pattern as [`Self::gold_export_locks`]/[`Self::bronze_stats_cache`]).
     pub policy_decision_latencies: PolicyDecisionLatencies,
     /// Client for Lakekeeper's `management/v1/*` API, used by `POST
     /// /api/identity/tenants` to provision a tenant's
@@ -226,10 +256,6 @@ pub struct AppState {
     /// field carried while nothing read it yet is removed now that a
     /// reader exists.
     pub lakekeeper_admin: Option<Arc<LakekeeperAdminClient>>,
-    /// Login-throttle policy resolved from config — shared (via
-    /// [`Arc`]) across every clone of [`AppState`] so the login
-    /// handler reads it without copying.
-    pub throttle_policy: Arc<ThrottlePolicy>,
     /// Counts the files being received by `POST /api/uploads` (`SEC-17`),
     /// per user and in total. Shared across clones; always populated.
     pub upload_receive: ReceiveLimiter,
@@ -243,6 +269,10 @@ pub struct AppState {
     /// feature decision 5); a third request waits for a slot. Shared across
     /// clones.
     pub pdf_slots: Arc<tokio::sync::Semaphore>,
+    /// At most [`EXPORT_AT_ONCE`] dashboard downloads run at once per process
+    /// (`BI-34`, plan D3); a further one is refused with a 429, it does not
+    /// wait. Scheduled reports do not take these slots. Shared across clones.
+    pub export_slots: Arc<tokio::sync::Semaphore>,
     /// At most `TILE_CONCURRENCY_MAX` (default 24) dashboard tiles are
     /// computed at once per process, across every request (`BI-4` part A,
     /// plan D2); a request also caps itself at 6. Shared across clones.
@@ -254,6 +284,25 @@ pub struct AppState {
     /// The 30-second memo of the query limits (`BI-5` plan D2), so a
     /// dashboard does not read Postgres per tile. Shared across clones.
     pub query_limits: crate::query_limits::QueryLimitsMemo,
+    /// The five 30-second memos of the console's saved settings rows —
+    /// email (`ADM-7` plan D3), sign-in limits (`ADM-8` plan D3), the
+    /// workspace name and pictures (`ADM-2` decision 6), the assistant's
+    /// provider (`ADM-9` plan D3) and SSO (`ADM-12` plan D1/D3) — so a
+    /// send, a sign-in, a branding visit, a message or a check does not
+    /// read Postgres each time. The matching `PUT` clears its row's cache
+    /// on this process; another process sees the change within the TTL.
+    /// Shared across clones.
+    ///
+    /// One field, not one per row: a new field in [`AppState`] grows every
+    /// future that holds a copy of the state, and `routes/ai/mod.rs`'s chat
+    /// handler and its streaming twin already sit at clippy's 16384-byte
+    /// limit for a future (`clippy::large_future`), so one more pointer
+    /// there is a lint failure in a file the assistant's team owns. See
+    /// [`crate::runtime_settings::SettingsCaches`].
+    pub settings_caches: Arc<crate::runtime_settings::SettingsCaches>,
+    /// How often each caller may ask for a test email (`ADM-7` plan D10).
+    /// Shared across clones.
+    pub email_test_limiter: Arc<crate::runtime_settings::TestEmailLimiter>,
     /// Test seam for the alert webhook sender (merge of `SEC-10` into the
     /// `SRC-17` delivery tests): those tests deliver to a `wiremock`
     /// listener on loopback, which the real address policy refuses by
@@ -261,11 +310,28 @@ pub struct AppState {
     /// so a service build has no way to swap the policy.
     #[cfg(test)]
     pub webhook_sender_override: Option<lakehouse_notify::WebhookSender>,
+    /// Test seam for the console-set SSO connection's HTTP client
+    /// (`ADM-12` review round 1, B1): a sign-in test has to reach a mock
+    /// provider at an `https://` address, and nothing in a deployment can
+    /// tell `reqwest` to trust a certificate minted for one test (the
+    /// `rustls` client trusts `webpki` roots only). The test supplies a
+    /// client that trusts its own CA; the `https://` and `resolve_checked`
+    /// address checks still run on every URL, and the pins are the only
+    /// thing this replaces. Compiled only for this crate's tests, so a
+    /// service build has no way to set it.
+    #[cfg(test)]
+    pub sso_http_override: Option<reqwest::Client>,
 }
 
 /// PDFs made at once per API process (`BI-1` D5). Chromium is heavy, and the
 /// Gotenberg container has 1 GiB; a third request waits its turn.
 pub const PDF_AT_ONCE: usize = 2;
+
+/// Dashboard downloads at once per API process (`BI-34`, plan D3): the same
+/// number as the PDF's, because a download holds a statement on the engine
+/// ([`crate::export::EXPORT_MEMORY_BYTES`] each) and a file in the temporary
+/// directory ([`crate::export::EXPORT_BYTE_CAP`] at most) for as long as it runs.
+pub const EXPORT_AT_ONCE: usize = 2;
 
 /// Build the admin-scoped [`LakekeeperAdminClient`] from the token file at
 /// `token_path`, or `None` when this deployment has no usable admin token.
@@ -309,11 +375,12 @@ const POLICY_DECISION_LATENCY_CAP: usize = 1000;
 
 /// Thread-safe ring buffer of policy-decision durations, shared (via
 /// [`Arc`]) across every clone of [`AppState`] so every request records
-/// into, and every `/api/ops/observability` read sees, the SAME buffer.
+/// into the SAME buffer.
 ///
 /// A plain `Mutex<VecDeque<Duration>>`, not a lock-free structure: this is
-/// written once per `routes::query::run` call and read at most once per
-/// `/api/ops/observability` request — nowhere near a contention hot path
+/// written once per `routes::query::run` call. WEB-4 removed the
+/// `/api/ops/observability` reader, so there is no request-time read today
+/// (only the type's own unit tests) — nowhere near a contention hot path
 /// (WS7 item C2 Step 2's own "implementer's choice, documented").
 #[derive(Clone, Default)]
 pub struct PolicyDecisionLatencies(
@@ -629,40 +696,10 @@ pub(crate) fn connector_allowed_patterns(manager: Option<SecretManagerKind>) -> 
 
 /// Translate [`Config`]'s flat `oidc_*` env-derived fields into
 /// [`lakehouse_auth::OidcConfig`], or `None` if `OIDC` is not configured.
-///
-/// `OIDC` is considered configured only when BOTH `OIDC_ISSUER` and
-/// `OIDC_CLIENT_ID` are set — see [`Config::oidc_issuer`]'s doc comment.
-/// This is the one place that decision is made; every other piece of this
-/// module and `crate::auth` just reacts to [`AuthState::oidc`] being
-/// present or absent.
-///
-/// `SEC-38`: an operator-set `OIDC_JWKS_URL` is passed through unchanged
-/// and no discovery request is ever made; when it is unset the key set's
-/// address comes from the provider's discovery document
-/// (`{issuer}/.well-known/openid-configuration`), read lazily on the first
-/// key lookup, so an unreachable provider never stops the API from
-/// starting.
-fn oidc_config(config: &Config) -> Option<OidcConfig> {
-    let issuer = config.oidc_issuer.as_ref()?;
-    let client_id = config.oidc_client_id.as_ref()?;
-    let mut oidc = match config.oidc_jwks_url.clone() {
-        Some(jwks_url) => OidcConfig::new(
-            issuer.clone(),
-            client_id.clone(),
-            config.oidc_provider_name.clone(),
-            jwks_url,
-        ),
-        None => OidcConfig::with_discovery(
-            issuer.clone(),
-            client_id.clone(),
-            config.oidc_provider_name.clone(),
-        ),
-    };
-    oidc.jit_provisioning = config.oidc_jit_provisioning;
-    oidc.role_map.clone_from(&config.oidc_role_map);
-    oidc.groups_claim.clone_from(&config.oidc_groups_claim);
-    oidc.clock_skew_seconds = config.oidc_clock_skew_seconds;
-    Some(oidc)
+#[cfg(test)]
+pub(crate) fn oidc_config(config: &Config) -> Option<lakehouse_auth::OidcConfig> {
+    let sso = crate::runtime_settings::resolve_sso(config, None, None);
+    sso.is_configured().then(|| sso.to_oidc_config())
 }
 
 /// The Phase 2 Postgres pool, or `None` when there is nothing to connect to.
@@ -686,19 +723,21 @@ fn postgres_pool(config: &Config) -> Option<Arc<PgPool>> {
     }
 }
 
-/// The login-throttle policy [`AppState::new`] stores (`SEC-5`): the three
-/// configured numbers, converted to the shape the login handler reads.
-/// A free function only so the state constructor stays inside clippy's
-/// line budget as the state grows; behaviour is unchanged.
-fn login_throttle_policy(config: &Config) -> ThrottlePolicy {
-    ThrottlePolicy {
-        max_failures: config.login_max_failures,
-        window: Duration::seconds(i64::from(config.login_failure_window_secs)),
-        lockout: Duration::seconds(i64::from(config.login_lockout_secs)),
-    }
-}
-
 impl AppState {
+    /// The login-throttle policy in effect (`SEC-5`): the environment's
+    /// numbers, else the console's saved ones, else the code defaults
+    /// (`ADM-8` plan D12).
+    ///
+    /// A method, not a field: the numbers may now come from the console,
+    /// and a save there must reach the next sign-in without a restart. The
+    /// resolver reads the saved row through its 30-second cache, so this
+    /// costs a lock, not a query, on the common path.
+    pub async fn throttle_policy(&self) -> ThrottlePolicy {
+        crate::runtime_settings::sign_in(self)
+            .await
+            .throttle_policy()
+    }
+
     /// A state with no database at all: for the unit tests that run a
     /// statement against a mock `ClickHouse` and ask the unrestricted
     /// tenant gate (`SEC-50` slice 2 T1).
@@ -725,9 +764,9 @@ impl AppState {
     #[allow(
         clippy::too_many_lines,
         reason = "one struct literal naming every shared handle, a line per \
-                  field; `tile_slots` (BI-4 part A), `result_cache` (part B), `query_limits` (BI-5) and \
-                  `readiness_cache` (REL-2 S1 review SHOULD-FIX 1) are \
-                  the lines that took it from 100 to 103"
+                  field; `tile_slots` (BI-4 part A), `result_cache` (part B), `query_limits` (BI-5), \
+                  `readiness_cache` (REL-2 S1 review SHOULD-FIX 1) and `data_map_cache` (OPS-36) \
+                  are the later lines that grew it past 100"
     )]
     pub fn new(config: Config) -> Self {
         let clickhouse = Arc::new(ChClient::new(
@@ -740,11 +779,6 @@ impl AppState {
             config.dagster_repo.clone(),
             config.dagster_location.clone(),
         );
-        let llm = LlmClient::new(
-            config.llm_url.clone(),
-            config.llm_model.clone(),
-            config.llm_key.clone(),
-        );
         // `connect_lazy` performs no I/O, so this never blocks on, or fails
         // because of, Postgres being down — see the field doc comment and
         // `lakehouse_store::connect_lazy`'s; a malformed URL is logged and
@@ -755,8 +789,6 @@ impl AppState {
             local: Arc::new(LocalPasswordAuthenticator::new((**pool).clone())),
             session: Arc::new(SessionAuthenticator::new((**pool).clone())),
             service: Arc::new(ServiceTokenAuthenticator::new((**pool).clone())),
-            oidc: oidc_config(&config)
-                .map(|oidc_config| Arc::new(OidcAuthenticator::new(oidc_config, (**pool).clone()))),
         });
         // `TrinoConfig::new` supplies the documented `max_rows`/`paging_cap`
         // defaults; only `base_url` and `max_rows` are overridden from
@@ -811,7 +843,26 @@ impl AppState {
         let secret_manager = config.secret_manager.clone();
         warn_if_no_reference_prefixes(&secret_manager);
         let secrets_keyring = connector_secrets_keyring(&config);
-        let throttle_policy = login_throttle_policy(&config);
+        // `ADM-9`: the secret store is built before the assistant client,
+        // because the store's keyring opens the console's saved key.
+        let connector_secret_store = Arc::new(ConnectorSecretStore::new(
+            secrets_dir.clone(),
+            secrets_keyring.clone(),
+        ));
+        // The assistant client is swappable, and the resolver rebuilds it
+        // when the effective provider settings change. The client this
+        // process starts with is built from the environment's values (there
+        // is no saved row at start-up).
+        let llm = crate::runtime_settings::initial_assistant_client(
+            &config,
+            connector_secret_store.keyring().ok(),
+        );
+        // `ADM-12` D4/D10: the SSO runtime is built on the first request
+        // that needs it, by `runtime_settings::sso_runtime`, because the
+        // checks it makes (the issuer's address, the provider's discovery
+        // document) need the resolved config and the pool this constructor
+        // is still assembling.
+        let initial_oidc: Option<crate::runtime_settings::SwappableOidc> = None;
         let upload_receive = ReceiveLimiter::new(
             config.upload_max_concurrent_per_user,
             config.upload_max_concurrent,
@@ -836,34 +887,33 @@ impl AppState {
             config: Arc::new(config),
             clickhouse,
             dagster: Arc::new(dagster),
-            llm: Arc::new(llm),
+            llm: Arc::new(RwLock::new(llm)),
+            oidc: Arc::new(RwLock::new(initial_oidc)),
             pg,
-            db_ready: Arc::new(AtomicBool::new(false)),
+            db_status: Arc::new(DatabaseStatus::default()),
             connector_secret_resolver: connector_secret_resolver(
                 EnvSecretResolver::new(),
                 &secrets_dir,
-                secrets_keyring.clone(),
+                secrets_keyring,
                 &secret_manager,
             ),
-            connector_secret_store: Arc::new(ConnectorSecretStore::new(
-                secrets_dir,
-                secrets_keyring,
-            )),
+            connector_secret_store,
             auth,
             gold_export_locks: MartLocks::default(),
             iceberg: Arc::new(RwLock::new(None)),
             bronze_stats_cache: Arc::new(BronzeStatsCache::new()),
             catalog_search_cache: Arc::new(SearchSnapshotCache::new()),
+            data_map_cache: Arc::new(DataMapCache::default()),
             trino: Arc::new(trino),
             health_cache: Arc::new(tokio::sync::Mutex::new(None)),
             readiness_cache: Arc::new(tokio::sync::Mutex::new(None)),
             pipeline_source_allowlist: Arc::new(pipeline_source_allowlist),
             policy_decision_latencies: PolicyDecisionLatencies::default(),
             lakekeeper_admin,
-            throttle_policy: Arc::new(throttle_policy),
             upload_receive,
             conversion_runner,
             pdf_slots: Arc::new(tokio::sync::Semaphore::new(PDF_AT_ONCE)),
+            export_slots: Arc::new(tokio::sync::Semaphore::new(EXPORT_AT_ONCE)),
             tile_slots: Arc::new(crate::tile_pool::slots_from_env()),
             result_cache: Arc::new(crate::result_cache::ResultCache::new(
                 crate::result_cache::max_mb_from(
@@ -871,8 +921,12 @@ impl AppState {
                 ),
             )),
             query_limits: crate::query_limits::QueryLimitsMemo::default(),
+            settings_caches: crate::runtime_settings::settings_caches(),
+            email_test_limiter: Arc::new(crate::runtime_settings::TestEmailLimiter::new()),
             #[cfg(test)]
             webhook_sender_override: None,
+            #[cfg(test)]
+            sso_http_override: None,
         }
     }
 
@@ -888,21 +942,51 @@ impl AppState {
         crate::webhook_guard::sender(&self.config)
     }
 
+    /// The HTTP client a console-set SSO connection dials through
+    /// (`ADM-12` review round 1, B1): the test override when one is set, else
+    /// `None`, and the runtime builds its own pinned client. Compiled out
+    /// of every non-test build with the field it reads.
+    #[must_use]
+    pub fn sso_http_client(&self) -> Option<reqwest::Client> {
+        #[cfg(test)]
+        if let Some(client) = &self.sso_http_override {
+            return Some(client.clone());
+        }
+        #[cfg(not(test))]
+        let _ = self;
+        None
+    }
+
+    /// The audit rows that could not be written since this process started
+    /// (`GOV-1`, see [`DatabaseStatus::audit_write_failures`]).
+    #[must_use]
+    pub fn audit_write_failure_count(&self) -> u64 {
+        self.db_status.audit_write_failures.load(Ordering::Relaxed)
+    }
+
+    /// Counts one audit row that could not be written
+    /// ([`crate::audit_coverage::record_best_effort`] is the caller).
+    pub(crate) fn count_audit_write_failure(&self) {
+        self.db_status
+            .audit_write_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Whether `GET /health` should report the application database as
     /// usable (`OPS-4`): no pool is never ready, and a pool is ready only
     /// after [`Self::mark_database_ready`].
     #[must_use]
     pub fn database_ready(&self) -> bool {
-        self.pg.is_some() && self.db_ready.load(Ordering::Relaxed)
+        self.pg.is_some() && self.db_status.ready.load(Ordering::Relaxed)
     }
 
     /// Records that the start-up step confirmed the application database's
     /// schema is at this build's version (`OPS-4`). Set once, from `main::
     /// bring_database_up` or its retry loop; nothing clears it, since the
     /// only way to lose the database after that is a per-request failure
-    /// this flag deliberately does not track (see [`Self::db_ready`]).
+    /// this flag deliberately does not track (see [`DatabaseStatus::ready`]).
     pub fn mark_database_ready(&self) {
-        self.db_ready.store(true, Ordering::Relaxed);
+        self.db_status.ready.store(true, Ordering::Relaxed);
     }
 }
 

@@ -26,6 +26,13 @@ describe("recordsQuery", () => {
     expect(q.has("value")).toBe(false)
   })
 
+  // QA LH-BI-13-04 (BI-55, D9): the question's name is display only.
+  it("the question's name is shown, never sent", () => {
+    const q = recordsQuery({ ...base, question: "Rooms" }, 0)
+    expect(q.has("question")).toBe(false)
+    expect(q.toString()).not.toContain("Rooms")
+  })
+
   it("keeps an empty value, which is a real category", () => {
     expect(recordsQuery({ ...base, value: "" }, 0).get("value")).toBe("")
   })

@@ -301,34 +301,148 @@ pub async fn must_change_password(pool: &PgPool, app_user_id: Uuid) -> Result<bo
     row.map(|(flag,)| flag).ok_or(AuthError::NotFound)
 }
 
-/// Verify an `identifier`/`password` pair and, on success, load the
-/// caller's [`Principal`]. See the module doc comment for the
-/// non-enumeration guarantee this makes.
+// ADM-11 review 1 S6: fixed doc comments (removed orphan doc above MIN_PASSWORD_LENGTH).
+/// Minimum length for a user password (ADM-11 D4).
+pub const MIN_PASSWORD_LENGTH: usize = 8;
+/// Maximum length for a user password (ADM-11 D4).
+pub const MAX_PASSWORD_LENGTH: usize = 1024;
+
+/// Errors produced by password rule validation (ADM-11 D4).
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PasswordRuleError {
+    /// Password has fewer than [`MIN_PASSWORD_LENGTH`] characters.
+    #[error("Password must be at least 8 characters")]
+    TooShort,
+    /// Password has more than [`MAX_PASSWORD_LENGTH`] characters.
+    #[error("Password must be at most 1024 characters")]
+    TooLong,
+    /// Password is equal to the username (case-insensitive).
+    #[error("Password cannot be equal to the username")]
+    EqualsUsername,
+    /// Password is equal to the email address (case-insensitive).
+    #[error("Password cannot be equal to the email address")]
+    EqualsEmail,
+}
+
+/// Check `password` against the system password rules (ADM-11 D4).
+///
+/// Rules:
+/// - At least 8 characters (counted as Unicode scalar values, `chars()`).
+/// - At most 1024 characters.
+/// - Not equal (case-insensitive) to `username` (if provided).
+/// - Not equal (case-insensitive) to `email` (if provided).
+///
+/// # Errors
+///
+/// Returns [`PasswordRuleError`] naming the broken rule.
+pub fn check_rules(
+    password: &str,
+    username: Option<&str>,
+    email: Option<&str>,
+) -> Result<(), PasswordRuleError> {
+    let char_count = password.chars().count();
+    if char_count < MIN_PASSWORD_LENGTH {
+        return Err(PasswordRuleError::TooShort);
+    }
+    if char_count > MAX_PASSWORD_LENGTH {
+        return Err(PasswordRuleError::TooLong);
+    }
+    if let Some(u) = username {
+        let u_trimmed = u.trim();
+        if !u_trimmed.is_empty() && password.eq_ignore_ascii_case(u_trimmed) {
+            return Err(PasswordRuleError::EqualsUsername);
+        }
+    }
+    if let Some(e) = email {
+        let e_trimmed = e.trim();
+        if !e_trimmed.is_empty() && password.eq_ignore_ascii_case(e_trimmed) {
+            return Err(PasswordRuleError::EqualsEmail);
+        }
+    }
+    Ok(())
+}
+
+/// Verify `identifier` (username or email, case-insensitive) and `password`
+/// against `auth_identity`.
+///
+/// ADM-11 D6: sign-in accepts either identifier in any letter case.
 ///
 /// # Errors
 ///
 /// Returns [`AuthError::InvalidCredentials`] if `identifier` names no user,
-/// the user has no `local` identity, or `password` does not match — these
-/// three cases are indistinguishable to the caller by design. Returns
-/// [`AuthError::Database`] on any other failure.
+/// the user has no `local` identity, matches multiple users, or `password`
+/// does not match — these cases are indistinguishable to the caller by design.
+/// Returns [`AuthError::Database`] on any other failure.
 pub async fn verify(
     pool: &PgPool,
     identifier: &str,
     password: &Secret,
 ) -> Result<Principal, AuthError> {
-    let row: Option<(Uuid, String, bool)> = sqlx::query_as(
+    let rows: Vec<(Uuid, String, bool)> = sqlx::query_as(
         "SELECT ai.app_user_id, ai.password_hash, ai.must_change_password FROM auth_identity ai \
          JOIN app_user u ON u.id = ai.app_user_id \
-         WHERE u.email = $1 AND ai.provider = 'local'",
+         WHERE (lower(u.username) = lower($1) OR lower(u.email) = lower($1)) \
+           AND ai.provider = 'local'",
     )
     .bind(identifier)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.len() != 1 {
+        // D6: with 0 rows, check against DUMMY_HASH as today. With 2 or more
+        // (ambiguous identifier), also check against DUMMY_HASH (same timing) and refuse.
+        let _ = verify_hash(password, DUMMY_HASH);
+        if rows.len() >= 2 {
+            let user_ids: Vec<Uuid> = rows.iter().map(|(id, _, _)| *id).collect();
+            tracing::warn!(
+                ?user_ids,
+                "ambiguous login identifier matched multiple users"
+            );
+        }
+        return Err(AuthError::InvalidCredentials);
+    }
+
+    let (app_user_id, stored_hash, must_change_password) = &rows[0];
+
+    if !verify_hash(password, stored_hash) {
+        return Err(AuthError::InvalidCredentials);
+    }
+
+    repository::load_principal_for_user(
+        pool,
+        *app_user_id,
+        "local".to_owned(),
+        *must_change_password,
+    )
+    .await
+    .map_err(|_| AuthError::InvalidCredentials)
+}
+
+/// Verify `password` for `user_id` without an identifier lookup.
+///
+/// ADM-11 D6: used by `change_password` so an account changing its password
+/// does not need to verify by email or username, which would fail for an
+/// account with no email or require looking up its username first.
+///
+/// # Errors
+///
+/// Returns [`AuthError::InvalidCredentials`] if `user_id` has no `local`
+/// identity or `password` does not match, or [`AuthError::Database`] on
+/// failure.
+pub async fn verify_for_user(
+    pool: &PgPool,
+    user_id: Uuid,
+    password: &Secret,
+) -> Result<(), AuthError> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT password_hash FROM auth_identity \
+         WHERE app_user_id = $1 AND provider = 'local'",
+    )
+    .bind(user_id)
     .fetch_optional(pool)
     .await?;
 
-    let Some((app_user_id, stored_hash, must_change_password)) = row else {
-        // No such identity: verify against the dummy hash anyway, so this
-        // branch costs the same as a real verification, then fail exactly
-        // as a wrong password would.
+    let Some((stored_hash,)) = row else {
         let _ = verify_hash(password, DUMMY_HASH);
         return Err(AuthError::InvalidCredentials);
     };
@@ -337,9 +451,7 @@ pub async fn verify(
         return Err(AuthError::InvalidCredentials);
     }
 
-    repository::load_principal_for_user(pool, app_user_id, "local".to_owned(), must_change_password)
-        .await
-        .map_err(|_| AuthError::InvalidCredentials)
+    Ok(())
 }
 
 /// [`Authenticator`] for [`Credential::Password`].
@@ -501,8 +613,44 @@ mod tests {
         assert_ne!(first.expose(), second.expose());
     }
 
+    /// ADM-11 review 1 S6 / ADM-11 D4: `check_rules` verifies password length
+    /// and ensures password is not equal to username or email.
+    #[test]
+    fn password_rules_checks_length_and_equality() {
+        assert_eq!(
+            check_rules("short", Some("username"), Some("user@example.com")),
+            Err(PasswordRuleError::TooShort)
+        );
+        assert_eq!(
+            check_rules("1234567", Some("username"), Some("user@example.com")),
+            Err(PasswordRuleError::TooShort)
+        );
+        assert_eq!(
+            check_rules("12345678", Some("username"), Some("user@example.com")),
+            Ok(())
+        );
+        let long_pass = "a".repeat(1025);
+        assert_eq!(
+            check_rules(&long_pass, Some("username"), Some("user@example.com")),
+            Err(PasswordRuleError::TooLong)
+        );
+        assert_eq!(
+            check_rules("Username", Some("username"), Some("user@example.com")),
+            Err(PasswordRuleError::EqualsUsername)
+        );
+        assert_eq!(
+            check_rules(
+                "USER@EXAMPLE.COM",
+                Some("username"),
+                Some("user@example.com")
+            ),
+            Err(PasswordRuleError::EqualsEmail)
+        );
+        assert_eq!(check_rules("valid-pass-123", None, None), Ok(()));
+    }
+
     /// The generated password is a [`Secret`]: it cannot be logged by
-    /// accident, which is half of ADM-3 D1's "never logged" promise.
+    /// accident, which is half of ADM-3 D1's "never logged" promise (ADM-11 review 1 S6).
     #[test]
     fn a_generated_temporary_password_never_renders_itself() {
         let password = generate_temporary_password();

@@ -7,7 +7,7 @@ import type {
   DigitalEmployee,
 } from "../contracts/agents"
 import { apiFetch } from "../http"
-import { ServiceError } from "../errors"
+import { ServiceError, deniedFor } from "../errors"
 
 /**
  * AgentService is real: employee definitions, run history and the approval
@@ -15,18 +15,23 @@ import { ServiceError } from "../errors"
  * `lakehouse-store`, Task 2.9).
  *
  * `WEB-3` slice 1 (D1/D2/D3) removed the employees list, employee detail and
- * runs list — and with them the employee create/suspend/resume/revoke/run
- * actions and the two list reads. What remains is what live pages read: a
- * run's own trace (`/agents/runs/[runId]`, reachable from an approval, D3)
- * and the approvals inbox. The backend routes stay registered (D2): the
- * assistant's tools still use them, and `WEB-4` retires them.
+ * runs list pages — and with them the employee create/suspend/resume/revoke
+ * actions and the two list reads. `WEB-4` retired those API routes: the
+ * workflows routes, employee create/lifecycle and the runs LIST had no
+ * caller left. What stays is what live consumers still use: `getEmployee`
+ * names the employee on a run's trace, `getRun` reads that trace (from an
+ * approval), and the approvals inbox. Dagster also reads the employee
+ * list/detail and calls the headless-run route directly.
  */
 
-function errorFor(status: number, message: string): ServiceError {
+function errorFor(status: number, body: { error?: string } | null, fallback: string): ServiceError {
+  // WEB-12: a refusal goes through deniedFor (errors.ts).
+  const denied = deniedFor(status, body)
+  if (denied) return denied
+  const message = body?.error ?? fallback
   if (status === 404) return new ServiceError("not_found", message)
   if (status === 400 || status === 409 || status === 422)
     return new ServiceError("invalid_request", message)
-  if (status === 401 || status === 403) return new ServiceError("permission_denied", message)
   return new ServiceError("unavailable", message)
 }
 
@@ -34,7 +39,7 @@ async function request<T>(url: string, init: RequestInit, fallback: string): Pro
   const res = await apiFetch(url, init)
   const json = await res.json().catch(() => null)
   if (!res.ok) {
-    throw errorFor(res.status, json?.error ?? fallback)
+    throw errorFor(res.status, json, fallback)
   }
   return json as T
 }

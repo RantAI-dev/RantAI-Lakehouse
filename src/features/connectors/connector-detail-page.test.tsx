@@ -450,7 +450,10 @@ describe("ConnectorDetailPage", () => {
     expect(fact("Tenant")).toBe("Acme Co")
     expect(fact("Residency")).toBe("id-jakarta")
     expect(fact("Owner")).toBe("admin")
-    expect(fact("Credential")).toBe("Stored by lakehouse, encrypted")
+    // QA LH-SRC-6-39 (SRC-41 D15): the fact is "—" until the ingest spec has
+    // answered, so this one expectation waits for it (the expected text is
+    // unchanged; the page gained a loading state).
+    await waitFor(() => expect(fact("Credential")).toBe("Stored by lakehouse, encrypted"))
     expect(fact("Last test")).toBe("Never tested")
     // The type (the description) and the environment (a pill by the name) are
     // in the header already, so the row does not say them a second time.
@@ -725,4 +728,158 @@ describe("ConnectorDetailPage", () => {
     await waitFor(() => expect(pushed).toEqual(["/connectors"]))
     expect(count("DELETE /api/connectors/conn-a")).toBe(1)
   })
+})
+
+/**
+ * `SRC-4` slice 4 (S4-g): a change-capture connector has a Change capture tab with its state, the lag of each
+ * table and the lag limit; any other connector has none. A connection test of such a connector lists what the
+ * source must have switched on, the missing settings first (S4-f).
+ */
+describe("ConnectorDetailPage change capture", () => {
+  const CDC_SPEC = { ...SPEC, adapter: "cdc", ingestMode: "cdc", sourceObjects: [{ name: "public.orders", target: "orders" }] }
+  const CAPTURE = {
+    supported: true,
+    state: "running",
+    lag: {
+      tables: [
+        { table: "public.orders", status: "behind", seconds: 125 },
+        { table: "public.items", status: "up_to_date" },
+      ],
+      worst: { table: "public.orders", seconds: 125 },
+      limitMinutes: 15,
+      alertOpen: false,
+    },
+  }
+
+  it("has a Change capture tab for a change-capture connector, between Ingest and Schema changes", async () => {
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () => json(CDC_SPEC),
+      "GET /api/connectors/conn-a/change-capture": () => json(CAPTURE),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await settle()
+    await waitFor(() => expect(screen.getAllByRole("tab").map((t) => t.textContent ?? "")[2]).toBe("Change capture"))
+  })
+
+  it("has no Change capture tab for any other connector, and ?tab=capture lands on the Overview", async () => {
+    url.search = "tab=capture"
+    stubFetch()
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await settle()
+    expect(screen.queryByRole("tab", { name: "Change capture" })).toBeNull()
+    await waitFor(() => expect(selected("Overview")).toBe("true"))
+  })
+
+  it("opens the tab for ?tab=capture and words each table's lag", async () => {
+    url.search = "tab=capture"
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () => json(CDC_SPEC),
+      "GET /api/connectors/conn-a/change-capture": () => json(CAPTURE),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    expect(await screen.findByText("Behind by 2m")).toBeDefined()
+    expect(screen.getByText("Up to date")).toBeDefined()
+    expect(screen.getByText("Running")).toBeDefined()
+    expect((screen.getByLabelText("Alert after (minutes)") as HTMLInputElement).value).toBe("15")
+  })
+
+  it("lists the setup checks after a test, the missing one first with its command", async () => {
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () => json(CDC_SPEC),
+      "POST /api/connectors/conn-a/test": () =>
+        json({
+          ok: true,
+          supported: true,
+          latencyMs: 5,
+          message: "Connected via PostgreSQL",
+          testedAt: "2026-10-30T01:00:00.000Z",
+          setupChecks: [
+            { setting: "wal_level", status: "ok", message: "wal_level is logical." },
+            {
+              setting: "publication",
+              status: "missing",
+              message: "The publication named in the connector does not exist.",
+              command: 'CREATE PUBLICATION "orders_pub" FOR TABLE "public"."orders";',
+            },
+          ],
+        }),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    fireEvent.click(await screen.findByRole("button", { name: "Test connection" }))
+    const section = await screen.findByRole("region", { name: "Source setup" })
+    const settings = within(section).getAllByRole("listitem").map((li) => li.textContent ?? "")
+    expect(settings[0]).toContain("publication")
+    expect(settings[1]).toContain("wal_level")
+    expect(within(section).getByText(/CREATE PUBLICATION/)).toBeDefined()
+    expect(within(section).getByText(/1 setting missing/)).toBeDefined()
+  })
+
+  it("shows no setup list for a test that sent none", async () => {
+    stubFetch()
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    fireEvent.click(await screen.findByRole("button", { name: "Test connection" }))
+    await screen.findByText("Connection test passed")
+    expect(screen.queryByRole("region", { name: "Source setup" })).toBeNull()
+  })
+})
+
+// QA LH-SRC-6-39 (SRC-41 D15): a connection that reads no credential says so,
+// instead of repeating where an absent credential would be stored.
+describe("a connector that authenticates with none (LH-SRC-6-39)", () => {
+  it("says None for a connector that authenticates with none", async () => {
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () =>
+        json({ ...SPEC, adapter: "kafka", dial: { bootstrapServers: ["broker:9092"], auth: { type: "none" } } }),
+    })
+    const { container } = render(<ConnectorDetailPage connectorId="conn-a" />)
+    await screen.findByRole("heading", { level: 1, name: "db demo" })
+    const facts = within(container.querySelector("dl") as HTMLElement)
+    const fact = (label: string) => facts.getByText(label).nextElementSibling?.textContent
+    await waitFor(() => expect(fact("Credential")).toBe("None: this connection authenticates with none"))
+    expect(facts.queryByText("Stored by lakehouse, encrypted")).toBeNull()
+  })
+})
+
+// SRC-46 (QA LH-SRC-6-43): the health follows a run only when the orchestrator's sensor reports it to the API,
+// about a minute after the run ends, so the page reads the detail again until the run is counted. The wait's
+// own cases (counted, cap, paused, unmount) are in `use-run-count-wait.test.tsx`, with real timers and tiny values.
+// SRC-46 review round 3, BLOCKER 3: real timers here too; fake timers with stubbed fetch hung on CI.
+describe("ConnectorDetailPage after a run ends", () => {
+  it("reads the detail again when the run ends, and shows Degraded once the detail reports the failure", async () => {
+    const world = { ended: false, counted: false }
+    const run = () => ({
+      runId: "run-live-00001",
+      trigger: "schedule",
+      table: null,
+      status: world.ended ? "failed" : "running",
+      startedAt: new Date().toISOString(),
+      endedAt: world.ended ? new Date().toISOString() : null,
+      durationSeconds: world.ended ? 90 : null,
+      rowsLoaded: 0,
+      attempts: 4,
+      endReason: world.ended ? "table_failed" : null,
+    })
+    const stub = stubFetch({
+      "GET /api/connectors/conn-a/runs": () => json({ runs: [run()] }),
+      "GET /api/connectors/conn-a": () =>
+        json(
+          world.counted
+            ? { ...DETAIL, health: "degraded", lastRunFailureAt: "2026-11-19T08:28:40.000Z", failureStreak: 1 }
+            : DETAIL
+        ),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await screen.findByText(/Run run-live is running/)
+    expect(screen.queryByText("Degraded")).toBeNull()
+    const before = stub.count("GET /api/connectors/conn-a")
+
+    // The panel's own 3 s poll sees the run end, then the page reads the detail at once: still healthy.
+    world.ended = true
+    await waitFor(() => expect(stub.count("GET /api/connectors/conn-a")).toBeGreaterThan(before), { timeout: 6000 })
+    expect(screen.queryByText("Degraded")).toBeNull()
+
+    // The sensor counts the run; the page's own wait (every 10 s) picks it up.
+    world.counted = true
+    await waitFor(() => expect(screen.getAllByText("Degraded").length).toBeGreaterThan(0), { timeout: 14000 })
+  }, 25000)
 })

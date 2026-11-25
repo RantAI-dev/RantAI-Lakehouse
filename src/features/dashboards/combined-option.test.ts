@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
-import { buildCombinedOption, categoryKeys, failedLayers, type LayerCell } from "./combined-option"
+import { buildCombinedOption, categoryKeys, failedLayers, unavailableLayers, type LayerCell } from "./combined-option"
 
 type Series = { name: string; type: string; yAxisIndex: number; data: (number | null)[]; tooltip: { valueFormatter: (v: unknown) => string } }
 type Axis = { position: string; axisLabel: { formatter: (v: number) => string } }
@@ -78,6 +78,29 @@ test("a question that failed draws nothing and is listed with its reason", () =>
   assert.deepEqual(built.owners, [-1, 1])
   assert.deepEqual(failedLayers([failed, rooms]), [{ label: "Rooms", error: "no access", errorId: "ab12" }])
   assert.deepEqual(failedLayers(undefined), [])
+})
+
+// QA LH-BI-13-03 (BI-51): a question outside the viewer's access keeps a
+// place in the legend, greyed and silent, and adds no axis of its own.
+test("a question outside the viewer's access is a greyed legend entry with no points and adds no axis", () => {
+  const hidden: LayerCell = { ...rooms, label: "Occupancy", rows: [], error: "Not available with your access.", cause: "access" }
+  const built = buildCombinedOption({ ...input, layers: [hidden] }, false)
+  const series = built.option.series as Series[]
+  assert.deepEqual(series.map((s) => s.name), ["visitors", "Occupancy (not available with your access)"])
+  assert.equal(series[1].data.length, built.keys.length, "one position per category")
+  assert.ok(series[1].data.every((v) => v === null), "no points at all")
+  assert.equal((built.option.yAxis as Axis[]).length, 1)
+  const legend = built.option.legend as { data: { name: string; textStyle?: { color?: string } }[] }
+  const entry = legend.data.find((d) => d.name === "Occupancy (not available with your access)")
+  assert.equal(typeof entry?.textStyle?.color, "string")
+  assert.deepEqual(failedLayers([hidden]), [])
+  assert.deepEqual(unavailableLayers([hidden]), ["Occupancy"])
+  assert.deepEqual(built.owners, [-1, 0])
+})
+
+test("a chart with no such question has the legend it always had", () => {
+  const legend = buildCombinedOption(input, false).option.legend as Record<string, unknown>
+  assert.equal("data" in legend, false)
 })
 
 test("a grain labels the buckets while the keys stay the stored values", () => {

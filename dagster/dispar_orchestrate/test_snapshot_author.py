@@ -1,11 +1,13 @@
-"""`DATA-15` F5: our own `pyiceberg` commits record who made them, as the snapshot
-summary key `rantai.author`, which the console's Snapshots card reads as the version's
-author. The two commit sites are `sink.empty_table` (via `clear_table`) and the history
-mode's transaction (`history.write_versions`), on the harness of
-`test_load_modes_measurement.py`: a local Iceberg catalog, no network.
+"""`DATA-15` F5, `DATA-52`: our own `pyiceberg` commits record who made them, as the
+snapshot summary key `rantai.author`, which the console's Snapshots card reads as the
+version's author. The commit sites are `sink.empty_table` (via `clear_table`), the history
+mode's transaction (`history.write_versions`), a type-changing replace
+(`sink._replace_changing_types`) and the streamed write of a `replace` or an `append`
+(`adapters/iceberg_stream.py`), on the harness of `test_load_modes_measurement.py`: a local
+Iceberg catalog, no network.
 
-`dlt`'s own commits record no author (that is the loader's owners' change), and a commit
-made without a run context records none rather than a guess.
+A merge load is `dlt`'s own write, and it records no author; a commit made without an
+author records none rather than a guess.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from typing import Any
 import pytest
 
 from dispar_orchestrate import ingest_factory
+from dispar_orchestrate.adapters import iceberg_stream
 from dispar_orchestrate.adapters.history import AUTHOR_PROPERTY, snapshot_properties
 from dispar_orchestrate.adapters.sink import LoadPlan, SinkConfig, clear_table, load_via_sink
 from dispar_orchestrate.test_load_modes_measurement import Lab, lab  # noqa: F401 -- `lab` is a fixture
@@ -56,6 +59,34 @@ def test_clearing_a_table_without_a_run_records_no_author(lab: Lab) -> None:
     assert set(_authors(lab, "t")) == {None}
 
 
+def test_a_replace_and_an_append_record_the_author_of_the_load(lab: Lab) -> None:
+    # `DATA-52` (QA `LH-DATA-15-08`): both of these go through the streamed write, which
+    # used to carry no author and left the version saying "unknown".
+    config: SinkConfig = dataclasses.replace(lab.config, author="a person (file upload)")
+    load_via_sink([{"id": 1, "v": "a"}], "t", config, LoadPlan(mode="replace"))
+    load_via_sink([{"id": 2, "v": "b"}], "t", config, LoadPlan(mode="append"))
+
+    assert _authors(lab, "t") == ["a person (file upload)"] * 2
+
+
+def test_a_load_without_an_author_records_none_and_nothing_stays_registered(lab: Lab) -> None:
+    load_via_sink([{"id": 1, "v": "a"}], "t", lab.config, LoadPlan(mode="replace"))
+    assert iceberg_stream._snapshot_properties == {}
+    load_via_sink([{"id": 2, "v": "b"}], "t", lab.config, LoadPlan(mode="append"))
+    assert set(_authors(lab, "t")) == {None}
+    assert iceberg_stream._snapshot_properties == {}
+
+    def failing() -> Any:
+        yield {"id": 3, "v": "c"}
+        raise RuntimeError("the source failed part way")
+
+    # The registration is removed on the way out, so a later load of the table records
+    # its own author and not this one's.
+    with pytest.raises(Exception):
+        load_via_sink(failing(), "t", lab.config, LoadPlan(mode="append"))
+    assert iceberg_stream._snapshot_properties == {}
+
+
 def test_a_history_load_records_the_author_on_its_appended_and_updating_commits(lab: Lab) -> None:
     config = dataclasses.replace(lab.config, author="connector conn-x, run 9z8y")
     plan = LoadPlan(mode="history", key=("id",))
@@ -66,3 +97,13 @@ def test_a_history_load_records_the_author_on_its_appended_and_updating_commits(
     authors: list[Any] = _authors(lab, "h")
     assert "connector conn-x, run 9z8y" in authors
     assert authors[-1] == "connector conn-x, run 9z8y"
+
+
+def test_every_snapshot_of_a_first_history_load_names_the_run(lab: Lab) -> None:
+    # `DATA-52`, review round 1 R2: creating the table (and adding a column) is a
+    # commit of the load too (`history.ensure_columns`), and it carried no author.
+    config = dataclasses.replace(lab.config, author="connector conn-x, run 9z8y")
+
+    load_via_sink([{"id": 1, "v": "a"}], "h", config, LoadPlan(mode="history", key=("id",)))
+
+    assert set(_authors(lab, "h")) == {"connector conn-x, run 9z8y"}

@@ -563,7 +563,9 @@ impl CacheScope {
                     // Unreachable by construction (the leader sets one of the
                     // two before it returns `NotStored`); the tile answers
                     // `Refused` rather than inventing a result.
-                    None => Err(SpecRunFailure::Refused("The result could not be read.")),
+                    None => Err(SpecRunFailure::Refused(
+                        "The result could not be read.".to_owned(),
+                    )),
                 }
             }
             // BI-4 B review P-S2: the leader's deterministic outcome, shared.
@@ -581,7 +583,9 @@ impl CacheScope {
                     let take = work.lock().unwrap_or_else(PoisonError::into_inner).take();
                     match take {
                         Some(compute) => uncached(compute).await,
-                        None => Err(SpecRunFailure::Refused("The result could not be read.")),
+                        None => Err(SpecRunFailure::Refused(
+                            "The result could not be read.".to_owned(),
+                        )),
                     }
                 }
             },

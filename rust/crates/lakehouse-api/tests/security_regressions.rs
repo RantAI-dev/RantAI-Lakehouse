@@ -19,7 +19,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -372,9 +372,13 @@ async fn bootstrap_admin_can_still_reach_the_three_allowed_routes() {
         )
         .await
         .expect("router never fails a request outright");
+    // 200 with a body, not the 204 this route answered before: the body
+    // names the identity provider's own logout address, so the provider's
+    // session ends with this deployment's. The status is the point here —
+    // the route must stay reachable regardless of must_change_password.
     assert_eq!(
         logout_resp.status(),
-        StatusCode::NO_CONTENT,
+        StatusCode::OK,
         "/api/auth/logout must stay reachable regardless of must_change_password"
     );
 }

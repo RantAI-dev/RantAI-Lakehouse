@@ -17,11 +17,15 @@
 // the shared redact/audit-record helpers, and the SAME tool dispatch
 // (`tools::run_tool`) the chat loop and `POST /api/ai/tool` use, so an
 // approved `WriteHigh` call executes through the identical code path
-// rather than a second, divergent one. `gate` stays private: approval
-// CREATION only ever happens from inside this module's own dispatch.
+// rather than a second, divergent one. `gate` is `pub(in crate::routes)` as
+// well, for the permission and risk helpers a sibling module reuses; the
+// approval CREATION itself only ever happens from inside this module's own
+// dispatch.
 pub(in crate::routes) mod audit;
 mod citations;
-mod data_map;
+// `pub(crate)`: the crate's own surface clears this module's cache for a
+// test that pins the system prompt's bytes (`AI-32`).
+pub(crate) mod data_map;
 pub(in crate::routes) mod gate;
 mod prompt;
 pub(in crate::routes) mod registry;
@@ -30,17 +34,19 @@ pub(crate) mod semantic_api;
 pub(crate) mod terms;
 pub(in crate::routes) mod tools;
 
+use std::collections::HashMap;
+
 use axum::body::Bytes;
 use axum::extract::{Extension, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
-use lakehouse_clickhouse::ChClient;
+use lakehouse_clickhouse::{ChClient, QueryOptions};
 use lakehouse_core::ApiError;
 use lakehouse_llm::{
     ChatOptions, HiddenSpans, LlmMessage, LlmMessageRole, StreamPiece, ToolCall, ToolCallFunction,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::error::ApiResult;
@@ -110,6 +116,120 @@ pub async fn build_status(
 
 const MAX_ITER: u32 = 8;
 
+/// How many times the same call with the same arguments may fail before the
+/// chat loop stops calling tools (plan 111, the parking lot's item 6).
+///
+/// The same call with the same arguments on the same state gets the same
+/// answer, so a fourth try buys nothing and costs a round of the turn's 120
+/// seconds: three failures of one call are a refusal, not a hiccup. Three
+/// leave a model room to try a call twice before the loop stops it, and a
+/// call with other arguments — a fixed chart, a corrected query — is another
+/// call and is counted on its own.
+const MAX_SAME_CALL_FAILURES: u32 = 3;
+
+/// The note the answer carries when the loop stopped calling tools because
+/// the same call failed too many times (plan 111).
+const REPEATED_CALL_NOTE: &str = "the same call failed too many times";
+
+/// The key a call is counted under: the tool's name and the arguments it
+/// was called with, in a fixed order.
+///
+/// The order is fixed here because `serde_json::Map` keeps the order the
+/// model sent its arguments in (the workspace's `preserve_order` feature),
+/// and the same call is the same call whatever order its arguments came in.
+fn call_signature(tool: &str, args: &Map<String, Value>) -> String {
+    let mut keys: Vec<&str> = args.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let mut signature = tool.to_owned();
+    for key in keys {
+        signature.push('\u{1f}');
+        signature.push_str(key);
+        signature.push('=');
+        signature.push_str(&args[key].to_string());
+    }
+    signature
+}
+
+/// The key a tool's result carries the browser's copy of an engine failure
+/// under.
+///
+/// Owner rule LH-QS-2-08 (owner 2026-11-12): an engine failure reaches a
+/// person as a fixed sentence and a reference, never as the engine's own
+/// text. The model still reads the engine's trimmed diagnosis (SEC-11, the
+/// query-author exception, product owner 2026-10-10), so a tool hands back
+/// BOTH copies: the diagnosis in `error` (the model's copy) and the fixed
+/// sentence in this key (the browser's copy).
+///
+/// Every caller that hands a tool's result to a model or to a browser takes
+/// this key out first: the model gets the result without it, and the browser
+/// gets the same result with `error` replaced by the key's text. So the key
+/// reaches neither of them, and the name is not part of the wire contract:
+/// no client reads it. The chat loop splits the two copies itself, with
+/// [`take_browser_error`] and [`browser_copy`], for its trace. The other
+/// three callers go through [`split_tool_result`]: `POST /api/ai/tool`'s
+/// answer, an agent run's step, and an agent run's approval outcome.
+pub(in crate::routes) const BROWSER_ERROR_KEY: &str = "_browserError";
+
+/// Puts a tool's browser copy of an engine failure next to its error, in
+/// the one key only the server reads ([`BROWSER_ERROR_KEY`]).
+pub(in crate::routes) fn with_browser_error(mut result: Value, browser: &str) -> Value {
+    if let Value::Object(map) = &mut result {
+        map.insert(
+            BROWSER_ERROR_KEY.to_owned(),
+            Value::String(browser.to_owned()),
+        );
+    }
+    result
+}
+
+/// Takes the browser's copy of a tool's failure out of the tool's result:
+/// the key is removed and the text returned, so the chat loop can show it
+/// to the person while the model's copy stays with the model.
+fn take_browser_error(result: Value) -> (Value, Option<String>) {
+    let mut map = match result {
+        Value::Object(map) => map,
+        other => return (other, None),
+    };
+    let browser = map
+        .remove(BROWSER_ERROR_KEY)
+        .and_then(|value| value.as_str().map(str::to_owned));
+    (Value::Object(map), browser)
+}
+
+/// Splits a tool's result into the two copies a caller hands out: the
+/// model's copy and the browser's copy (LH-QS-2-08, owner 2026-11-12).
+///
+/// The model's copy is the result without [`BROWSER_ERROR_KEY`], so `error`
+/// keeps the engine's trimmed diagnosis. The browser's copy is the same
+/// result with `error` replaced by the fixed sentence and the reference
+/// ([`browser_copy`]). A result with no browser text (a success, or a
+/// failure whose message is already fixed) has one copy: both are the
+/// result as the tool returned it.
+///
+/// A caller that shows a tool's result to a person uses the browser's copy,
+/// and a caller that feeds it to the model uses the model's. No caller keeps
+/// the server-only key in what it hands out. The chat loop does not call
+/// this function: it splits the copies with [`take_browser_error`] and
+/// [`browser_copy`].
+pub(in crate::routes) fn split_tool_result(result: Value) -> (Value, Value) {
+    let (model, browser) = take_browser_error(result);
+    let shown = match browser {
+        Some(text) => browser_copy(&model, &text),
+        None => model.clone(),
+    };
+    (model, shown)
+}
+
+/// The browser's copy of a tool's failure: the tool's result with its
+/// `error` replaced by the fixed sentence and the reference.
+fn browser_copy(result: &Value, browser: &str) -> Value {
+    let mut result = result.clone();
+    if let Value::Object(map) = &mut result {
+        map.insert("error".to_owned(), Value::String(browser.to_owned()));
+    }
+    result
+}
+
 /// What a late `ask_user` gets back (plan 14). The model reads it on its
 /// next round, so it asks the model to answer with the reading it used.
 /// The wording forbids the three defects staging QA saw in the model's
@@ -121,6 +241,38 @@ mention this refusal. Answer now from the results above with the reading \
 you used, and say in one sentence which reading it is. Do not end with a \
 question: if another reading is possible, name it as a statement. Reply in \
 the language of the user's question.";
+
+/// The tools whose success makes a later `ask_user` late (`AI-17`,
+/// 2026-11-10): they are the only registered tools that return data rows,
+/// so their success means the turn has answered from data — the refusal's
+/// own words, "runs a query". A lookup that only finds which metrics or
+/// tables exist (`list_metrics`, `describe_metric`, `list_datasets`) is not
+/// that, and since the prompt sends the model to those lookups first
+/// (`AI-7`), counting them would take the ask away exactly when the model
+/// obeys the prompt.
+const QUERY_TOOLS: [&str; 3] = ["run_sql", "query_metric", "run_saved_query"];
+
+/// Whether an `ask_user` made now is a late ask: the turn has run a query
+/// (a tool from [`QUERY_TOOLS`]) that succeeded, and the step just before
+/// this call is not a failed call to another tool. A refusal or tool error
+/// says the call cannot be built as
+/// asked, so asking the person is the honest next step (for example which
+/// column to bin), even after a query. Only another tool's failure opens the
+/// way: a failed `ask_user` (a rejected ask) is not one; otherwise a rejected ask
+/// would let a second ask through after a query. The late-ask rule itself
+/// (#125, #208) stays for every other case.
+fn ask_is_late(tool_trace: &[Value]) -> bool {
+    let previous_call_failed = tool_trace.last().is_some_and(|step| {
+        step["tool"].as_str() != Some(registry::ASK_USER) && step["ok"].as_bool() == Some(false)
+    });
+    !previous_call_failed
+        && tool_trace.iter().any(|step| {
+            step["tool"]
+                .as_str()
+                .is_some_and(|tool| QUERY_TOOLS.contains(&tool))
+                && step["ok"].as_bool() == Some(true)
+        })
+}
 
 /// What a call gets back when the console's allowlist did not offer the tool
 /// (plan 17). The model reads it on its next round, so it is told to answer
@@ -138,6 +290,16 @@ struct IncomingMessage {
     content: String,
 }
 
+/// The dashboard on screen, sent only by the dashboard page (`AI-30`). The
+/// server uses it to fill a PDF export's filters; it is never handed to the
+/// model as arguments it could change.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ScreenView {
+    board: String,
+    #[serde(default)]
+    filters: Vec<Value>,
+}
+
 /// `POST /api/ai/chat` request body.
 #[derive(Debug, Default, Deserialize)]
 struct ChatBody {
@@ -147,6 +309,9 @@ struct ChatBody {
     tools: Option<Vec<String>>,
     #[serde(default)]
     context: Option<String>,
+    /// The dashboard on screen; only the dashboard page sends it (`AI-30`).
+    #[serde(default)]
+    view: Option<ScreenView>,
     #[serde(default)]
     messages: Vec<IncomingMessage>,
     /// Answer as an NDJSON progress stream instead of one JSON body; see
@@ -191,6 +356,9 @@ pub async fn chat(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
+    // AI-34: the turn's clock starts with this handler, a little after the
+    // route's timeout has started (`timeout_middleware`).
+    let clock = TurnClock::new(std::time::Instant::now(), *super::AI_CHAT_TIMEOUT);
     let Ok(parsed) = serde_json::from_slice::<ChatBody>(&body) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -205,9 +373,13 @@ pub async fn chat(
         Err(response) => return response,
     };
     if stream {
-        return stream_chat(state, principal, run);
+        return stream_chat(state, principal, run, clock);
     }
-    match run_chat(&state, principal.as_ref(), run, None).await {
+    // GOV-17 review R9: table visibility adds state to nested tool futures.
+    // The chat future carries the turn's whole state, and an unboxed future of
+    // that size overflows the request task's stack (`clippy::large_futures`);
+    // heap-pin the chat state machine at the HTTP boundary to bound its stack.
+    match Box::pin(run_chat(&state, principal.as_ref(), run, None, clock)).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => llm_unavailable(&err),
     }
@@ -222,6 +394,15 @@ struct PreparedChat {
     /// to a tool outside `tools` is refused at dispatch (plan 17); a chat
     /// with no allowlist dispatches as before.
     allowlisted: bool,
+    /// The request's latest user message, exactly as [`prompt::closing`] saw
+    /// it (the mode note is appended to the copy in `messages` later, and
+    /// the loop's pushed messages are nudges and repair requests, not the
+    /// question). `AI-17`: the script gate on the final answer reads this,
+    /// so what the loop pushes mid-turn cannot change which questions are
+    /// checked.
+    latest_user: String,
+    /// The dashboard on screen, when the caller was the dashboard page.
+    view: Option<ScreenView>,
 }
 
 /// Hard cap on the page context a client may add to the system prompt, in
@@ -324,6 +505,62 @@ async fn users_terms(
         })
 }
 
+/// ADM-13 (D6): What level of access the principal has to the assistant.
+///
+/// Decided once per request from the principal:
+/// `Full` if holding `assistant:use`, else `AskOnly` if holding `assistant:ask`.
+/// (The route policy layer already rejected callers holding neither with 403).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantAccess {
+    /// Full access: ask and build mode, write tools available.
+    Full,
+    /// Ask-only access: only `Risk::Read` tools, forced Ask mode.
+    AskOnly,
+}
+
+impl AssistantAccess {
+    /// Decide assistant access from a principal.
+    // ADM-13 review round 1, S2: delegates to from_perms (one match helper).
+    #[must_use]
+    pub fn from_principal(principal: Option<&Principal>) -> Self {
+        Self::from_perms(principal.map(|p| &p.permissions))
+    }
+
+    /// Decide assistant access from a permission set.
+    #[must_use]
+    pub fn from_perms(perms: Option<&lakehouse_auth::PermissionSet>) -> Self {
+        match perms {
+            Some(p) if p.has("assistant:use") => Self::Full,
+            Some(p) if p.has("assistant:ask") => Self::AskOnly,
+            // ADM-13 review round 1, S2: A caller with neither permission
+            // defaults to Full because the route gate already refused
+            // unauthenticated/unauthorized callers (RequiresAnyPermission(["assistant:use", "assistant:ask"]));
+            // headless runs (e.g. agents.rs) pass through here unchanged.
+            _ => Self::Full,
+        }
+    }
+
+    /// True if the caller is restricted to Ask-only mode.
+    #[must_use]
+    pub fn is_ask_only(self) -> bool {
+        self == Self::AskOnly
+    }
+}
+
+/// ADM-13 (D6), ADM-13 review round 1, S2: Checks whether `perms` has read permission
+/// `perm` directly, or — for `query:read` and `catalog:read` — via `assistant:ask`.
+/// Single helper used across gate.rs, registry.rs, and `data_map_access` in ai/mod.rs.
+#[must_use]
+pub fn assistant_reads(perms: Option<&lakehouse_auth::PermissionSet>, perm: &str) -> bool {
+    let Some(p) = perms else {
+        return false;
+    };
+    if p.has(perm) {
+        return true;
+    }
+    (perm == "query:read" || perm == "catalog:read") && p.has("assistant:ask")
+}
+
 /// What the DATA MAP may show a caller (`SEC-24`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MapAccess {
@@ -342,11 +579,15 @@ enum MapAccess {
 /// `/api/catalog/{id}/sample`. Both routes need `query:read`, so the ranges
 /// and samples need it too.
 /// `Principal::has` honours wildcards, so a `*:*` holder gets the full map.
+/// ADM-13 (D6): `assistant:ask` counts as `catalog:read` + `query:read` here.
 fn data_map_access(principal: Option<&Principal>) -> MapAccess {
-    match principal {
-        Some(p) if p.has("catalog:read") && p.has("query:read") => MapAccess::Full,
-        Some(p) if p.has("catalog:read") => MapAccess::WithoutSamples,
-        _ => MapAccess::None,
+    let perms = principal.map(|p| &p.permissions);
+    if assistant_reads(perms, "catalog:read") && assistant_reads(perms, "query:read") {
+        MapAccess::Full
+    } else if assistant_reads(perms, "catalog:read") {
+        MapAccess::WithoutSamples
+    } else {
+        MapAccess::None
     }
 }
 
@@ -415,12 +656,42 @@ async fn system_prompt(
             } else {
                 None
             };
+            // `GOV-7` D6: the map is built for the caller's table access
+            // BEFORE anything reaches the model. A store that cannot say
+            // which roles may read what hides every table (fail closed) —
+            // the map still renders, with none of its tables in it.
+            let access = match principal {
+                Some(principal) => {
+                    crate::table_access::for_roles(state.pg.as_deref(), &principal.role_names)
+                        .await
+                        .unwrap_or_else(|_| {
+                            crate::table_access::TableAccess::Listed(
+                                std::collections::HashSet::new(),
+                                std::collections::HashSet::new(),
+                            )
+                        })
+                }
+                None => crate::table_access::TableAccess::All,
+            };
+            // `SEC-20`, plan 97: the closing line of the map names registry
+            // datasets, which another tenant's upload is one of. The reach is
+            // the request's own (`X-Tenant`); a reach that cannot be resolved
+            // covers nothing.
+            let reach = match principal {
+                Some(principal) => tools::data::RegistryReach::of(state, principal, headers)
+                    .await
+                    .unwrap_or_else(|_| tools::data::RegistryReach::nothing(state)),
+                None => tools::data::RegistryReach::nothing(state),
+            };
             data_map::data_map(
+                &state.data_map_cache,
                 &state.clickhouse,
                 withheld,
                 &notes,
                 &query_words,
                 state.config.ai_relevant_tables,
+                &access,
+                Some(&reach),
             )
             .await
         }
@@ -534,7 +805,8 @@ async fn prepare_chat(
         )
             .into_response());
     }
-    let is_build = parsed.mode.as_deref() == Some("build");
+    let access = AssistantAccess::from_principal(principal);
+    let is_build = !access.is_ask_only() && parsed.mode.as_deref() == Some("build");
     let recent_user: Vec<&str> = parsed
         .messages
         .iter()
@@ -650,6 +922,10 @@ async fn prepare_chat(
         tools,
         is_build,
         allowlisted: allow.is_some(),
+        // The same message `system_prompt` read for the closing line: the
+        // latest user message of the request, before any loop message.
+        latest_user: recent_user.last().copied().unwrap_or_default().to_owned(),
+        view: parsed.view,
     })
 }
 
@@ -714,14 +990,9 @@ const RETRY_DELAYS: [std::time::Duration; 2] = [
 fn is_transient(err: &lakehouse_llm::LlmError) -> bool {
     match err {
         lakehouse_llm::LlmError::Transport(_) => true,
-        lakehouse_llm::LlmError::Api(msg) => {
-            let status: u16 = msg
-                .strip_prefix("LLM ")
-                .and_then(|rest| rest.split(':').next())
-                .and_then(|code| code.trim().parse().ok())
-                .unwrap_or(0);
-            status == 408 || status == 429 || (500..=599).contains(&status)
-        }
+        lakehouse_llm::LlmError::Api(_) => err
+            .status()
+            .is_some_and(|status| status == 408 || status == 429 || (500..=599).contains(&status)),
     }
 }
 
@@ -747,9 +1018,13 @@ async fn model_round_once(
     tools: &[Value],
     progress: Progress<'_>,
 ) -> Result<LlmMessage, lakehouse_llm::LlmError> {
+    // `ADM-9`: the client comes from the resolver, which rebuilds it when
+    // the effective provider settings change — so a save in the console
+    // takes effect on this message.
+    let assistant = crate::runtime_settings::assistant(state).await;
     if progress.is_none() {
-        return state
-            .llm
+        return assistant
+            .client
             .chat_with_tools(messages, tools, round_options())
             .await;
     }
@@ -757,8 +1032,8 @@ async fn model_round_once(
         ("<minimax:tool_call>", "</minimax:tool_call>"),
         ("<invoke ", "</invoke>"),
     ]);
-    state
-        .llm
+    assistant
+        .client
         .chat_with_tools_streamed(messages, tools, round_options(), |piece| match piece {
             StreamPiece::Text(text) => {
                 let visible = tool_xml.push(text);
@@ -771,10 +1046,148 @@ async fn model_round_once(
         .await
 }
 
+/// `AI-17` decision 2: the one request for a rewrite that both answer paths
+/// of [`run_chat`] push when an answer to a Latin-script question holds a
+/// CJK character ([`prompt::contains_cjk`]). It names no language: the model
+/// is told to match the question's own.
+const CJK_REWRITE_REQUEST: &str = "Write your answer again in the language of my question, with the same content and no Chinese, Japanese or Korean characters.";
+
+/// What [`cjk_rewrite_round`] decided.
+enum CjkRewrite {
+    /// A usable rewrite: non-empty and free of CJK characters.
+    Clean(String),
+    /// The rewrite was empty or still held a CJK character; the caller keeps
+    /// its first answer.
+    Discarded,
+    /// The streaming client has gone; the caller ends the turn as "stopped".
+    ClientGone,
+}
+
+/// `AI-17` decisions 1-2: one tool-free rewrite round for an answer to a
+/// Latin-script question that holds a CJK character. Sends a `status`
+/// event (a streaming client clears its draft on one, or the rewrite's
+/// deltas would be appended to the CJK text; `AI-17` review fix
+/// (SHOULD-FIX 2), the pattern of the citation repair's `verifying`), pushes
+/// [`CJK_REWRITE_REQUEST`] after the answer it asks about, which the caller
+/// has already pushed as the last message of `messages` (the loop pushes
+/// every round's message; the budget-exhausted path pushes its final one
+/// for this; `AI-17` review fix round 2 (BLOCKER)), asks the model once with
+/// no tools (the
+/// iteration budget's final-answer round is the pattern), and cleans the
+/// reply the way an answer is cleaned on the normal path, since a clean
+/// rewrite becomes that path's answer.
+///
+/// A clean rewrite stays in `messages` with its request, as the model's own
+/// message without any tool call (the round offered no tools, so a call in
+/// the reply has no result to follow it; `AI-17` review fix round 2), so a
+/// later round (the citation repair) sees the answer it is
+/// asked to repair. A discarded one is removed together with its request,
+/// which leaves `messages` as it was and keeps the roles alternating for
+/// that later round (`AI-17` review fix (BLOCKER 1)). A discarded rewrite is
+/// logged with `build_run_id` (the runId of a build tool result this turn,
+/// `none` when there is none), never with the answer text.
+///
+/// # Errors
+/// The model round's own failure, verbatim: the caller's 503 path handles it
+/// like any other round's.
+async fn cjk_rewrite_round(
+    state: &AppState,
+    messages: &mut Vec<LlmMessage>,
+    progress: Progress<'_>,
+    build_run_id: Option<&str>,
+    ends: Option<std::time::Instant>,
+) -> Result<CjkRewrite, lakehouse_llm::LlmError> {
+    if !report(progress, json!({ "type": "status", "phase": "thinking" })) {
+        return Ok(CjkRewrite::ClientGone);
+    }
+    let before = messages.len();
+    messages.push(LlmMessage {
+        role: LlmMessageRole::User,
+        content: Some(CJK_REWRITE_REQUEST.to_owned()),
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    });
+    // AI-34: a rewrite that cannot finish by the turn's end is dropped, and
+    // the first answer stands, as it does when the rewrite is still not clean.
+    let Some(round) = before_turn_end(ends, model_round(state, messages, &[], progress)).await
+    else {
+        messages.truncate(before);
+        tracing::warn!(
+            "the rewrite of an answer to a Latin-script question ran past the turn's end; the first answer is kept (build run id: {})",
+            build_run_id.unwrap_or("none")
+        );
+        return Ok(CjkRewrite::Discarded);
+    };
+    let mut rewrite = round?;
+    let cleaned = strip_repair_preamble(&strip_tool_xml(rewrite.content.as_deref().unwrap_or("")));
+    let discard_reason = if cleaned.trim().is_empty() {
+        Some("came back empty")
+    } else if prompt::contains_cjk(&cleaned) {
+        Some("still held a CJK character")
+    } else {
+        None
+    };
+    if let Some(reason) = discard_reason {
+        messages.truncate(before);
+        tracing::warn!(
+            "the rewrite of an answer to a Latin-script question {reason}; the first answer is kept (build run id: {})",
+            build_run_id.unwrap_or("none")
+        );
+        return Ok(CjkRewrite::Discarded);
+    }
+    rewrite.tool_calls = None;
+    messages.push(rewrite);
+    Ok(CjkRewrite::Clean(cleaned))
+}
+
+/// The note a turn carries when it stopped for time (`AI-34`).
+const TIME_NOTE: &str = "the turn ran out of time before it could answer";
+
+/// When a chat turn stops for time, as instants measured from the start of
+/// the turn (`AI-34`).
+#[derive(Clone, Copy)]
+struct TurnClock {
+    /// Past this instant the loop offers no more tools and asks for the
+    /// final answer.
+    budget_ends: std::time::Instant,
+    /// No model round may run past this instant. A round still running then
+    /// is dropped, and the turn answers with the fixed time reply. `None`:
+    /// no end, so a round always runs to its answer (the streamed path).
+    ends: Option<std::time::Instant>,
+}
+
+impl TurnClock {
+    /// The clock of a turn that started at `started` under `timeout`, the
+    /// route's `AI_CHAT_TIMEOUT`. The budget is three quarters of the
+    /// timeout, and the end nine tenths: the last tenth is for the reply,
+    /// since the route's timeout starts its clock a little before the
+    /// handler does. Both are shares of one value, so a deployment that
+    /// raises the timeout raises both.
+    fn new(started: std::time::Instant, timeout: std::time::Duration) -> Self {
+        Self {
+            budget_ends: started + timeout * 3 / 4,
+            ends: Some(started + timeout * 9 / 10),
+        }
+    }
+
+    /// The same clock with no end: the budget still stops the tool rounds,
+    /// but no round is cut. The streamed path uses it (`AI-34`): the
+    /// route's timeout never cut a streamed turn, so the end adds a limit
+    /// where none existed.
+    fn without_end(self) -> Self {
+        Self { ends: None, ..self }
+    }
+}
+
 /// The agentic loop: ask the model, run the tools it calls (through
 /// [`gate::decide_by_name`]), feed the results back, until it answers
 /// without a tool call or [`MAX_ITER`] rounds pass. Returns the response
 /// body `{ answer, toolTrace, buildRunId?, chartCreated, note? }`.
+///
+/// `clock` bounds the turn in time (`AI-34`): past its budget the loop asks
+/// for the final answer without tools, and a model round still running at
+/// its end is dropped for the time reply.
 #[allow(
     clippy::too_many_lines,
     reason = "one straight-line port of a single TS handler's iterative \
@@ -786,6 +1199,7 @@ async fn run_chat(
     principal: Option<&Principal>,
     run: PreparedChat,
     progress: Progress<'_>,
+    clock: TurnClock,
 ) -> Result<Value, lakehouse_llm::LlmError> {
     let perms = principal.map(|p| &p.permissions);
     let PreparedChat {
@@ -793,12 +1207,25 @@ async fn run_chat(
         tools,
         is_build,
         allowlisted,
+        latest_user,
+        view,
     } = run;
     let mut tool_trace: Vec<Value> = Vec::new();
     let mut build_run_id: Option<String> = None;
     let mut chart_created = false;
     let mut repaired = false;
     let mut nudged = false;
+    // `AI-17`: set when this turn's one rewrite has been spent, used or
+    // discarded. The normal path can re-enter its answer block (the empty
+    // answer nudge, the citation repair), and the budget-exhausted path
+    // reads the flag too, so a turn never asks for a second rewrite.
+    let mut cjk_rewritten = false;
+    // Plan 111: the failures of each call, so a model that repeats the same
+    // failing call stops calling tools before the turn's timeout instead of
+    // running out of rounds.
+    let mut failed_calls: HashMap<String, u32> = HashMap::new();
+    // Why the loop stopped calling tools, when it did.
+    let mut stop_note: Option<&'static str> = None;
     // The conversation so far, which the citation check accepts as
     // evidence (`citations::Evidence`): the system prompt, whose DATA MAP
     // row counts, ranges and distinct counts were read from the data
@@ -816,7 +1243,13 @@ async fn run_chat(
         .collect();
     let conversation: Vec<&str> = conversation.iter().map(String::as_str).collect();
 
-    for _ in 0..MAX_ITER {
+    'rounds: for _ in 0..MAX_ITER {
+        // AI-34: past the budget the loop offers no more tools, and the final
+        // round below answers from the results so far.
+        if std::time::Instant::now() >= clock.budget_ends {
+            stop_note = Some(TIME_NOTE);
+            break 'rounds;
+        }
         if !report(progress, json!({ "type": "status", "phase": "thinking" })) {
             return Ok(chat_response_body(
                 "",
@@ -826,7 +1259,16 @@ async fn run_chat(
                 Some("stopped"),
             ));
         }
-        let msg = model_round(state, &messages, &tools, progress).await?;
+        let Some(round) =
+            before_turn_end(clock.ends, model_round(state, &messages, &tools, progress)).await
+        else {
+            return Ok(timed_out_body(
+                &tool_trace,
+                build_run_id.as_deref(),
+                chart_created,
+            ));
+        };
+        let msg = round?;
         messages.push(msg.clone());
 
         let mut calls: Vec<ToolCall> = msg.tool_calls.clone().unwrap_or_default();
@@ -859,6 +1301,43 @@ async fn run_chat(
                 });
                 continue;
             }
+            // `AI-17` decisions 1-4: an answer to a Latin-script question
+            // must not carry a CJK character, whatever the prompt said. One
+            // tool-free rewrite is asked for here, before the citation
+            // check; a clean rewrite replaces the answer, and a rewrite
+            // that is not clean keeps the first (logged with the build run
+            // id, never the text). `cjk_rewritten` holds the loop to one rewrite per
+            // turn however often the nudge and the citation repair re-enter
+            // this block.
+            let answer = if !cjk_rewritten
+                && prompt::is_latin_script(&latest_user)
+                && prompt::contains_cjk(&answer)
+            {
+                cjk_rewritten = true;
+                match cjk_rewrite_round(
+                    state,
+                    &mut messages,
+                    progress,
+                    build_run_id.as_deref(),
+                    clock.ends,
+                )
+                .await?
+                {
+                    CjkRewrite::Clean(rewrite) => rewrite,
+                    CjkRewrite::Discarded => answer,
+                    CjkRewrite::ClientGone => {
+                        return Ok(chat_response_body(
+                            "",
+                            &tool_trace,
+                            build_run_id.as_deref(),
+                            chart_created,
+                            Some("stopped"),
+                        ));
+                    }
+                }
+            } else {
+                answer
+            };
             let annotated = citations::annotate_answer_in(&answer, &tool_trace, &conversation);
             let (numbers, omitted) = citations::flagged(&annotated);
             if !repaired && (!numbers.is_empty() || omitted) {
@@ -919,14 +1398,21 @@ async fn run_chat(
                 &serde_json::from_str::<Map<String, Value>>(&call.function.arguments)
                     .unwrap_or_default(),
             );
+            // `AI-30`: a PDF of the dashboard on screen takes that screen's
+            // filters when the call sends no view of its own. Server-side and
+            // before the gate — the model cannot name the screen's filters.
+            let args = tools::with_screen_filters(
+                &call.function.name,
+                &args,
+                view.as_ref()
+                    .map(|v| (v.board.as_str(), v.filters.as_slice())),
+            );
             // plan 14: an ask after any tool that ran in this turn is refused
-            // before the gate. The prompt asks the model to ask first; this
-            // is the check that holds when it does not.
-            let late_ask = call.function.name == registry::ASK_USER
-                && tool_trace.iter().any(|step| {
-                    step["tool"].as_str() != Some(registry::ASK_USER)
-                        && step["ok"].as_bool() == Some(true)
-                });
+            // before the gate, unless the step just before it was another
+            // tool's failed call (see `ask_is_late`). The prompt asks the
+            // model to ask first; this is the check that holds when it does
+            // not.
+            let late_ask = call.function.name == registry::ASK_USER && ask_is_late(&tool_trace);
             // D3: `ask` mode filters non-Read tools, and permission
             // filters tools the principal lacks, out of the schema
             // ADVERTISED to the model (above, building `tools`), but that
@@ -971,11 +1457,19 @@ async fn run_chat(
                     approval_outcome(state, principal, spec, &args, resource_id.as_deref()).await
                 } else {
                     let outcome = gate::outcome_of(&refusal);
-                    if outcome == "needs_confirmation"
-                        && let Some(error) =
-                            tools::check_draft(state, &call.function.name, &args).await
-                    {
-                        (error, "failed", None, None)
+                    if outcome == "needs_confirmation" {
+                        match tools::check_draft(
+                            state,
+                            principal,
+                            &call.function.name,
+                            &args,
+                            refusal,
+                        )
+                        .await
+                        {
+                            Ok(draft) => (draft, outcome, None, None),
+                            Err(error) => (error, "failed", None, None),
+                        }
                     } else {
                         (refusal, outcome, None, None)
                     }
@@ -988,8 +1482,29 @@ async fn run_chat(
                 let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
                 (result, if ok { "executed" } else { "failed" }, None, None)
             };
+            // LH-QS-2-08 (owner 2026-11-12): a tool that failed on an
+            // engine statement hands back two copies — the model's copy
+            // (the engine's trimmed diagnosis, so the model can correct its
+            // SQL) and the browser's copy (a fixed sentence and the same
+            // reference). The browser's copy is taken out HERE, before
+            // either copy is built, so the key reaches neither the model nor
+            // the browser; the trace carries the browser's copy and the
+            // model carries its own.
+            let (result, browser_error) = take_browser_error(result);
             let (resource_kind, resource_id) =
                 audit::resource_for(&call.function.name, &args, &result);
+            // The browser's copy of the failure is the detail the audit row
+            // carries (plan 111): the fixed sentence and the reference, the
+            // text the person sees. The model's copy — the engine's own
+            // diagnosis — stays with the model and never reaches the audit
+            // trail.
+            let shown = browser_error
+                .as_deref()
+                .map_or_else(|| result.clone(), |text| browser_copy(&result, text));
+            let detail = shown
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             audit::record(
                 state.pg.as_deref(),
                 principal,
@@ -999,15 +1514,27 @@ async fn run_chat(
                 resource_id.as_deref(),
                 &Value::Object(args.clone()),
                 outcome,
-                None,
+                detail.as_deref(),
                 run_id.as_deref(),
                 approval_id.as_deref(),
             )
             .await;
             let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
             tool_trace.push(json!({
-                "tool": call.function.name, "args": args, "ok": ok, "result": result,
+                "tool": call.function.name, "args": args, "ok": ok, "result": shown,
             }));
+            // Plan 111: the same call failing again and again is a refusal,
+            // not a hiccup, so the loop stops calling tools and asks the
+            // model for its final answer, as the iteration budget does.
+            if outcome == "failed" {
+                let signature = call_signature(&call.function.name, &args);
+                let failures = failed_calls.entry(signature).or_insert(0);
+                *failures += 1;
+                if *failures >= MAX_SAME_CALL_FAILURES {
+                    stop_note = Some(REPEATED_CALL_NOTE);
+                    break 'rounds;
+                }
+            }
             // plan 14: an accepted ask ends the turn. The question is the
             // reply, so the reader sees it above the option buttons; calls
             // after it in this round are neither run nor recorded.
@@ -1078,31 +1605,208 @@ async fn run_chat(
         }
     }
 
-    // Iteration budget exhausted — ask once more for a final answer, tool-free.
+    // The iteration budget is exhausted, or the same call failed too many
+    // times — ask once more for a final answer, tool-free.
     report(progress, json!({ "type": "status", "phase": "thinking" }));
+    let stop_note = stop_note.unwrap_or("tool-call limit reached");
+    let reason = if stop_note == REPEATED_CALL_NOTE {
+        REPEATED_CALL_REASON
+    } else {
+        BUDGET_REASON
+    };
+    let final_request = if stop_note == REPEATED_CALL_NOTE {
+        format!(
+            "The same call failed {MAX_SAME_CALL_FAILURES} times with the same arguments and was \
+             not run again. Answer now from the results above, and say what went wrong."
+        )
+    } else {
+        "Give your final answer now, concisely, from the results above.".to_owned()
+    };
     messages.push(LlmMessage {
         role: LlmMessageRole::User,
-        content: Some("Give your final answer now, concisely, from the results above.".to_owned()),
+        content: Some(final_request),
         tool_calls: None,
         tool_call_id: None,
         name: None,
     });
-    let final_msg = model_round(state, &messages, &[], progress).await?;
+    // AI-34: the final round gets only the time before the turn's end. A round
+    // that cannot finish by then is dropped, and the reply says the time ran out.
+    let Some(round) =
+        before_turn_end(clock.ends, model_round(state, &messages, &[], progress)).await
+    else {
+        return Ok(timed_out_body(
+            &tool_trace,
+            build_run_id.as_deref(),
+            chart_created,
+        ));
+    };
+    let mut final_msg = round?;
+    // `AI-17` review fix round 2 (BLOCKER): the final answer joins the
+    // conversation, as the loop does for every round, so a rewrite request
+    // follows the answer it asks about and not the "Give your final answer
+    // now" request. Nothing reads `messages` after this except that
+    // rewrite, so pushing without a condition changes nothing else. The
+    // round offered no tools, so a call in the reply is dropped for the same
+    // reason as in `cjk_rewrite_round`.
+    final_msg.tool_calls = None;
+    let final_answer = final_msg.content.clone().unwrap_or_default();
+    messages.push(final_msg);
+    // An empty last answer is never the reply: a model that spent every round
+    // on refused calls came back with nothing, and the person saw nothing. The
+    // fixed text skips the citation check on purpose, since it has no claim to
+    // cite. `chat_response_body` still runs `take_next_step` on it, which
+    // leaves it whole because the text has no `NEXT:` line of its own.
+    if final_answer.trim().is_empty() {
+        // AI-34: a turn that stopped for time names its tools in the time
+        // reply; the refusal text of `unfinished_reply` is for the other stops.
+        let reply = if stop_note == TIME_NOTE {
+            timed_out_reply(&tool_trace)
+        } else {
+            unfinished_reply(&tool_trace, reason)
+        };
+        return Ok(chat_response_body(
+            &reply,
+            &tool_trace,
+            build_run_id.as_deref(),
+            chart_created,
+            Some(stop_note),
+        ));
+    }
     // WS7 item F2: the iteration-budget-exhausted final answer is checked
     // the same way as the normal return path — a model that runs out of
     // tool-calling turns is not exempt from citation checking.
-    let annotated = citations::annotate_answer_in(
-        &final_msg.content.unwrap_or_default(),
-        &tool_trace,
-        &conversation,
-    );
+    // `AI-17`: the same one-rewrite check as the normal return path, before
+    // the citation check. The flag is read here so a turn that already spent
+    // its rewrite inside the loop gets no second one; this path runs once by
+    // construction, so it only ever uses a rewrite the loop left unspent and
+    // does not set the flag itself.
+    let final_answer = if !cjk_rewritten
+        && prompt::is_latin_script(&latest_user)
+        && prompt::contains_cjk(&final_answer)
+    {
+        match cjk_rewrite_round(
+            state,
+            &mut messages,
+            progress,
+            build_run_id.as_deref(),
+            clock.ends,
+        )
+        .await?
+        {
+            CjkRewrite::Clean(rewrite) => rewrite,
+            CjkRewrite::Discarded => final_answer,
+            CjkRewrite::ClientGone => {
+                return Ok(chat_response_body(
+                    "",
+                    &tool_trace,
+                    build_run_id.as_deref(),
+                    chart_created,
+                    Some("stopped"),
+                ));
+            }
+        }
+    } else {
+        final_answer
+    };
+    let annotated = citations::annotate_answer_in(&final_answer, &tool_trace, &conversation);
     Ok(chat_response_body(
         &annotated,
         &tool_trace,
         build_run_id.as_deref(),
         chart_created,
-        Some("tool-call limit reached"),
+        Some(stop_note),
     ))
+}
+
+/// How much of a tool's refusal [`unfinished_reply`] repeats.
+const REFUSAL_MAX_CHARS: usize = 200;
+
+/// The reason an unfinished turn gives when the iteration budget ran out.
+const BUDGET_REASON: &str = "the assistant ran out of steps before it could answer";
+
+/// The reason an unfinished turn gives when the same call failed too many
+/// times (plan 111).
+const REPEATED_CALL_REASON: &str =
+    "the same call failed too many times, so the assistant stopped calling tools";
+
+/// The reply of a turn that ended without an answer: it says the request was
+/// not finished and why, and names the last tool a call of which was
+/// refused, with the refusal cut to [`REFUSAL_MAX_CHARS`]. Fixed text, never
+/// a claim that something was done.
+///
+/// A step counts as refused when its result has an `error` key, the same test
+/// the loop uses to set `ok`. The text is the tool's own refusal (the
+/// server's sentence about the model's arguments), never an upstream error's:
+/// the tools classify those before they return. An `error` that is not a
+/// string reads as "no reason given".
+fn unfinished_reply(tool_trace: &[Value], reason: &str) -> String {
+    let refused = tool_trace.iter().rev().find_map(|step| {
+        let refusal = step["result"].get("error")?;
+        Some((
+            step["tool"].as_str()?,
+            refusal.as_str().unwrap_or("no reason given"),
+        ))
+    });
+    match refused {
+        Some((refused_tool, refusal)) => {
+            let refusal: String = refusal.chars().take(REFUSAL_MAX_CHARS).collect();
+            format!(
+                "The request was not finished: {reason}. The last call a tool refused was `{refused_tool}`: {refusal}"
+            )
+        }
+        None => format!(
+            "The request was not finished: {reason}, and no tool refused a call. Check what exists before asking again."
+        ),
+    }
+}
+
+/// Runs one model round unless the turn's end comes first (`AI-34`). `None`
+/// means the round was dropped: no time was left, or it did not finish by
+/// `ends`. A dropped round is never waited for, so the reply goes out before
+/// the route's timeout cuts the turn. With no end (`None`) the round always
+/// runs, and the result is `Some`.
+async fn before_turn_end<T>(
+    ends: Option<std::time::Instant>,
+    round: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let Some(ends) = ends else {
+        return Some(round.await);
+    };
+    let remaining = ends.checked_duration_since(std::time::Instant::now())?;
+    tokio::time::timeout(remaining, round).await.ok()
+}
+
+/// The reply of a turn that stopped for time (`AI-34`): one sentence that
+/// says so, and names the tools that ran before the stop. Fixed text, and it
+/// claims nothing about what the results show.
+fn timed_out_reply(tool_trace: &[Value]) -> String {
+    let mut ran: Vec<&str> = Vec::new();
+    for step in tool_trace {
+        if let Some(tool) = step["tool"].as_str()
+            && !ran.contains(&tool)
+        {
+            ran.push(tool);
+        }
+    }
+    if ran.is_empty() {
+        return "The question took too long to answer in the time allowed, and no tool ran before the time ran out.".to_owned();
+    }
+    let names: Vec<String> = ran.iter().map(|tool| format!("`{tool}`")).collect();
+    format!(
+        "The question took too long to answer in the time allowed, so it stops after these tools ran: {}.",
+        names.join(", ")
+    )
+}
+
+/// The response body of a turn that stopped for time (`AI-34`).
+fn timed_out_body(tool_trace: &[Value], build_run_id: Option<&str>, chart_created: bool) -> Value {
+    chat_response_body(
+        &timed_out_reply(tool_trace),
+        tool_trace,
+        build_run_id,
+        chart_created,
+        Some(TIME_NOTE),
+    )
 }
 
 /// Drops a narrated preamble before a `Final answer:` line. After a repair
@@ -1165,8 +1869,17 @@ fn repair_request(numbers: &[String], table_omitted: bool) -> String {
 /// ([`model_round`]); the last line is `{"type":"done","body":…}` (the plain
 /// response body) or `{"type":"error","status":…,"body":…}`. When the
 /// client disconnects, the loop stops before its next round or tool.
-fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat) -> Response {
+fn stream_chat(
+    state: AppState,
+    principal: Option<Principal>,
+    run: PreparedChat,
+    clock: TurnClock,
+) -> Response {
     use tokio::io::AsyncWriteExt as _;
+
+    // AI-34: a streamed turn keeps the budget and loses the end. The route's
+    // timeout never cut a streamed turn, so no round of one is cut here either.
+    let clock = clock.without_end();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
     let (mut writer, reader) = tokio::io::duplex(16 * 1024);
@@ -1178,7 +1891,11 @@ fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat)
     // request's task, and handed to the spawned one.
     let query_run = crate::query_limits::QueryRun::current_or_detached();
     tokio::spawn(crate::query_limits::scope(query_run, async move {
-        let last = match run_chat(&state, principal.as_ref(), run, Some(&tx)).await {
+        // GOV-17 review R9: the streaming boundary needs the same bounded chat
+        // state machine; boxed for the same reason as the unstreamed chat above
+        // (`clippy::large_futures`).
+        let last = match Box::pin(run_chat(&state, principal.as_ref(), run, Some(&tx), clock)).await
+        {
             Ok(body) => json!({ "type": "done", "body": body }),
             Err(err) => json!({
                 "type": "error",
@@ -1292,10 +2009,11 @@ pub async fn tool_call(
         )
             .into_response();
     };
-    let is_build = parsed.mode.as_deref() == Some("build");
+    let caller = principal.as_ref().map(|Extension(p)| p);
+    let access = AssistantAccess::from_principal(caller);
+    let is_build = !access.is_ask_only() && parsed.mode.as_deref() == Some("build");
 
     // The two facts the gate needs beyond the arguments (see `gate_facts`).
-    let caller = principal.as_ref().map(|Extension(p)| p);
     let (audience, reach) = gate_facts(&state, caller, &parsed.tool, &parsed.args).await;
     let gate_result = gate::decide_with(is_build, perms, spec, &parsed.args, audience, reach);
     let (result, outcome, run_id, approval_id) = if let Some(refusal) = gate_result {
@@ -1313,10 +2031,12 @@ pub async fn tool_call(
             .await
         } else {
             let outcome = gate::outcome_of(&refusal);
-            if outcome == "needs_confirmation"
-                && let Some(error) = tools::check_draft(&state, &parsed.tool, &parsed.args).await
-            {
-                (error, "failed", None, None)
+            if outcome == "needs_confirmation" {
+                match tools::check_draft(&state, caller, &parsed.tool, &parsed.args, refusal).await
+                {
+                    Ok(draft) => (draft, outcome, None, None),
+                    Err(error) => (error, "failed", None, None),
+                }
             } else {
                 (refusal, outcome, None, None)
             }
@@ -1333,7 +2053,20 @@ pub async fn tool_call(
         let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
         (result, if ok { "executed" } else { "failed" }, None, None)
     };
+    // LH-QS-2-08 (owner 2026-11-12): this route answers a browser caller, so
+    // the answer carries the browser's copy of an engine failure (a fixed
+    // sentence and a reference), never the engine's own text. Only a model
+    // reads the diagnosis (the chat loop's or an agent run's), and it does
+    // not come through here.
+    let (result, shown) = split_tool_result(result);
     let (resource_kind, resource_id) = audit::resource_for(&parsed.tool, &parsed.args, &result);
+    // The browser's copy of the failure is the detail the audit row carries
+    // (plan 111): the fixed sentence and the reference, never the model's
+    // copy of an engine failure.
+    let detail = shown
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     audit::record(
         state.pg.as_deref(),
         principal.as_ref().map(|Extension(p)| p),
@@ -1343,7 +2076,7 @@ pub async fn tool_call(
         resource_id.as_deref(),
         &Value::Object(parsed.args.clone()),
         outcome,
-        None,
+        detail.as_deref(),
         run_id.as_deref(),
         approval_id.as_deref(),
     )
@@ -1351,7 +2084,7 @@ pub async fn tool_call(
 
     (
         StatusCode::OK,
-        ApiJson(json!({ "tool": parsed.tool, "outcome": outcome, "result": result })),
+        ApiJson(json!({ "tool": parsed.tool, "outcome": outcome, "result": shown })),
     )
         .into_response()
 }
@@ -1514,14 +2247,10 @@ fn llm_error_detail(err: &lakehouse_llm::LlmError) -> String {
         lakehouse_llm::LlmError::Transport(_) => {
             "The AI service could not be reached. Try again later.".to_owned()
         }
-        lakehouse_llm::LlmError::Api(msg) => msg
-            .strip_prefix("LLM ")
-            .and_then(|rest| rest.split(':').next())
-            .and_then(|code| code.trim().parse::<u16>().ok())
-            .map_or_else(
-                || "The AI service returned an error. Try again later.".to_owned(),
-                |code| format!("The AI service returned an error (HTTP {code}). Try again later."),
-            ),
+        lakehouse_llm::LlmError::Api(_) => err.status().map_or_else(
+            || "The AI service returned an error. Try again later.".to_owned(),
+            |code| format!("The AI service returned an error (HTTP {code}). Try again later."),
+        ),
     }
 }
 
@@ -1693,9 +2422,16 @@ async fn ensure_chat_session_table(ch: &ChClient) -> Result<(), lakehouse_clickh
         .map(drop)
 }
 
-/// `s.replace(/\\/g, "\\\\").replace(/'/g, "''")`.
-fn esc(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "''")
+/// A SQL fragment together with the values it binds.
+///
+/// SEC-60: the conversation store no longer hand-escapes values into its
+/// statements. SQL and parameters travel as one unit so a caller cannot pair
+/// a fragment with the wrong values, and a quote or a backslash in a value
+/// reaches the engine through `param_<name>` instead of through the text.
+#[derive(Debug, Default)]
+struct BoundSql {
+    sql: String,
+    params: Vec<(String, String)>,
 }
 
 /// The signed-in user every session operation is scoped to.
@@ -1763,22 +2499,33 @@ pub struct SessionIdQuery {
 }
 
 /// The list filters as a `WHERE` clause — owner always, then mode and search.
-fn session_filter(owner: &str, mode: Option<&str>, q: Option<&str>) -> String {
+///
+/// Every value is a `{name:Type}` placeholder filled by `ClickHouse` from the
+/// returned [`BoundSql::params`] (SEC-60). The search uses
+/// `positionCaseInsensitiveUTF8` rather than `LIKE`, so the value needs no
+/// wildcard escaping: `%` and `_` in a query are literal characters.
+fn session_filter(owner: &str, mode: Option<&str>, q: Option<&str>) -> BoundSql {
     let mut conditions = vec![
         "is_deleted = 0".to_owned(),
-        format!("owner_id = '{}'", esc(owner)),
+        "owner_id = {owner:String}".to_owned(),
     ];
+    let mut params = vec![("owner".to_owned(), owner.to_owned())];
     if let Some(m) = mode.filter(|m| matches!(*m, "ask" | "build")) {
-        conditions.push(format!("mode = '{m}'"));
+        conditions.push("mode = {mode:String}".to_owned());
+        params.push(("mode".to_owned(), m.to_owned()));
     }
     if let Some(q) = q.map(str::trim).filter(|q| !q.is_empty()) {
-        let q = esc(q);
-        conditions.push(format!(
-            "(positionCaseInsensitiveUTF8(title, '{q}') > 0 \
-             OR positionCaseInsensitiveUTF8(messages_json, '{q}') > 0)"
-        ));
+        conditions.push(
+            "(positionCaseInsensitiveUTF8(title, {q:String}) > 0 \
+             OR positionCaseInsensitiveUTF8(messages_json, {q:String}) > 0)"
+                .to_owned(),
+        );
+        params.push(("q".to_owned(), q.to_owned()));
     }
-    conditions.join(" AND ")
+    BoundSql {
+        sql: conditions.join(" AND "),
+        params,
+    }
 }
 
 /// `GET /api/ai/sessions` — a page of the caller's sessions, or `?id=` for
@@ -1826,17 +2573,27 @@ async fn session_list(
     let limit = q.limit.unwrap_or(30).clamp(1, 100);
     let offset = q.offset.unwrap_or(0).min(100_000);
     let filter = session_filter(owner, q.mode.as_deref(), q.q.as_deref());
-    // One row past the page says whether another page exists.
+    // One row past the page says whether another page exists. SEC-60: the
+    // filter, the page size and the offset are all bound values; only the
+    // fixed column list and literals written in this file are SQL text.
+    let sql = format!(
+        "SELECT id, title, mode, toString(updated_at) AS updated_at, \
+         positionCaseInsensitive(messages_json, '\"chartCreated\":true') > 0 AS chart_created, \
+         substringUTF8(JSONExtractString(messages_json, -1, 'content'), 1, 240) AS preview \
+         FROM console.chat_session FINAL WHERE {filter_sql} \
+         ORDER BY updated_at DESC LIMIT {{limit:UInt32}} OFFSET {{offset:UInt32}}",
+        filter_sql = filter.sql
+    );
+    let mut params = filter.params;
+    params.push(("limit".to_owned(), (limit + 1).to_string()));
+    params.push(("offset".to_owned(), offset.to_string()));
     let rows = ch
-        .rows(
-            &format!(
-                "SELECT id, title, mode, toString(updated_at) AS updated_at, \
-                 positionCaseInsensitive(messages_json, '\"chartCreated\":true') > 0 AS chart_created, \
-                 substringUTF8(JSONExtractString(messages_json, -1, 'content'), 1, 240) AS preview \
-                 FROM console.chat_session FINAL WHERE {filter} \
-                 ORDER BY updated_at DESC LIMIT {} OFFSET {offset}",
-                limit + 1
-            ),
+        .rows_with_options(
+            &sql,
+            &QueryOptions {
+                params,
+                ..QueryOptions::default()
+            },
             None,
         )
         .await?;
@@ -1856,11 +2613,16 @@ async fn session_list(
 
     let count_filter = session_filter(owner, None, q.q.as_deref());
     let count_rows = ch
-        .rows(
+        .rows_with_options(
             &format!(
                 "SELECT mode, count() AS n FROM console.chat_session FINAL \
-                 WHERE {count_filter} GROUP BY mode"
+                 WHERE {count_sql} GROUP BY mode",
+                count_sql = count_filter.sql
             ),
+            &QueryOptions {
+                params: count_filter.params,
+                ..QueryOptions::default()
+            },
             None,
         )
         .await?;
@@ -1892,15 +2654,21 @@ async fn session_row(
     owner: &str,
     id: &str,
 ) -> Result<Option<Map<String, Value>>, lakehouse_clickhouse::ChError> {
+    // SEC-60: both keys are bound by the engine. They used to be escaped by
+    // hand into the statement, which a quote or a backslash could break out
+    // of; the placeholders are filled from `param_id` / `param_owner` instead.
     let rows = ch
-        .rows(
-            &format!(
-                "SELECT id, title, mode, messages_json, title_locked, toString(updated_at) AS updated_at \
-                 FROM console.chat_session FINAL \
-                 WHERE is_deleted = 0 AND id = '{}' AND owner_id = '{}' LIMIT 1",
-                esc(id),
-                esc(owner)
-            ),
+        .rows_with_options(
+            "SELECT id, title, mode, messages_json, title_locked, toString(updated_at) AS updated_at \
+             FROM console.chat_session FINAL \
+             WHERE is_deleted = 0 AND id = {id:String} AND owner_id = {owner:String} LIMIT 1",
+            &QueryOptions {
+                params: vec![
+                    ("id".to_owned(), id.to_owned()),
+                    ("owner".to_owned(), owner.to_owned()),
+                ],
+                ..QueryOptions::default()
+            },
             None,
         )
         .await?;
@@ -2017,25 +2785,52 @@ fn derive_title(messages: &[Value]) -> String {
     format!("{}…", cut.trim_end())
 }
 
+/// The INSERT head for [`CREATE_CHAT_SESSION_TABLE`]. The data follows on the
+/// next line as `JSONEachRow`, so no caller value is ever part of the SQL.
+const INSERT_SESSION: &str = "INSERT INTO console.chat_session \
+     (id, title, mode, messages_json, owner_id, title_locked, is_deleted) FORMAT JSONEachRow";
+
+/// One row of [`CREATE_CHAT_SESSION_TABLE`] in `ClickHouse`'s `JSONEachRow`
+/// shape (the pattern `lakehouse_bi::geo::region_inserts` uses). The field
+/// names are the table's columns; `serde_json` quotes every value, so a
+/// quote, a backslash, a newline or Unicode in a conversation cannot end a
+/// field, and the whole row stays in the POST body instead of a URL
+/// parameter (`SEC-60` review: a 200 KB `messages_json` would overflow the
+/// URL once percent-encoded).
+#[derive(Serialize)]
+struct SessionJsonRow<'a> {
+    id: &'a str,
+    title: &'a str,
+    mode: &'a str,
+    messages_json: &'a str,
+    owner_id: &'a str,
+    title_locked: u8,
+    is_deleted: u8,
+}
+
 /// Insert one full version of a session row (`ReplacingMergeTree` keeps the
 /// newest by `updated_at`).
 async fn write_session(
     ch: &ChClient,
     row: &SessionWrite<'_>,
 ) -> Result<(), lakehouse_clickhouse::ChError> {
-    let sql = format!(
-        "INSERT INTO console.chat_session \
-         (id, title, mode, messages_json, owner_id, title_locked, is_deleted) \
-         VALUES ('{}', '{}', '{}', '{}', '{}', {}, {})",
-        esc(row.id),
-        esc(row.title),
-        esc(row.mode),
-        esc(row.messages_json),
-        esc(row.owner),
-        u8::from(row.title_locked),
-        u8::from(row.deleted),
-    );
-    ch.exec(&sql, None).await
+    let json = serde_json::to_string(&SessionJsonRow {
+        id: row.id,
+        title: row.title,
+        mode: row.mode,
+        messages_json: row.messages_json,
+        owner_id: row.owner,
+        title_locked: u8::from(row.title_locked),
+        is_deleted: u8::from(row.deleted),
+    })
+    .map_err(|err| {
+        // SEC-11 / SEC-60: log the serde error's raw text, but never put it in
+        // a response. The caller gets only this fixed sentence.
+        tracing::error!(error = %err, "could not serialize a chat session row");
+        lakehouse_clickhouse::ChError::Server("could not serialize a chat session row".to_owned())
+    })?;
+    // The statement itself has no user text; the data follows on one line.
+    ch.exec(&format!("{INSERT_SESSION}\n{json}\n"), None).await
 }
 
 struct SessionWrite<'a> {
@@ -2736,6 +3531,26 @@ mod tests {
         }
     }
 
+    /// `AI-30`: the dashboard page's view is read into the chat body, and a
+    /// body without one (every other page, and older clients) still parses.
+    #[test]
+    fn a_chat_body_reads_the_dashboard_on_screen_and_one_without_it_still_parses() {
+        let with: ChatBody = serde_json::from_value(json!({
+            "messages": [{ "role": "user", "content": "Send this PDF" }],
+            "view": { "board": "b1", "filters": [{ "column": "region", "values": ["West"] }] }
+        }))
+        .expect("a body with a view");
+        let view = with.view.expect("a screen view");
+        assert_eq!(view.board, "b1");
+        assert_eq!(view.filters.len(), 1);
+
+        let without: ChatBody = serde_json::from_value(json!({
+            "messages": [{ "role": "user", "content": "Send this PDF" }]
+        }))
+        .expect("a body without a view");
+        assert!(without.view.is_none());
+    }
+
     async fn offered(state: &AppState, tools: Option<&[&str]>) -> Vec<String> {
         let who = analyst(1);
         let prepared = prepare_chat(
@@ -2852,6 +3667,10 @@ mod tests {
     /// BI-18 part C review fix (SHOULD-FIX) R30: the chat of a person who cannot
     /// change dashboards says why the tools are withheld, ahead of the language
     /// line; a person who can gets no such sentence.
+    ///
+    /// The `AI-1-AC3` acceptance check changed the wording of the refusal: it is
+    /// described, not quoted in English, so the model says it in the language of
+    /// the person's message.
     #[tokio::test]
     async fn a_chat_without_dashboard_write_says_the_tools_are_withheld_for_permissions() {
         let state = state_with_ask_back("false");
@@ -2872,25 +3691,26 @@ mod tests {
                 chat.messages[0].content.clone().unwrap_or_default()
             }
         };
+        // `AI-29..31` review R1: T9 (D13) reworded this note away from the
+        // technical permission and ids. All three checks must read the new
+        // sentence; the old `find` returned None and passed the order check
+        // vacuously (`None < Some`), which hid the drift from a filtered run.
+        let refusal = "tells the person, in the language of the person's message and in plain words, that their account may not change dashboards";
         let viewer = system(analyst(1)).await;
+        assert!(viewer.contains(refusal), "{viewer}");
+        let refusal_at = viewer
+            .find(refusal)
+            .expect("the refusal sentence is present for a viewer");
+        let closing_at = viewer
+            .find(&prompt::closing("Move the map charts to a new tab.", None))
+            .expect("the language line is present");
         assert!(
-            viewer.contains(
-                "Your account cannot change dashboards; ask an editor or an administrator."
-            ),
-            "{viewer}"
-        );
-        assert!(
-            viewer.find("Your account cannot change dashboards")
-                < viewer.find(&prompt::closing("Move the map charts to a new tab.", None)),
+            refusal_at < closing_at,
             "the sentence comes before the language line"
         );
         let mut editor = analyst(2);
         editor.permissions = lakehouse_auth::PermissionSet::parse("dashboard:write, query:read");
-        assert!(
-            !system(editor)
-                .await
-                .contains("Your account cannot change dashboards")
-        );
+        assert!(!system(editor).await.contains(refusal));
     }
 
     #[tokio::test]
@@ -3216,19 +4036,32 @@ mod tests {
     #[test]
     fn session_filter_always_scopes_to_the_owner() {
         let f = session_filter("u-1", None, None);
-        assert_eq!(f, "is_deleted = 0 AND owner_id = 'u-1'");
+        assert_eq!(f.sql, "is_deleted = 0 AND owner_id = {owner:String}");
+        assert_eq!(f.params, vec![("owner".to_owned(), "u-1".to_owned())]);
     }
 
     #[test]
-    fn session_filter_whitelists_mode_and_escapes_search() {
+    fn session_filter_whitelists_mode_and_binds_search() {
         let f = session_filter("u-1", Some("build"), Some(" it's "));
-        assert!(f.contains("mode = 'build'"));
-        assert!(f.contains("positionCaseInsensitiveUTF8(title, 'it''s')"));
+        assert!(f.sql.contains("mode = {mode:String}"));
+        assert!(
+            f.sql
+                .contains("positionCaseInsensitiveUTF8(title, {q:String}) > 0")
+        );
+        assert_eq!(
+            f.params,
+            vec![
+                ("owner".to_owned(), "u-1".to_owned()),
+                ("mode".to_owned(), "build".to_owned()),
+                ("q".to_owned(), "it's".to_owned()),
+            ]
+        );
         let f = session_filter("u-1", Some("x' OR 1=1 --"), None);
         assert!(
-            !f.contains("mode"),
-            "unknown modes are dropped, not quoted in"
+            !f.sql.contains("mode"),
+            "unknown modes are dropped, not bound in"
         );
+        assert_eq!(f.params, vec![("owner".to_owned(), "u-1".to_owned())]);
     }
 
     #[test]
@@ -3321,6 +4154,367 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_unfinished_reply_names_the_last_refused_tool_and_cuts_its_refusal_to_200_characters() {
+        let trace = vec![
+            json!({ "tool": "list_boards", "ok": false, "result": { "error": "an older refusal" } }),
+            json!({ "tool": "create_chart", "ok": false, "result": { "error": "x".repeat(250) } }),
+            json!({ "tool": "list_charts", "ok": true, "result": { "charts": [] } }),
+        ];
+        let reply = unfinished_reply(&trace, BUDGET_REASON);
+        assert!(reply.contains("`create_chart`"), "{reply}");
+        assert!(!reply.contains("older refusal"), "{reply}");
+        assert!(reply.ends_with(&"x".repeat(200)), "{reply}");
+        assert!(!reply.contains(&"x".repeat(201)), "{reply}");
+    }
+
+    #[test]
+    fn the_unfinished_reply_reads_an_error_that_is_not_a_string_as_no_reason_given() {
+        let trace = vec![
+            json!({ "tool": "create_chart", "ok": false, "result": { "error": { "code": 7 } } }),
+        ];
+        let reply = unfinished_reply(&trace, BUDGET_REASON);
+        assert!(reply.contains("`create_chart`: no reason given"), "{reply}");
+    }
+
+    // AI-34: a turn that runs long on a slow model answers from what it
+    // found before its timeout, instead of ending in a 408. The clock is
+    // built by hand where a test needs a budget of a few hundred
+    // milliseconds, since the route's timeout has a floor of 30 seconds.
+
+    use std::time::{Duration, Instant};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const FINAL_ANSWER_REQUEST: &str =
+        "Give your final answer now, concisely, from the results above.";
+    const FINAL_ANSWER: &str = "The final answer, from what the tools found.";
+    const EARLY_ANSWER: &str = "An answer after one tool call.";
+    const TIMED_OUT_REPLY: &str = "The question took too long to answer in the time allowed, so it stops after these tools ran: `get_query_limits`.";
+
+    /// One model round as an OpenAI-compatible `/chat/completions` response.
+    fn mock_round(content: Option<&str>, calls: &[(&str, &str, &str)]) -> Value {
+        let tool_calls: Vec<Value> = calls
+            .iter()
+            .map(|(id, name, arguments)| {
+                json!({
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments },
+                })
+            })
+            .collect();
+        json!({ "choices": [{ "message": {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": if tool_calls.is_empty() { Value::Null } else { json!(tool_calls) },
+        } }] })
+    }
+
+    /// A streamed model round as server-sent events: one content delta per
+    /// piece, then `[DONE]`.
+    fn sse(pieces: &[&str]) -> String {
+        let mut body = String::new();
+        for piece in pieces {
+            let event = json!({ "choices": [ { "delta": { "content": piece } } ] });
+            let _ = std::fmt::Write::write_fmt(&mut body, format_args!("data: {event}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    /// The one tool these turns may call. It reads the query limits, which
+    /// needs no database, so every call succeeds.
+    fn limits_tool() -> Value {
+        json!({ "type": "function", "function": {
+            "name": "get_query_limits",
+            "description": "Reports the query limits that apply to the person.",
+            "parameters": { "type": "object", "properties": {} },
+        } })
+    }
+
+    /// A turn that asks the model one question, with the limits tool offered.
+    fn one_question(question: &str) -> PreparedChat {
+        PreparedChat {
+            messages: vec![LlmMessage {
+                role: LlmMessageRole::User,
+                content: Some(question.to_owned()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            tools: vec![limits_tool()],
+            is_build: false,
+            allowlisted: false,
+            latest_user: question.to_owned(),
+            // PR #639 review finding 2: `AI-29..31` on main added the
+            // dashboard-on-screen view to `PreparedChat`; a turn a test
+            // builds has no screen, so it carries none.
+            view: None,
+        }
+    }
+
+    /// A model that calls the limits tool in every round except the final
+    /// one. A tool round takes `round` to answer and the final round
+    /// `final_round`, so a test chooses how long the turn takes.
+    async fn slow_model(round: Duration, final_round: Duration) -> MockServer {
+        let llm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                if String::from_utf8_lossy(&request.body).contains(FINAL_ANSWER_REQUEST) {
+                    ResponseTemplate::new(200)
+                        .set_body_json(mock_round(Some(FINAL_ANSWER), &[]))
+                        .set_delay(final_round)
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_json(mock_round(None, &[("call-1", "get_query_limits", "{}")]))
+                        .set_delay(round)
+                }
+            })
+            .mount(&llm)
+            .await;
+        llm
+    }
+
+    /// The state of a turn whose model is `llm`, with no database.
+    fn state_for(llm: &MockServer) -> AppState {
+        state_with_env(&[
+            ("LLM_URL", llm.uri().as_str()),
+            ("DATABASE_URL", "not a postgres url"),
+        ])
+    }
+
+    async fn run_turn(state: &AppState, clock: TurnClock, turn: PreparedChat) -> Value {
+        let who = analyst(1);
+        // Boxed as `chat` boxes it: the turn's future is too large to sit in
+        // a test's own future (`clippy::large_futures`).
+        Box::pin(run_chat(state, Some(&who), turn, None, clock))
+            .await
+            .expect("the mock model answers")
+    }
+
+    /// The bodies of the requests the model received, in the order sent.
+    async fn sent_bodies(llm: &MockServer) -> Vec<Value> {
+        llm.received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|request| serde_json::from_slice(&request.body).expect("a JSON request body"))
+            .collect()
+    }
+
+    /// A turn that keeps calling tools answers from the final round before
+    /// its timeout. The budget stops the tool rounds, and the final round
+    /// is tool-free.
+    #[tokio::test]
+    async fn a_turn_that_keeps_calling_tools_answers_before_its_timeout() {
+        let timeout = Duration::from_secs(6);
+        let llm = slow_model(Duration::from_millis(800), Duration::ZERO).await;
+        let state = state_for(&llm);
+        let clock = TurnClock::new(Instant::now(), timeout);
+        let body = tokio::time::timeout(
+            timeout,
+            run_turn(
+                &state,
+                clock,
+                one_question("How many query limits apply to me?"),
+            ),
+        )
+        .await
+        .expect("the turn answers before its timeout");
+        assert_eq!(body["answer"], FINAL_ANSWER, "{body}");
+        assert_eq!(body["note"], TIME_NOTE, "{body}");
+        let sent = sent_bodies(&llm).await;
+        let (last, tool_rounds) = sent.split_last().expect("the model was asked");
+        assert!(last.to_string().contains(FINAL_ANSWER_REQUEST), "{last}");
+        assert!(!tool_rounds.is_empty(), "{sent:?}");
+        assert!(tool_rounds.len() < MAX_ITER as usize, "{sent:?}");
+        assert!(
+            tool_rounds
+                .iter()
+                .all(|round| round["tools"].as_array().is_some_and(|t| !t.is_empty())),
+            "every round before the budget offers the tool: {sent:?}"
+        );
+    }
+
+    /// A turn that finishes before its budget is unchanged: the same answer,
+    /// no note, and no final-answer request.
+    #[tokio::test]
+    async fn a_turn_that_finishes_early_is_unchanged() {
+        let llm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(mock_round(None, &[("call-1", "get_query_limits", "{}")])),
+            )
+            .up_to_n_times(1)
+            .mount(&llm)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(mock_round(Some(EARLY_ANSWER), &[])),
+            )
+            .mount(&llm)
+            .await;
+        let state = state_for(&llm);
+        let clock = TurnClock::new(Instant::now(), Duration::from_secs(6));
+        let body = run_turn(&state, clock, one_question("How many query limits apply?")).await;
+        assert_eq!(body["answer"], EARLY_ANSWER, "{body}");
+        assert!(body.get("note").is_none(), "{body}");
+        assert_eq!(
+            body["toolTrace"].as_array().map(Vec::len),
+            Some(1),
+            "{body}"
+        );
+        let sent = sent_bodies(&llm).await;
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(
+            sent.iter()
+                .all(|request| !request.to_string().contains(FINAL_ANSWER_REQUEST)),
+            "{sent:?}"
+        );
+    }
+
+    /// Past the budget, the final-answer round offers the model no tools.
+    #[tokio::test]
+    async fn the_final_answer_round_is_offered_no_tools() {
+        let llm = slow_model(Duration::ZERO, Duration::ZERO).await;
+        let state = state_for(&llm);
+        let now = Instant::now();
+        let clock = TurnClock {
+            budget_ends: now,
+            ends: Some(now + Duration::from_secs(10)),
+        };
+        let body = run_turn(&state, clock, one_question("How many query limits apply?")).await;
+        assert_eq!(body["answer"], FINAL_ANSWER, "{body}");
+        let sent = sent_bodies(&llm).await;
+        assert_eq!(
+            sent.len(),
+            1,
+            "the budget is spent before the first round: {sent:?}"
+        );
+        assert!(
+            sent[0]["tools"].as_array().is_none_or(Vec::is_empty),
+            "{}",
+            sent[0]
+        );
+        assert!(
+            sent[0].to_string().contains(FINAL_ANSWER_REQUEST),
+            "{}",
+            sent[0]
+        );
+    }
+
+    /// A round still running at the turn's end is cut there. The turn then
+    /// answers with the fixed sentence and names the tools that ran.
+    #[tokio::test]
+    async fn a_turn_that_runs_out_of_time_says_so_and_names_the_tools_that_ran() {
+        // A tool round takes 300 ms, the final round 1 s. The budget ends at
+        // 100 ms and the turn at 500 ms, so the final round is cut.
+        let llm = slow_model(Duration::from_millis(300), Duration::from_secs(1)).await;
+        let state = state_for(&llm);
+        let start = Instant::now();
+        let clock = TurnClock {
+            budget_ends: start + Duration::from_millis(100),
+            ends: Some(start + Duration::from_millis(500)),
+        };
+        let body = tokio::time::timeout(
+            Duration::from_secs(6),
+            run_turn(&state, clock, one_question("How many query limits apply?")),
+        )
+        .await
+        .expect("the turn ends before its timeout");
+        assert_eq!(body["answer"], TIMED_OUT_REPLY, "{body}");
+        assert_eq!(body["note"], TIME_NOTE, "{body}");
+        assert_eq!(
+            body["toolTrace"].as_array().map(Vec::len),
+            Some(1),
+            "{body}"
+        );
+    }
+
+    /// The non-streamed path keeps the hard end: a round still running at
+    /// nine tenths of the timeout is cut, and the turn answers with the time
+    /// reply. It does not wait for a later round to answer (`AI-34`).
+    #[tokio::test]
+    async fn a_round_past_the_hard_end_gets_the_time_reply_not_a_later_answer() {
+        // A one-second timeout: the budget ends at 0.75 s and the hard end at
+        // 0.9 s. The first round is quick; the second round takes 1.2 s.
+        let llm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(mock_round(None, &[("call-1", "get_query_limits", "{}")])),
+            )
+            .up_to_n_times(1)
+            .mount(&llm)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(mock_round(None, &[("call-2", "get_query_limits", "{}")]))
+                    .set_delay(Duration::from_millis(1200)),
+            )
+            .up_to_n_times(1)
+            .mount(&llm)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(mock_round(Some(FINAL_ANSWER), &[])),
+            )
+            .mount(&llm)
+            .await;
+        let state = state_for(&llm);
+        let clock = TurnClock::new(Instant::now(), Duration::from_secs(1));
+        let body = run_turn(&state, clock, one_question("How many query limits apply?")).await;
+        assert_eq!(body["answer"], TIMED_OUT_REPLY, "{body}");
+        assert_eq!(body["note"], TIME_NOTE, "{body}");
+        let sent = sent_bodies(&llm).await;
+        assert_eq!(sent.len(), 2, "no request follows the cut round: {sent:?}");
+    }
+
+    /// The streamed path has no hard end (`AI-34`, option C): a round that
+    /// runs past nine tenths of the timeout is not cut, and the streamed turn
+    /// answers from it.
+    #[tokio::test]
+    async fn a_streamed_round_past_the_hard_end_is_not_cut() {
+        // A one-second timeout: the budget ends at 0.75 s and the hard end
+        // would be at 0.9 s. The one round answers at 1.2 s.
+        let llm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(sse(&[EARLY_ANSWER]), "text/event-stream")
+                    .set_delay(Duration::from_millis(1200)),
+            )
+            .mount(&llm)
+            .await;
+        let state = state_for(&llm);
+        let clock = TurnClock::new(Instant::now(), Duration::from_secs(1));
+        let response = stream_chat(
+            state,
+            Some(analyst(1)),
+            one_question("How many query limits apply?"),
+            clock,
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the stream ends");
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let last: Value =
+            serde_json::from_str(text.lines().last().expect("a done line")).expect("a JSON line");
+        assert_eq!(last["type"], "done", "{text}");
+        assert_eq!(last["body"]["answer"], EARLY_ANSWER, "{text}");
+        assert!(last["body"].get("note").is_none(), "{text}");
+    }
+
     /// D4 regression: `buildRunId` must be omitted from the response body
     /// when absent, matching the TS's `JSON.stringify` dropping an
     /// `undefined`-valued key — a bare `Option<String>` field in a `json!`
@@ -3401,9 +4595,239 @@ mod tests {
         assert_eq!(id.len(), 10);
     }
 
+    /// The values that used to be hand-escaped into the SQL (SEC-60) now
+    /// travel as a `param_<name>` map beside a statement of placeholders.
     #[test]
-    fn esc_doubles_backslashes_and_quotes() {
-        assert_eq!(esc("O'Brien\\x"), "O''Brien\\\\x");
+    fn session_filter_binds_values_instead_of_interpolating_them() {
+        let filter = session_filter("o'wner\\x", Some("ask"), Some("  sea'rch\\%  "));
+        assert_eq!(
+            filter.sql,
+            "is_deleted = 0 AND owner_id = {owner:String} AND mode = {mode:String} \
+             AND (positionCaseInsensitiveUTF8(title, {q:String}) > 0 \
+             OR positionCaseInsensitiveUTF8(messages_json, {q:String}) > 0)"
+        );
+        assert!(
+            !filter.sql.contains("o'wner") && !filter.sql.contains("sea'rch"),
+            "no raw value may be written into the SQL: {}",
+            filter.sql
+        );
+        assert_eq!(
+            filter.params,
+            vec![
+                ("owner".to_owned(), "o'wner\\x".to_owned()),
+                ("mode".to_owned(), "ask".to_owned()),
+                // The search value is trimmed, but its quote and backslash
+                // are preserved byte for byte, and `%` is an ordinary char.
+                ("q".to_owned(), "sea'rch\\%".to_owned()),
+            ]
+        );
+
+        let bare = session_filter("o'wner\\x", None, Some("   "));
+        assert!(!bare.sql.contains("mode ="), "{}", bare.sql);
+        assert!(
+            !bare.sql.contains("positionCaseInsensitiveUTF8"),
+            "{}",
+            bare.sql
+        );
+        assert_eq!(
+            bare.params,
+            vec![("owner".to_owned(), "o'wner\\x".to_owned())]
+        );
+    }
+
+    /// A `ChClient` whose requests land on `server`, for the store's own
+    /// wiremock tests below. No Postgres or `AppState` is involved: these are
+    /// the store functions themselves, called with hostile keys.
+    fn ch_client(server: &MockServer) -> ChClient {
+        ChClient::new(server.uri(), "default".to_owned(), String::new())
+    }
+
+    /// Only the `param_<name>` pairs of a request: `query_with_options` also
+    /// sends a fixed `cancel_http_readonly_queries_on_client_close` setting.
+    fn bound_pairs(request: &wiremock::Request) -> Vec<(String, String)> {
+        request
+            .url
+            .query_pairs()
+            .filter(|(name, _)| name.starts_with("param_"))
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn session_row_sends_the_id_and_owner_as_http_parameters() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"meta":[],"data":[],"rows":0}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let row = session_row(&ch_client(&server), "o'w\\ner", "s'1\\2")
+            .await
+            .unwrap();
+        assert!(row.is_none(), "the mock returned no rows");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert!(body.contains("id = {id:String}"), "{body}");
+        assert!(body.contains("owner_id = {owner:String}"), "{body}");
+        assert!(
+            !body.contains("s'1\\2") && !body.contains("o'w\\ner"),
+            "raw keys must not be written into the SQL: {body}"
+        );
+        assert_eq!(
+            bound_pairs(&requests[0]),
+            vec![
+                ("param_id".to_owned(), "s'1\\2".to_owned()),
+                ("param_owner".to_owned(), "o'w\\ner".to_owned()),
+            ]
+        );
+    }
+
+    /// SEC-60 review: a 200 KB conversation must not go into the URL, where
+    /// percent-encoding can push it past the HTTP/ClickHouse URI limit. The
+    /// row goes in the POST body as one `JSONEachRow` object, and `serde_json`
+    /// — not hand-escaping — handles every tricky character.
+    #[tokio::test]
+    async fn write_session_sends_a_json_each_row_body_not_url_parameters() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let id = "s'1\\2";
+        let owner = "o'w\\ner\n☃";
+        let title = "a 'quoted' \\ title\nline 2";
+        let messages = serde_json::to_string(&json!([{
+            "role": "user",
+            "content": format!("it's \\ C:\\data\n100%_wild ☃ {}", "x".repeat(70_000)),
+        }]))
+        .unwrap();
+        assert!(messages.len() > 64 * 1024, "a large conversation body");
+        assert!(id.contains('\'') && id.contains('\\'), "a hostile id");
+        assert!(
+            owner.contains('\'') && owner.contains('\\') && owner.contains('\n'),
+            "a hostile owner"
+        );
+        write_session(
+            &ch_client(&server),
+            &SessionWrite {
+                id,
+                owner,
+                title,
+                title_locked: true,
+                mode: "ask",
+                messages_json: &messages,
+                deleted: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].url.query().is_none(),
+            "the whole row stays in the POST body, never in the URL: {:?}",
+            requests[0].url.query()
+        );
+
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        let (head, data) = body
+            .split_once('\n')
+            .expect("an INSERT head line then one JSONEachRow object");
+        assert_eq!(head, INSERT_SESSION);
+        assert!(data.ends_with('\n'), "one JSON object per line");
+        let row: Value = serde_json::from_str(data.trim_end()).expect("a JSONEachRow object");
+        assert_eq!(row.as_object().unwrap().len(), 7, "every column is named");
+        assert_eq!(row["id"], json!(id));
+        assert_eq!(row["title"], json!(title));
+        assert_eq!(row["mode"], json!("ask"));
+        assert_eq!(row["messages_json"], json!(messages));
+        assert_eq!(row["owner_id"], json!(owner));
+        assert_eq!(row["title_locked"], json!(1));
+        assert_eq!(row["is_deleted"], json!(0));
+        assert!(
+            !head.contains(id) && !head.contains(owner) && !head.contains(title),
+            "no caller value may be part of the SQL: {head}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_list_binds_the_search_mode_and_pagination() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"meta":[],"data":[],"rows":0}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let query = SessionsQuery {
+            id: None,
+            q: Some("sea'rch\\%".to_owned()),
+            mode: Some("build".to_owned()),
+            limit: Some(5),
+            offset: Some(2),
+        };
+        let page = session_list(&ch_client(&server), "o'w\\ner", &query)
+            .await
+            .unwrap();
+        assert_eq!(page["sessions"], json!([]));
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "the page read and the per-mode counts");
+        let list = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert!(
+            list.contains("owner_id = {owner:String} AND mode = {mode:String}"),
+            "{list}"
+        );
+        assert!(
+            list.contains("positionCaseInsensitiveUTF8(title, {q:String}) > 0"),
+            "{list}"
+        );
+        assert!(
+            list.contains("LIMIT {limit:UInt32} OFFSET {offset:UInt32}"),
+            "{list}"
+        );
+        assert!(
+            !list.contains("sea'rch") && !list.contains("o'w\\ner"),
+            "raw values must not be written into the SQL: {list}"
+        );
+        assert_eq!(
+            bound_pairs(&requests[0]),
+            vec![
+                ("param_owner".to_owned(), "o'w\\ner".to_owned()),
+                ("param_mode".to_owned(), "build".to_owned()),
+                ("param_q".to_owned(), "sea'rch\\%".to_owned()),
+                ("param_limit".to_owned(), "6".to_owned()),
+                ("param_offset".to_owned(), "2".to_owned()),
+            ]
+        );
+
+        let counts = String::from_utf8(requests[1].body.clone()).unwrap();
+        assert!(
+            counts.contains("WHERE is_deleted = 0 AND owner_id = {owner:String}"),
+            "{counts}"
+        );
+        assert!(
+            counts.contains("positionCaseInsensitiveUTF8(messages_json, {q:String}) > 0"),
+            "{counts}"
+        );
+        assert!(
+            !counts.contains("mode =") && !counts.contains("LIMIT"),
+            "the counts filter only by owner and search: {counts}"
+        );
+        assert_eq!(
+            bound_pairs(&requests[1]),
+            vec![
+                ("param_owner".to_owned(), "o'w\\ner".to_owned()),
+                ("param_q".to_owned(), "sea'rch\\%".to_owned()),
+            ]
+        );
     }
 
     /// One message with one tool step whose result carries `bytes` of text.
@@ -3494,5 +4918,29 @@ mod tests {
             fit_messages(&messages, MESSAGES_MAX_BYTES),
             serde_json::to_string(&messages).unwrap()
         );
+    }
+
+    /// ADM-13 (D6): `data_map_access` gives `Full` to `assistant:ask`.
+    #[test]
+    fn data_map_access_gives_full_to_assistant_ask() {
+        use lakehouse_auth::Principal;
+
+        let ask_only = holding("assistant:ask");
+        assert_eq!(data_map_access(Some(&ask_only)), MapAccess::Full);
+
+        let use_only = holding("assistant:use");
+        assert_eq!(data_map_access(Some(&use_only)), MapAccess::None);
+
+        let none: Option<&Principal> = None;
+        assert_eq!(data_map_access(none), MapAccess::None);
+
+        let catalog_only = holding("catalog:read");
+        assert_eq!(
+            data_map_access(Some(&catalog_only)),
+            MapAccess::WithoutSamples
+        );
+
+        let full_perms = holding("catalog:read, query:read");
+        assert_eq!(data_map_access(Some(&full_perms)), MapAccess::Full);
     }
 }

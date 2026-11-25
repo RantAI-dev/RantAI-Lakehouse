@@ -24,6 +24,7 @@ mock.module("next/navigation", () => ({
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import { formatBytes } from "@/lib/format"
 import { MAX_SESSION_BYTES, REGISTRATION_FAILED_REASON, TABLE_NAME_RULE } from "@/lib/uploads"
 import type { Upload, UploadColumnSpec, UploadFolder, UploadPreview } from "@/services/contracts/uploads"
@@ -109,6 +110,8 @@ type Answer<Args extends unknown[] = []> = Response | ((...args: Args) => Respon
 
 type Routes = {
   list?: Upload[] | Response
+  /** `GET /api/uploads?table=<name>` (`DATA-47`): the named table's own uploads; the default narrows `list`. */
+  tableUploads?: (table: string) => Upload[] | Response | Promise<Upload[] | Response>
   /** `POST /api/uploads/sessions`; the default opens `up-N` with 8 MiB pieces. */
   session?: Answer<[{ filename: string; sizeBytes: number }]>
   /** `PUT /api/uploads/{id}/parts/{n}`; the default stores the piece. */
@@ -117,8 +120,8 @@ type Routes = {
   complete?: Answer<[string]>
   get?: (n: number) => Upload | Response
   preview?: (query: URLSearchParams) => UploadPreview | Response
-  /** `POST /api/uploads/{id}/check`: gets the body the page sent. */
-  check?: (body: { columns: { name: string; type: string }[] }) => unknown | Response
+  /** `POST /api/uploads/{id}/check`: gets the body the page sent; may answer later (a promise). */
+  check?: (body: { columns: { name: string; type: string }[] }) => unknown | Response | Promise<unknown>
   /** `POST /api/uploads/{id}/compare` (several files into one table): gets the body the page sent; the default finds no mismatch. */
   compare?: (body: { alsoUploads: string[]; columns?: { name: string; type: string }[] }) => unknown | Response
   ingest?: Response
@@ -157,7 +160,18 @@ function stubFetch(routes: Routes = {}): Call[] {
     const body = typeof init?.body === "string" ? JSON.parse(init.body) : init?.body
     calls.push({ url: `${target.pathname}${target.search}`, method, body })
     const reply = (value: unknown) => (value instanceof Response ? value : json(value))
-    if (target.pathname === "/api/uploads" && method === "GET") return reply(routes.list ?? [])
+    if (target.pathname === "/api/uploads" && method === "GET") {
+      // `DATA-47`: the Table step asks about one table by its exact name. Without a
+      // `tableUploads` route the answer is the unfiltered list narrowed the way the
+      // API narrows it, so a test that gives `list` keeps its meaning.
+      const table = target.searchParams.get("table")
+      if (table !== null) {
+        if (routes.tableUploads) return reply(await routes.tableUploads(table))
+        const list = routes.list ?? []
+        return reply(Array.isArray(list) ? list.filter((u) => u.bronzeTable === table) : list)
+      }
+      return reply(routes.list ?? [])
+    }
     // Before the per-upload routes below: `folders` is not an upload id.
     if (target.pathname === "/api/uploads/folders" && method === "GET") return reply(routes.folders ?? [])
     if (target.pathname === "/api/uploads/folders" && method === "POST") {
@@ -193,7 +207,9 @@ function stubFetch(routes: Routes = {}): Call[] {
     if (/^\/api\/uploads\/[^/]+$/.test(target.pathname) && method === "DELETE") return new Response(null, { status: 204 })
     if (target.pathname.endsWith("/preview") && routes.preview) return reply(routes.preview(target.searchParams))
     if (target.pathname.endsWith("/check") && method === "POST" && routes.check) {
-      return reply(routes.check(body as { columns: { name: string; type: string }[] }))
+      // A route may answer later (`Answer`), so its promise is awaited here.
+      const value = await routes.check(body as { columns: { name: string; type: string }[] })
+      return reply(value)
     }
     if (target.pathname.endsWith("/compare") && method === "POST") {
       const asked = body as { alsoUploads: string[]; columns?: { name: string; type: string }[] }
@@ -231,7 +247,7 @@ const CSV = () => new File(["sku,qty\na1,3\nb2,5\n"], "stock.csv", { type: "text
 describe("UploadFilePage, first step", () => {
   it("has a labelled file control and refuses a file over 2 GB, sending nothing", async () => {
     const calls = stubFetch()
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     const big = new File(["x"], "big.csv")
     Object.defineProperty(big, "size", { value: MAX_SESSION_BYTES + 1 })
     chooseFile(big)
@@ -247,7 +263,7 @@ describe("UploadFilePage, first step", () => {
   it("shows the API's refusal of a file in its row, word for word, and stays on the first step", async () => {
     const sentence = "This looks like a workbook. Save it as CSV and upload that."
     stubFetch({ complete: () => json({ error: sentence }, 400) })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     // A name the console does not refuse by itself (it refuses .xlsm before any
     // request, see below), so the API's own refusal by content is what shows.
     chooseFile(new File(["x"], "stock.dat"))
@@ -262,7 +278,7 @@ describe("UploadFilePage, first step", () => {
 
   it("refuses a workbook the API does not read by its name before any request, saying what to save it as", async () => {
     const calls = stubFetch()
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(new File(["x"], "stock.XLSM"))
 
     const alert = await screen.findByRole("alert")
@@ -276,7 +292,7 @@ describe("UploadFilePage, first step", () => {
 
   it("states the limits as short facts up front, and suggests text and Excel files in the picker", () => {
     stubFetch()
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     const facts = new Map(
       screen.getAllByRole("term").map((term) => [term.textContent, term.nextElementSibling?.textContent])
     )
@@ -304,9 +320,12 @@ describe("UploadFilePage, first step", () => {
 
   it("is a drop area with one line, a button labelling the real file input, and the page's subtitle names Excel", () => {
     stubFetch()
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     expect(screen.getByText("Drop files here, or choose some")).toBeDefined()
-    expect(screen.getByText(/CSV, TSV, JSON, Avro, Excel or Parquet files, or a gzip or zip of them, in as raw tables/)).toBeDefined()
+    // `DATA-51` (QA `LH-DATA-9-02`): JSON Lines is named too, as decision 12 of the page says.
+    expect(
+      screen.getByText(/CSV, TSV, JSON, JSON Lines, Avro, Excel or Parquet files, or a gzip or zip of them, in as raw tables/)
+    ).toBeDefined()
     const input = screen.getByLabelText("Choose files")
     const button = screen.getByText("Choose files", { selector: "label" })
     expect(button.getAttribute("for")).toBe(input.id)
@@ -314,7 +333,7 @@ describe("UploadFilePage, first step", () => {
 
   it("highlights the area while files are dragged over it, and takes the dropped files as rows that start to be sent", async () => {
     const calls = stubFetch()
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     const area = screen.getByText("Drop files here, or choose some").closest("[data-dragging]") as HTMLElement
     expect(area.dataset.dragging).toBe("false")
 
@@ -340,7 +359,7 @@ describe("UploadFilePage, first step", () => {
 
   it("marks the chosen files by their format: green spreadsheet and XLS/XLSX, text and CSV/TSV, neutral otherwise, in any case", () => {
     stubFetch()
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     const cases: [string, string | null, string, string][] = [
       ["stock.xls", "XLS", "workbook", "text-emerald-700"],
       ["Stock.XLSX", "XLSX", "workbook", "text-emerald-700"],
@@ -367,7 +386,7 @@ describe("UploadFilePage, first step", () => {
 
   it("refuses a dropped file by the same checks as a chosen one, and a drop with no file changes nothing", async () => {
     stubFetch()
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     const area = screen.getByText("Drop files here, or choose some").closest("[data-dragging]") as HTMLElement
     fireEvent.drop(area, { dataTransfer: { files: [new File(["x"], "stock.XLSM")] } })
     const alert = await screen.findByRole("alert")
@@ -381,7 +400,7 @@ describe("UploadFilePage, first step", () => {
 
   it("takes up to ten files at once, sends each, and says how many were left out of a larger pick", async () => {
     const calls = stubFetch()
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     const picked = Array.from({ length: 11 }, (_, i) => new File([`a,b\n${i},1\n`], `part-${i}.csv`))
     chooseFiles(picked)
 
@@ -413,7 +432,7 @@ describe("UploadFilePage, first step", () => {
         return json({ partNumber: n, sizeBytes: 4 })
       },
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(new File(["12345678"], "bars.csv"))
 
     const bar = await screen.findByRole("progressbar", { name: "bars.csv sent" })
@@ -432,7 +451,7 @@ describe("UploadFilePage, first step", () => {
       complete: (id) => json({ ...upload({ id, originalFilename: "stock.xlsx" }), workbook: WORKBOOK }),
       preview: (q) => workbookPreview(q.get("sheet") ?? WORKBOOK.defaultSheet),
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(new File(["x"], "stock.xlsx"))
     expect(screen.queryByRole("alert")).toBeNull()
     await waitFor(() => expect(next().disabled).toBe(false))
@@ -447,7 +466,7 @@ describe("UploadFilePage, first step", () => {
       complete: (id) => json({ ...upload({ id, originalFilename: "orders.parquet" }), parquet: PARQUET }),
       preview: () => parquetPreview(),
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(new File(["x"], "orders.parquet"))
     expect(screen.queryByRole("alert")).toBeNull()
     await waitFor(() => expect(next().disabled).toBe(false))
@@ -458,7 +477,7 @@ describe("UploadFilePage, first step", () => {
 
   it("does not show a proxy's plain-text 413 as such: it says the upload did not reach the service and names the limit", async () => {
     stubFetch({ session: () => new Response("Request Entity Too Large", { status: 413 }) })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(CSV())
 
     const alert = await screen.findByRole("alert")
@@ -470,7 +489,7 @@ describe("UploadFilePage, first step", () => {
 
   it("keeps trying when a proxy answers 500: the file waits for the connection, with no alert, and is not refused", async () => {
     stubFetch({ part: () => new Response("Internal Server Error", { status: 500 }) })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(CSV())
 
     expect(await screen.findByText(/Waiting for the connection/)).toBeDefined()
@@ -493,7 +512,7 @@ describe("UploadFilePage, first step", () => {
         return json({ partNumber: n, sizeBytes: 1 })
       },
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(CSV())
 
     await screen.findByText(/Received/)
@@ -507,7 +526,7 @@ describe("UploadFilePage, first step", () => {
         json({ ...upload({ id }), duplicateOf: upload({ id: "up-0", originalFilename: "stock_old.csv", bronzeTable: "stock" }) }),
       preview: () => preview(),
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(CSV())
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
@@ -539,7 +558,7 @@ describe("UploadFilePage, first step", () => {
       },
       preview: () => preview(),
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFiles([CSV(), new File(["qty,sku\n1,a\n"], "second.csv")])
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
@@ -572,7 +591,7 @@ describe("UploadFilePage, first step", () => {
         return json({ partNumber: n, sizeBytes: 1 })
       },
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(CSV())
     await screen.findByRole("progressbar", { name: "stock.csv sent" })
     await waitFor(() => expect(sent(calls, "PUT", /parts\/1$/).length).toBe(1))
@@ -585,10 +604,21 @@ describe("UploadFilePage, first step", () => {
 
   it("shows a refusal for a missing permission in the file's row, in the API's sentence", async () => {
     stubFetch({ session: () => json({ error: "You do not have permission to do this." }, 403) })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(CSV())
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toBe("You do not have permission to do this.")
+    expect(next().disabled).toBe(true)
+  })
+
+  // QA TC-1734 F1, LH-DATA-17-05, LH-DATA-18-03 (WEB-11): the row showed
+  // "permission_denied: connector:manage".
+  it("shows a refused file in words that name the permission, not the API's code", async () => {
+    stubFetch({ session: () => json({ error: "permission_denied: connector:manage" }, 403) })
+    render(<UploadFilePage lookupDelayMs={0} />)
+    chooseFile(CSV())
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe("You don't have access. This needs the connector:manage permission.")
     expect(next().disabled).toBe(true)
   })
 })
@@ -597,7 +627,7 @@ describe("UploadFilePage, Check step", () => {
   async function openCheck(routes: Routes) {
     url.search = "?id=up-1"
     const calls = stubFetch({ get: () => upload(), ...routes })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByLabelText("Encoding")
     return calls
   }
@@ -611,19 +641,23 @@ describe("UploadFilePage, Check step", () => {
     })
     expect(screen.getAllByText("Detected: Comma").length).toBe(1)
     expect(screen.getByText("Detected: UTF-8")).toBeDefined()
-    expect((screen.getByLabelText("Delimiter") as HTMLSelectElement).value).toBe(",")
+    // WEB-9 D5: the trigger shows the option's label, where the native select
+    // held the delimiter character.
+    expect(
+      screen.getByLabelText("Delimiter").querySelector('[data-slot="select-value"]')?.textContent
+    ).toBe("Comma")
     expect((screen.getByLabelText("Header row") as HTMLInputElement).value).toBe("1")
     expect(screen.getByRole("columnheader", { name: "sku" })).toBeDefined()
     // The first read sends nothing: the API detects.
     expect(calls.find((c) => c.url.includes("/preview"))?.url).toBe("/api/uploads/up-1/preview")
 
-    fireEvent.change(screen.getByLabelText("Delimiter"), { target: { value: ";" } })
+    chooseOption(screen.getByLabelText("Delimiter"), "Semicolon")
     await screen.findByRole("columnheader", { name: "sku,qty" })
     expect(calls.some((c) => c.url.includes("delimiter=%3B"))).toBe(true)
     // What was detected stays what was detected.
     expect(screen.getByText("Detected: Comma")).toBeDefined()
 
-    fireEvent.change(screen.getByLabelText("Delimiter"), { target: { value: "\t" } })
+    chooseOption(screen.getByLabelText("Delimiter"), "Tab")
     await waitFor(() => expect(calls.some((c) => c.url.includes("delimiter=%09"))).toBe(true))
   })
 
@@ -709,7 +743,7 @@ describe("UploadFilePage, Check step", () => {
     url.search = "?id=up-1"
     const sentence = "Upload storage is unavailable (timeout)."
     stubFetch({ get: () => upload(), preview: () => json({ error: sentence }, 503) })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toBe(sentence)
     expect(screen.getByRole("button", { name: "Retry" })).toBeDefined()
@@ -742,21 +776,27 @@ describe("UploadFilePage, Check step for a workbook", () => {
       preview: (q) => workbookPreview(q.get("sheet") ?? WORKBOOK.defaultSheet),
       ...routes,
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByLabelText("Sheet")
     return calls
   }
 
   it("shows a sheet picker with the default chosen and no encoding or delimiter, and says how cells are written", async () => {
     await openWorkbook()
-    expect((screen.getByLabelText("Sheet") as HTMLSelectElement).value).toBe("Stock")
+    // WEB-9 D5: the trigger shows the sheet's label.
+    expect(
+      screen.getByLabelText("Sheet").querySelector('[data-slot="select-value"]')?.textContent
+    ).toBe("Stock")
     expect(screen.queryByLabelText("Encoding")).toBeNull()
     expect(screen.queryByLabelText("Delimiter")).toBeNull()
     expect(screen.getByLabelText("Header row")).toBeDefined()
     expect(screen.getByRole("columnheader", { name: "sku" })).toBeDefined()
     const note = screen.getByText(/Numbers are read as the cell holds them/)
     expect(note.textContent).toContain("2025-09-24")
-    expect(screen.getByText("Notes (hidden)")).toBeDefined()
+    // WEB-9 D5: the hidden sheet's label is read from the opened list, where
+    // the native select's option text used to be.
+    fireEvent.click(screen.getByLabelText("Sheet"))
+    expect(screen.getByRole("option", { name: "Notes (hidden)" })).toBeDefined()
   })
 
   it("reads the chosen sheet and drops the header row chosen for the previous one", async () => {
@@ -764,7 +804,7 @@ describe("UploadFilePage, Check step for a workbook", () => {
     fireEvent.change(screen.getByLabelText("Header row"), { target: { value: "3" } })
     await waitFor(() => expect(calls.some((c) => c.url.includes("headerRow=2"))).toBe(true))
 
-    fireEvent.change(screen.getByLabelText("Sheet"), { target: { value: "Quirks" } })
+    chooseOption(screen.getByLabelText("Sheet"), "Quirks")
     await screen.findByRole("columnheader", { name: "case" })
     const last = calls.filter((c) => c.url.includes("/preview")).at(-1)
     expect(last?.url).toContain("sheet=Quirks")
@@ -774,11 +814,13 @@ describe("UploadFilePage, Check step for a workbook", () => {
   it("sends the sheet shown when Load is pressed, and the review names it instead of an encoding", async () => {
     const started = upload({ status: "ingesting", bronzeTable: "stock", loadMode: "replace" })
     const calls = await openWorkbook({ ingest: json({ upload: started, runId: "run-1" }) })
-    fireEvent.change(screen.getByLabelText("Sheet"), { target: { value: "Quirks" } })
+    chooseOption(screen.getByLabelText("Sheet"), "Quirks")
     await screen.findByRole("columnheader", { name: "case" })
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByRole("button", { name: "Load" })
     expect(screen.getByText("Sheet")).toBeDefined()
@@ -834,7 +876,7 @@ describe("UploadFilePage, Check step for a Parquet file", () => {
       preview: () => parquetPreview(),
       ...routes,
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByRole("columnheader", { name: /sku/ })
     return calls
   }
@@ -858,12 +900,67 @@ describe("UploadFilePage, Check step for a Parquet file", () => {
     await waitFor(() => expect(next().disabled).toBe(false))
   })
 
+  it("says under a decimal column what is stored, and under a nanosecond timestamp that it is cut", async () => {
+    // `DATA-53` (QA `LH-DATA-9-32`): one Decimal, and a nanosecond column cut to microseconds;
+    // a microsecond column says nothing, because nothing of it is cut.
+    url.search = "?id=up-1"
+    stubFetch({
+      get: () => upload({ originalFilename: "orders.parquet" }),
+      preview: () =>
+        preview({
+          columns: ["sku", "price", "seen_at", "made_at"],
+          columnSpecs: [
+            { source: "sku", name: "sku", type: "text", guessedType: "text", askDateOrder: false },
+            { source: "price", name: "price", type: "decimal", guessedType: "decimal", askDateOrder: false },
+            {
+              source: "seen_at",
+              name: "seen_at",
+              type: "timestamp",
+              guessedType: "timestamp",
+              askDateOrder: false,
+              dateFormat: "iso",
+              timezone: true,
+            },
+            {
+              source: "made_at",
+              name: "made_at",
+              type: "timestamp",
+              guessedType: "timestamp",
+              askDateOrder: false,
+              dateFormat: "iso",
+              timezone: true,
+            },
+          ],
+          rows: [["a1", "1.50", "2026-10-16T13:30:05.123456789Z", "2026-10-16T13:30:05.123456Z"]],
+          parquet: {
+            columns: [
+              { name: "sku", type: "string" },
+              { name: "price", type: "decimal(10,2)" },
+              { name: "seen_at", type: "timestamp (ns, UTC)" },
+              { name: "made_at", type: "timestamp (us, UTC)" },
+            ],
+            rows: 1,
+          },
+        }),
+    })
+    render(<UploadFilePage lookupDelayMs={0} />)
+    await screen.findByRole("columnheader", { name: /sku/ })
+    expect(screen.getByText("Stored exactly, with up to 38 digits, 9 of them after the point.")).toBeDefined()
+    expect(
+      screen.getByText("The file keeps nanoseconds. The table keeps microseconds, so digits after the sixth are cut.")
+    ).toBeDefined()
+    // One note, for the nanosecond column only.
+    expect(screen.getAllByText(/The file keeps nanoseconds/)).toHaveLength(1)
+  })
+
   it("sends the settings the preview used when Load is pressed (the API ignores them for Parquet), and the review names the format", async () => {
     const started = upload({ status: "ingesting", bronzeTable: "orders", loadMode: "replace" })
     const calls = await openParquet({ ingest: json({ upload: started, runId: "run-1" }) })
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByRole("button", { name: "Load" })
     expect(screen.getByText("Format")).toBeDefined()
@@ -894,7 +991,7 @@ describe("UploadFilePage, Check step for JSON, Avro, gzip and zip (DATA-17 slice
       get: () => upload({ originalFilename: name }),
       preview: () => preview({ columns: ["id", "name", "meta"], rows: [["1", "Anna", '{"x":1}']], ...over }),
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByRole("columnheader", { name: /id/ })
   }
 
@@ -947,6 +1044,8 @@ describe("UploadFilePage, Check step for JSON, Avro, gzip and zip (DATA-17 slice
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByRole("button", { name: "Load" })
     expect(screen.getByText("CSV or TSV in a zip archive")).toBeDefined()
@@ -958,7 +1057,7 @@ describe("UploadFilePage, Table step", () => {
   async function openTable(list: Upload[]) {
     url.search = "?id=up-1"
     const calls = stubFetch({ get: () => upload(), list, preview: () => preview() })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByLabelText("Encoding")
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
@@ -986,13 +1085,17 @@ describe("UploadFilePage, Table step", () => {
     expect(screen.getByText("Spaces are not allowed: use an underscore.")).toBeDefined()
   })
 
-  it("shows where the data will land, as the Catalog names it, only for a name that passes", async () => {
+  it("shows where the data will land, as the Catalog names it and as Query Studio reads it, only for a name that passes", async () => {
     await openTable([])
     expect(screen.getByText("bronze.stock")).toBeDefined()
+    // `DATA-53` (QA `LH-DATA-9-07`): the name Query Studio reads on the Trino engine.
+    expect(screen.getByTestId("upload-query-name").textContent).toBe("iceberg.bronze.stock")
     fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stock_b" } })
     expect(screen.getByText("bronze.stock_b")).toBeDefined()
+    expect(screen.getByTestId("upload-query-name").textContent).toBe("iceberg.bronze.stock_b")
     fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "Stock B" } })
     expect(screen.queryByText(/^bronze\./)).toBeNull()
+    expect(screen.queryByTestId("upload-query-name")).toBeNull()
     expect(screen.getByText("Enter a valid name to see it.")).toBeDefined()
     fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "" } })
     expect(screen.getByText("Enter a valid name to see it.")).toBeDefined()
@@ -1012,8 +1115,251 @@ describe("UploadFilePage, Table step", () => {
     expect(add.checked).toBe(false)
 
     fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stock_b" } })
+    // The check for the new name has to answer first (`DATA-47`): while it is
+    // `checking` the radios are hidden whatever the answer will be, so the two
+    // assertions below only prove something once the step may go on (review round
+    // 1 R6).
+    await waitFor(() => expect(next().disabled).toBe(false))
     expect(screen.queryByRole("radio", { name: "Replace its rows" })).toBeNull()
     expect(screen.queryByRole("radio", { name: "Add to its rows" })).toBeNull()
+  })
+
+  /** The same page opened with routes of the test's choosing (the lookup's answer, a folder list). */
+  async function openTableWith(routes: Routes) {
+    url.search = "?id=up-1"
+    const calls = stubFetch({ get: () => upload(), preview: () => preview(), ...routes })
+    render(<UploadFilePage lookupDelayMs={0} />)
+    await screen.findByLabelText("Encoding")
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Table name")
+    return calls
+  }
+
+  // QA LH-DATA-35-03 (DATA-47): the choice comes from the named table's own
+  // uploads, asked by the name, not from the newest hundred uploads of the tenant.
+  it("offers Replace or Add and the table's folder for a table whose upload is not in the newest list", async () => {
+    const calls = await openTableWith({
+      list: [],
+      folders: [folder({ id: "uf-q1", name: "Q1" })],
+      tableUploads: (table) =>
+        table === "stock"
+          ? [upload({ id: "up-old", status: "ingested", bronzeTable: "stock", assetId: "stock", folderId: "uf-q1" })]
+          : [],
+    })
+
+    await screen.findByRole("radio", { name: "Replace its rows" })
+    expect(screen.getByRole("radio", { name: "Add to its rows" })).toBeDefined()
+    expect(screen.getByRole("combobox", { name: "Folder (optional)" }).textContent).toContain("Q1")
+    expect(calls.filter((c) => c.url === "/api/uploads?table=stock").length).toBe(1)
+  })
+
+  it("says the check failed, keeps Next off, and asks again on Check again", async () => {
+    let attempts = 0
+    await openTableWith({
+      tableUploads: () => {
+        attempts += 1
+        return attempts === 1
+          ? json({ error: "The service is unavailable." }, 503)
+          : [upload({ id: "up-old", status: "ingested", bronzeTable: "stock", assetId: "stock" })]
+      },
+    })
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("Could not check whether an earlier upload created stock")
+    expect(alert.textContent).toContain("The service is unavailable.")
+    expect(next().disabled).toBe(true)
+    expect(screen.queryByRole("radio", { name: "Replace its rows" })).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }))
+    await screen.findByRole("radio", { name: "Replace its rows" })
+    expect(next().disabled).toBe(false)
+  })
+
+  it("keeps Next off and says it is checking until the table check answers", async () => {
+    const pending: Array<() => void> = []
+    await openTableWith({
+      tableUploads: () =>
+        new Promise<Upload[]>((resolve) => pending.push(() => resolve([upload({ id: "up-old", status: "ingested", bronzeTable: "stock", assetId: "stock" })]))),
+    })
+
+    expect(screen.getByText(/Checking whether an earlier upload created stock/)).toBeDefined()
+    expect(next().disabled).toBe(true)
+    await waitFor(() => expect(pending.length).toBe(1))
+    pending[0]!()
+    await screen.findByRole("radio", { name: "Replace its rows" })
+    expect(next().disabled).toBe(false)
+  })
+
+  it("keeps Load off on the Review step while the table check has not answered", async () => {
+    const pending: Array<() => void> = []
+    await openTableWith({
+      tableUploads: (table) =>
+        table === "stock"
+          ? [upload({ id: "up-old", status: "ingested", bronzeTable: "stock", assetId: "stock" })]
+          : new Promise<Upload[]>((resolve) => pending.push(() => resolve([]))),
+    })
+    await screen.findByRole("radio", { name: "Replace its rows" })
+    fireEvent.click(next())
+    await screen.findByRole("button", { name: "Load" })
+
+    // Back to the Table step, a new name, then straight on through the stepper —
+    // the step buttons are how a person reaches Review with a check still running.
+    fireEvent.click(screen.getByRole("button", { name: /Table Name the raw table/ }))
+    fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stock_new" } })
+    fireEvent.click(screen.getByRole("button", { name: /Review Load the files/ }))
+
+    const load = (await screen.findByRole("button", { name: "Load" })) as HTMLButtonElement
+    expect(load.disabled).toBe(true)
+    expect(screen.getByText(/Checking whether an earlier upload created stock_new/)).toBeDefined()
+    await waitFor(() => expect(pending.length).toBe(1))
+    pending[0]!()
+    await waitFor(() => expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(false))
+  })
+
+  // QA LH-DATA-35-03 (DATA-47), review round 1 R2: an answer belongs to one ask. After
+  // "Upload another file" the same name is a new ask, so the step says it is checking —
+  // the `[]` from before the load must not answer for it, or Load replaces rows without
+  // asking while the lookup is still running.
+  it("asks again about a name it answered before the load, and says it is checking until the new answer", async () => {
+    const held: Array<() => void> = []
+    let asks = 0
+    const started = upload({ status: "ingesting", bronzeTable: "stock", parseOptions: OPTIONS, loadMode: "replace" })
+    stubFetch({
+      preview: () => preview(),
+      tableUploads: (table) => {
+        asks += 1
+        return asks === 1
+          ? []
+          : new Promise<Upload[]>((resolve) =>
+              held.push(() =>
+                resolve([upload({ id: "up-old", status: "ingested", bronzeTable: table, assetId: table })]),
+              ),
+            )
+      },
+      get: () => ({ ...started, status: "ingested", rows: 3, assetId: "stock" }),
+      ingest: json({ upload: started, runId: "run-1" }),
+    })
+    render(<UploadFilePage pollMs={20} lookupDelayMs={0} />)
+    chooseFile(CSV())
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Encoding")
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Table name")
+    // The first answer is `[]`: `stock` is a new table, so no choice is offered.
+    await waitFor(() => expect(next().disabled).toBe(false))
+    expect(screen.queryByRole("radio", { name: "Replace its rows" })).toBeNull()
+    fireEvent.click(next())
+    fireEvent.click(await screen.findByRole("button", { name: "Load" }))
+    await screen.findByText("Load finished")
+    expect(asks).toBe(1)
+
+    fireEvent.click(screen.getByRole("button", { name: "Upload another file" }))
+    chooseFile(CSV())
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Encoding")
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Table name")
+
+    // The second ask for `stock` has not answered: `checking`, not the `[]` from before.
+    expect(screen.getByText(/Checking whether an earlier upload created stock/)).toBeDefined()
+    expect(next().disabled).toBe(true)
+    await waitFor(() => expect(held.length).toBe(1))
+    held[0]!()
+    await screen.findByRole("radio", { name: "Replace its rows" })
+    expect(screen.getByRole("radio", { name: "Add to its rows" })).toBeDefined()
+    expect(next().disabled).toBe(false)
+  })
+
+  // QA LH-DATA-35-03 (DATA-47), review round 1 R2: "Check again" must not answer from
+  // the successful check before the failed one. D4 says a failed lookup never falls
+  // back to Replace, so Next stays off until the retry answers.
+  it("keeps Next off after Check again until the retry answers, even with an earlier answer for the name", async () => {
+    const held: Array<() => void> = []
+    let stockAsks = 0
+    await openTableWith({
+      tableUploads: (table) => {
+        if (table !== "stock") return []
+        stockAsks += 1
+        if (stockAsks === 1) return []
+        if (stockAsks === 2) return json({ error: "The service is unavailable." }, 503)
+        return new Promise<Upload[]>((resolve) =>
+          held.push(() =>
+            resolve([upload({ id: "up-old", status: "ingested", bronzeTable: "stock", assetId: "stock" })]),
+          ),
+        )
+      },
+    })
+    // `stock` answered `[]` first, so the step may go on.
+    await waitFor(() => expect(next().disabled).toBe(false))
+
+    fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stockx" } })
+    fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stock" } })
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("Could not check whether an earlier upload created stock")
+    expect(next().disabled).toBe(true)
+
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }))
+    await waitFor(() => expect(held.length).toBe(1))
+    expect(next().disabled).toBe(true)
+    expect(screen.getByText(/Checking whether an earlier upload created stock/)).toBeDefined()
+
+    held[0]!()
+    await screen.findByRole("radio", { name: "Replace its rows" })
+    expect(next().disabled).toBe(false)
+  })
+
+  // QA LH-DATA-35-03 (DATA-47), review round 1 R3: a failure belongs to the ask that
+  // failed, so a later answer for the same name replaces it — the page must not stay on
+  // "Could not check" with Load off after a successful check of that same name.
+  it("uses a successful check of a name it failed on before, without Check again", async () => {
+    let stockAsks = 0
+    await openTableWith({
+      tableUploads: (table) => {
+        if (table !== "stock") return []
+        stockAsks += 1
+        return stockAsks === 1
+          ? json({ error: "The service is unavailable." }, 503)
+          : [upload({ id: "up-old", status: "ingested", bronzeTable: "stock", assetId: "stock" })]
+      },
+    })
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("Could not check whether an earlier upload created stock")
+
+    fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stockx" } })
+    fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stock" } })
+
+    await screen.findByRole("radio", { name: "Replace its rows" })
+    expect(screen.queryByRole("alert")).toBeNull()
+    expect(next().disabled).toBe(false)
+  })
+
+  it("asks about a typed name once, after the pause, and uses only the answer for the name in the field", async () => {
+    url.search = "?id=up-1"
+    const calls = stubFetch({ get: () => upload(), preview: () => preview() })
+    render(<UploadFilePage lookupDelayMs={30} />)
+    await screen.findByLabelText("Encoding")
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    const field = await screen.findByLabelText("Table name")
+    const asked = () => calls.filter((c) => c.url.startsWith("/api/uploads?table="))
+
+    // The page's own suggestion is asked at once, so the answer is there before
+    // the person reaches this step.
+    await waitFor(() => expect(asked().length).toBe(1))
+    expect(asked()[0]!.url).toBe("/api/uploads?table=stock")
+
+    fireEvent.change(field, { target: { value: "sto" } })
+    fireEvent.change(field, { target: { value: "stoc" } })
+    fireEvent.change(field, { target: { value: "stock_a" } })
+    await waitFor(() => expect(asked().some((c) => c.url === "/api/uploads?table=stock_a")).toBe(true))
+    expect(asked().filter((c) => c.url === "/api/uploads?table=stock_a").length).toBe(1)
+    expect(asked().filter((c) => c.url === "/api/uploads?table=sto")).toEqual([])
+    expect(asked().filter((c) => c.url === "/api/uploads?table=stoc")).toEqual([])
   })
 
   it("carries the choice to the review, and sends nothing before Load", async () => {
@@ -1033,7 +1379,7 @@ describe("UploadFilePage, Table step, folders (DATA-35)", () => {
   async function openTable(routes: Routes) {
     url.search = "?id=up-1"
     const calls = stubFetch({ get: () => upload(), preview: () => preview(), ...routes })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByLabelText("Encoding")
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
@@ -1133,11 +1479,13 @@ describe("UploadFilePage, after Load", () => {
   async function review(routes: Routes) {
     url.search = "?id=up-1"
     const calls = stubFetch({ preview: () => preview(), ...routes })
-    render(<UploadFilePage pollMs={20} />)
+    render(<UploadFilePage pollMs={20} lookupDelayMs={0} />)
     await screen.findByLabelText("Encoding")
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByRole("button", { name: "Load" })
     return calls
@@ -1175,10 +1523,24 @@ describe("UploadFilePage, after Load", () => {
   it("summarises the file, how it is read and the table by its full name, with one sentence saying what Load does", async () => {
     await review({ get: () => upload(), ingest: json({ upload: started, runId: "run-1" }) })
     const labels = screen.getAllByRole("term").map((term) => term.textContent)
-    expect(labels).toEqual(["Name", "Size", "Uploaded", "Encoding", "Delimiter", "Header row", "Columns", "Table", "sku", "qty", "A value that does not fit"])
+    expect(labels).toEqual([
+      "Name",
+      "Size",
+      "Uploaded",
+      "Encoding",
+      "Delimiter",
+      "Header row",
+      "Columns",
+      "Table",
+      "In Query Studio (Trino)",
+      "sku",
+      "qty",
+      "A value that does not fit",
+    ])
     const value = (label: string) =>
       screen.getAllByRole("term").find((term) => term.textContent === label)?.nextElementSibling?.textContent
     expect(value("Table")).toBe("bronze.stock")
+    expect(value("In Query Studio (Trino)")).toBe("iceberg.bronze.stock")
     expect(value("Columns")).toBe("2")
     const sentence = screen.getByText(/^Load reads/)
     expect(sentence.textContent).toContain("stock.csv")
@@ -1210,12 +1572,34 @@ describe("UploadFilePage, after Load", () => {
     await screen.findByText("Loaded", { selector: "span" })
     expect(screen.getByText("Load finished")).toBeDefined()
     expect(screen.getByText("bronze.stock")).toBeDefined()
+    expect(
+      screen.getByText(/In Query Studio, on the Trino engine, the table is/).textContent
+    ).toBe("In Query Studio, on the Trino engine, the table is iceberg.bronze.stock.")
     expect(screen.getByText("1,234")).toBeDefined()
     expect(screen.getByText("Replace its rows")).toBeDefined()
     expect(screen.getByText("stock.csv")).toBeDefined()
     expect(document.querySelector("[data-file-mark=delimited]")?.textContent).toBe("CSV")
     const open = screen.getByText("Open in Catalog").closest("a")
     expect(open?.getAttribute("href")).toBe("/data/assets/stock")
+  })
+
+  // QA `LH-DATA-14-05` (`DATA-54`): the on-load checks start when the
+  // orchestrator reports the finished run, not when the load ends.
+  it("says when on-load checks run once the load has finished", async () => {
+    await review({
+      get: (n) => (n === 1 ? upload() : { ...started, status: "ingested", rows: 1234, assetId: "stock" }),
+      ingest: json({ upload: started, runId: "run-1" }),
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Load" }))
+    await screen.findByText("Load finished")
+    const paragraph = screen.getByText(/^Quality checks set to run on every load/)
+    expect(paragraph.textContent).toContain(
+      "Their results are on the table's Quality tab."
+    )
+    // Review round 1 R4: the sentence names no time. Nothing in this
+    // repository bounds when the orchestrator reports a load, so a promise
+    // here would be one the code does not keep.
+    expect(paragraph.textContent).not.toMatch(/minute|second/)
   })
 
   it("offers no action while loading, and Upload another file after a failure goes back to an empty first step", async () => {
@@ -1229,6 +1613,9 @@ describe("UploadFilePage, after Load", () => {
     expect(screen.queryByRole("button", { name: "Try again" })).toBeNull()
 
     await screen.findByText("Load failed")
+    // QA `LH-DATA-14-05` (`DATA-54`): a load that did not finish says nothing
+    // about the checks that would follow it.
+    expect(screen.queryByText(/^Quality checks set to run/)).toBeNull()
     expect(screen.getByText("The load into bronze.stock failed.")).toBeDefined()
     expect(screen.getByText("The load into the table failed.")).toBeDefined()
     expect(screen.getByRole("button", { name: "Try again" })).toBeDefined()
@@ -1261,6 +1648,8 @@ describe("UploadFilePage, after Load", () => {
     fireEvent.click(screen.getByRole("button", { name: "Previous" }))
     fireEvent.click(await screen.findByRole("radio", { name: "Add to its rows" }))
     fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stock_b" } })
+    // The table check answers for the new name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     fireEvent.click(await screen.findByRole("button", { name: "Load" }))
     await waitFor(() => expect(calls.some((c) => c.url.endsWith("/ingest"))).toBe(true))
@@ -1365,7 +1754,7 @@ describe("UploadFilePage, with ?id=", () => {
   it("skips the file step and shows the page's own error state for an upload that is not there", async () => {
     url.search = "?id=gone"
     stubFetch({ get: () => json({ error: "Upload not found." }, 404) })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     expect(await screen.findByText("Not found")).toBeDefined()
     expect(screen.getByText(/Upload not found\./)).toBeDefined()
     expect(screen.queryByLabelText("Choose files")).toBeNull()
@@ -1376,7 +1765,7 @@ describe("UploadFilePage, with ?id=", () => {
     stubFetch({
       get: () => upload({ status: "ingesting", bronzeTable: "stock" }),
     })
-    render(<UploadFilePage pollMs={20} />)
+    render(<UploadFilePage pollMs={20} lookupDelayMs={0} />)
     expect(await screen.findByText("Loading", { selector: "span" })).toBeDefined()
     expect(screen.getByText(/Loading stock\.csv into stock/)).toBeDefined()
   })
@@ -1396,18 +1785,19 @@ describe("UploadFilePage, limits", () => {
           ? preview({ using: { ...OPTIONS, delimiter: ";" }, columns: ["sku;qty"], rows: [["a1;3"]] })
           : json({ error: TOO_MANY_COLUMNS }, 400),
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
 
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toBe(TOO_MANY_COLUMNS)
     // Nothing was read, so the controls have no value yet, but they are there and not disabled.
-    const delimiter = screen.getByLabelText("Delimiter") as HTMLSelectElement
+    // WEB-9 D5: the trigger is a button now, so `disabled` is the button's own.
+    const delimiter = screen.getByLabelText("Delimiter") as HTMLButtonElement
     expect(delimiter.disabled).toBe(false)
-    expect((screen.getByLabelText("Encoding") as HTMLSelectElement).disabled).toBe(false)
+    expect((screen.getByLabelText("Encoding") as HTMLButtonElement).disabled).toBe(false)
     expect((screen.getByLabelText("Header row") as HTMLInputElement).disabled).toBe(false)
     expect(next().disabled).toBe(true)
 
-    fireEvent.change(delimiter, { target: { value: ";" } })
+    chooseOption(delimiter, "Semicolon")
     await screen.findByRole("columnheader", { name: "sku;qty" })
     expect(calls.some((c) => c.url.includes("delimiter=%3B"))).toBe(true)
     expect(screen.queryByText(TOO_MANY_COLUMNS)).toBeNull()
@@ -1420,14 +1810,14 @@ describe("UploadFilePage, limits", () => {
       get: () => upload(),
       preview: (q) => (q.get("delimiter") === "|" ? json({ error: TOO_MANY_COLUMNS }, 400) : preview()),
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByRole("columnheader", { name: "sku" })
 
-    fireEvent.change(screen.getByLabelText("Delimiter"), { target: { value: "|" } })
+    chooseOption(screen.getByLabelText("Delimiter"), "Pipe")
 
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toBe(TOO_MANY_COLUMNS)
-    expect((screen.getByLabelText("Delimiter") as HTMLSelectElement).disabled).toBe(false)
+    expect((screen.getByLabelText("Delimiter") as HTMLButtonElement).disabled).toBe(false)
     expect(next().disabled).toBe(true)
   })
 
@@ -1438,11 +1828,13 @@ describe("UploadFilePage, limits", () => {
       preview: () => preview(),
       ingest: json({ error: TOO_MANY_UPLOADS }, 429),
     })
-    render(<UploadFilePage pollMs={20} />)
+    render(<UploadFilePage pollMs={20} lookupDelayMs={0} />)
     await screen.findByLabelText("Encoding")
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     fireEvent.click(await screen.findByRole("button", { name: "Load" }))
 
@@ -1476,7 +1868,7 @@ describe("UploadFilePage, column types", () => {
       check: () => ({ sampledRows: 3, count: 0, byColumn: [], rows: [] }),
       ...routes,
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByLabelText("Type of qty")
     return calls
   }
@@ -1484,14 +1876,60 @@ describe("UploadFilePage, column types", () => {
   it("shows each column's name and guessed type, and says how many rows the guess read", async () => {
     await openColumns()
     expect((screen.getByLabelText("Name of column 2") as HTMLInputElement).value).toBe("qty")
-    expect((screen.getByLabelText("Type of qty") as HTMLSelectElement).value).toBe("integer")
-    expect((screen.getByLabelText("Type of due") as HTMLSelectElement).value).toBe("date")
-    expect((screen.getByLabelText("How the dates of due are read", { selector: "select" }) as HTMLSelectElement).value).toBe("iso")
+    // WEB-9 D5: each trigger shows its option's label.
+    expect(
+      screen.getByLabelText("Type of qty").querySelector('[data-slot="select-value"]')?.textContent
+    ).toBe("Integer")
+    expect(
+      screen.getByLabelText("Type of due").querySelector('[data-slot="select-value"]')?.textContent
+    ).toBe("Date")
+    expect(
+      screen
+        .getByLabelText("How the dates of due are read")
+        .querySelector('[data-slot="select-value"]')?.textContent
+    ).toBe("Year first (2026-10-16)")
     expect(screen.getByText(/Types guessed from the first 3 rows/)).toBeDefined()
-    // The six types a person chooses among.
-    const options = Array.from((screen.getByLabelText("Type of sku") as HTMLSelectElement).options).map((o) => o.text)
-    expect(options).toEqual(["Text", "Integer", "Decimal", "Boolean", "Date", "Timestamp"])
+    // The six types a person chooses among, read from the opened list.
+    fireEvent.click(screen.getByLabelText("Type of sku"))
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Text",
+      "Integer",
+      "Decimal",
+      "Boolean",
+      "Date",
+      "Timestamp",
+    ])
     await waitFor(() => expect(next().disabled).toBe(false))
+  })
+
+  it("says under a CSV column set to Timestamp that a seven-digit fraction loses its last digits", async () => {
+    // `DATA-53` decision 17, review round 1 R5: this column is guessed Text and the person
+    // chooses Timestamp, so the value used to be stored as `…05.123456` with nothing on the
+    // Check step saying so, while the feature page promised the step says it.
+    url.search = "?id=up-1"
+    stubFetch({
+      get: () => upload(),
+      preview: () =>
+        preview({
+          columns: ["SKU", "Qty", "Seen"],
+          columnSpecs: [
+            { source: "SKU", name: "sku", type: "text", guessedType: "text", askDateOrder: false },
+            { source: "Qty", name: "qty", type: "integer", guessedType: "integer", askDateOrder: false },
+            { source: "Seen", name: "seen", type: "text", guessedType: "text", askDateOrder: false },
+          ],
+          rows: [["a1", "3", "2026-10-16T13:30:05.1234567"]],
+          sampledRows: 1,
+        }),
+      check: () => ({ sampledRows: 1, count: 0, byColumn: [], rows: [] }),
+    })
+    render(<UploadFilePage lookupDelayMs={0} />)
+    await screen.findByLabelText("Type of seen")
+
+    expect(screen.queryByText(/The file keeps nanoseconds/)).toBeNull()
+    chooseOption(screen.getByLabelText("Type of seen"), "Timestamp")
+    expect(
+      screen.getByText("The file keeps nanoseconds. The table keeps microseconds, so digits after the sixth are cut.")
+    ).toBeDefined()
   })
 
   it("lists up to 100 failing values after a change of type, with stop pre-selected, and sends the choice with Load", async () => {
@@ -1502,7 +1940,7 @@ describe("UploadFilePage, column types", () => {
           : { sampledRows: 3, count: 0, byColumn: [], rows: [] },
       ingest: json({ upload: upload({ status: "ingesting" }), runId: "run-1" }),
     })
-    fireEvent.change(screen.getByLabelText("Type of sku"), { target: { value: "integer" } })
+    chooseOption(screen.getByLabelText("Type of sku"), "Integer")
 
     await screen.findByText(/2 values do not fit/, {}, { timeout: 2000 })
     const panel = screen.getByLabelText("Values that do not fit")
@@ -1517,6 +1955,8 @@ describe("UploadFilePage, column types", () => {
     fireEvent.click(screen.getByLabelText(/Load them as empty/))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     fireEvent.click(await screen.findByRole("button", { name: "Load" }))
     await waitFor(() => expect(calls.some((c) => c.url.endsWith("/ingest"))).toBe(true))
@@ -1529,15 +1969,132 @@ describe("UploadFilePage, column types", () => {
     ])
   })
 
+  // QA LH-DATA-18-08 (DATA-18-AC8): the mismatch is listed on the Review step, before loading.
+  const BAD = {
+    sampledRows: 3,
+    count: 2,
+    byColumn: [{ column: "sku", count: 2 }],
+    rows: [
+      { row: 1, column: "sku", value: "A-1" },
+      { row: 3, column: "sku", value: "B-2" },
+    ],
+  }
+  const NONE = { sampledRows: 3, count: 0, byColumn: [], rows: [] }
+
+  /** Changes sku to integer (so the check runs) and goes on to Review. */
+  async function toReview(result: typeof BAD | typeof NONE) {
+    const calls = await openColumns({
+      check: () => result,
+      ingest: json({ upload: upload({ status: "ingesting" }), runId: "run-1" }),
+    })
+    chooseOption(screen.getByLabelText("Type of sku"), "Integer")
+    if (result.count > 0) await screen.findByText(/2 values do not fit/, {}, { timeout: 2000 })
+    return calls
+  }
+
+  async function goOn() {
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByText(/^Load reads/)
+  }
+
+  it("lists the values that do not fit on the Review step and turns Load off while the choice is Stop", async () => {
+    await toReview(BAD)
+    await goOn()
+    const panel = screen.getByLabelText("Values that do not fit")
+    expect(panel.textContent).toContain("2 values do not fit in the first 3 rows")
+    expect(within(panel).getByText("A-1")).toBeDefined()
+    expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(true)
+    // Back to Check returns to the step that can change the types.
+    fireEvent.click(within(panel).getByRole("button", { name: "Back to Check" }))
+    expect(await screen.findByLabelText("Type of sku")).toBeDefined()
+  })
+
+  it("lists them on the Review step with the 'loaded as empty' line and keeps Load on when the choice is empty", async () => {
+    await toReview(BAD)
+    fireEvent.click(screen.getByLabelText(/Load them as empty/))
+    await goOn()
+    const panel = screen.getByLabelText("Values that do not fit")
+    expect(panel.textContent).toContain("These values are loaded as empty.")
+    expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it("shows nothing extra on the Review step when every value fits, and Load is on", async () => {
+    await toReview(NONE)
+    await goOn()
+    expect(screen.queryByLabelText("Values that do not fit")).toBeNull()
+    // The load waits for the check's answer (review R1), so it is on once the check has answered.
+    await waitFor(() => expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(false))
+  })
+
+  // QA fails part A review R2: the QA case's own path. The file's own types fit, the
+  // table's do not, and the check re-runs after "Add to its rows"; the Review step must
+  // list what does not fit. With review R1, Load is off while that check is still running.
+  it("lists the values that do not fit after 'Add to its rows', and Load waits for the check", async () => {
+    url.search = "?id=up-1"
+    let release: (() => void) | null = null
+    const held = new Promise<Response>((resolve) => {
+      release = () => resolve(json(BAD))
+    })
+    const calls = stubFetch({
+      get: () => upload(),
+      list: [upload({ id: "up-0", status: "ingested", bronzeTable: "stock", assetId: "stock" })],
+      preview: (q) =>
+        preview({
+          columns: ["SKU", "Qty", "Due"],
+          // The table's types: the sku is a number there, so the file's "A-1" does not fit.
+          columnSpecs: typedColumns().map((c) =>
+            q.get("table") ? { ...c, type: "integer", guessedType: "integer" } : c,
+          ),
+          fromTable: q.get("table") !== null,
+          sampledRows: 3,
+        }),
+      // The file's own types fit; the table's do not, and that answer is held until the
+      // test lets it come, so the check is still running when the Review step opens.
+      check: (body) => (body.columns[0].type === "integer" ? held : NONE),
+    })
+    render(<UploadFilePage lookupDelayMs={0} />)
+    await screen.findByLabelText("Type of qty")
+    fireEvent.click(next())
+    await screen.findByLabelText("Table name")
+    fireEvent.click(await screen.findByRole("radio", { name: "Add to its rows" }))
+    // The preview is read again with the table, and the check is asked with the table's types.
+    await waitFor(() =>
+      expect(
+        calls.some(
+          (c) =>
+            c.url.endsWith("/check") &&
+            (c.body as { columns: { type: string }[] }).columns[0].type === "integer",
+        ),
+      ).toBe(true),
+    )
+    fireEvent.click(next())
+    // The check has not answered yet: the Review step says so, and the load waits (review R1).
+    expect(await screen.findByText("Checking the values against the columns…")).toBeDefined()
+    expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(true)
+    release!()
+    const panel = await screen.findByLabelText("Values that do not fit")
+    expect(panel.textContent).toContain("2 values do not fit")
+    expect(within(panel).getByText("A-1")).toBeDefined()
+    expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
   it("keeps Next off until 'day first or month first?' is answered", async () => {
     const asking = typedColumns()
     asking[2] = { source: "Due", name: "due", type: "date", guessedType: "date", askDateOrder: true }
     await openColumns({}, asking)
     expect(next().disabled).toBe(true)
     expect(screen.getByText(/Say how the dates of due are read: day first or month first/)).toBeDefined()
-    const reading = screen.getByLabelText("How the dates of due are read", { selector: "select" }) as HTMLSelectElement
-    expect(reading.options[0].text).toBe("Day first or month first?")
-    fireEvent.change(reading, { target: { value: "dmy" } })
+    const reading = screen.getByLabelText("How the dates of due are read")
+    // WEB-9 D2: the disabled prompt option is the trigger's placeholder now.
+    expect(reading.querySelector('[data-slot="select-value"]')?.textContent).toBe(
+      "Day first or month first?"
+    )
+    chooseOption(reading, "Day first (16/10/2026)")
     await waitFor(() => expect(next().disabled).toBe(false))
     expect(screen.queryByText(/Say how the dates of due are read/)).toBeNull()
   })
@@ -1554,7 +2111,11 @@ describe("UploadFilePage, column types", () => {
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
+    // The load waits for the check's answer (review R1); the check re-runs after the change.
+    await waitFor(() => expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(false))
     fireEvent.click(await screen.findByRole("button", { name: "Load" }))
     await waitFor(() => expect(calls.some((c) => c.url.endsWith("/ingest"))).toBe(true))
     const body = calls.find((c) => c.url.endsWith("/ingest"))?.body as { columns: { name: string }[] }
@@ -1575,7 +2136,7 @@ describe("UploadFilePage, column types", () => {
         }),
       check: () => ({ sampledRows: 3, count: 0, byColumn: [], rows: [] }),
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByLabelText("Type of qty")
     fireEvent.click(next())
     const name = await screen.findByLabelText("Table name")
@@ -1583,7 +2144,7 @@ describe("UploadFilePage, column types", () => {
     fireEvent.click(await screen.findByLabelText(/Add to its rows/))
     fireEvent.click(screen.getByRole("button", { name: "Previous" }))
     expect(await screen.findByText(/The names and types are the table's/)).toBeDefined()
-    expect((screen.getByLabelText("Type of qty") as HTMLSelectElement).disabled).toBe(true)
+    expect((screen.getByLabelText("Type of qty") as HTMLButtonElement).disabled).toBe(true)
     expect((screen.getByLabelText("Name of column 1") as HTMLInputElement).disabled).toBe(true)
   })
 
@@ -1601,11 +2162,12 @@ describe("UploadFilePage, column types", () => {
         check: () => ({ sampledRows: 2, count: 0, byColumn: [], rows: [] }),
         ingest: json({ upload: started, runId: "run-1" }),
       })
-      render(<UploadFilePage pollMs={20} />)
+      render(<UploadFilePage pollMs={20} lookupDelayMs={0} />)
       await screen.findByLabelText("Encoding")
       await waitFor(() => expect(next().disabled).toBe(false))
       fireEvent.click(next())
       await screen.findByLabelText("Table name")
+      await waitFor(() => expect(next().disabled).toBe(false))
       fireEvent.click(next())
       fireEvent.click(await screen.findByRole("button", { name: "Load" }))
       const report = await screen.findByLabelText("Values that did not fit")
@@ -1625,7 +2187,7 @@ describe("UploadFilePage, several files into one table", () => {
   /** Picks the files, goes to Check and waits for the comparison the API answers with `compare`. */
   async function openCheck(files: File[], routes: Routes = {}) {
     const calls = stubFetch({ preview: () => preview(), ...routes })
-    render(<UploadFilePage pollMs={20} />)
+    render(<UploadFilePage pollMs={20} lookupDelayMs={0} />)
     chooseFiles(files)
     await waitFor(() => expect(sent(calls, "POST", /complete$/).length).toBe(files.length))
     await waitFor(() => expect(next().disabled).toBe(false))
@@ -1686,7 +2248,7 @@ describe("UploadFilePage, several files into one table", () => {
     await within(list).findByText(/qty: the first file reads it as integer, here it looks like text/)
     expect(next().disabled).toBe(true)
 
-    fireEvent.change(screen.getByLabelText("Type of qty"), { target: { value: "text" } })
+    chooseOption(screen.getByLabelText("Type of qty"), "Text")
     await within(list).findByText("Same columns")
     await waitFor(() => expect(next().disabled).toBe(false))
     const last = sent(calls, "POST", /compare$/).pop()
@@ -1719,6 +2281,8 @@ describe("UploadFilePage, several files into one table", () => {
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByRole("button", { name: "Load" })
 
@@ -1749,6 +2313,8 @@ describe("UploadFilePage, several files into one table", () => {
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     fireEvent.click(await screen.findByRole("button", { name: "Load" }))
     fireEvent.click(await screen.findByRole("button", { name: "Try again" }))
@@ -1773,7 +2339,7 @@ describe("UploadFilePage, several files into one table", () => {
       get: (n) => (n === 1 ? second : { ...second, status: "failed", error: "The load into the table failed." }),
       list: [upload({ id: "up-1", originalFilename: "stock.csv" }), second],
     })
-    render(<UploadFilePage pollMs={20} />)
+    render(<UploadFilePage pollMs={20} lookupDelayMs={0} />)
 
     await screen.findByText("Load failed")
     expect(screen.queryByRole("button", { name: "Try again" })).toBeNull()

@@ -73,6 +73,10 @@ pub struct SavedQuery {
     pub owner_id: Option<String>,
     /// The level the caller holds on it: "view", "edit" or "manage".
     pub level: String,
+    /// The definitions of the `{{name}}` parameters in its SQL (`QS-5`): a
+    /// JSON array, `[]` when it has none. The store keeps it as the API
+    /// validated it and never reads inside it.
+    pub parameters: serde_json::Value,
 }
 
 /// A saved query, as the database holds it.
@@ -88,6 +92,7 @@ struct SavedQueryRow {
     owner_id: Option<Uuid>,
     tenant_id: Option<Uuid>,
     deleted_at: Option<OffsetDateTime>,
+    parameters: serde_json::Value,
 }
 
 impl SavedQueryRow {
@@ -113,6 +118,7 @@ impl SavedQueryRow {
             folder_id: self.folder_id.map(|id| id.to_string()),
             owner_id: self.owner_id.map(|id| id.to_string()),
             level: level.as_str().to_owned(),
+            parameters: self.parameters,
         }
     }
 }
@@ -322,7 +328,7 @@ pub async fn list_saved_filtered(
         Some(SavedQueryFolder::Folder(id)) => (Some("folder"), Some(id)),
     };
     let rows: Vec<SavedQueryRow> = sqlx::query_as(
-        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at \
+        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at, parameters \
          FROM saved_query \
          WHERE deleted_at IS NULL \
            AND ($1::uuid IS NULL OR tenant_id = $1 OR ($2::boolean AND tenant_id IS NULL)) \
@@ -404,7 +410,7 @@ async fn get_saved_inner(
         return Ok(None);
     };
     let row: Option<SavedQueryRow> = sqlx::query_as(
-        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at \
+        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at, parameters \
          FROM saved_query \
          WHERE id = $1 AND ($4::boolean OR deleted_at IS NULL) \
            AND ($2::uuid IS NULL OR tenant_id = $2 OR ($3::boolean AND tenant_id IS NULL))",
@@ -438,7 +444,7 @@ pub struct HistoryMention {
     pub owner_id: Option<Uuid>,
     /// When it ran, ISO 8601.
     pub at: String,
-    /// `completed | failed | cancelled | blocked`.
+    /// `completed | failed | stopped | blocked`, or `cancelled` on a row an older build wrote.
     pub status: String,
     /// How long it took, in milliseconds.
     pub duration_ms: i64,
@@ -546,6 +552,9 @@ pub enum SavedQueryPlacement {
 /// The first version is written in the same transaction as the row, so the
 /// history of a query never starts later than the query itself.
 ///
+/// The query has no parameters. [`create_saved_query_with_parameters`] saves
+/// one that does.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if a query fails.
@@ -554,6 +563,40 @@ pub async fn create_saved_query_at(
     viewer: &SavedQueryViewer,
     title: &str,
     sql: &str,
+    owner: &str,
+    tags: &[String],
+    placement: SavedQueryPlacement,
+) -> Result<SavedQuery, StoreError> {
+    create_saved_query_with_parameters(
+        pool,
+        viewer,
+        title,
+        sql,
+        &serde_json::json!([]),
+        owner,
+        tags,
+        placement,
+    )
+    .await
+}
+
+/// [`create_saved_query_at`] for a query that keeps the definitions of its
+/// `{{name}}` parameters (`query-parameters.md`, decision 3).
+///
+/// `parameters` is a JSON array, stored as given: the caller has already
+/// validated it against `sql` (`lakehouse-api` `query_params.rs`), and this
+/// crate does not depend on that module. The first version holds the same
+/// list.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn create_saved_query_with_parameters(
+    pool: &PgPool,
+    viewer: &SavedQueryViewer,
+    title: &str,
+    sql: &str,
+    parameters: &serde_json::Value,
     owner: &str,
     tags: &[String],
     placement: SavedQueryPlacement,
@@ -576,9 +619,9 @@ pub async fn create_saved_query_at(
     };
     let mut tx = pool.begin().await?;
     let row: SavedQueryRow = sqlx::query_as(
-        "INSERT INTO saved_query (title, sql, owner, tags, owner_id, tenant_id, folder_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
-         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at",
+        "INSERT INTO saved_query (title, sql, owner, tags, owner_id, tenant_id, folder_id, parameters) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at, parameters",
     )
     .bind(title)
     .bind(sql)
@@ -587,11 +630,19 @@ pub async fn create_saved_query_at(
     .bind(viewer.id)
     .bind(viewer.tenant_id)
     .bind(folder_id)
+    .bind(parameters)
     .fetch_one(&mut *tx)
     .await?;
     let author = version_author_name(&mut tx, viewer.id, owner).await?;
     write_version(
-        &mut tx, row.id, &row.title, &row.sql, viewer.id, &author, "",
+        &mut tx,
+        row.id,
+        &row.title,
+        &row.sql,
+        &row.parameters,
+        viewer.id,
+        &author,
+        "",
     )
     .await?;
     tx.commit().await?;
@@ -633,6 +684,10 @@ pub struct SavedQueryPatch {
     pub tags: Option<Vec<String>>,
     /// The folder the query moves to. `None` leaves it where it is.
     pub folder: Option<FolderMove>,
+    /// New parameter definitions, a JSON array (`query-parameters.md`, decision 3). `None` leaves
+    /// them as they are; the caller has validated them against the SQL the
+    /// query will have.
+    pub parameters: Option<serde_json::Value>,
 }
 
 /// Where a query moves to.
@@ -647,18 +702,22 @@ pub enum FolderMove {
 /// Change a saved query.
 ///
 /// The caller must hold **edit** on the query: `edit` changes the SQL,
-/// the title, the tags and the folder, `view` may do neither. A caller
+/// the title and the tags, `view` may do neither. A move to another folder
+/// (or to the root) needs **manage**. A caller
 /// that may not change the row finds no row at all, so the answer never
 /// says whether it exists.
 ///
-/// A version is written for every change of the title or the SQL, in the
-/// same transaction as the change; a change that leaves both as they
-/// were writes none.
+/// A version is written for every change of the title, the SQL or the
+/// parameters, in the same transaction as the change; a change that leaves
+/// all three as they were writes none.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::NotFound`] when the caller may not change the
-/// query, and [`StoreError::Database`] if a query fails.
+/// query, and when the folder a move names belongs to another tenant than
+/// the query's — an unseen folder; [`StoreError::NotAllowed`] when the
+/// patch moves the query to a folder other than the one it is in and the
+/// caller does not manage the query; and [`StoreError::Database`] if a query fails.
 pub async fn update_saved_query(
     pool: &PgPool,
     viewer: &SavedQueryViewer,
@@ -686,28 +745,60 @@ pub async fn update_saved_query(
     let title = patch.title.as_deref().unwrap_or(&row.title);
     let sql = patch.sql.as_deref().unwrap_or(&row.sql);
     let tags = patch.tags.as_deref().unwrap_or(&row.tags);
-    let folder_id = match patch.folder {
-        Some(FolderMove::Into(folder_id)) => Some(folder_id),
-        Some(FolderMove::Root) => None,
-        None => row.folder_id,
-    };
+    let parameters = patch.parameters.as_ref().unwrap_or(&row.parameters);
+    // A named move is re-checked here, before any write, the way the
+    // edit level above is (`QS-3` review of #382): the folder a query moves into
+    // belongs to the query's own tenant, and a move needs manage on the
+    // query, wherever it goes. Edit changes what the query says; manage
+    // also decides who sees it, so an edit holder can neither publish a
+    // private query, hide a shared one, nor raise edit to manage by moving
+    // the query into a folder of their own.
+    let moved = patch.folder.map(|move_to| match move_to {
+        FolderMove::Into(folder_id) => Some(folder_id),
+        FolderMove::Root => None,
+    });
+    if let Some(target) = moved {
+        // The same tenant limiting a folder's new parent gets: only the
+        // row's own tenant's folders are reachable, so a folder of another
+        // tenant is an unseen folder.
+        let folders = list_folders(pool, row.tenant_id).await?;
+        if let Some(folder_id) = target
+            && !folders.iter().any(|folder| folder.id == folder_id)
+        {
+            return Err(StoreError::NotFound);
+        }
+        // A patch that names the folder the query is already in is not a
+        // move, so an editor who renames with the folder sent again is
+        // not refused. The refusal is the store's own fixed sentence,
+        // mapped to 403 — never a 404, which would say the query is not
+        // there at all.
+        if target != row.folder_id && level < Level::Manage {
+            return Err(StoreError::NotAllowed);
+        }
+    }
+    let folder_id = moved.unwrap_or(row.folder_id);
     let mut tx = pool.begin().await?;
     let updated: SavedQueryRow = sqlx::query_as(
         "UPDATE saved_query \
-         SET title = $2, sql = $3, tags = $4, folder_id = $5, updated_at = now() \
+         SET title = $2, sql = $3, tags = $4, folder_id = $5, parameters = $6, \
+             updated_at = now() \
          WHERE id = $1 \
-         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at",
+         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at, parameters",
     )
     .bind(query_id)
     .bind(title)
     .bind(sql)
     .bind(tags)
     .bind(folder_id)
+    .bind(parameters)
     .fetch_one(&mut *tx)
     .await?;
-    if title != row.title || sql != row.sql {
+    if title != row.title || sql != row.sql || *parameters != row.parameters {
         let author = version_author_name(&mut tx, viewer.id, &row.owner).await?;
-        write_version(&mut tx, query_id, title, sql, viewer.id, &author, "").await?;
+        write_version(
+            &mut tx, query_id, title, sql, parameters, viewer.id, &author, "",
+        )
+        .await?;
     }
     tx.commit().await?;
     Ok(updated.into_saved(level))
@@ -715,8 +806,9 @@ pub async fn update_saved_query(
 
 /// Move a saved query to the trash.
 ///
-/// The caller must hold **manage** on the query: only then may it be
-/// deleted. Trashing a query that is already in the trash does nothing.
+/// The caller must hold **edit** on the query: decision 6 (plan 55 D5)
+/// puts deleting a query beside changing it. Trashing a query that is
+/// already in the trash does nothing.
 ///
 /// # Errors
 ///
@@ -740,7 +832,8 @@ pub async fn trash_saved_query(
     let Some(level) = visibility.level(&row.target()) else {
         return Err(StoreError::NotFound);
     };
-    if level < Level::Manage {
+    // Edit may delete a query (decision 6, plan 55 D5).
+    if level < Level::Edit {
         return Err(StoreError::NotFound);
     }
     if row.deleted_at.is_some() {
@@ -756,8 +849,8 @@ pub async fn trash_saved_query(
 
 /// Bring a saved query back out of the trash, into the folder it was in.
 ///
-/// The caller must hold **manage** on the query: only then may it be
-/// restored.
+/// The caller must hold **edit** on the query: whoever may delete it may
+/// bring it back (decision 6, plan 55 D5).
 ///
 /// # Errors
 ///
@@ -781,14 +874,15 @@ pub async fn restore_saved_query(
     let Some(level) = visibility.level(&row.target()) else {
         return Err(StoreError::NotFound);
     };
-    if level < Level::Manage {
+    // Edit may restore a query (decision 6, plan 55 D5).
+    if level < Level::Edit {
         return Err(StoreError::NotFound);
     }
     let restored: SavedQueryRow = sqlx::query_as(
         "UPDATE saved_query \
          SET deleted_at = NULL, deleted_by = NULL, updated_at = now() \
          WHERE id = $1 \
-         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at",
+         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at, parameters",
     )
     .bind(query_id)
     .fetch_one(pool)
@@ -820,11 +914,13 @@ pub struct SavedQueryTrashEntry {
     pub days_left: i32,
 }
 
-/// The queries in the trash the caller may manage.
+/// The queries in the trash the caller may edit (decision 6, plan 55
+/// D5).
 ///
 /// A trashed query waits here until it is restored or swept away; the
-/// caller sees only the ones it may manage, because the trash entry is
-/// part of managing a query.
+/// caller sees the ones it may edit — the same set that may delete and
+/// restore a query — so what the list shows is what the caller can act
+/// on.
 ///
 /// The days left are counted here rather than by the caller, so the
 /// number the console shows and the number the sweep acts on come from
@@ -841,7 +937,7 @@ pub async fn list_saved_trash_entries(
         return Ok(Vec::new());
     };
     let rows: Vec<SavedQueryRow> = sqlx::query_as(
-        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at \
+        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at, parameters \
          FROM saved_query \
          WHERE deleted_at IS NOT NULL \
            AND ($1::uuid IS NULL OR tenant_id = $1 OR ($2::boolean AND tenant_id IS NULL)) \
@@ -857,7 +953,9 @@ pub async fn list_saved_trash_entries(
         .into_iter()
         .filter_map(|row| {
             let level = visibility.level(&row.target())?;
-            if level < Level::Manage {
+            // The trash lists the queries the caller may edit, the same
+            // level delete and restore ask for (decision 6, plan 55 D5).
+            if level < Level::Edit {
                 return None;
             }
             let deleted_at = row.deleted_at?;
@@ -905,7 +1003,8 @@ pub async fn purge_trashed_before(
     Ok(removed.rows_affected())
 }
 
-/// One version of a saved query: the title and the SQL it had.
+/// One version of a saved query: the title, the SQL and the parameter
+/// definitions it had.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SavedQueryVersion {
@@ -915,6 +1014,8 @@ pub struct SavedQueryVersion {
     pub title: String,
     /// The SQL the query had.
     pub sql: String,
+    /// The parameter definitions the query had, a JSON array (`QS-5`).
+    pub parameters: serde_json::Value,
     /// The author's user id, when there is one.
     pub author_id: Option<String>,
     /// The author's name, as the history shows it.
@@ -932,6 +1033,7 @@ struct SavedQueryVersionRow {
     version: i32,
     title: String,
     sql: String,
+    parameters: serde_json::Value,
     author_id: Option<Uuid>,
     author_name: String,
     label: String,
@@ -944,6 +1046,7 @@ impl From<SavedQueryVersionRow> for SavedQueryVersion {
             version: row.version,
             title: row.title,
             sql: row.sql,
+            parameters: row.parameters,
             author_id: row.author_id.map(|id| id.to_string()),
             author_name: row.author_name,
             label: row.label,
@@ -965,7 +1068,7 @@ pub async fn list_versions(
     query_id: Uuid,
 ) -> Result<Vec<SavedQueryVersion>, StoreError> {
     let rows: Vec<SavedQueryVersionRow> = sqlx::query_as(
-        "SELECT version, title, sql, author_id, author_name, label, created_at \
+        "SELECT version, title, sql, parameters, author_id, author_name, label, created_at \
          FROM saved_query_version WHERE query_id = $1 ORDER BY version DESC",
     )
     .bind(query_id)
@@ -977,7 +1080,7 @@ pub async fn list_versions(
 /// Go back to an earlier version of a saved query.
 ///
 /// The revert writes a **new** version, holding the content of the
-/// version it went back to, so going back is itself undoable.
+/// version it went back to (its SQL and its parameters together), so going back is itself undoable.
 ///
 /// The caller must hold **edit** on the query.
 ///
@@ -1005,25 +1108,27 @@ pub async fn revert_to_version(
     if level < Level::Edit {
         return Err(StoreError::NotFound);
     }
-    let wanted: Option<(String, String)> = sqlx::query_as(
-        "SELECT title, sql FROM saved_query_version WHERE query_id = $1 AND version = $2",
+    let wanted: Option<(String, String, serde_json::Value)> = sqlx::query_as(
+        "SELECT title, sql, parameters FROM saved_query_version \
+         WHERE query_id = $1 AND version = $2",
     )
     .bind(query_id)
     .bind(version)
     .fetch_optional(pool)
     .await?;
-    let Some((title, sql)) = wanted else {
+    let Some((title, sql, parameters)) = wanted else {
         return Err(StoreError::NotFound);
     };
     let mut tx = pool.begin().await?;
     let updated: SavedQueryRow = sqlx::query_as(
-        "UPDATE saved_query SET title = $2, sql = $3, updated_at = now() \
+        "UPDATE saved_query SET title = $2, sql = $3, parameters = $4, updated_at = now() \
          WHERE id = $1 \
-         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at",
+         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at, parameters",
     )
     .bind(query_id)
     .bind(&title)
     .bind(&sql)
+    .bind(&parameters)
     .fetch_one(&mut *tx)
     .await?;
     let author = version_author_name(&mut tx, viewer.id, &row.owner).await?;
@@ -1032,6 +1137,7 @@ pub async fn revert_to_version(
         query_id,
         &title,
         &sql,
+        &parameters,
         viewer.id,
         &author,
         &format!("Restored version {version}"),
@@ -1044,7 +1150,7 @@ pub async fn revert_to_version(
 /// One row, with the columns the access rules need.
 async fn load_row(pool: &PgPool, query_id: Uuid) -> Result<Option<SavedQueryRow>, StoreError> {
     let row: Option<SavedQueryRow> = sqlx::query_as(
-        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at \
+        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at, parameters \
          FROM saved_query WHERE id = $1",
     )
     .bind(query_id)
@@ -1077,6 +1183,7 @@ async fn write_version(
     query_id: Uuid,
     title: &str,
     sql: &str,
+    parameters: &serde_json::Value,
     author_id: Option<Uuid>,
     author_name: &str,
     label: &str,
@@ -1089,13 +1196,14 @@ async fn write_version(
     .await?;
     sqlx::query(
         "INSERT INTO saved_query_version \
-         (query_id, version, title, sql, author_id, author_name, label) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+         (query_id, version, title, sql, parameters, author_id, author_name, label) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(query_id)
     .bind(next)
     .bind(title)
     .bind(sql)
+    .bind(parameters)
     .bind(author_id)
     .bind(author_name)
     .bind(label)
@@ -1147,7 +1255,8 @@ pub struct QueryHistoryItem {
     pub user: String,
     /// When the query ran, ISO 8601.
     pub at: String,
-    /// `"completed" | "failed" | "cancelled" | "blocked"`.
+    /// `"completed" | "failed" | "stopped" | "blocked"`, or `"cancelled"` on
+    /// a row an older build wrote (`0127_query_history_stopped.sql`).
     pub status: String,
     /// Wall-clock execution time. Serializes as `durationMs`.
     pub duration_ms: i64,
@@ -1240,11 +1349,15 @@ impl From<QueryHistoryRow> for QueryHistoryItem {
 /// every value, so its SQL is one constant statement. `None` means "no
 /// filter on this axis", and the all-`None` default is the side panel's
 /// and the page's first view: the newest page of the last 14 days.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HistoryFilter<'a> {
-    /// `completed | failed | cancelled | blocked` — the statuses the
-    /// table's own check allows. The route rejects anything else with a
-    /// 400 before this is built.
+    /// One run's id (`QS-12`, `LH-QS-4-07`): QS-12 opens a run by the id in
+    /// the address, never by its SQL. Still inside the owner scope and the
+    /// 14-day window — this does not reach anyone else's or older runs.
+    pub id: Option<&'a str>,
+    /// `completed | failed | stopped | blocked` — the statuses `run`
+    /// records. The route rejects anything else (`cancelled`, which only
+    /// older rows carry, included) with a 400 before this is built.
     pub status: Option<&'a str>,
     /// `clickhouse | trino` — the engines `run` records. The route
     /// rejects anything else with a 400 before this is built.
@@ -1261,22 +1374,53 @@ pub struct HistoryFilter<'a> {
     pub from: Option<OffsetDateTime>,
     /// The window's end, inclusive.
     pub to: Option<OffsetDateTime>,
-    /// The page cursor's `at` half: the `at` of the last row the caller
-    /// has already seen. With [`HistoryFilter::before_id`] it pages
-    /// without repeats or skips.
-    pub before_at: Option<OffsetDateTime>,
-    /// The page cursor's `id` half, breaking ties between rows that share
-    /// an `at` (rows land in one millisecond more often than a cursor
-    /// built on `at` alone could survive).
-    pub before_id: Option<&'a str>,
+    /// The 1-based page number: page N is rows (N-1)*50 to N*50 of the
+    /// newest-first list. A value below 1 reads as page 1, and an offset
+    /// too large for the database saturates, so a huge page is an empty
+    /// page, not an error.
+    pub page: i64,
+}
+
+impl Default for HistoryFilter<'_> {
+    /// No filter, first page: the side panel's and the page's first view.
+    fn default() -> Self {
+        Self {
+            id: None,
+            status: None,
+            engine: None,
+            min_duration_ms: None,
+            table: None,
+            from: None,
+            to: None,
+            page: 1,
+        }
+    }
 }
 
 /// The page size of [`list_history`]: the most rows any one answer
-/// carries. "Load more" asks for the next page with the cursor (decision
-/// 5), so no answer grows as `routes::query::run` keeps inserting, and
-/// reaching an older row is what the filters are for — the side panel's
-/// old first bite of 200 is not kept.
-const HISTORY_PAGE_LIMIT: i64 = 50;
+/// carries, and the `pageSize` the route reports. Pages are numbered
+/// (`QS-4` QA of 2026-11-05), so no answer grows as `routes::query::run`
+/// keeps inserting, and reaching an older row is what the filters and the
+/// page number are for — the side panel's old first bite of 200 is not
+/// kept.
+pub const HISTORY_PAGE_LIMIT: i64 = 50;
+
+/// The `WHERE` of [`list_history`] and [`count_history`], written once so
+/// `total` can never count a row the list would not show. It reads
+/// `$1..$8` — owner, status, engine, minimum duration, table, `from`,
+/// `to`, `id` — and both statements bind them in that order. The text is a
+/// constant: every value is bound, none is interpolated.
+const HISTORY_WHERE: &str = "q.owner_id = $1 \
+           AND ($2::text IS NULL OR q.status = $2) \
+           AND ($3::text IS NULL OR q.engine = $3) \
+           AND ($4::bigint IS NULL OR q.duration_ms >= $4) \
+           AND ($5::text IS NULL OR EXISTS ( \
+               SELECT 1 FROM unnest(q.tables_read) AS t(t) \
+                WHERE t.t ILIKE '%' || replace(replace(replace($5, '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '%')) \
+           AND q.at >= GREATEST(COALESCE($6::timestamptz, now() - interval '14 days'), \
+                                now() - interval '14 days') \
+           AND ($7::timestamptz IS NULL OR q.at <= $7) \
+           AND ($8::text IS NULL OR q.id = $8)";
 
 /// List one user's recorded query executions, filtered, most recent
 /// first, one page at a time.
@@ -1288,11 +1432,12 @@ const HISTORY_PAGE_LIMIT: i64 = 50;
 ///
 /// # One constant statement
 ///
-/// Every filter is a `$n IS NULL OR ...` arm, so the SQL never changes
-/// shape and every value is bound — `format!` has nothing to do here
-/// (decision 5; the repo rule that only constant identifiers may be
-/// interpolated). An absent filter costs Postgres one null test per row
-/// and buys a statement whose shape Postgres can learn once.
+/// Every filter is a `$n IS NULL OR ...` arm of [`HISTORY_WHERE`], so the
+/// SQL never changes shape and every value is bound. `format!` only joins
+/// that constant to the constant select list (decision 5; the repo rule
+/// that only constants may be interpolated). An absent filter costs
+/// Postgres one null test per row and buys a statement whose shape
+/// Postgres can learn once.
 ///
 /// # The 14-day window (decision 2)
 ///
@@ -1302,20 +1447,15 @@ const HISTORY_PAGE_LIMIT: i64 = 50;
 /// and a `from` older than the floor is clamped to it. Nothing is
 /// deleted — an older row is still in the table, it is just not listed.
 ///
-/// # The cursor (decision 5)
+/// # Numbered pages (`QS-4` QA of 2026-11-05)
 ///
-/// `(date_trunc('milliseconds', q.at), q.id) < ($8::timestamptz, $9::text)`
-/// under `ORDER BY date_trunc('milliseconds', q.at) DESC, q.id DESC` pages
-/// by the `at` *and* `id` of the last row seen: a cursor on `at` alone
-/// would repeat or skip every row that shares its millisecond.
-///
-/// The millisecond is the value the cursor carries: a row's `at` leaves
-/// the store cut to milliseconds ([`iso_millis`]), so the console's cursor
-/// holds `T.000` for a row at `T.000150`. Comparing that millisecond
-/// against the stored microsecond `at` skips every row inside the last
-/// page's millisecond — `T.000100` is not below `T.000` — so the order
-/// and the comparison both run on `date_trunc('milliseconds', q.at)`, the
-/// value the cursor holds.
+/// `LIMIT 50 OFFSET (page - 1) * 50` under `ORDER BY
+/// date_trunc('milliseconds', q.at) DESC, q.id DESC`. A row's `at` leaves
+/// the store cut to milliseconds ([`iso_millis`]), so the order cuts to the
+/// same value and falls back to the id: rows inside one displayed
+/// millisecond keep a fixed order and a page boundary never repeats or
+/// skips one. The offset saturates instead of overflowing, so a page no
+/// table could reach is an empty page.
 ///
 /// # The `table` match (decision 7)
 ///
@@ -1347,7 +1487,13 @@ pub async fn list_history(
     owner_id: Uuid,
     filter: &HistoryFilter<'_>,
 ) -> Result<Vec<QueryHistoryItem>, StoreError> {
-    let rows: Vec<QueryHistoryRow> = sqlx::query_as(
+    let offset = filter
+        .page
+        .max(1)
+        .saturating_sub(1)
+        .saturating_mul(HISTORY_PAGE_LIMIT);
+    // safe: only the constant `HISTORY_WHERE` is formatted in; every value is bound.
+    let sql = format!(
         "SELECT q.id, q.sql, q.user_name, q.at, q.status, q.duration_ms, q.scanned_bytes, \
          q.cost_units, q.workload_class, q.engine, q.cache_assisted, ae.id AS audit_event_id, \
          q.owner_id, q.tables_read, q.message \
@@ -1357,33 +1503,53 @@ pub async fn list_history(
               WHERE ae.resource_kind = 'query_history' AND ae.resource_id = q.id \
               ORDER BY ae.at DESC LIMIT 1 \
          ) ae ON true \
-         WHERE q.owner_id = $1 \
-           AND ($2::text IS NULL OR q.status = $2) \
-           AND ($3::text IS NULL OR q.engine = $3) \
-           AND ($4::bigint IS NULL OR q.duration_ms >= $4) \
-           AND ($5::text IS NULL OR EXISTS ( \
-               SELECT 1 FROM unnest(q.tables_read) AS t(t) \
-                WHERE t.t ILIKE '%' || replace(replace(replace($5, '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '%')) \
-           AND q.at >= GREATEST(COALESCE($6::timestamptz, now() - interval '14 days'), \
-                                now() - interval '14 days') \
-           AND ($7::timestamptz IS NULL OR q.at <= $7) \
-           AND ($8::timestamptz IS NULL OR (date_trunc('milliseconds', q.at), q.id) < ($8::timestamptz, $9::text)) \
+         WHERE {HISTORY_WHERE} \
          ORDER BY date_trunc('milliseconds', q.at) DESC, q.id DESC \
-         LIMIT $10",
-    )
-    .bind(owner_id)
-    .bind(filter.status)
-    .bind(filter.engine)
-    .bind(filter.min_duration_ms)
-    .bind(filter.table)
-    .bind(filter.from)
-    .bind(filter.to)
-    .bind(filter.before_at)
-    .bind(filter.before_id)
-    .bind(HISTORY_PAGE_LIMIT)
-    .fetch_all(pool)
-    .await?;
+         LIMIT $9 OFFSET $10"
+    );
+    let rows: Vec<QueryHistoryRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(owner_id)
+        .bind(filter.status)
+        .bind(filter.engine)
+        .bind(filter.min_duration_ms)
+        .bind(filter.table)
+        .bind(filter.from)
+        .bind(filter.to)
+        .bind(filter.id)
+        .bind(HISTORY_PAGE_LIMIT)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(QueryHistoryItem::from).collect())
+}
+
+/// Count the rows [`list_history`] pages through: the same owner scope, the
+/// same 14-day window and every filter, from the one [`HISTORY_WHERE`], with
+/// `filter.page` ignored. The history page's "Page N of M" and its empty
+/// state read this, so it must not count a row the list would not show.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn count_history(
+    pool: &PgPool,
+    owner_id: Uuid,
+    filter: &HistoryFilter<'_>,
+) -> Result<i64, StoreError> {
+    // safe: only the constant `HISTORY_WHERE` is formatted in; every value is bound.
+    let sql = format!("SELECT COUNT(*) FROM query_history q WHERE {HISTORY_WHERE}");
+    let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(owner_id)
+        .bind(filter.status)
+        .bind(filter.engine)
+        .bind(filter.min_duration_ms)
+        .bind(filter.table)
+        .bind(filter.from)
+        .bind(filter.to)
+        .bind(filter.id)
+        .fetch_one(pool)
+        .await?;
+    Ok(total)
 }
 
 /// Fetch one query-history row by id — added for an owner-scoped lookup
@@ -1433,7 +1599,7 @@ pub struct RecordHistoryInput<'a> {
     /// The user the row belongs to. `None` for a run with no authenticated
     /// caller, which [`list_history`] then shows to nobody.
     pub owner_id: Option<Uuid>,
-    /// `"completed" | "failed" | "cancelled" | "blocked"`.
+    /// `"completed" | "failed" | "stopped" | "blocked"`.
     pub status: &'a str,
     /// Wall-clock execution time, in milliseconds.
     pub duration_ms: i64,
@@ -1457,6 +1623,13 @@ pub struct RecordHistoryInput<'a> {
     /// caller's screen showed. `None` where there is nothing to say: a
     /// completed run, and every row recorded before the column existed.
     pub message: Option<&'a str>,
+    /// The tenant the run acted as: the one `X-Tenant` selected, or the
+    /// caller's first (`OPS-8`, migration `0144_query_history_tenant.sql`).
+    /// `None` for a caller that belongs to no tenant (a service identity)
+    /// and for every row recorded before the column existed, which
+    /// belonged to an unknown tenant. A reader that sums per tenant must
+    /// not treat a `None` row as any tenant's.
+    pub tenant_id: Option<Uuid>,
 }
 
 /// Record one query execution.
@@ -1486,8 +1659,9 @@ pub async fn record_history(
     sqlx::query(
         "INSERT INTO query_history \
          (id, sql, user_name, status, duration_ms, scanned_bytes, cost_units, \
-          workload_class, engine, cache_assisted, owner_id, tables_read, message) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+          workload_class, engine, cache_assisted, owner_id, tables_read, message, \
+          tenant_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(input.id)
@@ -1503,6 +1677,7 @@ pub async fn record_history(
     .bind(input.owner_id)
     .bind(input.tables_read)
     .bind(input.message)
+    .bind(input.tenant_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -1528,6 +1703,7 @@ mod tests {
             folder_id: None,
             owner_id: None,
             level: "view".to_owned(),
+            parameters: serde_json::json!([]),
         };
         let value = serde_json::to_value(&saved).unwrap();
         for key in [
@@ -1540,8 +1716,36 @@ mod tests {
             "folderId",
             "ownerId",
             "level",
+            "parameters",
         ] {
             assert!(value.get(key).is_some(), "SavedQuery is missing `{key}`");
+        }
+
+        let version = SavedQueryVersion {
+            version: 1,
+            title: "t".to_owned(),
+            sql: "SELECT 1".to_owned(),
+            parameters: serde_json::json!([]),
+            author_id: None,
+            author_name: "a".to_owned(),
+            label: String::new(),
+            created_at: "2026-01-01T00:00:00.000Z".to_owned(),
+        };
+        let value = serde_json::to_value(&version).unwrap();
+        for key in [
+            "version",
+            "title",
+            "sql",
+            "parameters",
+            "authorId",
+            "authorName",
+            "label",
+            "createdAt",
+        ] {
+            assert!(
+                value.get(key).is_some(),
+                "SavedQueryVersion is missing `{key}`"
+            );
         }
 
         let history = QueryHistoryItem {

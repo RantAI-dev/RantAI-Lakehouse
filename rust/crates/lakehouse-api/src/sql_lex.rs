@@ -1,0 +1,1003 @@
+//! The one lexer the console reads SQL with (`SEC-62`).
+//!
+//! # Why one lexer, and not one per reader
+//!
+//! Two scanners read the SQL a person wrote: the read-only guard
+//! ([`crate::sql_guard`]) and the parameter scanner
+//! ([`crate::query_params`]). Each had its own copy of the lexical rules,
+//! and neither copy was the engine's. A copy that disagrees with the
+//! engine is a hole and not a nuisance: text the scanner believes is code
+//! can be code the engine reads.
+//!
+//! - The guard read a `\` as an escape on `Trino` and knew no `ClickHouse`
+//!   heredoc, so a statement could hide a write from its keyword scan.
+//! - The scanner refused to open a heredoc after a digit, so `SELECT 1$$
+//!   {{x}} $$` was a heredoc to the engine and ordinary text to the
+//!   scanner: the placeholder was filled, and a value holding `$$` closed
+//!   the heredoc and ran as SQL.
+//!
+//! Both are `SEC-62`, and both came out of the planner's post-merge
+//! reviews of PR #420 and PR #437. So the rules live here once, and
+//! both readers take them from here (AGENTS.md rule 4: a duplicated guard
+//! is a finding).
+//!
+//! # The rules, per engine
+//!
+//! ## `ClickHouse`
+//!
+//! The rules this module implements, measured 2026-11-10 on
+//! `clickhouse/clickhouse-server:26.8` (server version `26.8.15.10`) and
+//! read out of `ClickHouse`'s own lexer (`src/Parsers/Lexer.cpp`):
+//!
+//! - `'…'`, `"…"` and `` `…` `` are quoted runs. A `\` escapes the next
+//!   character, and a doubled quote is an escaped quote.
+//! - `--` starts a line comment. `//` starts one too, with or without a
+//!   space after it — measured on `26.8` (2026-11-10): `SELECT 1 // c`,
+//!   `SELECT 1 //c` and `SELECT 8 // 3` each run with the operand before
+//!   the `//` alone, and the quote in `SELECT 1 // '` opens no string.
+//!   `Trino` has no `//` comment, so the same text is code there. `#`
+//!   starts one only when the next
+//!   character is a space or `!`; every other `#` is an "Unrecognized
+//!   token" error. A tab is not a comment either: on `26.8.15.10` a tab
+//!   after the `#` is refused with "Unrecognized token"
+//!   (`a_tab_after_a_hash_is_not_a_comment_on_clickhouse` pins it). The
+//!   engine's own comment in `Lexer.cpp` says: "For less ambiguity, we
+//!   will recognize a comment only if # is followed by whitespace. or #!
+//!   as a special case for "shebang"." — that "whitespace" is the
+//!   engine's wording; the measurement is what the code follows.
+//! - `/* … */` comments nest: the comment runs to the `*/` that closes the
+//!   outermost one. The `#437` review read the nesting rule out of
+//!   `ClickHouse`'s own lexer.
+//! - `$tag$ … $tag$` is a heredoc: a literal whose body is raw text, read
+//!   as it stands and not read as SQL again. Measured: `SELECT $$'; SELECT
+//!   42; SELECT '$$` answers the literal `'; SELECT 42; SELECT '` and does
+//!   not run the `SELECT 42`. Measured on `26.8` (2026-11-10): the tag is
+//!   empty or `[A-Za-z0-9_]+`, digits included — `$1$x$1$` runs and
+//!   answers `x` — while `$a b$`, `$'$` and `$é$` are no heredocs: the
+//!   engine refuses the statement.
+//! - A heredoc opens only when its closing delimiter is found again in the
+//!   text: `src/Parsers/Lexer.cpp` (the `$` branch of `nextTokenImpl`)
+//!   emits a heredoc token only then, and when the delimiter is not found
+//!   again the `$` opens nothing — it is a standalone `$` or the start of
+//!   one bareword, and the text after it is ordinary SQL to the engine.
+//!   Measured: `SELECT 1$b$` answers `1` over HTTP (the run is read as an
+//!   alias), and the native client splits `SELECT 1$b$ ; DROP TABLE t` on
+//!   the `;` and runs both halves (the `DROP TABLE` runs) — two statements
+//!   to that client. Over the HTTP interface the console uses, the engine
+//!   reads the body as one statement and refuses it with `Multi-statements
+//!   are not allowed` (HTTP 400), so the second statement does not run on
+//!   that path — and the console's read-only guard refuses the statement
+//!   before it is sent.
+//! - A `$` opens a heredoc only where it starts a token. The run of
+//!   `[A-Za-z0-9_$]` before it is a name when it starts with a letter, `_`
+//!   or `$` — the engine's bareword reader takes those — and a number
+//!   otherwise, so the `$` opens the heredoc. Measured on `26.8`
+//!   (2026-11-10), a `$` beside name characters is part of one identifier
+//!   instead: `$a-b$x$a-b$` parses as the identifiers `$a`, `b$x$a` and
+//!   `b$`, not as a heredoc. A non-ASCII character is
+//!   not in that set, so it ends the run and the `$` after it opens the
+//!   heredoc — but the engine refuses the statement at that character
+//!   with "Unrecognized token", so the statement never runs and the
+//!   heredoc question never decides it. Measured: `SELECT 'x' AS a$$b`
+//!   answers `x` and `SELECT 'x' AS _a$$b$$` is the identifier
+//!   `_a$$b$$`, while `1$$`, `1.5$$`, `0x1F$$` and `1a$$` each open a
+//!   heredoc; on `26.8.15.10` `SELECT 'x' AS aé$$b` and `SELECT 'x' AS
+//!   中$$b` are refused at the non-ASCII character
+//!   (`a_dollar_after_a_non_ascii_character_opens_a_heredoc_on_clickhouse`
+//!   pins it). (`#437` review)
+//! - A `$`-run written immediately after a closed heredoc, and a `$`
+//!   before a quote, a non-ASCII character or the end of the text, are
+//!   shapes no measured rule reads: the engine refuses every one the
+//!   measurements cover with `SYNTAX_ERROR` (code 62, measured
+//!   2026-11-10 on `clickhouse/clickhouse-server:26.8`), so
+//!   [`dollar_span`] marks the run [`SpanKind::Uncertain`] instead of
+//!   guessing. The guard refuses a statement that holds an uncertain run,
+//!   and the scanner refuses a placeholder in a statement that holds one.
+//!
+//! ## `Trino`
+//!
+//! From `Trino`'s own grammar
+//! (`core/trino-parser/src/main/antlr4/io/trino/sql/parser/SqlBase.g4`)
+//! and <https://trino.io/docs/current/language/comments.html>:
+//!
+//! - `STRING_`: `'…'`, where the only escape is a doubled quote. A `\` is
+//!   a plain character.
+//! - `QUOTED_IDENTIFIER_`: `"…"`, with a doubled quote as the only escape.
+//! - `SIMPLE_COMMENT_`: `-- …` to the end of the line.
+//! - `BRACKETED_COMMENT_`: `/* … */`, which does not nest.
+//! - No heredoc, and no `#` comment: a `#` is a character the engine does
+//!   not read as a comment start, so the text after it cannot run.
+//! - No backtick quoting. A backtick run is read as a quoted run here all
+//!   the same, so a placeholder inside one is refused rather than filled:
+//!   such a statement is invalid `Trino` anyway, and refusing is the safe
+//!   reading.
+//!
+//! ## What this module does not implement
+//!
+//! `ClickHouse`'s lexer reads one form this module does not follow: the
+//! Unicode quotes. Measured on `clickhouse/clickhouse-server:26.8`
+//! (2026-11-12, the `#452` review SHOULD-FIX), `‘ … ’` is a string literal
+//! and `“ … ”` a quoted identifier there. Reading them as ordinary code is
+//! not the safe direction, as an earlier version of this doc claimed. The
+//! `'` inside `‘ ' ’` opens no string on the engine, but this lexer opens
+//! one, so `SELECT ‘ ' ’; DROP TABLE t; SELECT ‘ ' ’` showed the guard a
+//! string around the `DROP` that the engine did not see. A placeholder
+//! between the two quotes would be filled into a literal in the same way.
+//!
+//! The lexer cannot follow them, so on `ClickHouse` each of `‘` (U+2018),
+//! `’` (U+2019), `“` (U+201C) and `”` (U+201D) outside a quoted run, a
+//! comment or a heredoc is a one-character [`SpanKind::Uncertain`] span:
+//! the guard refuses the statement and the scanner refuses a placeholder in
+//! it. Inside an ASCII quoted run, a comment or a heredoc they are data and
+//! open nothing. `Trino` has no such quotes, so the text stays code there.
+//!
+//! # What the spans say
+//!
+//! [`lex`] yields the statement's spans in order: the code between two of
+//! them is one [`SpanKind::Code`] span, and each comment, quoted run and
+//! heredoc is one span of its own kind.
+//!
+//! - [`SpanKind::Comment`]: a comment the engine reads.
+//! - [`SpanKind::Literal`]: a quoted run, or a heredoc that is closed. The
+//!   body of a heredoc is raw text, so a placeholder inside one is a
+//!   placeholder inside quotes.
+//! - [`SpanKind::NotCode`]: text the engine reads as neither code nor a
+//!   comment — the run after a `#` that the engine does not read as a
+//!   comment start. The engine refuses the statement there, so the text
+//!   cannot run: the parameter scanner leaves it alone, and the guard
+//!   reads it as it stands.
+//! - [`SpanKind::UnclosedHeredoc`]: the tail of a heredoc that is never
+//!   closed. It is the one text the two readers read differently, and it
+//!   has a kind of its own so that neither reader has to guess.
+//! - [`SpanKind::Uncertain`]: a `$`-run no measured rule reads, or, on
+//!   `ClickHouse`, one of the four Unicode quotes the lexer does not
+//!   follow. The engine refuses every `$` shape of this kind the
+//!   measurements cover, and its reading of the rest is unknown, so both
+//!   readers refuse: the guard refuses the whole statement when one is
+//!   present, and the scanner refuses a placeholder in a statement that
+//!   holds one.
+//!
+//! An unclosed literal or comment runs to the end of the text, and so does
+//! an unclosed heredoc — but the engine reads that tail as code, and the
+//! scanner reads it as raw text.
+//!
+//! ## The one text the two readers read differently
+//!
+//! `ClickHouse` opens a heredoc only when the closing delimiter is found
+//! again in the text (the rule above, read out of `src/Parsers/Lexer.cpp`).
+//! When it is not found again, the `$` opens nothing and the text after it
+//! is ordinary SQL to the engine, so a denied keyword in it is a keyword
+//! the engine would run.
+//!
+//! The scanner reads that tail as raw text, as it reads the body of a
+//! closed heredoc: a placeholder in it is refused like one inside quotes.
+//! The scanner cannot know that the author meant a heredoc, and refusing
+//! is the safe reading. The guard must read it as code, as the engine
+//! does, or a denied keyword hides in it.
+
+use crate::sql_rewrite::Engine;
+
+/// What the engine reads in one span of a statement.
+///
+/// One kind is the one text the engine and the scanner read differently:
+/// [`SpanKind::UnclosedHeredoc`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpanKind {
+    /// Text the engine reads as code.
+    Code,
+    /// A comment the engine reads.
+    Comment,
+    /// A quoted run: a string literal, a quoted identifier, or a heredoc
+    /// that is closed.
+    Literal,
+    /// Text the engine reads as neither code nor a comment.
+    NotCode,
+    /// Text the engine reads as code, but that the scanner reads as raw
+    /// text: the tail of a heredoc that is never closed.
+    ///
+    /// `ClickHouse`'s lexer opens a heredoc only when the closing
+    /// delimiter is found again in the text (`src/Parsers/Lexer.cpp`, the
+    /// `$` branch of `nextTokenImpl`). When it is not found again the `$`
+    /// opens nothing: it is a standalone `$` or the start of one bareword,
+    /// and the text after it is ordinary SQL to the engine.
+    ///
+    /// The scanner cannot know that the author meant a heredoc, so it
+    /// reads the tail as raw text and refuses a placeholder there as it
+    /// refuses one inside quotes. The guard must read it as code, as the
+    /// engine does: a denied keyword in it is a keyword the engine would
+    /// run.
+    UnclosedHeredoc,
+    /// A `$` run in code that no measured rule reads (it neither continues
+    /// an identifier nor opens a heredoc the engine measurements claim), or,
+    /// on `ClickHouse`, one of the Unicode quotes `‘ ’ “ ”` outside a
+    /// quoted run, a comment or a heredoc.
+    ///
+    /// The Unicode quotes: measured on `clickhouse/clickhouse-server:26.8`
+    /// (2026-11-12, `#452` review SHOULD-FIX), `‘ … ’` is a string literal
+    /// and `“ … ”` a quoted identifier there. The lexer does not follow
+    /// either, so it cannot say where such a run ends, and the span is the
+    /// single quote character. Both readers refuse, as for a `$` run below.
+    ///
+    /// The `$` run:
+    ///
+    /// Measured on `clickhouse/clickhouse-server:26.8` (2026-11-10, image
+    /// digest
+    /// `sha256:3043f691ec1a847f38b446ff43708893fcbf9815bd9bd88c0f84bfe064ce852f`):
+    /// the engine answers `SYNTAX_ERROR` (code 62) for every shape of this
+    /// kind the measurements cover — `SELECT $$x$$$$y$$`, `SELECT $$x$$$$
+    /// ' $$`, `SELECT $'$x$'$`, `SELECT $é$x$é$` — and reads none of them
+    /// as code that runs. The engine's reading of a shape the measurements
+    /// do not cover is unknown, so both readers refuse: the guard refuses
+    /// the whole statement when a span of this kind is present, and the
+    /// scanner refuses a placeholder in a statement that holds one.
+    Uncertain,
+}
+
+/// One span of a statement, in character positions.
+///
+/// The positions are character indices and not byte offsets: the readers
+/// work on a `Vec<char>`, and the one that needs byte offsets maps them
+/// itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Span {
+    /// The first character of the span.
+    pub(crate) start: usize,
+    /// The index just past the last character of the span.
+    pub(crate) end: usize,
+    /// What the engine reads there.
+    pub(crate) kind: SpanKind,
+}
+
+/// The spans of `sql`, read the way `engine` reads it.
+///
+/// The spans are in order and cover the whole text: the code between two
+/// of them is one [`SpanKind::Code`] span.
+#[must_use]
+pub(crate) fn lex(engine: Engine, sql: &str) -> Vec<Span> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut spans: Vec<Span> = Vec::new();
+    let mut code_from = 0usize;
+    // Whether the span just before `code_from` is a closed heredoc: a
+    // `$`-run written immediately after one is a shape the engine refuses
+    // (`SYNTAX_ERROR`, code 62, measured 2026-11-10 on
+    // `clickhouse/clickhouse-server:26.8`), so it cannot be read as a
+    // heredoc that happens to close, and no other rule claims it either.
+    let mut after_closed_heredoc = false;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        let dollar = c == '$' && has_heredoc(engine);
+        let span = if dollar {
+            dollar_span(&chars, i, code_from, after_closed_heredoc)
+        } else {
+            match c {
+                '-' if next == Some('-') => Some((skip_to_line_end(&chars, i), SpanKind::Comment)),
+                // `//` starts a line comment on `ClickHouse`, with or
+                // without a space after it: measured 2026-11-10 on
+                // `clickhouse/clickhouse-server:26.8.15.10`, where
+                // `SELECT 1 // c`, `SELECT 1 //c` and `SELECT 8 // 3` each
+                // run with the operand before the `//` alone, and the
+                // quote in `SELECT 1 // '` opens no string. `Trino` has no
+                // `//` comment, so the same text is code there.
+                '/' if next == Some('/') && engine == Engine::ClickHouse => {
+                    Some((skip_to_line_end(&chars, i), SpanKind::Comment))
+                }
+                '/' if next == Some('*') => Some((
+                    if nests_block_comments(engine) {
+                        skip_nested_block_comment(&chars, i)
+                    } else {
+                        skip_block_comment(&chars, i)
+                    },
+                    SpanKind::Comment,
+                )),
+                '#' => Some((skip_to_line_end(&chars, i), hash_kind(engine, next))),
+                '\'' | '"' | '`' => Some((
+                    skip_quoted(&chars, i, c, backslash_escapes(engine)),
+                    SpanKind::Literal,
+                )),
+                // The Unicode quotes open a literal or a quoted identifier
+                // on `ClickHouse` that this lexer does not follow, so the
+                // run behind one is unknown (`#452` review SHOULD-FIX).
+                // `Trino` has no such quotes: the text stays code there.
+                c if engine == Engine::ClickHouse && is_unicode_quote(c) => {
+                    Some((i + 1, SpanKind::Uncertain))
+                }
+                _ => None,
+            }
+        };
+        let Some((end, kind)) = span else {
+            i += 1;
+            // Ordinary code now sits between the last span and whatever
+            // comes next, so the next `$` is no longer adjacent to a
+            // heredoc.
+            after_closed_heredoc = false;
+            continue;
+        };
+        if code_from < i {
+            spans.push(Span {
+                start: code_from,
+                end: i,
+                kind: SpanKind::Code,
+            });
+        }
+        spans.push(Span {
+            start: i,
+            end,
+            kind,
+        });
+        // Only the `$` branch yields `Literal` for a closed heredoc; a
+        // quote's `Literal`, an `Uncertain` or an unclosed heredoc ends
+        // the adjacency.
+        after_closed_heredoc = dollar && kind == SpanKind::Literal;
+        code_from = end;
+        i = end;
+    }
+    if code_from < chars.len() {
+        spans.push(Span {
+            start: code_from,
+            end: chars.len(),
+            kind: SpanKind::Code,
+        });
+    }
+    spans
+}
+
+/// Whether `c` is one of the four Unicode quotes `ClickHouse` reads as a
+/// quote: U+2018 and U+2019 around a string literal, U+201C and U+201D
+/// around a quoted identifier.
+fn is_unicode_quote(c: char) -> bool {
+    matches!(c, '\u{2018}' | '\u{2019}' | '\u{201C}' | '\u{201D}')
+}
+
+/// What a `#` and the rest of its line are on `engine`.
+///
+/// `ClickHouse` reads `#` as the start of a line comment when the next
+/// character is a space or `!`, and every other `#` as an "Unrecognized
+/// token" error. `Trino` has no `#` comment at all.
+fn hash_kind(engine: Engine, next: Option<char>) -> SpanKind {
+    match engine {
+        Engine::ClickHouse if matches!(next, Some(' ' | '!')) => SpanKind::Comment,
+        _ => SpanKind::NotCode,
+    }
+}
+
+/// Whether a backslash escapes the next character inside a quoted run.
+///
+/// `ClickHouse` does, so `'a\'` is still open there. `Trino` does not: `'a\'`
+/// is a complete string, and the `\` in it is a plain character.
+pub(crate) fn backslash_escapes(engine: Engine) -> bool {
+    match engine {
+        Engine::ClickHouse => true,
+        Engine::Trino => false,
+    }
+}
+
+/// Whether a heredoc (`$$ … $$`) opens a run of raw text, as it does on
+/// `ClickHouse`. `Trino` has none.
+pub(crate) fn has_heredoc(engine: Engine) -> bool {
+    match engine {
+        Engine::ClickHouse => true,
+        Engine::Trino => false,
+    }
+}
+
+/// Whether a `/* … */` comment nests, as it does on `ClickHouse`: the
+/// comment then runs to the `*/` that closes the outermost one.
+pub(crate) fn nests_block_comments(engine: Engine) -> bool {
+    match engine {
+        Engine::ClickHouse => true,
+        Engine::Trino => false,
+    }
+}
+
+/// Index of the newline that ends the line starting at `from` (the end of
+/// the text when the last line has none), so the caller resumes on the
+/// newline itself.
+pub(crate) fn skip_to_line_end(chars: &[char], from: usize) -> usize {
+    let mut i = from;
+    while i < chars.len() && chars[i] != '\n' {
+        i += 1;
+    }
+    i
+}
+
+/// Index just past the `/* … */` comment that opens at `from`. An
+/// unterminated comment consumes the rest of the statement.
+pub(crate) fn skip_block_comment(chars: &[char], from: usize) -> usize {
+    let mut i = from + 2;
+    while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+        i += 1;
+    }
+    (i + 2).min(chars.len())
+}
+
+/// Index just past the quoted run that opens at `from` with `quote`.
+/// An unterminated quote consumes the rest of the statement, which is the
+/// safe reading: the reader sees less, not more.
+///
+/// `backslash_escapes` says whether a backslash escapes the next character.
+/// `ClickHouse` does, `Trino` does not, and [`lex`] passes the engine's own
+/// answer.
+pub(crate) fn skip_quoted(
+    chars: &[char],
+    from: usize,
+    quote: char,
+    backslash_escapes: bool,
+) -> usize {
+    let mut i = from + 1;
+    while i < chars.len() {
+        if backslash_escapes && chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if chars[i] == quote {
+            // A doubled quote is an escaped quote, not the end of the run.
+            if chars.get(i + 1) == Some(&quote) {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    chars.len()
+}
+
+/// What the engine reads in the `$`-run that starts at `from`, and the
+/// index just past it.
+///
+/// Returns `None` when the `$` is no span of its own — it continues a name
+/// or starts one, and stays ordinary code. Otherwise returns the span's
+/// end and kind, by the rules in order:
+///
+/// 1. The run of `[A-Za-z0-9_$]` before the `$` is a name when it starts
+///    with a letter, `_` or `$` — the engine's bareword reader takes
+///    those — and the `$` belongs to that name. The scan stops at
+///    `code_from`, the start of the code span the `$` sits in: the
+///    characters of the span before it are no part of this run
+///    (`#446` review — unbounded, the scan crossed into the closed
+///    heredoc `$$x$$` and read the run after it as one name).
+///    Measured on `clickhouse/clickhouse-server:26.8.15.10`:
+///    `SELECT 1 AS a$$b` answers `1` and `SELECT 'x' AS _a$$b$$` is the
+///    identifier `_a$$b$$`, while `1$$`, `1.5$$`, `0x1F$$` and `1a$$`
+///    each open a heredoc. (`#437` review)
+/// 2. The tag scan — `$`, a tag of ASCII letters, digits and `_` (which
+///    may be empty), and a closing `$` — decides: when it finds the
+///    delimiter, the run opens a heredoc, closed ([`SpanKind::Literal`])
+///    or not ([`SpanKind::UnclosedHeredoc`]). A `$`-run written
+///    immediately after a closed heredoc (`after_closed_heredoc`, an
+///    empty code span between) is the exception: the engine refuses every
+///    such shape with `SYNTAX_ERROR` (code 62, measured 2026-11-10 on
+///    `clickhouse/clickhouse-server:26.8`), so no rule reads it and the
+///    run is [`SpanKind::Uncertain`].
+/// 3. When the tag scan finds no delimiter, a name character right after
+///    the `$` makes the two one bareword the engine reads as a name:
+///    measured, `$a-b$x$a-b$` parses as the identifiers `$a`, `b$x$a`,
+///    `b$`.
+/// 4. Every other `$` — before a quote, a non-ASCII character, or the end
+///    of the text — is a shape no measured rule reads:
+///    [`SpanKind::Uncertain`], covering the run of `$` characters.
+fn dollar_span(
+    chars: &[char],
+    from: usize,
+    code_from: usize,
+    after_closed_heredoc: bool,
+) -> Option<(usize, SpanKind)> {
+    let mut name_from = from;
+    while name_from > code_from && is_name_char(chars[name_from - 1]) {
+        name_from -= 1;
+    }
+    if name_from < from {
+        let first = chars[name_from];
+        if first.is_ascii_alphabetic() || first == '_' || first == '$' {
+            return None;
+        }
+    }
+    let mut at = from + 1;
+    while at < chars.len() && (chars[at].is_ascii_alphanumeric() || chars[at] == '_') {
+        at += 1;
+    }
+    if chars.get(at) != Some(&'$') {
+        if chars.get(from + 1).is_some_and(|&c| is_name_char(c)) {
+            return None;
+        }
+        return Some((dollar_run_end(chars, from), SpanKind::Uncertain));
+    }
+    if after_closed_heredoc {
+        return Some((dollar_run_end(chars, from), SpanKind::Uncertain));
+    }
+    let (end, closed) = skip_heredoc(chars, from, at + 1);
+    Some((
+        end,
+        if closed {
+            SpanKind::Literal
+        } else {
+            SpanKind::UnclosedHeredoc
+        },
+    ))
+}
+
+/// Index just past the run of `$` characters that starts at `from`: the
+/// extent of an [`SpanKind::Uncertain`] span.
+fn dollar_run_end(chars: &[char], from: usize) -> usize {
+    let mut at = from;
+    while at < chars.len() && chars[at] == '$' {
+        at += 1;
+    }
+    at
+}
+
+/// Whether `c` is one of the characters the engine's bareword reader takes:
+/// letters, digits, `_` and `$`.
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '$'
+}
+
+/// Index just past the heredoc that opens with the delimiter
+/// `chars[open..close]`, and whether the closing delimiter was found.
+///
+/// The closing delimiter is the opening one, as the engine reads it. A
+/// heredoc that is never closed consumes the rest of the statement, which
+/// is the scanner's safe reading: the rest of the statement is inside it.
+/// The engine reads that tail as code, so the caller gives the span the
+/// kind that says so.
+fn skip_heredoc(chars: &[char], open: usize, close: usize) -> (usize, bool) {
+    let delimiter = &chars[open..close];
+    let mut at = close;
+    while at < chars.len() {
+        if chars[at..].starts_with(delimiter) {
+            return (at + delimiter.len(), true);
+        }
+        at += 1;
+    }
+    (chars.len(), false)
+}
+
+/// Index just past the `/* … */` comment that opens at `from`, counting the
+/// nested ones: `ClickHouse` nests block comments, so the comment ends at
+/// the `*/` that closes the outermost one. An unterminated comment
+/// consumes the rest of the statement.
+fn skip_nested_block_comment(chars: &[char], from: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = from;
+    while i < chars.len() {
+        match (chars[i], chars.get(i + 1)) {
+            ('/', Some('*')) => {
+                depth += 1;
+                i += 2;
+            }
+            ('*', Some('/')) => {
+                depth = depth.saturating_sub(1);
+                i += 2;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    chars.len()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::{Engine, SpanKind, lex};
+
+    /// The spans of `sql`, as `(kind, text)` pairs.
+    fn spans(engine: Engine, sql: &str) -> Vec<(SpanKind, String)> {
+        let chars: Vec<char> = sql.chars().collect();
+        lex(engine, sql)
+            .into_iter()
+            .map(|span| {
+                let text: String = chars[span.start..span.end].iter().collect();
+                (span.kind, text)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_clickhouse_heredoc_after_a_number_is_one_literal() {
+        // The `1` is code: the heredoc opens at the `$`, which starts a
+        // token there because a number holds no `$`.
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT 1$$ body $$"),
+            vec![
+                (SpanKind::Code, "SELECT 1".to_owned()),
+                (SpanKind::Literal, "$$ body $$".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_closed_clickhouse_heredoc_with_a_tag_is_one_literal() {
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT $t$ body $t$"),
+            vec![
+                (SpanKind::Code, "SELECT ".to_owned()),
+                (SpanKind::Literal, "$t$ body $t$".to_owned()),
+            ]
+        );
+    }
+
+    /// A heredoc tag is word characters only: the tag scan stops at the
+    /// space, so `$a b$` opens no heredoc and the text stays ordinary
+    /// code.
+    #[test]
+    fn a_heredoc_tag_holds_word_characters_only() {
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT $a b$ x"),
+            vec![(SpanKind::Code, "SELECT $a b$ x".to_owned())]
+        );
+    }
+
+    /// `ClickHouse` opens a heredoc only when the closing delimiter is
+    /// found again in the text: `src/Parsers/Lexer.cpp` (the `$` branch of
+    /// `nextTokenImpl`) emits a heredoc token only then, and when the
+    /// delimiter is not found again the `$` opens nothing: it is a
+    /// standalone `$` or the start of one bareword, and the text after it
+    /// is ordinary SQL to the engine.
+    ///
+    /// Measured: `SELECT 1$b$ ; DROP TABLE t` is two statements to the
+    /// native client, which splits on the `;` and runs both halves; the
+    /// HTTP interface the console uses parses the body as one statement
+    /// and refuses two (`Multi-statements are not allowed`, HTTP 400).
+    #[test]
+    fn an_unclosed_clickhouse_heredoc_is_the_tail_the_engine_reads_as_code() {
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT 1$b$ ; DROP TABLE t"),
+            vec![
+                (SpanKind::Code, "SELECT 1".to_owned()),
+                (SpanKind::UnclosedHeredoc, "$b$ ; DROP TABLE t".to_owned()),
+            ]
+        );
+        // `Trino` has no heredoc at all, so the same text is code there.
+        assert_eq!(
+            spans(Engine::Trino, "SELECT 1$b$ ; DROP TABLE t"),
+            vec![(SpanKind::Code, "SELECT 1$b$ ; DROP TABLE t".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_name_that_holds_a_dollar_sign_is_code() {
+        assert_eq!(
+            spans(Engine::ClickHouse, "a$$b"),
+            vec![(SpanKind::Code, "a$$b".to_owned())]
+        );
+    }
+
+    /// A `$` after a non-ASCII character opens a heredoc: the bareword
+    /// reader takes ASCII letters, digits, `_` and `$` only, so the
+    /// non-ASCII character ends the name run and the `$` starts a token.
+    ///
+    /// Measured on `clickhouse/clickhouse-server:26.8.15.10`: `SELECT 'x' AS
+    /// aé$$b` answers `Code: 62. DB::Exception: Unrecognized token: Syntax
+    /// error: failed at position 16 (é): é$$b. (SYNTAX_ERROR)`. The engine
+    /// reads no non-ASCII character as part of a bareword and refuses the
+    /// statement there, so the statement never runs and the heredoc
+    /// question never decides it.
+    #[test]
+    fn a_dollar_after_a_non_ascii_character_opens_a_heredoc_on_clickhouse() {
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT 'x' AS aé$$b"),
+            vec![
+                (SpanKind::Code, "SELECT ".to_owned()),
+                (SpanKind::Literal, "'x'".to_owned()),
+                (SpanKind::Code, " AS aé".to_owned()),
+                (SpanKind::UnclosedHeredoc, "$$b".to_owned()),
+            ]
+        );
+        // A closing delimiter makes the heredoc a closed one.
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT 'x' AS aé$$b$$"),
+            vec![
+                (SpanKind::Code, "SELECT ".to_owned()),
+                (SpanKind::Literal, "'x'".to_owned()),
+                (SpanKind::Code, " AS aé".to_owned()),
+                (SpanKind::Literal, "$$b$$".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hash_is_a_comment_on_clickhouse_only_after_a_space_or_bang() {
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT 1 # c"),
+            vec![
+                (SpanKind::Code, "SELECT 1 ".to_owned()),
+                (SpanKind::Comment, "# c".to_owned()),
+            ]
+        );
+        // `#!` is the engine's shebang form of the comment.
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT 1 #!c"),
+            vec![
+                (SpanKind::Code, "SELECT 1 ".to_owned()),
+                (SpanKind::Comment, "#!c".to_owned()),
+            ]
+        );
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT 1 #c"),
+            vec![
+                (SpanKind::Code, "SELECT 1 ".to_owned()),
+                (SpanKind::NotCode, "#c".to_owned()),
+            ]
+        );
+        assert_eq!(
+            spans(Engine::Trino, "SELECT 1 # c"),
+            vec![
+                (SpanKind::Code, "SELECT 1 ".to_owned()),
+                (SpanKind::NotCode, "# c".to_owned()),
+            ]
+        );
+    }
+
+    /// A tab is not the space the rule asks for: the engine reads a
+    /// comment only after a space or a `!`.
+    ///
+    /// Measured on `clickhouse/clickhouse-server:26.8.15.10`: `SELECT 1
+    /// #<TAB>comment` answers `Code: 62. DB::Exception: Unrecognized token:
+    /// Syntax error: failed at position 10 (#): #<TAB>comment.
+    /// (SYNTAX_ERROR)`, so the engine refuses the statement there and the
+    /// text cannot run. The engine's own lexer comment says it recognizes
+    /// a comment "only if # is followed by whitespace", but the measurement
+    /// shows the rule is a space or a `!`.
+    #[test]
+    fn a_tab_after_a_hash_is_not_a_comment_on_clickhouse() {
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT 1 #\tcomment"),
+            vec![
+                (SpanKind::Code, "SELECT 1 ".to_owned()),
+                (SpanKind::NotCode, "#\tcomment".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_block_comment_nests_on_clickhouse_and_not_on_trino() {
+        assert_eq!(
+            spans(Engine::ClickHouse, "/* a /* b */ c */"),
+            vec![(SpanKind::Comment, "/* a /* b */ c */".to_owned())]
+        );
+        assert_eq!(
+            spans(Engine::Trino, "/* a /* b */"),
+            vec![(SpanKind::Comment, "/* a /* b */".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_backslash_escapes_a_quote_on_clickhouse_and_not_on_trino() {
+        assert_eq!(
+            spans(Engine::ClickHouse, "'a\\' b'"),
+            vec![(SpanKind::Literal, "'a\\' b'".to_owned())]
+        );
+        assert_eq!(
+            spans(Engine::Trino, "'a\\' b'"),
+            vec![
+                (SpanKind::Literal, "'a\\'".to_owned()),
+                (SpanKind::Code, " b".to_owned()),
+                // The last quote opens a run that is never closed.
+                (SpanKind::Literal, "'".to_owned()),
+            ]
+        );
+    }
+
+    // ── the ClickHouse rules measured 2026-11-10 ────────────────────────
+
+    /// The backward scan that decides whether a `$` opens a
+    /// heredoc stops at the start of the current code span. In the `#446`
+    /// review shape a `$$` is written right after the closed heredoc
+    /// `$$x$$`; when the scan crossed into that heredoc it read the run as
+    /// part of one name, the `'` behind it opened a string, and the `DROP`
+    /// hid from the guard. Measured on `clickhouse/clickhouse-server:26.8`
+    /// (2026-11-10): the engine refuses the whole shape with
+    /// `SYNTAX_ERROR` (code 62), so the run is uncertain.
+    #[test]
+    fn a_dollar_run_after_a_closed_heredoc_is_uncertain_and_the_scan_stops_at_the_span() {
+        assert_eq!(
+            spans(
+                Engine::ClickHouse,
+                "SELECT $$x$$$$ ' $$; DROP TABLE t; SELECT 'z'"
+            ),
+            vec![
+                (SpanKind::Code, "SELECT ".to_owned()),
+                (SpanKind::Literal, "$$x$$".to_owned()),
+                (SpanKind::Uncertain, "$$".to_owned()),
+                // The code between two spans is one Code span of its own,
+                // one space here.
+                (SpanKind::Code, " ".to_owned()),
+                (SpanKind::Literal, "' $$; DROP TABLE t; SELECT '".to_owned()),
+                (SpanKind::Code, "z".to_owned()),
+                (SpanKind::Literal, "'".to_owned()),
+            ]
+        );
+    }
+
+    /// Measured on `clickhouse/clickhouse-server:26.8` (2026-11-10):
+    /// `SELECT $$x$$$$y$$` is refused with `SYNTAX_ERROR` at the second
+    /// `$`-run. The run written immediately after a closed heredoc is
+    /// uncertain; the `$`s of `y$$` are identifier continuations after the
+    /// name `y` and stay code.
+    #[test]
+    fn a_dollar_run_adjacent_to_a_closed_heredoc_is_uncertain() {
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT $$x$$$$y$$"),
+            vec![
+                (SpanKind::Code, "SELECT ".to_owned()),
+                (SpanKind::Literal, "$$x$$".to_owned()),
+                (SpanKind::Uncertain, "$$".to_owned()),
+                (SpanKind::Code, "y$$".to_owned()),
+            ]
+        );
+    }
+
+    /// Measured on `clickhouse/clickhouse-server:26.8` (2026-11-10):
+    /// `SELECT $'$x$'$` is refused with `SYNTAX_ERROR` at the first `$`,
+    /// and `SELECT $é$x$é$` with "Unrecognized token" at the non-ASCII
+    /// character. No measured rule reads a `$` before a quote, so the run
+    /// is uncertain and the statement is refused at the guard; behind the
+    /// uncertain run the ordinary rules still span the text.
+    #[test]
+    fn a_dollar_no_measured_rule_reads_is_uncertain() {
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT $'$x$'$"),
+            vec![
+                (SpanKind::Code, "SELECT ".to_owned()),
+                (SpanKind::Uncertain, "$".to_owned()),
+                (SpanKind::Literal, "'$x$'".to_owned()),
+                (SpanKind::Uncertain, "$".to_owned()),
+            ]
+        );
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT $é$x$é$"),
+            vec![
+                (SpanKind::Code, "SELECT ".to_owned()),
+                (SpanKind::Uncertain, "$".to_owned()),
+                (SpanKind::Code, "é".to_owned()),
+                (SpanKind::UnclosedHeredoc, "$x$é$".to_owned()),
+            ]
+        );
+    }
+
+    /// Measured on `clickhouse/clickhouse-server:26.8` (2026-11-12, `#452`
+    /// review SHOULD-FIX): `‘ … ’` is a string literal and `“ … ”` a quoted
+    /// identifier there, and this lexer follows neither, so each of the four
+    /// characters is an uncertain span of its own on `ClickHouse`.
+    #[test]
+    fn a_unicode_quote_outside_a_span_is_uncertain_on_clickhouse() {
+        for quote in ['\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}'] {
+            assert_eq!(
+                spans(Engine::ClickHouse, &format!("SELECT {quote} 1")),
+                vec![
+                    (SpanKind::Code, "SELECT ".to_owned()),
+                    (SpanKind::Uncertain, quote.to_string()),
+                    (SpanKind::Code, " 1".to_owned()),
+                ],
+                "{quote}"
+            );
+        }
+    }
+
+    /// The span is one character, and the ordinary rules keep spanning the
+    /// text around it: the `'` between the two quotes still opens a string.
+    #[test]
+    fn a_unicode_quote_span_is_one_character_and_the_rules_go_on_behind_it() {
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT \u{2018} ' \u{2019}"),
+            vec![
+                (SpanKind::Code, "SELECT ".to_owned()),
+                (SpanKind::Uncertain, "\u{2018}".to_owned()),
+                (SpanKind::Code, " ".to_owned()),
+                (SpanKind::Literal, "' \u{2019}".to_owned()),
+            ]
+        );
+    }
+
+    /// `Trino` has no such quotes: the text stays code there, byte for byte
+    /// as before the rule existed.
+    #[test]
+    fn a_unicode_quote_is_plain_code_on_trino() {
+        for quote in ['\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}'] {
+            assert_eq!(
+                spans(Engine::Trino, &format!("SELECT {quote} 1")),
+                vec![(SpanKind::Code, format!("SELECT {quote} 1"))],
+                "{quote}"
+            );
+        }
+    }
+
+    /// Inside an ASCII literal, a quoted identifier, a comment or a heredoc
+    /// the four characters are data, so they open no uncertain span there.
+    #[test]
+    fn a_unicode_quote_inside_another_span_stays_plain_text() {
+        for sql in [
+            "'\u{2018}'",
+            "\"\u{2019}\"",
+            "`\u{201C}`",
+            "-- \u{2018}",
+            "/* \u{201D} */",
+            "# \u{2018}",
+            "$$\u{2019}$$",
+        ] {
+            assert!(
+                spans(Engine::ClickHouse, sql)
+                    .iter()
+                    .all(|(kind, _)| *kind != SpanKind::Uncertain),
+                "{sql}"
+            );
+        }
+    }
+
+    /// Measured on `clickhouse/clickhouse-server:26.8` (2026-11-10):
+    /// `SELECT $1$x$1$` runs and answers `x` — a heredoc whose tag holds a
+    /// digit. The tag charset stays `[A-Za-z0-9_]`.
+    #[test]
+    fn a_heredoc_tag_of_digits_is_a_literal() {
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT $1$x$1$"),
+            vec![
+                (SpanKind::Code, "SELECT ".to_owned()),
+                (SpanKind::Literal, "$1$x$1$".to_owned()),
+            ]
+        );
+    }
+
+    /// Measured on `clickhouse/clickhouse-server:26.8` (2026-11-10):
+    /// `SELECT $a-b$x$a-b$` parses as `minus` over the identifiers `$a`,
+    /// `b$x$a` and `b$` — a `$` beside name characters is part of one
+    /// identifier, not a heredoc delimiter. The whole shape stays code at
+    /// the lexing level; the engine refuses the statement later, at
+    /// analysis, over the unknown names.
+    #[test]
+    fn a_dollar_beside_name_characters_is_code() {
+        assert_eq!(
+            spans(Engine::ClickHouse, "$a-b$x$a-b$"),
+            vec![(SpanKind::Code, "$a-b$x$a-b$".to_owned())]
+        );
+    }
+
+    /// Measured on `clickhouse/clickhouse-server:26.8` (2026-11-10):
+    /// `SELECT 1 // c` runs and answers `1` — `//` starts a line comment,
+    /// with or without a space after it, and a quote inside the comment
+    /// opens no string: `SELECT 1 // '` followed by a newline and `, 2`
+    /// answers `1` and `2`. `Trino` has no `//` comment, so the same text
+    /// is code there.
+    #[test]
+    fn a_double_slash_starts_a_line_comment_on_clickhouse_only() {
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT 1 // c"),
+            vec![
+                (SpanKind::Code, "SELECT 1 ".to_owned()),
+                (SpanKind::Comment, "// c".to_owned()),
+            ]
+        );
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT 1 //c"),
+            vec![
+                (SpanKind::Code, "SELECT 1 ".to_owned()),
+                (SpanKind::Comment, "//c".to_owned()),
+            ]
+        );
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT 8 // 3"),
+            vec![
+                (SpanKind::Code, "SELECT 8 ".to_owned()),
+                (SpanKind::Comment, "// 3".to_owned()),
+            ]
+        );
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT 1 // '\n, 2"),
+            vec![
+                (SpanKind::Code, "SELECT 1 ".to_owned()),
+                (SpanKind::Comment, "// '".to_owned()),
+                (SpanKind::Code, "\n, 2".to_owned()),
+            ]
+        );
+        assert_eq!(
+            spans(Engine::Trino, "SELECT 1 // c"),
+            vec![(SpanKind::Code, "SELECT 1 // c".to_owned())]
+        );
+    }
+}

@@ -23,7 +23,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 
@@ -31,9 +31,6 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use lakehouse_clickhouse::ChClient;
 use serde_json::Value;
-use testcontainers::ImageExt;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::clickhouse::ClickHouse;
 use tower::ServiceExt;
 
 use common::{
@@ -48,36 +45,17 @@ use common::{
 /// `console.gold_export_run` read then hits a server without the table
 /// and 500s). Tests stay isolated the other way: each has its own
 /// Postgres database, and every test uses its own mart names.
-static CLICKHOUSE: tokio::sync::OnceCell<(String, testcontainers::ContainerAsync<ClickHouse>)> =
+///
+/// `pub(crate)`: `gold_latest_copy`'s tests share this same container for
+/// the same reason — its `LATEST_COPY_TABLE_ENSURED` `OnceCell` is just as
+/// process-wide, so a second container would let whichever module ran
+/// first pin the other's DDL to the wrong server.
+static CLICKHOUSE: tokio::sync::OnceCell<lakehouse_test_support::clickhouse::Started> =
     tokio::sync::OnceCell::const_new();
 
-async fn shared_clickhouse() -> &'static (String, testcontainers::ContainerAsync<ClickHouse>) {
+pub(crate) async fn shared_clickhouse() -> &'static lakehouse_test_support::clickhouse::Started {
     CLICKHOUSE
-        .get_or_init(|| async {
-            // Exactly the compose service's env trio (CH_USER defaults to
-            // "default", CH_PASSWORD to empty,
-            // CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT pinned "1"). ALL THREE
-            // are required: the 26.8 image's entrypoint disables network
-            // access for `default` when CLICKHOUSE_USER is unset — even
-            // with an empty password — and
-            // CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT is what keeps
-            // passwordless `default` reachable (the compose file documents
-            // the same trio as its local-dev default).
-            let container = ClickHouse::default()
-                .with_env_var("CLICKHOUSE_USER", "default")
-                .with_env_var("CLICKHOUSE_PASSWORD", "")
-                .with_env_var("CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT", "1")
-                .with_tag("26.8")
-                .start()
-                .await
-                .expect("start the ClickHouse testcontainer");
-            let host = container.get_host().await.expect("container host");
-            let port = container
-                .get_host_port_ipv4(8123)
-                .await
-                .expect("container HTTP port");
-            (format!("http://{host}:{port}"), container)
-        })
+        .get_or_init(lakehouse_test_support::clickhouse::start)
         .await
 }
 
@@ -101,6 +79,28 @@ async fn spin_up_with_clickhouse() -> (TestApp, ChClient) {
     let app = spin_up_with_env(&overrides).await;
     let ch = ChClient::new(ch_url.clone(), "default".to_owned(), String::new());
     (app, ch)
+}
+
+/// The app of [`spin_up_with_clickhouse`], with a Gold export token file that
+/// exists, so a `POST /api/gold/export/{mart}` gets past `read_catalog_token`
+/// and fails at the harness's dead catalog. The file's content is any text: the
+/// harness never presents it to anything. The returned file is kept alive by the
+/// caller for the test's duration.
+async fn spin_up_with_clickhouse_and_export_token() -> (TestApp, ChClient, tempfile::NamedTempFile)
+{
+    let (ch_url, _container) = shared_clickhouse().await;
+    let token = tempfile::NamedTempFile::new().expect("a temporary token file");
+    std::fs::write(token.path(), "test-token").expect("write the token file");
+    let mut overrides = HashMap::new();
+    overrides.insert("CH_URL".to_owned(), ch_url.clone());
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    overrides.insert(
+        "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE".to_owned(),
+        token.path().display().to_string(),
+    );
+    let app = spin_up_with_env(&overrides).await;
+    let ch = ChClient::new(ch_url.clone(), "default".to_owned(), String::new());
+    (app, ch, token)
 }
 
 /// Seeds `serving.{mart}` as a real `MergeTree` with a few rows — the same
@@ -213,11 +213,11 @@ async fn put_publication_is_denied_to_a_principal_without_gold_export() {
     assert_eq!(status, StatusCode::FORBIDDEN, "403 from the auth gate");
 }
 
-/// The scheduler's list route has TWO layers: the `RequiresAuth` floor
-/// (covered by `route_auth.rs`) PLUS `check_export_token` in the handler
-/// (the plan's own requirement). A session that clears the floor but
-/// holds neither `gold:export` nor the shared token must not read the
-/// publication list.
+/// The scheduler's list route has TWO layers: the SEC-66 read grant in
+/// `POLICY_TABLE` PLUS `check_export_token` in the handler (the plan's own
+/// requirement). A session holding neither a Gold grant nor the shared
+/// token must not read the publication list — since SEC-66 it is refused
+/// at the gate (403) before the handler's token branch is ever reached.
 #[tokio::test]
 async fn publications_list_still_requires_the_export_permission_beyond_the_auth_floor() {
     let (app, _ch) = spin_up_with_clickhouse().await;
@@ -233,8 +233,11 @@ async fn publications_list_still_requires_the_export_permission_beyond_the_auth_
     )
     .await;
     assert!(
-        status == StatusCode::UNAUTHORIZED || status == StatusCode::SERVICE_UNAVAILABLE,
-        "check_export_token must refuse a session without gold:export, got {status}"
+        status == StatusCode::FORBIDDEN
+            || status == StatusCode::UNAUTHORIZED
+            || status == StatusCode::SERVICE_UNAVAILABLE,
+        "neither the SEC-66 policy gate nor check_export_token may let a session \
+         without a Gold grant or the shared token read the list, got {status}"
     );
 }
 
@@ -365,14 +368,15 @@ async fn enabling_lists_a_mart_and_disabling_removes_it_from_the_list() {
 
 /// A mart that exists but was never switched on reports the OFF default:
 /// `enabled: false, updatedAt: null`, honest nulls for both freshness
-/// facts it cannot have yet, and `canEdit: false` for a session without
-/// `gold:export` (the floor is only `RequiresAuth` here — read-only).
+/// facts it cannot have yet, and `canEdit: false` for a reader who holds
+/// `gold:read` but not `gold:export` (SEC-66 made the detail read-gated,
+/// while the edit button still follows the write permission).
 #[tokio::test]
 async fn detail_defaults_for_a_never_enabled_mart_are_the_off_state() {
     let (app, ch) = spin_up_with_clickhouse().await;
     seed_mart(&ch, "plain_mart").await;
     let sessions = Sessions { app };
-    let cookie = sessions.with("").await;
+    let cookie = sessions.with("gold:read").await;
 
     let (status, body) = send(
         &sessions.app.router,
@@ -581,8 +585,9 @@ async fn if_changed_exports_a_mart_with_differing_fingerprint() {
     assert!(body.get("skipped").is_none(), "{body}");
     assert_eq!(
         history_row_count(&ch, "busy_mart").await,
-        1,
-        "still exactly the seeded row: the 503 at read_catalog_token          happens before export_mart, so nothing new was recorded"
+        2,
+        "the seeded row plus one failed run: the 503 at read_catalog_token is \
+         now a recorded failed publish (DATA-56), corrected from 1"
     );
 }
 
@@ -745,4 +750,777 @@ async fn publication_detail_reports_trim_failed() {
     assert!(body["trim"]["oldestKeptExportedAt"].is_null());
     assert!(body["trim"]["finishedAt"].is_string());
     assert_eq!(body["trim"]["reason"], "delete_failed");
+}
+
+// ── DATA-6 T2: the latest-copy block of the publication detail ──────────
+
+use lakehouse_api::gold_latest_copy;
+
+/// Seeds one `console.gold_latest_copy_run` row, mirroring
+/// `seed_trim_run` above. `started_ms` orders the rows, so a test can
+/// make one run newer than another.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one flat seed row whose columns are each independently optional; \
+              grouping them into a struct would only move the same facts one \
+              level of indirection from the two call sites"
+)]
+async fn seed_latest_copy_run(
+    ch: &ChClient,
+    mart: &str,
+    status: &str,
+    reason: Option<&str>,
+    copy_micros: Option<i64>,
+    rows: Option<u64>,
+    cleanup: Option<&str>,
+    started_ms: i64,
+    finished_ms: i64,
+) {
+    gold_latest_copy::ensure_gold_latest_copy_run_table(ch)
+        .await
+        .expect("ensure latest-copy run table");
+    let reason_sql = reason.map_or_else(
+        || "NULL".to_owned(),
+        |r| format!("'{}'", r.replace('\\', "\\\\").replace('\'', "''")),
+    );
+    let cleanup_sql = cleanup.map_or_else(
+        || "NULL".to_owned(),
+        |c| format!("'{}'", c.replace('\\', "\\\\").replace('\'', "''")),
+    );
+    let copy_sql = copy_micros.map_or_else(
+        || "NULL".to_owned(),
+        |us| format!("fromUnixTimestamp64Micro({us})"),
+    );
+    let rows_sql = rows.map_or_else(|| "NULL".to_owned(), |n| n.to_string());
+    ch.exec(
+        &format!(
+            "INSERT INTO console.gold_latest_copy_run \
+             (id, mart, latest_table, status, reason, copy_exported_at, rows, \
+              snapshot_id, cleanup, started_at, finished_at) VALUES \
+             ('{id}', '{mart}', '{mart}_latest', '{status}', {reason_sql}, {copy_sql}, \
+              {rows_sql}, NULL, {cleanup_sql}, fromUnixTimestamp64Milli({started_ms}), \
+              fromUnixTimestamp64Milli({finished_ms}))",
+            id = uuid::Uuid::new_v4(),
+        ),
+        None,
+    )
+    .await
+    .expect("seed latest-copy run row");
+}
+
+#[tokio::test]
+async fn publication_detail_names_the_latest_table_before_any_update() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "fresh_latest_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/fresh_latest_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The name is a fact of the design (D1), not of any run: it shows
+    // before the first copy exists, so a tool can be pointed at the table
+    // ahead of time. Nothing is held and nothing has run.
+    assert_eq!(body["latestCopy"]["table"], "gold.fresh_latest_mart_latest");
+    assert!(body["latestCopy"]["holds"].is_null(), "{body}");
+    assert!(body["latestCopy"]["lastRun"].is_null(), "{body}");
+}
+
+#[tokio::test]
+async fn publication_detail_reports_what_the_latest_table_holds() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "holding_latest_mart").await;
+    seed_latest_copy_run(
+        &ch,
+        "holding_latest_mart",
+        "success",
+        None,
+        Some(1_795_168_800_123_456),
+        Some(17),
+        None,
+        1_700_000_000_000,
+        1_700_000_001_000,
+    )
+    .await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/holding_latest_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["latestCopy"]["holds"]["rows"], 17);
+    // Microseconds are kept: two publishes can fall in one second, and
+    // the copy stamp is what tells them apart.
+    assert_eq!(
+        body["latestCopy"]["holds"]["copyExportedAt"],
+        "2026-11-20T10:00:00.123456Z"
+    );
+    assert!(body["latestCopy"]["holds"]["replacedAt"].is_string());
+    assert_eq!(body["latestCopy"]["lastRun"]["status"], "success");
+    assert!(body["latestCopy"]["lastRun"]["reason"].is_null());
+    assert!(body["latestCopy"]["lastRun"]["cleanup"].is_null());
+}
+
+#[tokio::test]
+async fn a_failed_update_after_a_success_keeps_holds_and_reports_the_reason() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "stale_latest_mart").await;
+    seed_latest_copy_run(
+        &ch,
+        "stale_latest_mart",
+        "success",
+        None,
+        Some(1_795_168_800_123_456),
+        Some(17),
+        None,
+        1_700_000_000_000,
+        1_700_000_001_000,
+    )
+    .await;
+    // The failed run is NEWER, so `lastRun` reports it while `holds`
+    // still reads the newest SUCCESS row — the card can say both facts
+    // at once (the same split the publish's own failure card uses).
+    seed_latest_copy_run(
+        &ch,
+        "stale_latest_mart",
+        "failed",
+        Some("copy_incomplete"),
+        Some(1_795_169_000_000_000),
+        None,
+        None,
+        1_700_000_010_000,
+        1_700_000_011_000,
+    )
+    .await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/stale_latest_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["latestCopy"]["holds"]["rows"], 17);
+    assert_eq!(
+        body["latestCopy"]["holds"]["copyExportedAt"],
+        "2026-11-20T10:00:00.123456Z"
+    );
+    assert_eq!(body["latestCopy"]["lastRun"]["status"], "failed");
+    assert_eq!(body["latestCopy"]["lastRun"]["reason"], "copy_incomplete");
+}
+
+/// QA `LH-DATA-1-01` (`DATA-49`): a failed publish stores the sentence the
+/// response carried. The catalog is unreachable in this harness, so the run
+/// fails there; the row must read the classified sentence with its reference,
+/// never the catalog client's own text (which names the HTTP answer and its
+/// headers), and the row and the response must agree word for word.
+#[tokio::test]
+async fn a_failed_publish_stores_the_sentence_the_response_carried_and_no_catalog_text() {
+    let (app, ch, _token) = spin_up_with_clickhouse_and_export_token().await;
+    seed_mart(&ch, "catalog_down_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/catalog_down_mart",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let answered = body["error"]
+        .as_str()
+        .expect("a failed publish answers a sentence")
+        .to_owned();
+    assert!(
+        answered.starts_with("The catalog request failed. Reference: "),
+        "{answered}"
+    );
+    assert!(
+        !answered.contains("http://"),
+        "the catalog's address must not travel: {answered}"
+    );
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/exports?mart=catalog_down_mart",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let newest = &body["runs"][0];
+    assert_eq!(newest["status"], "failed", "{body}");
+    assert_eq!(
+        newest["error"], answered,
+        "the stored sentence is the response's own: {body}"
+    );
+}
+
+/// The row-cap sentence this repository wrote, which the rewrite must leave
+/// alone.
+const ROW_CAP_SENTENCE: &str = "mart \"raw_history_mart\" has 5000001 rows, exceeding \
+                                GOLD_EXPORT_MAX_ROWS (5000000); refusing to export a partial mart silently";
+
+/// Seeds one history row per raw shape this code used to store, plus a failed
+/// row with this repository's own sentence and one success — each a different
+/// second, so the newest-first order is fixed.
+async fn seed_history_rows_with_raw_text(ch: &ChClient, mart: &str) {
+    for (offset, status, error) in [
+        (
+            -50,
+            "failed",
+            Some(
+                "reading Gold mart from ClickHouse failed: Code: 60. DB::Exception: \
+                 Unknown table (version 26.8.1.1)",
+            ),
+        ),
+        (
+            -40,
+            "failed",
+            Some(
+                "Iceberg export failed: iceberg catalog operation failed: \
+                 status: 401 Unauthorized, headers: {www-authenticate: Bearer}",
+            ),
+        ),
+        (
+            -30,
+            "failed",
+            Some("failed to build export batch: amount: \"12,5\" is not a valid decimal"),
+        ),
+        (-20, "failed", Some(ROW_CAP_SENTENCE)),
+        (-10, "success", None),
+    ] {
+        gold_export_history::record_export_run(
+            ch,
+            &gold_export_history::NewGoldExportRun {
+                mart,
+                status,
+                rows_exported: if status == "success" { Some(5) } else { None },
+                format_version: None,
+                snapshot_id: None,
+                error,
+                triggered_by: "user:test",
+                content_fingerprint: "",
+                started_at_ms: unix_ms(offset),
+                finished_at_ms: unix_ms(offset),
+            },
+        )
+        .await
+        .expect("seed a history row");
+    }
+}
+
+/// QA `LH-DATA-1-01` (`DATA-49`): the rows written before a failed publish was
+/// classified hold the engine's or the catalog's own text. The list route never
+/// shows it, and `rewrite_raw_errors` replaces it at rest — once, then never
+/// again — while a sentence this repository wrote stays as it is.
+#[tokio::test]
+async fn stored_upstream_text_is_rewritten_at_rest_and_never_listed() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "raw_history_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+    seed_history_rows_with_raw_text(&ch, "raw_history_mart").await;
+
+    // The read path maps the raw shapes before a row leaves the API.
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/exports?mart=raw_history_mart",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed: Vec<&str> = body["runs"]
+        .as_array()
+        .expect("runs")
+        .iter()
+        .map(|run| run["error"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            "",
+            ROW_CAP_SENTENCE,
+            "A value in this table could not be written in open format.",
+            "The catalog request failed.",
+            "The database request failed.",
+        ],
+        "newest first: the success, the row cap, and one fixed sentence per raw shape: {body}"
+    );
+
+    // The rewrite replaces exactly the three raw shapes, at rest.
+    let rewritten = gold_export_history::rewrite_raw_errors(&ch)
+        .await
+        .expect("the rewrite runs");
+    assert_eq!(rewritten, 3, "three rows held a raw shape");
+
+    let stored = ch
+        .rows(
+            "SELECT status, error FROM console.gold_export_run \
+             WHERE mart = 'raw_history_mart' ORDER BY started_at ASC FORMAT JSON",
+            None,
+        )
+        .await
+        .expect("read the stored rows");
+    let stored_errors: Vec<Option<&str>> = stored
+        .iter()
+        .map(|row| row.get("error").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        stored_errors,
+        [
+            Some("The database request failed."),
+            Some("The catalog request failed."),
+            Some("A value in this table could not be written in open format."),
+            Some(ROW_CAP_SENTENCE),
+            None,
+        ],
+        "the row cap is this repository's own sentence and stays"
+    );
+
+    assert_eq!(
+        gold_export_history::rewrite_raw_errors(&ch)
+            .await
+            .expect("the second run reads the count"),
+        0,
+        "nothing matches after the rewrite"
+    );
+}
+
+/// One history row of any status, for the `DATA-49` tests that need a failed
+/// run beside a successful one.
+async fn seed_run(
+    ch: &ChClient,
+    mart: &str,
+    status: &str,
+    started_ms: i64,
+    content_fingerprint: &str,
+    error: Option<&str>,
+) {
+    gold_export_history::record_export_run(
+        ch,
+        &gold_export_history::NewGoldExportRun {
+            mart,
+            status,
+            rows_exported: if status == "success" { Some(5) } else { None },
+            format_version: if status == "success" { Some(2) } else { None },
+            snapshot_id: None,
+            error,
+            triggered_by: "user:test",
+            content_fingerprint,
+            started_at_ms: started_ms,
+            finished_at_ms: started_ms,
+        },
+    )
+    .await
+    .expect("seed an export history row");
+}
+
+/// QA `LH-DATA-1-01` (`DATA-49`): after a failed publish the publication says so
+/// — with the time and the stored sentence — while `lastExportedAt` still names
+/// the last SUCCESSFUL publish. A later success clears the failure.
+#[tokio::test]
+async fn publication_detail_reports_the_last_failure_until_a_later_run_succeeds() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "failure_status_mart").await;
+    let fingerprint =
+        gold_export_history::mart_content_fingerprint(&ch, "serving", "failure_status_mart")
+            .await
+            .expect("read the fingerprint")
+            .expect("the mart has a fingerprint");
+    seed_run(
+        &ch,
+        "failure_status_mart",
+        "success",
+        unix_ms(-3_600),
+        &fingerprint,
+        None,
+    )
+    .await;
+    seed_run(
+        &ch,
+        "failure_status_mart",
+        "failed",
+        unix_ms(-60),
+        &fingerprint,
+        Some("The catalog request failed. Reference: abc123"),
+    )
+    .await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/failure_status_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["lastFailure"]["reason"], "The catalog request failed. Reference: abc123",
+        "{body}"
+    );
+    assert!(
+        body["lastFailure"]["failedAt"].is_string(),
+        "the failure names when it happened: {body}"
+    );
+    assert!(
+        body["lastExportedAt"].is_string(),
+        "the last successful publish is still reported: {body}"
+    );
+
+    // A later success clears the failure and moves lastExportedAt.
+    seed_run(
+        &ch,
+        "failure_status_mart",
+        "success",
+        unix_ms(0),
+        &fingerprint,
+        None,
+    )
+    .await;
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/failure_status_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["lastFailure"].is_null(),
+        "a success after the failure clears it: {body}"
+    );
+}
+
+/// QA `LH-DATA-1-01` (`DATA-49`): `?ifChanged=true` must not skip a mart whose
+/// newest run failed, even when its fingerprint matches the last success — the
+/// run has to be attempted again, which in this harness means reaching the
+/// missing token file (503), not answering `skipped`.
+#[tokio::test]
+async fn if_changed_does_not_skip_after_a_failed_run() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "retry_after_failure_mart").await;
+    let fingerprint =
+        gold_export_history::mart_content_fingerprint(&ch, "serving", "retry_after_failure_mart")
+            .await
+            .expect("read the fingerprint")
+            .expect("the mart has a fingerprint");
+    seed_run(
+        &ch,
+        "retry_after_failure_mart",
+        "success",
+        unix_ms(-3_600),
+        &fingerprint,
+        None,
+    )
+    .await;
+    seed_run(
+        &ch,
+        "retry_after_failure_mart",
+        "failed",
+        unix_ms(-60),
+        &fingerprint,
+        Some("The database request failed. Reference: abc123"),
+    )
+    .await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/retry_after_failure_mart?ifChanged=true",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body.get("skipped").is_none(),
+        "a failed newest run is published again, never skipped: {body}"
+    );
+    assert_eq!(
+        history_row_count(&ch, "retry_after_failure_mart").await,
+        3,
+        "the two seeded rows plus one failed run: the 503 at read_catalog_token is \
+         now a recorded failed publish (DATA-56), corrected from 2"
+    );
+}
+
+/// #484 review R4 (`DATA-56`): a publish that fails before the export starts
+/// still leaves a run, so the card says "Last publish
+/// failed". Here the catalog's token file is missing: the caller is allowed,
+/// the mart exists, and the answer is the fixed sentence of
+/// `token_unavailable_message` — never a path or an io error.
+#[tokio::test]
+async fn a_publish_that_cannot_read_the_catalog_token_is_recorded_and_the_card_says_it_failed() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "tokenless_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+    let sentence = lakehouse_api::lakekeeper_token::token_unavailable_message(
+        "gold-export",
+        "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE",
+    );
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/tokenless_mart",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"].as_str(), Some(sentence.as_str()), "{body}");
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/tokenless_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let reason = body["lastFailure"]["reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the card names the failure: {body}"));
+    assert!(reason.starts_with(&sentence), "{body}");
+    assert_eq!(reason, sentence, "the card and the answer read the same");
+    assert!(
+        body["lastFailure"]["failedAt"].is_string(),
+        "the failure names when it happened: {body}"
+    );
+    assert!(
+        body["lastExportedAt"].is_null(),
+        "nothing was ever published: {body}"
+    );
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/exports?mart=tokenless_mart",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["runs"][0]["status"], "failed", "{body}");
+    assert_eq!(
+        body["runs"][0]["error"].as_str(),
+        Some(sentence.as_str()),
+        "the history row carries the answer's sentence: {body}"
+    );
+    assert_eq!(
+        history_row_count(&ch, "tokenless_mart").await,
+        1,
+        "one publish, one row, even though the export never started"
+    );
+}
+
+/// `DATA-56` D22: a scheduler run (`?ifChanged=true`) that fails before the
+/// export is recorded every time it is tried, so a mart whose every scheduled
+/// publish fails never looks quiet.
+#[tokio::test]
+async fn a_scheduled_publish_that_fails_before_the_export_is_recorded_each_time() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "scheduled_tokenless_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    for expected in 1..=2 {
+        let (status, body) = send(
+            &sessions.app.router,
+            "POST",
+            "/api/gold/export/scheduled_tokenless_mart?ifChanged=true",
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            body.get("skipped").is_none(),
+            "a failed publish is not a skip: {body}"
+        );
+        assert_eq!(
+            history_row_count(&ch, "scheduled_tokenless_mart").await,
+            expected,
+            "run {expected} is recorded"
+        );
+    }
+}
+
+/// `DATA-56` D20: the sentence a fingerprint read that failed stores is the
+/// classified one — a fixed message and a reference — and never the engine's
+/// own text or the name of the table that is gone.
+#[tokio::test]
+async fn a_publish_whose_fingerprint_read_fails_is_recorded_with_the_classified_sentence() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "ghost_base_mart").await;
+    ch.exec(
+        "CREATE VIEW serving.ghost_view_mart AS SELECT * FROM serving.ghost_base_mart",
+        None,
+    )
+    .await
+    .expect("create a view over the seeded mart");
+    ch.exec("DROP TABLE serving.ghost_base_mart", None)
+        .await
+        .expect("drop the table the view reads");
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/ghost_view_mart",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let sentence = body["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the answer carries a sentence: {body}"))
+        .to_owned();
+    assert!(
+        sentence.starts_with("The database request failed. Reference: "),
+        "{body}"
+    );
+    assert!(
+        !sentence.contains("ghost_base_mart"),
+        "the engine's own text never travels: {body}"
+    );
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/exports?mart=ghost_view_mart",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["runs"][0]["status"], "failed", "{body}");
+    assert_eq!(
+        body["runs"][0]["error"].as_str(),
+        Some(sentence.as_str()),
+        "the history row carries the answer's sentence: {body}"
+    );
+    assert_eq!(
+        history_row_count(&ch, "ghost_view_mart").await,
+        1,
+        "the failed fingerprint read is recorded"
+    );
+}
+
+/// `DATA-56` D19: a request that is turned away is not a publish and records
+/// nothing — no permission, a mart of another tenant, or a name that is not a
+/// mart at all (which goes on and fails where it failed before, `D23`).
+#[tokio::test]
+async fn a_refused_publish_and_a_name_that_is_not_a_mart_record_no_run() {
+    // The tenant that does NOT own the shared catalog: a member of it is
+    // answered 404 by the gate, and 404 is not a failed publish.
+    const OTHER_TENANT: &str = "11111111-1111-4111-8111-000000000002";
+
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "refused_mart").await;
+    // A refused request never creates the table the count reads.
+    gold_export_history::ensure_gold_export_run_table(&ch)
+        .await
+        .expect("ensure the history table");
+    let sessions = Sessions { app };
+
+    // (a) A session without `gold:export`.
+    let cookie = sessions.with("query:read").await;
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/refused_mart",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("gold export is not configured")),
+        "{body}"
+    );
+    assert_eq!(
+        history_row_count(&ch, "refused_mart").await,
+        0,
+        "a turned-away call is not a publish"
+    );
+
+    // (b) A person holding `gold:export`, in another tenant than the
+    // catalog's own.
+    let outsider = create_principal_with_permissions(&sessions.app.pool, "gold:export").await;
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(outsider)
+        .bind(uuid::Uuid::parse_str(OTHER_TENANT).expect("a seeded tenant id"))
+        .execute(&sessions.app.pool)
+        .await
+        .expect("add the principal to another tenant");
+    let cookie = session_cookie_for_user(&sessions.app.pool, outsider).await;
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/refused_mart",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        history_row_count(&ch, "refused_mart").await,
+        0,
+        "a mart of another tenant is not published"
+    );
+
+    // (c) A name that was never seeded: it goes on as before and stops at
+    // the missing token file, and nothing is recorded for a name that is not
+    // a table.
+    let cookie = sessions.with("gold:export").await;
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/never_seeded_mart",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        history_row_count(&ch, "never_seeded_mart").await,
+        0,
+        "a name that is not a table is not a publish (DATA-56 D23)"
+    );
 }

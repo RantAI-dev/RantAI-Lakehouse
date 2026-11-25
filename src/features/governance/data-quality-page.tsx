@@ -4,72 +4,48 @@ import * as React from "react"
 import Link from "next/link"
 import { PlusIcon } from "lucide-react"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
-import { CreateSheet } from "@/components/patterns/create-sheet"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { CheckBadge, SeverityBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { useDataTable } from "@/hooks/use-data-table"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
+import { useUrlTab } from "@/hooks/use-url-tab"
 import { filterDataClientSide } from "@/lib/data-table"
 import { formatRelativeTime } from "@/lib/format"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { notifyError, withNotify } from "@/lib/notify"
-import type { Severity } from "@/lib/status"
+import { withNotify } from "@/lib/notify"
 import { governanceService } from "@/services"
 import type { QualityRule } from "@/services/contracts/governance"
-import {
-  SEVERITY_OPTIONS,
-  getDataQualityColumns,
-} from "./data-quality-columns"
-import { CheckFields, ThresholdForms } from "./quality-check-fields"
-import { EMPTY_FORM, KINDS, ruleThreshold, type RuleForm } from "./quality-checks"
+import { getDataQualityColumns } from "./data-quality-columns"
 import { QualityIncidents } from "./quality-incidents"
+import { FreshnessTargetsTab } from "./freshness-targets-tab"
 import { EditRuleDialog } from "./quality-rule-edit-dialog"
 import { RuleRuns } from "./quality-rule-runs"
+import { QualitySchedulesTab } from "./quality-schedules-tab"
 
-const selectClassName =
-  "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+const QUALITY_TABS = ["rules", "schedules", "freshness"] as const
+type QualityTab = (typeof QUALITY_TABS)[number]
 
+/**
+ * Data Quality, in three tabs (`WEB-3` S3-D5): the incidents and rules, the
+ * tables' check schedules, and the tables' freshness targets. Schedules and
+ * targets were set only on each table's page, one at a time; the tabs show
+ * them all, and the table page keeps its own controls. The open tab is in
+ * `?tab=`; the rules are the bare address.
+ */
 export function DataQualityPage() {
+  const [tab, setTab] = useUrlTab("tab", QUALITY_TABS)
   const state = useService((s) => governanceService.listQuality(s), [])
   const [selected, setSelected] = React.useState<QualityRule | null>(null)
-  const [createOpen, setCreateOpen] = React.useState(false)
-  const [name, setName] = React.useState("")
-  const [asset, setAsset] = React.useState("")
-  const [formDimension, setFormDimension] = React.useState("")
-  const [threshold, setThreshold] = React.useState("")
-  // DATA-14 (F7): a check is picked by default, so the threshold is always
-  // one the API can run; the typed form stays for what a picker cannot say.
-  const [typedThreshold, setTypedThreshold] = React.useState(false)
-  const [checkForm, setCheckForm] = React.useState<RuleForm>(EMPTY_FORM)
-  const builtThreshold = ruleThreshold(checkForm)
-  const finalThreshold = typedThreshold ? threshold.trim() : (builtThreshold ?? "")
-  const finalDimension =
-    formDimension.trim() || (typedThreshold ? "" : KINDS[checkForm.kind].dimension)
-  const [severity, setSeverity] = React.useState<Severity>("medium")
   const tableUrlState = useTableUrlState()
-
-  const create = useServiceAction(
-    withNotify(
-      {
-        success: "Quality rule created",
-        error: "Failed to create quality rule",
-      },
-      (
-        signal,
-        input: Parameters<typeof governanceService.createQualityRule>[0]
-      ) => governanceService.createQualityRule(input, signal)
-    )
-  )
 
   const runCheck = useServiceAction(
     withNotify(
@@ -90,6 +66,10 @@ export function DataQualityPage() {
     () => getDataQualityColumns({ onSelect: setSelected }),
     []
   )
+
+  // QA `LH-DATA-14-01` F1 (`DATA-54`): the incidents panel is read again
+  // after a rule ran, was added, edited or deleted.
+  const [incidentsKey, setIncidentsKey] = React.useState(0)
 
   const filteredData = React.useMemo(() => {
     if (state.status !== "success" || !state.data) return []
@@ -128,16 +108,6 @@ export function DataQualityPage() {
     },
   })
 
-  function resetForm() {
-    setName("")
-    setAsset("")
-    setFormDimension("")
-    setThreshold("")
-    setTypedThreshold(false)
-    setCheckForm(EMPTY_FORM)
-    setSeverity("medium")
-  }
-
   async function handleRun(rule: QualityRule) {
     const result = await runCheck.run(rule.id)
     if (!result) return
@@ -148,6 +118,7 @@ export function DataQualityPage() {
       lastValue: result.value,
       lastRunAt: new Date().toISOString(),
     })
+    setIncidentsKey((k) => k + 1)
     state.reload()
   }
 
@@ -158,43 +129,22 @@ export function DataQualityPage() {
     if (ok === null) return
     setDeleting(null)
     setSelected(null)
+    setIncidentsKey((k) => k + 1)
     state.reload()
-  }
-
-  async function handleCreate() {
-    const result = await create.run({
-      name: name.trim(),
-      asset: asset.trim(),
-      dimension: finalDimension,
-      threshold: finalThreshold,
-      severity,
-    })
-    if (result) {
-      // DATA-14 (AC1): run the new rule once now, so a check that already
-      // fails opens its incident at once; the rule stays whatever this says.
-      if (hasPermission("query:read") && result.evaluable !== false) {
-        try {
-          await governanceService.runQualityRule(result.id)
-        } catch (err) {
-          notifyError("The rule was added, but its first run failed", err)
-        }
-      }
-      setCreateOpen(false)
-      resetForm()
-      state.reload()
-    }
   }
 
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Data Quality"
-        description="Rules, dimensions, thresholds, and remediation signals."
+        description="The checks on each table, when they run, and how fresh each table must be."
         actions={
           // SEC-23 (F4): the API now refuses adding a rule without
-          // governance:write, like editing and deleting one.
-          hasPermission("governance:write") ? (
-            <Button size="sm" onClick={() => setCreateOpen(true)}>
+          // governance:write, like editing and deleting one. WEB-3 S3-D5:
+          // adding a rule belongs to the rules tab. WEB-7 D2: the form is
+          // its own page.
+          tab === "rules" && hasPermission("governance:write") ? (
+            <Button size="sm" render={<Link href="/governance/data-quality/rules/new" />}>
               <PlusIcon data-icon="inline-start" />
               Add Quality Rule
             </Button>
@@ -202,21 +152,36 @@ export function DataQualityPage() {
         }
       />
 
-      {/* DATA-14 (F7): what is wrong now leads; the rules follow. */}
-      <QualityIncidents />
+      <Tabs value={tab} onValueChange={(v) => setTab(v as QualityTab)} className="gap-4">
+        <TabsList>
+          <TabsTrigger value="rules">Incidents and rules</TabsTrigger>
+          <TabsTrigger value="schedules">Schedules</TabsTrigger>
+          <TabsTrigger value="freshness">Freshness targets</TabsTrigger>
+        </TabsList>
+        <TabsContent value="rules" className="flex flex-col gap-4">
+          {/* DATA-14 (F7): what is wrong now leads; the rules follow. */}
+          <QualityIncidents reloadKey={incidentsKey} />
 
-      {state.status === "loading" ? <LoadingSkeleton /> : null}
-      {state.status === "error" ? (
-        <ErrorState error={state.error} onRetry={state.reload} />
-      ) : null}
-      {state.status === "success" ? (
-        <div className="flex flex-col gap-4">
-          <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
-            <DataTableSearch placeholder="Search rule, asset, dimension…" />
-          </DataTableAdvancedToolbar>
-          <DataTable table={table} onRowClick={setSelected} />
-        </div>
-      ) : null}
+          {state.status === "loading" ? <LoadingSkeleton /> : null}
+          {state.status === "error" ? (
+            <ErrorState error={state.error} onRetry={state.reload} />
+          ) : null}
+          {state.status === "success" ? (
+            <div className="flex flex-col gap-4">
+              <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
+                <DataTableSearch placeholder="Search rule, asset, dimension…" />
+              </DataTableAdvancedToolbar>
+              <DataTable table={table} onRowClick={setSelected} />
+            </div>
+          ) : null}
+        </TabsContent>
+        <TabsContent value="schedules">
+          <QualitySchedulesTab canWrite={hasPermission("governance:write")} />
+        </TabsContent>
+        <TabsContent value="freshness">
+          <FreshnessTargetsTab canWrite={hasPermission("governance:write")} />
+        </TabsContent>
+      </Tabs>
 
       <DetailDrawer
         open={selected !== null}
@@ -267,7 +232,10 @@ export function DataQualityPage() {
               </section>
             ) : null}
             <div className="flex flex-wrap gap-2">
-              {selected.evaluable ? (
+              {/* QA LH-DATA-14-04 (GOV-10, DEC-17): running a rule by hand is
+                  a governance action, like editing one — the API takes
+                  `governance:write` for it, so the button follows. */}
+              {selected.evaluable && hasPermission("governance:write") ? (
                 <Button
                   size="sm"
                   onClick={() => void handleRun(selected)}
@@ -310,6 +278,7 @@ export function DataQualityPage() {
             setEditing(null)
             // The drawer shows the rule as it now reads; the list catches up.
             setSelected(saved)
+            setIncidentsKey((k) => k + 1)
             state.reload()
           }}
         />
@@ -325,102 +294,6 @@ export function DataQualityPage() {
         destructive
         onConfirm={() => void handleDelete()}
       />
-      <CreateSheet
-        open={createOpen}
-        onOpenChange={(open) => {
-          setCreateOpen(open)
-          if (!open) resetForm()
-        }}
-        title="Add Quality Rule"
-        description="Define a quality check with dimension, threshold, and severity."
-        canSubmit={Boolean(name.trim() && asset.trim() && finalDimension && finalThreshold)}
-        submitting={create.status === "pending"}
-        onSubmit={handleCreate}
-      >
-        <div className="space-y-1.5">
-          <Label htmlFor="qr-name">Name</Label>
-          <Input
-            id="qr-name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="qr-asset">Asset</Label>
-          <Input
-            id="qr-asset"
-            value={asset}
-            onChange={(e) => setAsset(e.target.value)}
-          />
-        </div>
-        {typedThreshold ? (
-          <div className="space-y-1.5">
-            <Label htmlFor="qr-threshold">Threshold</Label>
-            <Input
-              id="qr-threshold"
-              className="font-mono"
-              value={threshold}
-              onChange={(e) => setThreshold(e.target.value)}
-              placeholder="email not null >= 99%"
-            />
-            <p className="text-xs text-muted-foreground">
-              To be runnable, write it as one of: <ThresholdForms />. Name the asset as
-              silver.table, serving.table or bronze.table.
-            </p>
-          </div>
-        ) : (
-          <div className="grid gap-3">
-            <CheckFields
-              form={checkForm}
-              onChange={(patch) => setCheckForm((f) => ({ ...f, ...patch }))}
-              columns={null}
-              idPrefix="qr"
-            />
-            <p className="text-xs text-muted-foreground">
-              {builtThreshold ? (
-                <>
-                  Threshold: <span className="font-mono text-foreground">{builtThreshold}</span>
-                </>
-              ) : (
-                "Fill in the check to see its threshold."
-              )}
-            </p>
-          </div>
-        )}
-        <Button
-          type="button"
-          variant="link"
-          size="sm"
-          className="self-start px-0"
-          onClick={() => setTypedThreshold((t) => !t)}
-        >
-          {typedThreshold ? "Pick a check instead" : "Write the threshold myself"}
-        </Button>
-        <div className="space-y-1.5">
-          <Label htmlFor="qr-dim">Dimension</Label>
-          <Input
-            id="qr-dim"
-            value={formDimension}
-            onChange={(e) => setFormDimension(e.target.value)}
-            placeholder={typedThreshold ? "completeness" : KINDS[checkForm.kind].dimension}
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="qr-severity">Severity</Label>
-          <select
-            id="qr-severity"
-            className={selectClassName}
-            value={severity}
-            onChange={(e) => setSeverity(e.target.value as Severity)}
-          >
-            {SEVERITY_OPTIONS.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.label}
-              </option>
-            ))}
-          </select>
-        </div>
-      </CreateSheet>
     </div>
   )
 }

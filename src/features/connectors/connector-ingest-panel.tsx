@@ -13,14 +13,17 @@ import {
   XIcon,
 } from "lucide-react"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { SelectField } from "@/components/patterns/select-field"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredMarker } from "@/components/ui/required"
 import { useRefreshable } from "@/hooks/use-refreshable"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { backfillTriggerMessage } from "@/lib/connectors/backfill-message"
+import { ingestModeFor } from "@/lib/connectors/ingest-mode"
 import { specWithTopic } from "@/lib/connectors/kafka-topic"
 import { formatDateTime, formatDuration, formatRelativeTime, formatTimeUntil, parseTimestamp } from "@/lib/format"
 import { notifySuccess, withNotify } from "@/lib/notify"
@@ -139,6 +142,9 @@ type Selection = Selected[]
 /** What a table gets when it is ticked: one copy of the source per run. */
 const DEFAULT_LOAD_MODE: LoadMode = "replace"
 
+/** `SRC-4` decision S2-g: a change-capture table keeps the current row per key unless history is chosen. */
+const defaultLoadMode = (adapter: string): LoadMode => (adapter === "cdc" ? "incremental_dedup" : DEFAULT_LOAD_MODE)
+
 const LOAD_MODE_LABEL: Record<LoadMode, string> = {
   replace: "Replace all rows",
   incremental: "Add only new rows",
@@ -146,6 +152,23 @@ const LOAD_MODE_LABEL: Record<LoadMode, string> = {
   replace_dedup: "Replace all rows, one per key",
   incremental_dedup: "Add only new rows, one per key",
   history: "Keep history",
+}
+
+/** `SRC-4` decision S2-g: the two modes change capture offers, in the words the product owner signed. */
+const CHANGE_CAPTURE_LABEL: Partial<Record<LoadMode, string>> = {
+  incremental_dedup: "Current row per key",
+  history: "Keep history",
+}
+
+const modeLabel = (mode: LoadMode, changeCapture: boolean): string =>
+  (changeCapture ? CHANGE_CAPTURE_LABEL[mode] : undefined) ?? LOAD_MODE_LABEL[mode]
+
+/** What a mode does for change capture, in one line under the choice. */
+function changeCaptureHint(mode: LoadMode): string {
+  if (mode === "history") {
+    return "Every change is kept as a row, with its operation (_op), the time it happened at the source (_source_ts_ms), whether it deleted the row (_deleted) and its position (_offset)."
+  }
+  return "The table holds the current row of each key: a change updates the row and a delete removes it. A first copy of the source is taken when capture starts."
 }
 
 /** What a mode does on each run, in one line under the choice, including what happens to the rows already there. */
@@ -176,6 +199,8 @@ function loadModeHint(mode: LoadMode, cursor: string): string {
  * no other adapter runs them (SRC-10 decision 2).
  */
 function loadModesFor(adapter: string): LoadMode[] {
+  // SRC-4 decision S2-g: change capture keeps the current row per key (the default) or every change.
+  if (adapter === "cdc") return ["incremental_dedup", "history"]
   // SRC-3 AD6: a business-app object loads incrementally by the cursor its vendor declares (the finder shows
   // which objects have one). PR #216 final review BLOCKER 18: plain `incremental` appends a changed record as
   // a second row, so `saas` offers only the mode that merges on the vendor's key.
@@ -186,7 +211,8 @@ function loadModesFor(adapter: string): LoadMode[] {
 }
 
 /** Why a source cannot offer the incremental modes, or `null` when it can. */
-function missingModesNote(modes: LoadMode[]): string | null {
+function missingModesNote(modes: LoadMode[], changeCapture = false): string | null {
+  if (changeCapture) return null
   return modes.includes("incremental") || modes.includes("incremental_dedup")
     ? null
     : "Adding only new rows, with or without one row per key, is offered for SQL sources and business apps only: they can ask the source for just the new rows."
@@ -221,28 +247,37 @@ export function loadModeProblem(selected: {
     return "A business app can only add new rows one per key: choose “Add only new rows, one per key”."
   }
   if (
+    selected.adapter !== "cdc" &&
     (selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup") &&
     !(selected.incrementalKey ?? "").trim()
   ) {
     return "Pick the column that marks new rows, such as an id or an updated-at time."
   }
   if (needsKey(selected.loadMode) && (selected.primaryKey ?? []).length === 0) {
+    if (selected.adapter === "cdc") {
+      return "Name the column, or the columns together, that identify one row. Change capture cannot follow a table without a key."
+    }
     return "Name the column, or the columns together, that identify one row. A mode with one row per key cannot be saved without a key."
   }
   return null
 }
 
+/** Said under the box an Oracle change-capture connector's tables are typed in (`SRC-4` Amendment 10, S10-c). */
+export const ORACLE_BY_HAND_NOTE =
+  "Type each table as SCHEMA.TABLE, as Oracle names it (upper case). The names are not checked against the source until you test the connection: a name that does not exist captures nothing."
+
 /**
  * `SRC-11` decision 9: the sources whose columns the product lists before loading, so a column can be left
- * out: `sql` connectors on the PostgreSQL, MySQL (MariaDB uses it) or SQL Server driver. Oracle is listed by
- * `SRC-13` but the API refuses `excludedColumns` for it (`validate_excluded_columns`), so it is not offered here;
- * files, REST, MongoDB, Kafka and SFTP have no declared column list to choose from. Business apps (`saas`, `SRC-3`
+ * out: `sql` connectors on the PostgreSQL, MySQL (MariaDB uses it), SQL Server or Oracle driver (Oracle since
+ * `SRC-4` T1.2: `SRC-13` lists its columns and the orchestrator maps their spelling to the reflected one, as
+ * `supports_column_choice` in `ingest_spec.rs` says); files, REST, MongoDB, Kafka and SFTP have no declared column
+ * list to choose from. Business apps (`saas`, `SRC-3`
  * AD6) are offered it too: a vendor that describes its fields lists them. The columns come from the
  * preview route (`useColumnPreviews`), also for a table saved in an earlier visit.
  */
 export function supportsColumnChoice(adapter: string, dial: Dial | null | undefined): boolean {
   const driver = typeof dial?.driver === "string" ? dial.driver : ""
-  return adapter === "saas" || (adapter === "sql" && (driver === "postgres" || driver === "mysql" || driver === "mssql"))
+  return adapter === "saas" || (adapter === "sql" && (driver === "postgres" || driver === "mysql" || driver === "mssql" || driver === "oracle"))
 }
 
 /**
@@ -277,25 +312,25 @@ function fromSpec(spec: IngestSpec): Selection {
   return spec.sourceObjects.map((o) => ({
     name: o.name,
     target: o.target,
-    // Saved before load modes existed: the ingest job replaces.
-    loadMode: o.loadMode ?? DEFAULT_LOAD_MODE,
+    // Saved before load modes existed: the ingest job replaces; change capture keeps the current row per key.
+    loadMode: o.loadMode ?? defaultLoadMode(spec.adapter ?? ""),
     incrementalKey: o.incrementalKey,
     primaryKey: o.primaryKey,
     excludedColumns: o.excludedColumns,
   }))
 }
 
-/** `withModes: false` for CDC, whose tables stream and are never loaded by a run. */
-function toSourceObjects(selection: Selection, withModes: boolean): SourceObject[] {
+/** `withCursor: false` for change capture, whose tables follow the source's changes and read no cursor column. */
+function toSourceObjects(selection: Selection, withCursor: boolean): SourceObject[] {
   return selection.map((s) => ({
     name: s.name,
     target: s.target,
-    ...(withModes ? { loadMode: s.loadMode } : {}),
-    ...(withModes && (s.loadMode === "incremental" || s.loadMode === "incremental_dedup") && s.incrementalKey?.trim()
+    loadMode: s.loadMode,
+    ...(withCursor && (s.loadMode === "incremental" || s.loadMode === "incremental_dedup") && s.incrementalKey?.trim()
       ? { incrementalKey: s.incrementalKey.trim() }
       : {}),
-    ...(withModes && s.primaryKey && s.primaryKey.length > 0 ? { primaryKey: s.primaryKey } : {}),
-    ...(withModes && effectiveExcluded(s).length > 0 ? { excludedColumns: effectiveExcluded(s) } : {}),
+    ...(s.primaryKey && s.primaryKey.length > 0 ? { primaryKey: s.primaryKey } : {}),
+    ...(effectiveExcluded(s).length > 0 ? { excludedColumns: effectiveExcluded(s) } : {}),
   }))
 }
 
@@ -324,6 +359,7 @@ export function ConnectorIngestPanel({
   pausedReason = null,
   waitingTables,
   onResumed,
+  onRunEnded,
 }: {
   connectorId: string
   connectorName: string
@@ -331,6 +367,8 @@ export function ConnectorIngestPanel({
   onTableCount?: (count: number) => void
   /** Called after Resume lifted a pause (`SRC-11`), so the page reloads the connector and the pause goes. */
   onResumed?: () => void
+  /** Called once when a run the panel was watching is over (`SRC-46`), with the run as the list returned it. */
+  onRunEnded?: (run: ConnectorRun) => void
   /** Why the connector is paused (`SRC-8`); the API refuses a run meanwhile. */
   pausedReason?: string | null
   /** Source tables that wait for a schema decision (`SRC-8`), from the Schema changes tab's one list. */
@@ -373,6 +411,7 @@ export function ConnectorIngestPanel({
       pausedReason={pausedReason}
       waitingTables={waitingTables}
       onResumed={onResumed}
+      onRunEnded={onRunEnded}
     />
   )
 }
@@ -386,6 +425,7 @@ function IngestEditor({
   pausedReason,
   waitingTables,
   onResumed,
+  onRunEnded,
 }: {
   connectorId: string
   connectorName: string
@@ -395,6 +435,7 @@ function IngestEditor({
   pausedReason: string | null
   waitingTables?: ReadonlySet<string>
   onResumed?: () => void
+  onRunEnded?: (run: ConnectorRun) => void
 }) {
   const adapter = spec.adapter ?? ""
   const isCdc = adapter === "cdc"
@@ -423,7 +464,7 @@ function IngestEditor({
   const previews = useColumnPreviews(connectorId)
   const columnChoice = !isCdc && supportsColumnChoice(adapter, spec.dial)
   // Owned here, not by the Runs card: the per-table actions are disabled while a run is going.
-  const runState = useIngestRunState(connectorId)
+  const runState = useIngestRunState(connectorId, onRunEnded)
 
   const saved = React.useMemo(() => fromSpec(spec), [spec])
   const [selection, setSelection] = React.useState<Selection>(saved)
@@ -437,13 +478,16 @@ function IngestEditor({
   const cron = cronChoice === "custom" ? customCron.trim() : cronChoice
 
   const [manualName, setManualName] = React.useState("")
+  // `SRC-4` Amendment 10 (S10-c): an Oracle change-capture connector lists nothing; each table is typed as
+  // SCHEMA.TABLE, in the upper case Oracle stores it in, and is not checked against the source until capture starts.
+  const oracleByHand = isCdc && spec.dial.driver === "oracle"
   const save = useServiceAction(
     withNotify({ success: "Tables and schedule saved", error: "Could not save tables" }, (signal) =>
       connectorService.setIngestSpec(
         connectorId,
         {
           adapter,
-          ingestMode: spec.ingestMode ?? "batch",
+          ingestMode: spec.ingestMode ?? ingestModeFor(adapter),
           dial: keepsDialObjects ? { ...spec.dial, objects: reports } : spec.dial,
           sourceObjects: toSourceObjects(selection, !isCdc),
           ...(cron && !isCdc ? { scheduleCron: cron } : {}),
@@ -460,7 +504,7 @@ function IngestEditor({
       selection.filter((_, j) => j !== i).map((o) => o.target)
     )
   )
-  const modeProblems = selection.map((s) => (isCdc ? null : loadModeProblem({ ...s, adapter })))
+  const modeProblems = selection.map((s) => loadModeProblem({ ...s, adapter }))
   const scheduleProblem = !isCdc && cronChoice === "custom" ? cronProblem(customCron) : null
   const dirty =
     JSON.stringify(toSourceObjects(selection, !isCdc)) !== JSON.stringify(toSourceObjects(saved, !isCdc)) ||
@@ -517,7 +561,7 @@ function IngestEditor({
     return {
       name,
       target: label ? labelTarget(connectorName, label) : defaultTarget(connectorName, name),
-      loadMode: DEFAULT_LOAD_MODE,
+      loadMode: defaultLoadMode(adapter),
       ...(detected ? { primaryKey: detected } : {}),
     }
   }
@@ -561,7 +605,9 @@ function IngestEditor({
   }
 
   function addManual() {
-    const name = manualName.trim()
+    const typed = manualName.trim()
+    // Oracle stores unquoted names in upper case and the API requires that spelling (S10-c).
+    const name = oracleByHand ? typed.toUpperCase() : typed
     if (!name || selectedNames.has(name)) return
     setSelection((current) => [...current, newTable(name)])
     setManualName("")
@@ -590,7 +636,9 @@ function IngestEditor({
   const page = layout === "page"
   const tablesIntro = isStream
     ? "A Kafka connector reads its topic; each run takes one micro-batch."
-    : "Each table here lands in its own Bronze table. A run replaces its rows, or adds to them, as chosen per table. Nothing is ingested until at least one table is saved."
+    : isCdc
+      ? "Each table here lands in its own Bronze table, kept in step with the source by following its changes. Nothing is captured until at least one table is saved."
+      : "Each table here lands in its own Bronze table. A run replaces its rows, or adds to them, as chosen per table. Nothing is ingested until at least one table is saved."
 
   const cdcNotes = (
     <>
@@ -599,7 +647,6 @@ function IngestEditor({
           {backfillTriggerMessage(typeof spec.dial.driver === "string" ? spec.dial.driver : "cdc")}
         </p>
       ) : null}
-      {isCdc && saved[0] ? <DebeziumPanel connectorId={connectorId} table={saved[0].name} /> : null}
     </>
   )
 
@@ -668,17 +715,16 @@ function IngestEditor({
                   />
                 </div>
                 {problems[i] ? <p className="text-xs text-destructive">{problems[i]}</p> : null}
-                {!isCdc ? (
-                  <LoadModeFields
-                    selected={s}
-                    modes={loadModesFor(adapter)}
-                    savedMode={saved.find((t) => t.name === s.name)?.loadMode ?? null}
-                    columns={columnsOf.get(s.name) ?? null}
-                    detectedKey={keysOf.get(s.name) ?? null}
-                    problem={modeProblems[i]}
-                    onChange={(patch) => change(s.name, patch)}
-                  />
-                ) : null}
+                <LoadModeFields
+                  selected={s}
+                  modes={loadModesFor(adapter)}
+                  savedMode={saved.find((t) => t.name === s.name)?.loadMode ?? null}
+                  columns={columnsOf.get(s.name) ?? null}
+                  detectedKey={keysOf.get(s.name) ?? null}
+                  problem={modeProblems[i]}
+                  changeCapture={isCdc}
+                  onChange={(patch) => change(s.name, patch)}
+                />
                 {columnChoice ? (
                   <ColumnChoice
                     selected={s}
@@ -725,12 +771,13 @@ function IngestEditor({
       ) : null}
       {manualAdd ? (
         <div className="space-y-1.5">
-          <Label htmlFor="manual-object" className="text-xs">
+          <Label htmlFor="manual-object" className="text-xs" required>
             Add by name
           </Label>
           <div className={cn("flex gap-2", page && "max-w-md")}>
             <Input
               id="manual-object"
+              aria-required
               value={manualName}
               onChange={(e) => setManualName(e.target.value)}
               onKeyDown={(e) => {
@@ -740,7 +787,9 @@ function IngestEditor({
                 }
               }}
               placeholder={
-                adapter === "sftp" || adapter === "files"
+                oracleByHand
+                  ? "SCHEMA.TABLE"
+                  : adapter === "sftp" || adapter === "files"
                   ? "orders.csv"
                   : finder === "oracle"
                     ? "SCHEMA.TABLE"
@@ -757,7 +806,9 @@ function IngestEditor({
             </Button>
           </div>
           <p className="text-xs text-muted-foreground">
-            {finder === null
+            {oracleByHand
+              ? ORACLE_BY_HAND_NOTE
+              : finder === null
               ? "This connector type cannot list its objects, so type each one as the source names it."
               : finder === "oracle"
                 ? "Or type SCHEMA.TABLE as Oracle names it, for a table the list does not show."
@@ -812,28 +863,34 @@ function IngestEditor({
       <Label htmlFor="ingest-schedule" className={page ? "sr-only" : "text-xs"}>
         Schedule
       </Label>
-      <select
+      {/* WEB-9 D3: the presets and the custom entry, as before; "Manual only"
+          is a real choice with value "", held by `SelectField`. */}
+      <SelectField
         id="ingest-schedule"
-        className={cn("h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm", page && "max-w-xs")}
+        className={cn("w-full", page && "max-w-xs")}
         value={cronChoice}
-        onChange={(e) => setCronChoice(e.target.value)}
-      >
-        {SCHEDULE_PRESETS.map((p) => (
-          <option key={p.label} value={p.value}>
-            {p.label}
-          </option>
-        ))}
-        <option value="custom">Custom cron…</option>
-      </select>
+        options={[
+          ...SCHEDULE_PRESETS.map((p) => ({ value: p.value, label: p.label })),
+          { value: "custom", label: "Custom cron…" },
+        ]}
+        onValueChange={(next) => setCronChoice(next)}
+      />
       {cronChoice === "custom" ? (
-        <Input
-          aria-label="Cron expression"
-          value={customCron}
-          onChange={(e) => setCustomCron(e.target.value)}
-          placeholder="30 1 * * 1-5"
-          className={cn("h-8 font-mono text-xs", page && "max-w-xs")}
-          autoComplete="off"
-        />
+        <>
+          <label htmlFor="ingest-custom-cron" className="text-xs">
+            Cron expression <RequiredMarker />
+          </label>
+          <Input
+            id="ingest-custom-cron"
+            aria-label="Cron expression"
+            aria-required
+            value={customCron}
+            onChange={(e) => setCustomCron(e.target.value)}
+            placeholder="30 1 * * 1-5"
+            className={cn("h-8 font-mono text-xs", page && "max-w-xs")}
+            autoComplete="off"
+          />
+        </>
       ) : null}
       {scheduleProblem ? (
         <p className="text-xs text-destructive">{scheduleProblem}</p>
@@ -887,6 +944,7 @@ function IngestEditor({
       state={runState}
       pausedReason={pausedReason}
       onResumed={onResumed}
+      resumeOnCaptureTab={isCdc}
       blockedReason={
         pausedReason
           ? `Paused: ${pausedReason}`
@@ -962,6 +1020,7 @@ function LoadModeFields({
   columns,
   detectedKey,
   problem,
+  changeCapture,
   onChange,
 }: {
   selected: Selected
@@ -972,51 +1031,55 @@ function LoadModeFields({
   /** The key the source declares for this table, when it was found and declares one. */
   detectedKey: string[] | null
   problem: string | null
+  /** `SRC-4`: a change-capture table reads no cursor column and has its own words for the two modes. */
+  changeCapture: boolean
   onChange: (patch: Partial<Selected>) => void
 }) {
   const cursor = selected.incrementalKey ?? ""
   // A saved mode this adapter no longer offers still shows, rather than
   // silently reading as another one.
   const offered = modes.includes(selected.loadMode) ? modes : [...modes, selected.loadMode]
-  const fieldClass = "h-7 rounded-lg border border-input bg-transparent px-2 text-xs"
-  const note = missingModesNote(modes)
+  const note = missingModesNote(modes, changeCapture)
+  const needsCursor =
+    selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup"
   return (
     <div className="space-y-1">
       <div className="flex flex-wrap items-center gap-1.5">
-        <span className="shrink-0 text-xs text-muted-foreground">Each run</span>
-        <select
+        <span className="shrink-0 text-xs text-muted-foreground">{changeCapture ? "Keep" : "Each run"}</span>
+        {/* WEB-9 D3: the compact trigger keeps the row's h-7, px-2 and text-xs. */}
+        <SelectField
           aria-label={`Load mode for ${selected.name}`}
-          className={fieldClass}
+          size="sm"
+          className="px-2 text-xs"
           value={selected.loadMode}
-          onChange={(e) => onChange({ loadMode: e.target.value as LoadMode })}
-        >
-          {offered.map((mode) => (
-            <option key={mode} value={mode}>
-              {LOAD_MODE_LABEL[mode]}
-            </option>
-          ))}
-        </select>
-        {selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup" ? (
+          options={offered.map((mode) => ({ value: mode, label: modeLabel(mode, changeCapture) }))}
+          onValueChange={(next) => onChange({ loadMode: next as LoadMode })}
+        />
+        {!changeCapture && (selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup") ? (
           <>
-            <span className="shrink-0 text-xs text-muted-foreground">by</span>
+            <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
+              by {needsCursor ? <RequiredMarker /> : null}
+            </span>
             {columns && columns.length > 0 ? (
-              <select
+              <SelectField
                 aria-label={`New-row column for ${selected.name}`}
-                className={`${fieldClass} min-w-0 flex-1 font-mono`}
+                size="sm"
+                aria-required={needsCursor}
+                className="min-w-0 flex-1 px-2 font-mono text-xs"
                 value={cursor}
+                /* WEB-9 D2: "Pick a column…" was only a prompt, so it is the
+                   placeholder; a saved column the list lacks stays an option. */
+                placeholder="Pick a column…"
                 aria-invalid={problem !== null}
-                onChange={(e) => onChange({ incrementalKey: e.target.value })}
-              >
-                <option value="">Pick a column…</option>
-                {(columns.includes(cursor) || cursor === "" ? columns : [cursor, ...columns]).map((column) => (
-                  <option key={column} value={column}>
-                    {column}
-                  </option>
-                ))}
-              </select>
+                options={(columns.includes(cursor) || cursor === "" ? columns : [cursor, ...columns]).map(
+                  (column) => ({ value: column, label: column })
+                )}
+                onValueChange={(next) => onChange({ incrementalKey: next })}
+              />
             ) : (
               <Input
                 aria-label={`New-row column for ${selected.name}`}
+                aria-required={needsCursor}
                 value={cursor}
                 onChange={(e) => onChange({ incrementalKey: e.target.value })}
                 placeholder="updated_at"
@@ -1040,9 +1103,9 @@ function LoadModeFields({
         />
       ) : null}
       <p className={problem ? "text-xs text-destructive" : "text-xs text-muted-foreground"}>
-        {problem ?? loadModeHint(selected.loadMode, cursor.trim())}
+        {problem ?? (changeCapture ? changeCaptureHint(selected.loadMode) : loadModeHint(selected.loadMode, cursor.trim()))}
       </p>
-      {crossesHistoryBoundary(savedMode, selected.loadMode) ? (
+      {!changeCapture && crossesHistoryBoundary(savedMode, selected.loadMode) ? (
         <p className="text-xs text-muted-foreground">{HISTORY_BOUNDARY_NOTE}</p>
       ) : null}
     </div>
@@ -1110,9 +1173,10 @@ function ColumnChoice({
                 const reason = locked.get(column)
                 return (
                   <li key={column}>
-                    <label className="flex items-center gap-1.5 font-mono text-xs">
+                    <label className="flex min-w-0 items-center gap-1.5 font-mono text-xs">
                       <input
                         type="checkbox"
+                        className="shrink-0"
                         aria-label={`Load column ${column} of ${selected.name}`}
                         checked={reason !== undefined || !excluded.includes(column)}
                         disabled={reason !== undefined}
@@ -1120,8 +1184,11 @@ function ColumnChoice({
                           onChange(e.target.checked ? excluded.filter((c) => c !== column) : [...excluded, column])
                         }
                       />
-                      {column}
-                      {reason ? <span className="font-sans text-muted-foreground">{reason}</span> : null}
+                      {/* WEB-13: a source column name is dynamic. Wrap it so an
+                          unbroken identifier folds inside the row; the checkbox
+                          and the locked-column reason stay intact. */}
+                      <span className="min-w-0 break-all leading-snug">{column}</span>
+                      {reason ? <span className="min-w-0 font-sans text-muted-foreground">{reason}</span> : null}
                     </label>
                   </li>
                 )
@@ -1158,6 +1225,7 @@ function KeyFields({
   onChange: (key: string[]) => void
 }) {
   const [typed, setTyped] = React.useState(value.join(", "))
+  const inputId = `key-${name.replace(/[^a-zA-Z0-9_-]/g, "-")}`
   const origin =
     detected && detected.length > 0
       ? sameColumns(value, detected)
@@ -1166,22 +1234,34 @@ function KeyFields({
       : null
   return (
     <div className="space-y-1">
+      {/* UX-1-R6: `aria-required` is not supported on a native fieldset's
+          implicit group role. Put the star on a visible group label and link
+          the requirement text; no individual checkbox is marked required. */}
+      <p id={`${inputId}-help`} className="text-xs text-muted-foreground">
+        Select at least one key column, or type the names separated by commas.
+      </p>
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-        <span className="shrink-0 text-xs text-muted-foreground">Key</span>
+        <span className="shrink-0 text-xs text-muted-foreground">
+          Key <RequiredMarker />
+        </span>
         {columns && columns.length > 0 ? (
-          <fieldset aria-label={`Key columns for ${name}`} className="flex min-w-0 flex-wrap gap-x-3 gap-y-0.5">
+          <fieldset aria-label={`Key columns for ${name}`} aria-describedby={`${inputId}-help`} className="flex min-w-0 flex-wrap gap-x-3 gap-y-0.5">
             {(value.every((c) => columns.includes(c)) ? columns : [...value.filter((c) => !columns.includes(c)), ...columns]).map(
               (column) => (
-                <label key={column} className="flex items-center gap-1 font-mono text-xs">
+                <label key={column} className="flex min-w-0 items-center gap-1 font-mono text-xs">
                   <input
                     type="checkbox"
+                    className="shrink-0"
                     aria-label={`${column} is part of the key of ${name}`}
                     checked={value.includes(column)}
                     onChange={(e) =>
                       onChange(e.target.checked ? [...value, column] : value.filter((c) => c !== column))
                     }
                   />
-                  {column}
+                  {/* WEB-13: the key column name is source data; let it wrap
+                      inside the already min-w-0 fieldset instead of widening
+                      the key row. */}
+                  <span className="min-w-0 break-all leading-snug">{column}</span>
                 </label>
               )
             )}
@@ -1223,13 +1303,13 @@ const POLL_MS = 3_000
 const LAUNCH_GRACE_MS = 60_000
 
 /**
- * How long a run whose record still says `running` is believed. A table holds
- * a run open for at most about 21 minutes of waiting between its three retries
- * (`SRC-11` decision 1) plus the load itself, so a run with no end reported
- * after six hours was stopped without reporting one: a worker killed or a run
- * cancelled in the orchestrator fires neither of the reports that close a
- * record (the Rust handoff of tasks 1 to 4 says so). It is shown as "no end
- * reported", not as active forever, and it no longer disables Run now.
+ * The fallback for how long a run whose record still says `running` is believed, used only when the
+ * API's run list does not carry its limit (`ConnectorRunList.maxRuntimeSeconds`). A table holds a run
+ * open for at most about 21 minutes of waiting between its three retries (`SRC-11` decision 1) plus
+ * the load itself, so a run with no end reported after six hours was stopped without reporting one: a
+ * worker killed or a run cancelled in the orchestrator fires neither of the reports that close a
+ * record (the Rust handoff of tasks 1 to 4 says so). It is shown as "no end reported", not as active
+ * forever, and it no longer disables Run now.
  */
 export const STALE_RUN_MS = 6 * 60 * 60 * 1000
 
@@ -1237,20 +1317,29 @@ function startedMillis(run: ConnectorRun): number {
   return parseTimestamp(run.startedAt).getTime()
 }
 
-/** Whether the run's record says it is going and the bound above has not passed. */
-export function isActive(run: ConnectorRun, now = Date.now()): boolean {
+/**
+ * The bound a run is believed for, from the API's own setting (`SRC-39`, QA `TC-1702`; `review round
+ * 1, R8`). The API refuses the next run while the previous one is inside this limit, so the page must
+ * not use a smaller number of its own: it would offer "Run now" for a run the API still holds.
+ */
+export function runLimitMillis(maxRuntimeSeconds: number | undefined): number {
+  return typeof maxRuntimeSeconds === "number" && maxRuntimeSeconds > 0 ? maxRuntimeSeconds * 1000 : STALE_RUN_MS
+}
+
+/** Whether the run's record says it is going and the bound has not passed. */
+export function isActive(run: ConnectorRun, limitMs = STALE_RUN_MS, now = Date.now()): boolean {
   if (run.status !== "running") return false
   const started = startedMillis(run)
-  return Number.isNaN(started) || now - started < STALE_RUN_MS
+  return Number.isNaN(started) || now - started < limitMs
 }
 
-/** A record that says `running` for longer than `STALE_RUN_MS`: its end was never reported. */
-export function isNoEndReported(run: ConnectorRun, now = Date.now()): boolean {
-  return run.status === "running" && !isActive(run, now)
+/** A record that says `running` for longer than the run limit: its end was never reported. */
+export function isNoEndReported(run: ConnectorRun, limitMs = STALE_RUN_MS, now = Date.now()): boolean {
+  return run.status === "running" && !isActive(run, limitMs, now)
 }
 
-export function runStatusLabel(run: ConnectorRun, now = Date.now()): string {
-  if (isNoEndReported(run, now)) return "No end reported"
+export function runStatusLabel(run: ConnectorRun, limitMs = STALE_RUN_MS, now = Date.now()): string {
+  if (isNoEndReported(run, limitMs, now)) return "No end reported"
   switch (run.status) {
     case "running":
       return "Running"
@@ -1267,9 +1356,10 @@ export function runStatusLabel(run: ConnectorRun, now = Date.now()): string {
 
 export function runStatusTone(
   run: ConnectorRun,
+  limitMs = STALE_RUN_MS,
   now = Date.now()
 ): "success" | "destructive" | "warning" | "neutral" | "info" {
-  if (isNoEndReported(run, now)) return "neutral"
+  if (isNoEndReported(run, limitMs, now)) return "neutral"
   switch (run.status) {
     case "running":
       return "info"
@@ -1296,6 +1386,7 @@ const END_REASON_LABEL: Record<string, string> = {
   completed: "Every table was loaded.",
   table_failed: "At least one table could not be loaded.",
   connector_paused: "The connector was paused, so nothing was loaded.",
+  timed_out: "The run did not finish within the time limit and was stopped.",
   other: "The run ended for another reason.",
 }
 
@@ -1334,13 +1425,16 @@ const EVENT_LABEL: Record<string, string> = {
  * every few seconds while a run is going. Used by the editor (the per-table
  * actions are disabled meanwhile) and handed to the Runs card.
  */
-function useIngestRunState(connectorId: string) {
+function useIngestRunState(connectorId: string, onRunEnded?: (run: ConnectorRun) => void) {
   const list = useRefreshable((s) => connectorService.listConnectorRuns(connectorId, s), connectorId)
   // A run just launched, until the record lists it.
   const [launchedRunId, setLaunchedRunId] = React.useState<string | null>(null)
 
-  const runs = list.data ?? []
-  const activeRun = runs.find((r) => isActive(r)) ?? null
+  const runs = list.data?.runs ?? []
+  // `SRC-39` (`review round 1, R8`): the limit the API judges a run by travels
+  // with the list, so raising the setting cannot bring the QA symptom back.
+  const limitMs = runLimitMillis(list.data?.maxRuntimeSeconds)
+  const activeRun = runs.find((r) => isActive(r, limitMs)) ?? null
   const awaitingLaunch = launchedRunId !== null && !runs.some((r) => r.runId === launchedRunId)
   const watching = activeRun !== null || awaitingLaunch
   const { refresh: refreshRuns } = list
@@ -1358,10 +1452,41 @@ function useIngestRunState(connectorId: string) {
     return () => window.clearTimeout(timer)
   }, [launchedRunId])
 
+  // `SRC-46` (`QA LH-SRC-6-43`): tell the page when the run it watched is over, so it can read the connector
+  // again (its health follows the run by about a minute). The run handed over is the one the last read
+  // after the edge returns, by `runId`, not the stale row that was going. The handler sits in a ref so a
+  // new function on each render neither re-runs the effects nor loses the call.
+  const onRunEndedRef = React.useRef(onRunEnded)
+  React.useEffect(() => {
+    onRunEndedRef.current = onRunEnded
+  })
+  const lastActiveRunId = React.useRef<string | null>(null)
+  const endedRunId = React.useRef<string | null>(null)
+  // `SRC-46 review round 1, BLOCKER 1`: written in an effect, not during render (`react-hooks/refs`). When the run
+  // ends `activeRun` is null, so the id of the run that was going stays for the edge effect below.
+  const activeRunId = activeRun?.runId ?? null
+  React.useEffect(() => {
+    if (activeRunId !== null) lastActiveRunId.current = activeRunId
+  }, [activeRunId])
+  // Declared before the edge effect below: the list that ends the watch is not the "last read", so the
+  // edge must not find its own run id waiting in the same commit.
+  React.useEffect(() => {
+    const id = endedRunId.current
+    if (id === null) return
+    const run = list.data?.runs.find((r) => r.runId === id)
+    if (!run) return
+    endedRunId.current = null
+    onRunEndedRef.current?.(run)
+  }, [list.data])
+
   // A run that just finished: one last read, so its final numbers show.
   const wasWatching = React.useRef(false)
   React.useEffect(() => {
-    if (wasWatching.current && !watching) refreshRuns()
+    if (wasWatching.current && !watching) {
+      endedRunId.current = lastActiveRunId.current
+      lastActiveRunId.current = null
+      refreshRuns()
+    }
     wasWatching.current = watching
   }, [watching, refreshRuns])
 
@@ -1372,6 +1497,7 @@ function useIngestRunState(connectorId: string) {
     awaitingLaunch,
     launchedRunId,
     watching,
+    limitMs,
     launch: setLaunchedRunId,
     refreshRuns,
   }
@@ -1389,6 +1515,13 @@ export function isAutoDisablePause(reason: string | null | undefined): boolean {
   return /^Paused after \d+ failed runs in a row$/.test(reason ?? "")
 }
 
+/** The reason a person's own pause carries (`PERSON_PAUSE_REASON` in `connectors.rs`, `SRC-4`); Resume lifts it too. */
+export const PERSON_PAUSE_REASON = "Paused by a person"
+
+/** A pause Resume can lift: repeated failures set it, or a person did. */
+export const isLiftablePause = (reason: string | null | undefined): boolean =>
+  isAutoDisablePause(reason) || reason === PERSON_PAUSE_REASON
+
 /**
  * The connector's runs from the product's own record (newest 50), each opening
  * to its log, and a Run now that stays disabled while a run is going: Bronze is
@@ -1403,6 +1536,7 @@ function IngestRuns({
   blockedReason,
   pausedReason,
   onResumed,
+  resumeOnCaptureTab = false,
 }: {
   layout: "page" | "embedded"
   connectorId: string
@@ -1410,8 +1544,10 @@ function IngestRuns({
   blockedReason: string | null
   pausedReason: string | null
   onResumed?: () => void
+  /** A change-capture connector is paused and resumed on the Change capture tab (`SRC-4` S4-g), not here. */
+  resumeOnCaptureTab?: boolean
 }) {
-  const { list, runs, activeRun, awaitingLaunch, launchedRunId, watching, refreshRuns } = state
+  const { list, runs, activeRun, awaitingLaunch, launchedRunId, watching, limitMs, refreshRuns } = state
   const runNow = useServiceAction((signal, id: string) => connectorService.runIngest(id, signal))
 
   const runNowButton = (
@@ -1434,7 +1570,12 @@ function IngestRuns({
   const body = (
     <>
       {pausedReason ? (
-        <PausedNote connectorId={connectorId} reason={pausedReason} onResumed={onResumed} />
+        <PausedNote
+          connectorId={connectorId}
+          reason={pausedReason}
+          onResumed={onResumed}
+          resumeOnCaptureTab={resumeOnCaptureTab}
+        />
       ) : blockedReason && !watching ? (
         <p className="text-xs text-muted-foreground">{blockedReason}</p>
       ) : null}
@@ -1443,7 +1584,20 @@ function IngestRuns({
           <LoaderIcon className="size-3.5 animate-spin" />
           Run {activeRun.runId.slice(0, 8)} is running. Its log shows each attempt as it ends.
         </p>
-      ) : awaitingLaunch ? (
+      ) : null}
+      {activeRun && activeRun.attempts > 0 ? (
+        // QA LH-SRC-6-16 (SRC-41 D17): the run record is closed by the
+        // orchestrator's run-status sensor, which is evaluated every 30 s (at
+        // most 5 ended runs of all jobs per tick, one sensor after another),
+        // so the status can lag minutes behind the last table's rows. Nothing
+        // here is retimed; the limits to tell a customer say so, with the
+        // three settings, on the feature page.
+        <p className="text-xs text-muted-foreground">
+          The status changes when the orchestrator reports the end of the run. That can be a few
+          minutes after the last table&apos;s rows are counted.
+        </p>
+      ) : null}
+      {!activeRun && awaitingLaunch ? (
         <p className="flex items-center gap-1.5 text-xs text-primary">
           <LoaderIcon className="size-3.5 animate-spin" />
           Starting run {launchedRunId?.slice(0, 8)}…
@@ -1468,6 +1622,7 @@ function IngestRuns({
               layout={layout}
               connectorId={connectorId}
               run={run}
+              limitMs={limitMs}
               defaultOpen={index === 0}
             />
           ))}
@@ -1504,10 +1659,12 @@ function PausedNote({
   connectorId,
   reason,
   onResumed,
+  resumeOnCaptureTab = false,
 }: {
   connectorId: string
   reason: string
   onResumed?: () => void
+  resumeOnCaptureTab?: boolean
 }) {
   const resume = useServiceAction(async (signal) => {
     const result = await connectorService.resumeConnector(connectorId, signal)
@@ -1517,10 +1674,14 @@ function PausedNote({
   return (
     <div className="space-y-1.5 rounded-md border border-border bg-muted/30 px-3 py-2">
       <p className="text-xs">Paused: {reason}</p>
-      {isAutoDisablePause(reason) ? (
+      {isLiftablePause(reason) && resumeOnCaptureTab ? (
+        <p className="text-xs text-muted-foreground">Resume it on the Change capture tab.</p>
+      ) : isLiftablePause(reason) ? (
         <>
           <p className="text-xs text-muted-foreground">
-            Fix the cause, then resume. The count of failed runs starts again from zero.
+            {isAutoDisablePause(reason)
+              ? "Fix the cause, then resume. The count of failed runs starts again from zero."
+              : "Resume when you want it to run again."}
           </p>
           <Button
             type="button"
@@ -1547,21 +1708,24 @@ function RunCard({
   layout,
   connectorId,
   run,
+  limitMs,
   defaultOpen,
 }: {
   layout: "page" | "embedded"
   connectorId: string
   run: ConnectorRun
+  /** The API's run limit (`review round 1, R8`), so a run is "going" for as long as the API holds it. */
+  limitMs: number
   defaultOpen: boolean
 }) {
   const [logOpen, setLogOpen] = React.useState(false)
-  const noEnd = isNoEndReported(run)
+  const noEnd = isNoEndReported(run, limitMs)
   const attempts = `${run.attempts} ${run.attempts === 1 ? "attempt" : "attempts"}`
   const summary = noEnd
     ? "No end reported"
     : `${run.rowsLoaded.toLocaleString()} rows · ${attempts}`
 
-  const status = <Pill tone={runStatusTone(run)}>{runStatusLabel(run)}</Pill>
+  const status = <Pill tone={runStatusTone(run, limitMs)}>{runStatusLabel(run, limitMs)}</Pill>
   const runId = (
     <>
       <span className="font-mono text-xs">{run.runId.slice(0, 8)}</span>
@@ -1618,7 +1782,11 @@ function RunCard({
                 : null}
         </p>
         {logOpen ? (
-          <RunLog connectorId={connectorId} runId={run.runId} />
+          <RunLog
+            connectorId={connectorId}
+            runId={run.runId}
+            followKey={`${run.status}|${run.attempts}|${run.endedAt ?? ""}`}
+          />
         ) : (
           <Button type="button" size="xs" variant="outline" onClick={() => setLogOpen(true)}>
             Show log
@@ -1640,8 +1808,21 @@ function waitLabel(seconds: number): string {
  * writes the lines from a closed list and never carries the source's or the
  * driver's error text; this view only words the closed event and error class.
  */
-function RunLog({ connectorId, runId }: { connectorId: string; runId: string }) {
-  const log = useService((s) => connectorService.getConnectorRunLog(connectorId, runId, s), [connectorId, runId])
+function RunLog({ connectorId, runId, followKey }: { connectorId: string; runId: string; followKey: string }) {
+  // `SRC-46` (`QA LH-SRC-6-43`): a log opened while the run was going stayed at
+  // the attempts it first read. `keepDataOnReload` holds the lines on screen
+  // only for a reload with the same deps, so `followKey` (the run's status,
+  // attempts and end) is not a dep: an effect calls `reload()` when it changes.
+  const log = useService((s) => connectorService.getConnectorRunLog(connectorId, runId, s), [connectorId, runId], {
+    keepDataOnReload: true,
+  })
+  const { reload } = log
+  const seenKey = React.useRef(followKey)
+  React.useEffect(() => {
+    if (seenKey.current === followKey) return
+    seenKey.current = followKey
+    reload()
+  }, [followKey, reload])
   const download = useServiceAction(async (signal) => {
     const text = await connectorService.downloadConnectorRunLog(connectorId, runId, signal)
     if (signal.aborted) return text
@@ -1726,32 +1907,6 @@ function RunLog({ connectorId, runId }: { connectorId: string; runId: string }) 
           ) : null}
         </>
       )}
-    </div>
-  )
-}
-
-/**
- * Read-only `Debezium` `.properties` rendering for a `cdc` adapter's
- * captured table. `properties` holds ONLY `${ENV_VAR_NAME}` references —
- * labeled explicitly as such, never resolved here or anywhere in the
- * console.
- */
-function DebeziumPanel({ connectorId, table }: { connectorId: string; table: string }) {
-  const props = useService(
-    (signal) => connectorService.getDebeziumProperties(connectorId, table, signal),
-    [connectorId, table]
-  )
-
-  if (props.status === "loading") return <LoadingSkeleton rows={2} />
-  if (props.status === "error") return <ErrorState error={props.error} onRetry={props.reload} />
-
-  return (
-    <div>
-      <p className="text-xs font-medium text-muted-foreground">Debezium properties · {props.data.table}</p>
-      <p className="mt-0.5 text-xs text-muted-foreground">{props.data.note}</p>
-      <pre className="mt-1.5 overflow-x-auto rounded-md border bg-muted p-2 font-mono text-xs">
-        {props.data.properties}
-      </pre>
     </div>
   )
 }

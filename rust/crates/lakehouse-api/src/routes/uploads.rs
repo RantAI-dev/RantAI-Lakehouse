@@ -64,7 +64,7 @@
 //!   error reaches a response only as the store's own fixed `database error`.
 //!   The one piece of recorded text a response can carry is a reason
 //!   `file_ingest_job` wrote into `ingest_run`, and only when it is one of the
-//!   eleven the API knows ([`JOB_FAILURE_REASONS`], review findings B6 and C2);
+//!   twelve the API knows ([`JOB_FAILURE_REASONS`], review findings B6 and C2);
 //!   anything else the job recorded is shown as [`LOAD_FAILED`].
 //! * **Fail closed on a table name.** A load may target a table that does not
 //!   exist or one this tenant's uploads claimed; never a connector's table,
@@ -72,6 +72,11 @@
 //!   (`lakehouse_store::uploads::claim_table`, review finding B4), not the
 //!   upload rows'. When the API cannot tell, it answers 503 and does not guess
 //!   that the name is free ([`ensure_table_free`]).
+//!   A name whose table was dropped from the console and can still be
+//!   restored is closed too (`DATA-55` D11, QA `LH-DATA-15-06`, `TC-1731`):
+//!   a new load would create a table of that name, and the dropped one could
+//!   no longer come back, so the answer is [`TABLE_DROPPED`] until the window
+//!   ends.
 //! * **One load per upload, and the row is claimed before the job is
 //!   launched** (review finding B2): see [`ingest`].
 //!
@@ -139,7 +144,7 @@ use lakehouse_clickhouse::ChError;
 use lakehouse_core::ApiError;
 use lakehouse_dagster::map_run_status;
 use lakehouse_store::PgPool;
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
 use lakehouse_store::connectors;
 use lakehouse_store::upload_folders;
 use lakehouse_store::uploads::{
@@ -157,6 +162,7 @@ use super::catalog::registered_slug;
 use super::catalog_source::{PresenceUnknown, iceberg_table_presence};
 use super::governance::{IngestRunRow, ingest_runs_or_empty};
 use super::lakehouse::is_unknown_table_or_database_error;
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::QUERY_STRING_UNREADABLE;
@@ -196,7 +202,7 @@ pub(super) const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
 /// session path already took (found in the measurement of
 /// `docs/plans/DATA-17-RESULT.md`). A bomb is decoded by range and counted,
 /// never held, so the size costs time and not memory. Plan T6.2, item 2.
-pub(super) const MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// What `DefaultBodyLimit` allows the `POST /api/uploads` request as a whole:
 /// the cap plus 1 MiB for the multipart framing around the file. Applied to
@@ -246,8 +252,9 @@ const UNKNOWN_RUN_BOUND: time::Duration = time::Duration::hours(1);
 /// How long a read waits for the orchestrator or for `ClickHouse` while it
 /// settles a loading upload. A bound so that a page that polls is not held
 /// for the whole request deadline by a hung connection; not a measurement.
-/// The upload is returned unchanged when it elapses.
-const SETTLE_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// The upload is returned unchanged when it elapses. The connector's run list
+/// uses it too, for the same reason.
+pub(super) const SETTLE_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The Dagster job that loads an uploaded file
 /// (`dagster/dispar_orchestrate/file_ingest.py`).
@@ -312,6 +319,10 @@ const CONNECTOR_TABLE: &str = "A connector loads that table, so a file cannot be
 /// `SEC-16`'s, replacing a sentence that said "no upload of this tenant
 /// created it".
 const TABLE_NOT_FREE: &str = "That table name cannot be used. Choose another name.";
+/// A load into a table that was dropped from the console and can still be
+/// restored (`DATA-55` D11). A new table of that name would make the dropped
+/// one impossible to undrop, so the name stays closed until the window ends.
+const TABLE_DROPPED: &str = "That table was dropped and can still be restored. Restore it from its page in the Catalog, or choose another name.";
 const TABLE_UNCHECKED: &str =
     "Could not check whether that table already exists, so nothing was loaded.";
 const NO_QUERY_DATABASE: &str = "Uploads need ICEBERG_QUERY_DB to be set, so the API can check that a table name is free. Nothing was loaded.";
@@ -340,10 +351,10 @@ const LOAD_FAILED: &str = "The load failed.";
 const RUN_UNKNOWN: &str = "The orchestrator no longer knows this load.";
 
 // The reasons `file_ingest_job` records when a load fails (plan T7). The API
-// shows a recorded reason only when it is one of these eleven (review finding
+// shows a recorded reason only when it is one of these twelve (review finding
 // B6): `ingest_run.error` is free text, so one `str(exc)` in the job would
 // otherwise put exception text, a host or a path into a response. These are
-// the same eleven as `ops/fixtures/upload_load_failure_reasons.json`, which a
+// the same twelve as `ops/fixtures/upload_load_failure_reasons.json`, which a
 // test below reads and which the job's own tests assert its constants against.
 
 const JOB_FILE_UNREADABLE: &str = "The stored file could not be read.";
@@ -362,14 +373,20 @@ const JOB_TOO_MANY_COLUMNS: &str = "The file has more than 1,000 columns.";
 // `DATA-18`: a load told to stop at a value that does not fit its column's type.
 const JOB_BAD_VALUES: &str = "Some values do not fit their column's type.";
 // `DATA-17` slice 4 (decision 2): the decoded bytes of a gzip or zip file passed the cap.
-const JOB_TOO_LARGE_UNPACKED: &str = "The file is larger than the upload limit once unpacked.";
+// No longer raised (`DATA-51` named the number): kept so a load an older job recorded
+// keeps its message, as `JOB_TOO_MANY_ROWS` did.
+const JOB_TOO_LARGE_UNPACKED_UNNAMED: &str =
+    "The file is larger than the upload limit once unpacked.";
 // PR #186 review SHOULD-FIX 1: the column list sent with the load is not the file's (a JSON key that
 // first appears after the rows the preview sampled), so the person is told to look at the preview again.
 const JOB_COLUMNS_NOT_PREVIEWED: &str = "The file's columns are not the ones the preview showed.";
+// `DATA-51` (`LH-DATA-17-13`): the same sentence as the API's own refusal once unpacked,
+// whose number comes from [`MAX_UNPACKED_BYTES`] (`Refusal::TooLargeUnpacked`).
+const JOB_TOO_LARGE_UNPACKED: &str = "The file is larger than the 2 GB limit once unpacked.";
 
 /// Every reason the job may record, in the order of
 /// `ops/fixtures/upload_load_failure_reasons.json`.
-const JOB_FAILURE_REASONS: [&str; 11] = [
+const JOB_FAILURE_REASONS: [&str; 12] = [
     JOB_FILE_UNREADABLE,
     JOB_HEADER_PAST_END,
     JOB_HEADER_NO_COLUMNS,
@@ -379,8 +396,9 @@ const JOB_FAILURE_REASONS: [&str; 11] = [
     JOB_NOT_REGISTERED,
     JOB_TOO_MANY_COLUMNS,
     JOB_BAD_VALUES,
-    JOB_TOO_LARGE_UNPACKED,
+    JOB_TOO_LARGE_UNPACKED_UNNAMED,
     JOB_COLUMNS_NOT_PREVIEWED,
+    JOB_TOO_LARGE_UNPACKED,
 ];
 
 fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
@@ -1042,9 +1060,30 @@ fn classify_head(head: &[u8], filename: &str) -> Result<Accepted, ApiError> {
         Kind::Gzip => GZIP,
         Kind::Avro if named == ByName::Plain(Format::Avro) => return Ok(Accepted::Avro),
         Kind::Avro => AVRO,
-        Kind::OtherBinary => OTHER_BINARY,
+        Kind::OtherBinary => return Err(ApiError::BadRequest(unreadable_as_named(filename))),
     };
     Err(ApiError::BadRequest(message.to_owned()))
+}
+
+/// The sentence for bytes that are neither text nor a kind this API knows, said by what the
+/// file's NAME claims it is (QA `LH-DATA-17-05`, `DATA-51`): a damaged file of a format this
+/// upload reads "could not be opened" as that format, which is a different answer from "this
+/// is not a format this upload reads". Every name has an answer, the last being [`OTHER_BINARY`]
+/// for a name that claims nothing, so the function returns no `Result` and needs no `# Errors`.
+fn unreadable_as_named(filename: &str) -> String {
+    if has_parquet_name(filename) {
+        return upload_parquet::ParquetFileError::Unreadable.to_string();
+    }
+    if has_workbook_name(filename) {
+        return upload_workbook::WorkbookError::Unreadable.to_string();
+    }
+    match upload_formats::by_name(filename) {
+        ByName::Plain(Format::Avro) => NOT_AVRO,
+        ByName::Plain(Format::Json | Format::JsonLines) => return Refusal::JsonInvalid.to_string(),
+        ByName::Gzip(_) | ByName::Zip => NOT_AN_ARCHIVE,
+        ByName::Plain(_) | ByName::Other => OTHER_BINARY,
+    }
+    .to_owned()
 }
 
 /// Text by its first bytes: delimited text, unless its name says JSON, JSON Lines or an
@@ -1299,7 +1338,7 @@ pub async fn create(
         json!({ "fileName": row.original_filename, "sizeBytes": row.size_bytes }),
         "executed",
     );
-    record_audit(pool, event).await;
+    audit_coverage::record_best_effort(&state, event).await;
     Ok((
         StatusCode::CREATED,
         ApiJson(CreateResponse {
@@ -1569,21 +1608,46 @@ impl<'a> Settler<'a> {
 
     /// Write `outcome` under `run_id`. A reader that lost the race, or lost
     /// the row to a delete, returns whatever is there now.
+    ///
+    /// `REL-15`: the report is read while the row is still `ingesting`, then
+    /// status, error, row count and bad values are written by ONE update
+    /// ([`uploads::mark_finished_with_bad_values`]). A reader that settles the
+    /// same run concurrently either wins that update — and gets the whole row
+    /// back — or re-reads the winner's row: nobody observes a terminal status
+    /// before its report. Reading first is safe: the job writes the report in
+    /// the `finally` around the load, before it records the run's outcome.
     async fn record(&self, row: Upload, run_id: Option<&str>, outcome: &Outcome) -> Upload {
+        let report = if run_id.is_some() {
+            columns::read_report(self.state, &row).await
+        } else {
+            None
+        };
         let settled = match outcome {
             Outcome::Ingested { rows } => {
-                uploads::mark_finished(self.pool, &row.id, run_id, None, *rows).await
+                uploads::mark_finished_with_bad_values(
+                    self.pool,
+                    &row.id,
+                    run_id,
+                    None,
+                    *rows,
+                    report.as_ref(),
+                )
+                .await
             }
             Outcome::Failed(reason) => {
-                uploads::mark_finished(self.pool, &row.id, run_id, Some(reason), None).await
+                uploads::mark_finished_with_bad_values(
+                    self.pool,
+                    &row.id,
+                    run_id,
+                    Some(reason),
+                    None,
+                    report.as_ref(),
+                )
+                .await
             }
         };
         match settled {
-            Ok(Some(updated)) => match run_id {
-                // `DATA-18`: a typed load may have left a report of values that did not fit.
-                Some(run_id) => columns::keep_report(self.state, self.pool, updated, run_id).await,
-                None => updated,
-            },
+            Ok(Some(updated)) => updated,
             Ok(None) => uploads::get(self.pool, &row.id)
                 .await
                 .ok()
@@ -1607,8 +1671,9 @@ pub(super) async fn settle_loading_upload(state: &AppState, pool: &PgPool, row: 
 
 /// `GET /api/uploads` — the active tenant's uploads, newest first, at most
 /// [`LIST_LIMIT`]. A caller in no tenant gets an empty list, never another
-/// tenant's. A loading upload is settled first. `folderId=<id>|none` and `q=<text>`
-/// narrow the list before the window is cut (`DATA-35`, [`ListQuery`]).
+/// tenant's. A loading upload is settled first. `folderId=<id>|none`,
+/// `q=<text>` and `table=<name>` narrow the list before the window is cut
+/// (`DATA-35`, `DATA-47`, [`ListQuery`]).
 ///
 /// # Errors
 ///
@@ -1636,6 +1701,13 @@ pub async fn list(
     // so a folder's files and a search are not hidden by newer files elsewhere. With
     // neither, this is the list it always was.
     let text = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
+    // `DATA-47` (QA `LH-DATA-35-03`): the Table step asks which uploads loaded into
+    // one table, by its exact raw name. An empty value is no filter, like `q`.
+    let table = query
+        .table
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
     let filter = ListFilter {
         folder: match query.folder_id.as_deref() {
             None | Some("") => FolderFilter::Any,
@@ -1643,6 +1715,7 @@ pub async fn list(
             Some(id) => FolderFilter::In(id),
         },
         text,
+        table,
     };
     let rows = uploads::list_filtered(pool, tenant_id, LIST_LIMIT, &filter).await?;
     let mut settler = Settler::new(&state, pool);
@@ -1653,7 +1726,7 @@ pub async fn list(
     Ok(ApiJson(views))
 }
 
-/// Query parameters of [`list`] (`DATA-35`, plan AD-5).
+/// Query parameters of [`list`] (`DATA-35`, plan AD-5; `DATA-47`).
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
     /// A folder id, or `none` for the files in no folder; absent: every file.
@@ -1661,6 +1734,8 @@ pub struct ListQuery {
     folder_id: Option<String>,
     /// Text a file name or a table name must contain, case-insensitively.
     q: Option<String>,
+    /// Exactly this raw table name; absent or empty: every table.
+    table: Option<String>,
 }
 
 /// `GET /api/uploads/{id}` — one upload, settled first if it is loading.
@@ -2564,8 +2639,12 @@ fn parse_ingest_request(
 ///    person that someone else has a connector writing a table of that name
 ///    (`SEC-16`).
 /// 2. The claim table's answer ([`uploads::table_claim`]): the name is this
-///    tenant's, and it is free to load into, whether or not the table exists
-///    yet; or it is another tenant's, and it is not.
+///    tenant's and no drop of it is on record inside its window, and it is
+///    free to load into, whether or not the table exists yet; or it is another
+///    tenant's, and it is not. A name this tenant's table was dropped from,
+///    while that table can still be restored, is [`TABLE_DROPPED`]
+///    (`DATA-55` D11): a new table of that name would make the dropped one
+///    impossible to bring back.
 /// 3. Nobody's claim: the table must not exist (a registry row or an Iceberg
 ///    table). Never "free" on a doubt.
 ///
@@ -2578,10 +2657,11 @@ fn parse_ingest_request(
 ///
 /// 409 for a connector's table ([`CONNECTOR_TABLE`] for the caller's own
 /// tenant's connector, otherwise [`TABLE_NOT_FREE`]), for a name another
-/// tenant holds, and for an existing table nobody claimed (those with the one
-/// sentence, [`TABLE_NOT_FREE`]); 503 when the question cannot be answered (Postgres,
-/// `ClickHouse` or the Iceberg query database did not give a definite
-/// answer, or there is no Iceberg query database to ask).
+/// tenant holds, for an existing table nobody claimed (those with the one
+/// sentence, [`TABLE_NOT_FREE`]), and for this tenant's table that was dropped
+/// and can still be restored ([`TABLE_DROPPED`]); 503 when the question
+/// cannot be answered (Postgres, `ClickHouse` or the Iceberg query database did
+/// not give a definite answer, or there is no Iceberg query database to ask).
 async fn ensure_table_free(
     state: &AppState,
     pool: &PgPool,
@@ -2613,8 +2693,25 @@ async fn ensure_table_free(
         .map_err(|err| unchecked(&err))?
     {
         // This tenant's own claim settles it, whether or not the table exists
-        // yet: replacing or adding to one's own table is the point.
-        TableClaim::Ours => return Ok(()),
+        // yet: replacing or adding to one's own table is the point — unless its
+        // table was dropped from the console and can still be restored
+        // (DATA-55 D11, QA LH-DATA-15-06, TC-1731). The load job would create a
+        // new table of that name, and the dropped one could no longer be
+        // undropped. The record is believed whether or not the table is there,
+        // and a table that IS there only heals it once the record is past its
+        // grace (`DATA-55` review R2, U5, `dropped_now`): a young record whose
+        // `DELETE` may still be on its way keeps the name closed, and a stale
+        // one cannot. An unreadable record is `unchecked` like its neighbours:
+        // 503, never an assumption that the name is free (fail closed).
+        TableClaim::Ours => {
+            if super::catalog_drop::dropped_now(state, pool, table)
+                .await
+                .map_err(|err| unchecked(&err))?
+            {
+                return Err(ApiError::Conflict(TABLE_DROPPED.to_owned()));
+            }
+            return Ok(());
+        }
         // Another tenant's claim, or a claim whose tenant is gone. The same
         // sentence as for an existing table nobody claimed, so the answer does
         // not say which it is.
@@ -2683,12 +2780,24 @@ fn upload_audit_event(
     }
 }
 
-/// Best effort: a failed audit write never fails, or undoes, the action it
-/// records.
-async fn record_audit(pool: &PgPool, event: NewAuditEvent) {
-    let action = event.action.clone();
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, action, "failed to record an upload audit event");
+/// Who a load is recorded as in the table's own history (`DATA-52`, QA
+/// `LH-DATA-15-08`): the display name of the person who pressed Load, and
+/// ` (file upload)` after it, so a version written by an upload says how it was
+/// written. A name with nothing usable in it is `file upload` alone rather than a
+/// bare suffix. Control characters go (a name is shown in a table's history) and
+/// the name is cut at [`MAX_STORED_TEXT_CHARS`], like every other stored text of
+/// an upload.
+fn load_author(display_name: &str) -> String {
+    let name: String = display_name
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_STORED_TEXT_CHARS)
+        .collect();
+    let name = name.trim();
+    if name.is_empty() {
+        "file upload".to_owned()
+    } else {
+        format!("{name} (file upload)")
     }
 }
 
@@ -2697,12 +2806,15 @@ async fn record_audit(pool: &PgPool, event: NewAuditEvent) {
 /// converted sheet of a workbook ([`converted_key`]). The config schema is
 /// closed, so nothing about the sheet can be added here. `load_keys` lists every
 /// file of the load, the primary first (`DATA-17` slice 5, plan AD5); the
-/// `bronze_table_name` path the `DATA-19` sensor reads does not move.
+/// `bronze_table_name` path the `DATA-19` sensor reads does not move. `author` is
+/// [`load_author`]'s answer for the person who started the load (`DATA-52`); the
+/// job takes it from this change on, so the schema stays closed.
 fn run_config(
     upload_id: &str,
     request: &IngestRequest,
     load_keys: &[String],
     (format, compression): (&str, &str),
+    author: &str,
 ) -> Value {
     let (columns, on_bad_value) = columns::run_config_columns(request.columns.as_ref());
     json!({
@@ -2721,6 +2833,7 @@ fn run_config(
                     "header_row": request.header_row,
                     "columns": columns,
                     "on_bad_value": on_bad_value,
+                    "author": author,
                 }
             }
         }
@@ -2812,12 +2925,13 @@ async fn launch(
     request: &IngestRequest,
     load_keys: &[String],
     kind: (&str, &str),
+    author: &str,
 ) -> Result<String, ApiError> {
     let failure = match state
         .dagster
         .launch_run_with_config(
             FILE_INGEST_JOB,
-            &run_config(&claimed.id, request, load_keys, kind),
+            &run_config(&claimed.id, request, load_keys, kind, author),
         )
         .await
     {
@@ -2833,11 +2947,12 @@ async fn launch(
             ApiError::Unavailable(LAUNCH_UNREACHABLE.to_owned())
         }
     };
-    if let Err(err) =
-        uploads::mark_finished(pool, &claimed.id, None, Some(COULD_NOT_START), None).await
-    {
-        tracing::warn!(%err, upload_id = %claimed.id, "a claim that could not be launched could not be settled");
-    }
+    settle_claim_failed(
+        pool,
+        claimed,
+        "a claim that could not be launched could not be settled",
+    )
+    .await;
     Err(failure)
 }
 
@@ -3023,6 +3138,18 @@ async fn claim_load(
             .into());
         }
     })
+}
+
+/// Settle a claim that will not be launched as failed, the one way every
+/// refusal after [`claim_load`] does (`DATA-55` review S9): the row must not sit
+/// at `ingesting` with no run. Best effort — a failure is logged with the
+/// caller's own words, and the caller's refusal is the answer either way.
+async fn settle_claim_failed(pool: &PgPool, claimed: &Upload, why: &'static str) {
+    if let Err(err) =
+        uploads::mark_finished(pool, &claimed.id, None, Some(COULD_NOT_START), None).await
+    {
+        tracing::warn!(%err, upload_id = %claimed.id, "{why}");
+    }
 }
 
 /// The folder a load puts its files in (`DATA-35` decision 2, plan AD-4): the one
@@ -3282,9 +3409,41 @@ pub async fn ingest(
 
     let claimed = claim_load(pool, &row, &request, folder, converted.as_ref(), limits).await?;
 
-    let run_id = launch(&state, pool, &claimed, &request, &load_keys, kind).await?;
+    // `DATA-55` review R3: the write comes first and the check second, so a drop
+    // recorded between `ensure_table_free` and this claim cannot pass its own
+    // check while this load passes its earlier one. The claim is already
+    // `ingesting`, so a refusal settles it as failed, the way a refused launch
+    // does — never leaving a row that just sits at `ingesting`.
+    match super::catalog_drop::dropped_now(&state, pool, &request.table).await {
+        Ok(false) => {}
+        Ok(true) => {
+            settle_claim_failed(
+                pool,
+                &claimed,
+                "a claim refused for a dropped table could not be settled",
+            )
+            .await;
+            return Err(ApiError::Conflict(TABLE_DROPPED.to_owned()).into());
+        }
+        Err(err) => {
+            // The record could not be read: whether the name is dropped is not
+            // known, so the load must not start — and must not stay loading.
+            settle_claim_failed(
+                pool,
+                &claimed,
+                "a claim that could not be checked could not be settled",
+            )
+            .await;
+            return Err(err.into());
+        }
+    }
+
+    // `DATA-52`: the author is the person who pressed Load, taken from the
+    // authenticated principal rather than from anything the request sent.
+    let author = load_author(&principal.display_name);
+    let run_id = launch(&state, pool, &claimed, &request, &load_keys, kind, &author).await?;
     let attached = finish_launch_and_audit(
-        pool,
+        &state,
         &principal,
         &claimed,
         run_id.clone(),
@@ -3310,7 +3469,7 @@ pub async fn ingest(
 /// way this happens is a row settled or was deleted between the launch and
 /// the attach — a logged error, not a panic).
 async fn finish_launch_and_audit(
-    pool: &PgPool,
+    state: &AppState,
     principal: &Principal,
     claimed: &Upload,
     run_id: String,
@@ -3318,6 +3477,7 @@ async fn finish_launch_and_audit(
     converted: Option<&Converted>,
     conversion: Option<Conversion>,
 ) -> ApiResult<Upload> {
+    let pool = pool(state)?;
     let Some(attached) = uploads::attach_run(pool, &claimed.id, &run_id).await? else {
         // Not reachable through this API: only an `ingesting` row with no run
         // takes a run, and nothing settles or deletes the claim in the
@@ -3357,7 +3517,7 @@ async fn finish_launch_and_audit(
         }
     }
     let event = upload_audit_event(principal, "upload.ingest", &attached.id, args, "executed");
-    record_audit(pool, event).await;
+    audit_coverage::record_best_effort(state, event).await;
     Ok(attached)
 }
 
@@ -3456,7 +3616,7 @@ pub async fn delete(
         map.insert("table".to_owned(), json!(table));
     }
     let event = upload_audit_event(&principal, "upload.delete", &row.id, args, "executed");
-    record_audit(pool, event).await;
+    audit_coverage::record_best_effort(&state, event).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3602,6 +3762,41 @@ mod tests {
             Accepted::Parquet
         );
         assert!(check_file(encrypted, "a.csv").is_err());
+    }
+
+    /// Bytes that are neither text nor a kind the API knows are answered by what the
+    /// file's name claims: "could not be opened" as that format, never "a format this
+    /// upload does not read" (QA `LH-DATA-17-05`, `DATA-51`).
+    #[test]
+    fn a_binary_file_named_like_an_accepted_format_is_told_it_could_not_be_opened() {
+        // The bytes of the "not text" case above: a NUL byte, so no reader takes it.
+        let binary = b"a,b\0c,d";
+        let refusal = |name: &str| check_file(binary, name).unwrap_err().to_string();
+        let sentences = [
+            (
+                "a.parquet",
+                upload_parquet::ParquetFileError::Unreadable.to_string(),
+            ),
+            (
+                "a.xlsx",
+                upload_workbook::WorkbookError::Unreadable.to_string(),
+            ),
+            ("a.avro", NOT_AVRO.to_owned()),
+            ("a.json", Refusal::JsonInvalid.to_string()),
+            ("a.csv.gz", NOT_AN_ARCHIVE.to_owned()),
+            ("a.zip", NOT_AN_ARCHIVE.to_owned()),
+        ];
+        for (name, sentence) in sentences {
+            assert_eq!(refusal(name), sentence, "{name}");
+            assert!(
+                !sentence.contains("not a file this upload reads"),
+                "{name} must not be answered as a format this upload does not read"
+            );
+        }
+        // A name that claims no format keeps the format-list sentence.
+        for name in ["a.bin", "a.pdf"] {
+            assert_eq!(refusal(name), OTHER_BINARY, "{name}");
+        }
     }
 
     #[test]
@@ -3778,6 +3973,30 @@ mod tests {
     fn the_unpacked_cap_is_2_gib_and_is_not_the_cap_of_a_whole_file() {
         assert_eq!(MAX_UNPACKED_BYTES, 2_147_483_648);
         assert_ne!(MAX_UNPACKED_BYTES, u64::try_from(MAX_UPLOAD_BYTES).unwrap());
+    }
+
+    /// `DATA-51` (QA `LH-DATA-17-13`): the refusal once unpacked names the cap, and the
+    /// job's recorded reason for it is that same sentence -- the API shows a recorded
+    /// reason only when it is one of [`JOB_FAILURE_REASONS`], so the two must not drift.
+    #[test]
+    fn the_unpacked_sentences_name_the_unpacked_cap() {
+        assert_eq!(
+            MAX_UNPACKED_BYTES % (1024 * 1024 * 1024),
+            0,
+            "the sentence says a whole number of GB"
+        );
+        let gigabytes = MAX_UNPACKED_BYTES / (1024 * 1024 * 1024);
+        assert_eq!(
+            JOB_TOO_LARGE_UNPACKED,
+            Refusal::TooLargeUnpacked.to_string()
+        );
+        let cap = format!("the {gigabytes} GB limit");
+        for sentence in [
+            JOB_TOO_LARGE_UNPACKED,
+            Refusal::TooLargeUnpacked.to_string().as_str(),
+        ] {
+            assert!(sentence.contains(&cap), "{sentence} must name {cap}");
+        }
     }
 
     #[test]
@@ -4119,7 +4338,13 @@ mod tests {
             "uploads/t/up-3.csv",
         ]
         .map(str::to_owned);
-        let config = run_config("up-1", &request, &keys, ("delimited", "none"));
+        let config = run_config(
+            "up-1",
+            &request,
+            &keys,
+            ("delimited", "none"),
+            "a person (file upload)",
+        );
         let job = &config["ops"]["ingest_uploaded_file"]["config"];
         assert_eq!(job["storage_keys"], json!(keys));
         assert_eq!(job["upload_id"], "up-1");
@@ -4150,6 +4375,7 @@ mod tests {
             &request,
             &["uploads/t/up-1.xlsx.converted.csv".to_owned()],
             ("delimited", "none"),
+            "a person (file upload)",
         );
         let job = &config["ops"]["ingest_uploaded_file"]["config"];
         assert_eq!(job["upload_id"], "up-1");
@@ -4164,6 +4390,40 @@ mod tests {
         assert!(
             job.get("sheet").is_none(),
             "the job's config schema is closed"
+        );
+    }
+
+    /// `DATA-52`: the job is told who started the load, as the API stores it.
+    #[test]
+    fn the_run_config_names_who_started_the_load() {
+        let request = parse_ingest_request(&body(&valid()), None, None).unwrap();
+        let config = run_config(
+            "up-1",
+            &request,
+            &["uploads/t/up-1.csv".to_owned()],
+            ("delimited", "none"),
+            "Rina Wijaya (file upload)",
+        );
+        let job = &config["ops"]["ingest_uploaded_file"]["config"];
+        assert_eq!(job["author"], "Rina Wijaya (file upload)");
+    }
+
+    /// `DATA-52` (QA `LH-DATA-15-08`): a name is shown in a table's history, so it
+    /// carries no control character and no more than a stored text does; and an
+    /// upload with no usable name says how it was written, not " (file upload)".
+    #[test]
+    fn the_author_of_a_load_is_the_name_without_control_characters_or_file_upload_alone() {
+        assert_eq!(load_author("Rina Wijaya"), "Rina Wijaya (file upload)");
+        assert_eq!(load_author("Rina\nWijaya\u{7}"), "RinaWijaya (file upload)");
+        assert_eq!(load_author("  Rina Wijaya  "), "Rina Wijaya (file upload)");
+        for nothing in ["", "   ", "\n\u{7}"] {
+            assert_eq!(load_author(nothing), "file upload", "{nothing:?}");
+        }
+        let long = "x".repeat(300);
+        let author = load_author(&long);
+        assert_eq!(
+            author,
+            format!("{} (file upload)", "x".repeat(MAX_STORED_TEXT_CHARS))
         );
     }
 
@@ -4329,8 +4589,8 @@ mod tests {
     }
 
     /// Review finding B6: a recorded reason reaches a response only when it is
-    /// one of the eleven the API knows (six before finding C2). Each of the
-    /// eleven is kept; text that is near one of them, text with detail added,
+    /// one of the twelve the API knows (six before finding C2). Each of the
+    /// twelve is kept; text that is near one of them, text with detail added,
     /// and exception text are all the fixed `The load failed.`.
     #[test]
     fn a_recorded_reason_is_shown_only_when_it_is_one_the_api_knows() {
@@ -4365,9 +4625,10 @@ mod tests {
         }
     }
 
-    /// Review findings B6 and C2: the eleven reasons the API knows are the
-    /// eleven in the file (Phase 3 slice 3 review BLOCKER 3: `DATA-18` added the ninth;
-    /// `DATA-17` slice 4 the tenth; PR #186 review SHOULD-FIX 1 the eleventh) the job's own tests assert its constants against
+    /// Review findings B6 and C2: the twelve reasons the API knows are the
+    /// twelve in the file (Phase 3 slice 3 review BLOCKER 3: `DATA-18` added the ninth;
+    /// `DATA-17` slice 4 the tenth; PR #186 review SHOULD-FIX 1 the eleventh;
+    /// `DATA-51` the twelfth) the job's own tests assert its constants against
     /// too, in the same order, so the two sides cannot drift apart
     /// unnoticed. Read here from test code only, with `include_str!`, so the
     /// release build of the API depends on nothing outside `rust/`.
@@ -4383,7 +4644,7 @@ mod tests {
         let mut distinct = JOB_FAILURE_REASONS.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
-        assert_eq!(distinct.len(), 11, "eleven different reasons");
+        assert_eq!(distinct.len(), 12, "twelve different reasons");
         assert!(
             !JOB_FAILURE_REASONS.contains(&LOAD_FAILED),
             "the fixed fallback is not one of the job's reasons"

@@ -27,10 +27,14 @@ this dlt pipeline's own working directory.
 This must run **inside the compose network** — Lakekeeper's `/v1/config`
 response includes the server's own canonical catalog URI
 (`LAKEKEEPER__BASE_URI`), which pyiceberg's `RestCatalog` honors and uses
-for every subsequent call. If `LAKEKEEPER__BASE_URI` is a host-facing
-address (`http://localhost:8181`, `docker-compose.yml`'s default), a
-catalog client running outside the compose network hangs/times out
-resolving that address's Docker-internal counterpart, or vice versa. The
+for every subsequent call (and so does the Rust client
+`iceberg-catalog-rest` the API itself uses). The compose default for that
+URI is the in-network name `http://lakekeeper:8181` (REL-19 review R1) —
+the address a client inside the network can reach. A client OUTSIDE the
+compose network — a `pyiceberg` run on the host, the host-side form of the
+G1 test — hangs or times out resolving that address's Docker-internal
+counterpart, and needs the host mapping
+(`LAKEKEEPER_BASE_URI=http://localhost:8181`) instead. The
 `g3a-test-runner` compose service (see `docker-compose.yml`) — like
 `g1-test-runner` before it — runs this pipeline as a container attached
 to the compose network, with `LAKEKEEPER_BASE_URI` set to the
@@ -250,6 +254,7 @@ def run_bronze_ingest(
     plan: LoadPlan = LoadPlan(),
     *,
     gate: Callable[[schema_observer.ReflectedTable], schema_observer.Decision] | None = None,
+    author: str = "",
 ) -> dict[str, Any]:
     """Run the dlt pipeline once: build the Postgres `sql_database` source
     (SSRF-checked and `hostaddr`-pinned per WS3 item 20, the rest
@@ -261,6 +266,12 @@ def run_bronze_ingest(
     Dagster op in `assets.py`) to attach as metadata and pass on to Bronze
     catalog registration. `plan` is the load mode (`adapters/sink.py`'s
     "Load modes"); the default appends, as this function always did.
+
+    `author` is the run's label, recorded on the commits this load makes as
+    `rantai.author` through `SinkConfig.author` (`DATA-52`, review round 1 R2):
+    the PostgreSQL connector's own load was the one sink path that recorded no
+    author while the documents said a connector's replace and append name their
+    run. Empty when the caller has no run context, which records none.
 
     # Errors
 
@@ -339,7 +350,7 @@ def run_bronze_ingest(
     # `resource.add_map(_stamp_ingested_at)` here, which meant the column
     # only existed on the ONE code path (this one) that remembered to add
     # it.
-    result = load_via_sink(source, cfg.bronze_table_name, SinkConfig.from_bronze_ingest_config(cfg), plan)
+    result = load_via_sink(source, cfg.bronze_table_name, SinkConfig.from_bronze_ingest_config(cfg, author=author), plan)
     if result.has_failed_jobs:
         # `load_info_str` (`str(load_info)`) can contain a file path --
         # fine in a raised exception that stays server-side (this op is

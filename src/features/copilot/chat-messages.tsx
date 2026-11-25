@@ -17,7 +17,11 @@ import {
   X,
 } from "lucide-react";
 import { Button, buttonVariants } from "@/components/ui/button";
+import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+// The clipboard API is missing over plain http, so the copy goes through
+// the helper that falls back to a textarea (`UX-6`).
+import { copyTextWithToast } from "@/lib/copy-text";
 import { formatRelativeTime } from "@/lib/format";
 import { settleStreamingMarkdown } from "@/lib/stream-markdown";
 import { cn } from "@/lib/utils";
@@ -26,6 +30,7 @@ import { askFromStep } from "./ask-options";
 import { BuildTree } from "./build-tree";
 import { MiniMarkdown } from "./mini-markdown";
 import { PendingActionCard } from "./pending-action-card";
+import { SavedStatusLines } from "./saved-status";
 import { SuggestionButton } from "./suggestion-button";
 import { FinishedToolRow, RunningToolRow, ToolStepCard, asObj, toolLabel } from "./tool-step";
 import { useSmoothText } from "./smooth-text";
@@ -190,7 +195,13 @@ function MessageFooter({
       <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-200 group-hover:opacity-100 group-focus-within:opacity-100 [@media(hover:none)]:opacity-100">
         <ActionButton
           label={copied ? "Copied" : "Copy message"}
-          onClick={() => void navigator.clipboard.writeText(msg.content).then(() => setCopied(true), () => {})}
+          onClick={() =>
+            // The check mark means "on the clipboard", so it flips only when
+            // the helper reports the copy worked (`UX-6` D2).
+            void copyTextWithToast(msg.content).then((copied) => {
+              if (copied) setCopied(true);
+            })
+          }
         >
           {copied ? <Check className="size-3 text-emerald-500" /> : <Copy className="size-3" />}
         </ActionButton>
@@ -217,7 +228,7 @@ function MessageFooter({
 /** The Copilot message list — rich rendering (tool rows, build tree, markdown). */
 export function ChatMessages({
   messages, busy, error, className, onRetry,
-  onConfirmTool, onCancelTool, onCompleteTool, confirmingKey,
+  onConfirmTool, onCancelTool, confirmingKey,
   onEdit, onDelete, onDismissError, onAnswerAsk, askNotice,
 }: {
   messages: Msg[];
@@ -230,8 +241,6 @@ export function ChatMessages({
   onConfirmTool?: (messageIndex: number, stepIndex: number) => void;
   /** Cancel a `needs_confirmation` tool step. */
   onCancelTool?: (messageIndex: number, stepIndex: number) => void;
-  /** Mark a pending step done with this result, without re-running the tool. */
-  onCompleteTool?: (messageIndex: number, stepIndex: number, result: Record<string, unknown>) => void;
   /** `"<messageIndex>:<stepIndex>"` of the step currently being confirmed. */
   confirmingKey?: string | null;
   /** Replace the user message at `index` and ask again from there. */
@@ -301,8 +310,12 @@ export function ChatMessages({
 
                 {isEditing ? (
                   <div className="space-y-2">
+                    {/* UX-4: the textarea is this box's one required input, so
+                        no star and no legend; it keeps `aria-required`. */}
+                    <Label htmlFor="edit-message">Edit message</Label>
                     <Textarea
-                      aria-label="Edit message"
+                      id="edit-message"
+                      aria-required
                       value={editing.text}
                       onChange={(e) => setEditing({ index: i, text: e.target.value })}
                       className="min-h-[60px] bg-background"
@@ -376,13 +389,15 @@ export function ChatMessages({
                       <div className="mt-2">
                         <PendingActionCard
                           step={pendingStep}
+                          messageIndex={i}
+                          stepIndex={pendingIndex}
                           confirming={confirmingKey === `${i}:${pendingIndex}`}
                           onConfirm={() => onConfirmTool?.(i, pendingIndex)}
                           onCancel={() => onCancelTool?.(i, pendingIndex)}
-                          onSavedInBuilder={(result) => onCompleteTool?.(i, pendingIndex, result)}
                         />
                       </div>
                     ) : null}
+                    {m.tools?.length ? <SavedStatusLines tools={m.tools} /> : null}
                     {m.chartCreated ? (
                       <Link
                         href="/dashboards"

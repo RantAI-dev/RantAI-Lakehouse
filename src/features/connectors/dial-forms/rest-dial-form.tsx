@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import type { RestAuth, RestDial, RestEndpoint, RestPagination } from "@/services/contracts/connectors"
@@ -88,9 +89,10 @@ export function RestDialForm({
   return (
     <div className="grid gap-3">
       <div className="space-y-1.5">
-        <Label htmlFor="rest-dial-base-url">Base URL</Label>
+        <Label htmlFor="rest-dial-base-url" required>Base URL</Label>
         <Input
           id="rest-dial-base-url"
+          aria-required
           value={dial.baseUrl}
           onChange={(e) => set("baseUrl", e.target.value)}
           placeholder="https://api.example.com"
@@ -100,24 +102,22 @@ export function RestDialForm({
 
       <div className="space-y-1.5">
         <Label htmlFor="rest-dial-auth-type">Auth type</Label>
-        <select
+        {/* WEB-9 D3: the console's one dropdown; the five auth types and their
+            order are unchanged, labelled with the API's own words. */}
+        <SelectField
           id="rest-dial-auth-type"
-          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+          className="w-full"
           value={dial.auth.type}
-          onChange={(e) => set("auth", defaultAuth(e.target.value as RestAuth["type"]))}
-        >
-          {AUTH_TYPES.map((t) => (
-            <option key={t} value={t}>
-              {t}
-            </option>
-          ))}
-        </select>
+          options={AUTH_TYPES.map((t) => ({ value: t, label: t }))}
+          onValueChange={(next) => set("auth", defaultAuth(next as RestAuth["type"]))}
+        />
       </div>
       {dial.auth.type === "api_key" ? (
         <div className="space-y-1.5">
-          <Label htmlFor="rest-dial-auth-header">Header name</Label>
+          <Label htmlFor="rest-dial-auth-header" required>Header name</Label>
           <Input
             id="rest-dial-auth-header"
+            aria-required
             value={dial.auth.header}
             onChange={(e) => set("auth", { type: "api_key", header: e.target.value })}
             placeholder="X-API-Key"
@@ -127,9 +127,10 @@ export function RestDialForm({
       ) : null}
       {dial.auth.type === "oauth2_client_credentials" ? (
         <div className="space-y-1.5">
-          <Label htmlFor="rest-dial-auth-token-url">Token URL</Label>
+          <Label htmlFor="rest-dial-auth-token-url" required>Token URL</Label>
           <Input
             id="rest-dial-auth-token-url"
+            aria-required
             value={dial.auth.tokenUrl}
             onChange={(e) => set("auth", { type: "oauth2_client_credentials", tokenUrl: e.target.value })}
             autoComplete="off"
@@ -148,22 +149,25 @@ export function RestDialForm({
 
       <div className="space-y-1.5">
         <Label htmlFor="rest-dial-pagination-type">Pagination</Label>
-        <select
+        {/* WEB-9 D3: the same three choices, in the same order. */}
+        <SelectField
           id="rest-dial-pagination-type"
-          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+          className="w-full"
           value={dial.pagination.type}
-          onChange={(e) => set("pagination", defaultPagination(e.target.value as RestPagination["type"]))}
-        >
-          <option value="none">None</option>
-          <option value="page">Page number</option>
-          <option value="cursor">Cursor</option>
-        </select>
+          options={[
+            { value: "none", label: "None" },
+            { value: "page", label: "Page number" },
+            { value: "cursor", label: "Cursor" },
+          ]}
+          onValueChange={(next) => set("pagination", defaultPagination(next as RestPagination["type"]))}
+        />
       </div>
       {dial.pagination.type === "page" ? (
         <div className="space-y-1.5">
-          <Label htmlFor="rest-dial-pagination-param">Page query parameter</Label>
+          <Label htmlFor="rest-dial-pagination-param" required>Page query parameter</Label>
           <Input
             id="rest-dial-pagination-param"
+            aria-required
             value={dial.pagination.param}
             onChange={(e) => set("pagination", { type: "page", param: e.target.value })}
             autoComplete="off"
@@ -172,9 +176,10 @@ export function RestDialForm({
       ) : null}
       {dial.pagination.type === "cursor" ? (
         <div className="space-y-1.5">
-          <Label htmlFor="rest-dial-pagination-cursor-field">Cursor field (JSON path)</Label>
+          <Label htmlFor="rest-dial-pagination-cursor-field" required>Cursor field (JSON path)</Label>
           <Input
             id="rest-dial-pagination-cursor-field"
+            aria-required
             value={dial.pagination.cursorField}
             onChange={(e) => set("pagination", { type: "cursor", cursorField: e.target.value })}
             autoComplete="off"
@@ -184,12 +189,20 @@ export function RestDialForm({
 
       <div className="space-y-2">
         <p className="text-sm font-medium">Endpoints</p>
+        {/* UX-1-R5: every endpoint path is polled at runtime (`RestDial.
+            endpoints` is a Vec with all entries used), so every rendered
+            row's Path is required — not just the first. Records path stays
+            optional; Remove drops an unused endpoint. */}
+        <p className="text-xs text-muted-foreground">
+          Every listed endpoint is polled, so each Path is required; use Remove endpoint for one you do not need.
+        </p>
         {dial.endpoints.map((endpoint, index) => (
           <div key={index} className="grid gap-2 sm:grid-cols-2">
             <div className="space-y-1.5">
-              <Label htmlFor={`rest-dial-endpoint-${index}-path`}>Path</Label>
+              <Label htmlFor={`rest-dial-endpoint-${index}-path`} required>Path</Label>
               <Input
                 id={`rest-dial-endpoint-${index}-path`}
+                aria-required
                 value={endpoint.path}
                 onChange={(e) => setEndpoint(index, { ...endpoint, path: e.target.value })}
                 placeholder="/v1/records"

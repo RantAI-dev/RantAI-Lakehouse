@@ -33,7 +33,8 @@ use lakehouse_store::upload_folders::{self, FolderError, FolderPatch, ParentChan
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use super::{BODY_NOT_AN_OBJECT, FOLDER_ID_RULE, NOT_FOUND, pool, record_audit};
+use super::{BODY_NOT_AN_OBJECT, FOLDER_ID_RULE, NOT_FOUND, pool};
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
@@ -230,7 +231,7 @@ pub async fn create(
         Some(&id),
         args,
     );
-    record_audit(pool(&state)?, event).await;
+    audit_coverage::record_best_effort(&state, event).await;
     Ok((StatusCode::CREATED, ApiJson(made)))
 }
 
@@ -277,8 +278,8 @@ pub async fn update(
         // The name the folder ended up with, not the one that was typed: the
         // store trims it (`PR #259 review SHOULD-FIX 5`).
         let args = json!({ "name": changed.name });
-        record_audit(
-            pool,
+        audit_coverage::record_best_effort(
+            &state,
             folder_audit_event(
                 &principal,
                 "upload.folder.rename",
@@ -291,8 +292,8 @@ pub async fn update(
     }
     if parent != FolderRef::Absent {
         let args = json!({ "parentId": changed.parent_id });
-        record_audit(
-            pool,
+        audit_coverage::record_best_effort(
+            &state,
             folder_audit_event(
                 &principal,
                 "upload.folder.move",
@@ -332,7 +333,7 @@ pub async fn delete(
         Some(&id),
         json!({}),
     );
-    record_audit(pool, event).await;
+    audit_coverage::record_best_effort(&state, event).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -377,8 +378,8 @@ pub async fn move_uploads(
             other => refusal(other),
         })?;
     let args = json!({ "uploadIds": upload_ids, "folderId": folder });
-    record_audit(
-        pool,
+    audit_coverage::record_best_effort(
+        &state,
         folder_audit_event(&principal, "upload.move", "upload", None, args),
     )
     .await;

@@ -941,7 +941,8 @@ pub fn kpi_trend_sql(
     } else if agg == Aggregate::Count {
         "count()".to_owned()
     } else {
-        format!("round({agg}({measure}))")
+        // QA LH-BI-6-04 (BI-55, D4).
+        agg.rounded(measure.as_str())
     };
     Some(format!(
         "SELECT * FROM (SELECT {column}, {value} AS v FROM {} WHERE {column} IS NOT NULL \
@@ -1290,7 +1291,7 @@ mod tests {
             &TimeContext::default(),
         )
         .unwrap();
-        assert!(sql.starts_with("SELECT * FROM (SELECT t, round(sum(v)) AS v FROM (SELECT date_trunc('week', toTimeZone(t, 'Asia/Jakarta')) AS t, v FROM (SELECT * FROM serving.mart_demo WHERE x = 'a') AS flt) AS bkt WHERE t IS NOT NULL GROUP BY t ORDER BY t DESC LIMIT 12) ORDER BY t"), "{sql}");
+        assert!(sql.starts_with("SELECT * FROM (SELECT t, round(sum(v), 6) AS v FROM (SELECT date_trunc('week', toTimeZone(t, 'Asia/Jakarta')) AS t, v FROM (SELECT * FROM serving.mart_demo WHERE x = 'a') AS flt) AS bkt WHERE t IS NOT NULL GROUP BY t ORDER BY t DESC LIMIT 12) ORDER BY t"), "{sql}");
         let goal = compare(r#"{"compare":{"kind":"goal","value":3}}"#)
             .unwrap()
             .unwrap();

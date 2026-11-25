@@ -6,8 +6,7 @@
 // network.
 import { act, cleanup, fireEvent, render, renderHook, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
-import * as notify from "@/lib/notify"
-import { QUERY_DRAFT_KEY } from "@/lib/query-draft"
+import { LEGACY_QUERY_DRAFT_KEY, queryDraftKey } from "@/lib/query-draft"
 import { assetService, queryService } from "@/services"
 import { ServiceError } from "@/services/errors"
 import { QueryTabBar } from "./query-tab-bar"
@@ -28,7 +27,7 @@ function stubServices() {
 
 /** The bar with the hook behind it, and the SQL of the open tab on screen. */
 function Harness() {
-  const studio = useQueryStudio()
+  const studio = useQueryStudio(queryDraftKey("u1", null))
   return (
     <>
       <QueryTabBar studio={studio} />
@@ -65,7 +64,7 @@ function openSql(): string {
 /** Stores the tabs the way the browser keeps them. */
 function seedTabs(tabs: { id: string; name: string; sql: string; engine: string }[], activeId: string) {
   window.localStorage.setItem(
-    QUERY_DRAFT_KEY,
+    queryDraftKey("u1", null),
     JSON.stringify({ tabs, activeId, question: "", tab: "sql" })
   )
 }
@@ -180,9 +179,13 @@ describe("QueryTabBar", () => {
     expect(openTabName()).toBe("Orders")
   })
 
-  it("refuses a tab beyond the limit the browser keeps and says so", async () => {
+  // QS-11 (LH-QS-1-03), D9: the limit is said on the page, beside a disabled
+  // "+", not in a toast that vanishes. This replaces the toast-pinning test
+  // because the rule changed, not because the behaviour stopped being tested.
+  const LIMIT_SENTENCE = "At most 20 query tabs are kept. Close a tab to open another."
+
+  it("disables the add button and says why at 20 tabs", async () => {
     stubServices()
-    const notifyInfo = spyOn(notify, "notifyInfo")
     seedTabs(
       Array.from({ length: 20 }, (_, index) => ({
         id: `t${index}`,
@@ -195,24 +198,48 @@ describe("QueryTabBar", () => {
     render(<Harness />)
 
     await waitFor(() => expect(tabButtons().length).toBe(20))
-    fireEvent.click(screen.getByRole("button", { name: "Add query tab" }))
-
+    const add = screen.getByRole("button", { name: "Add query tab" }) as HTMLButtonElement
+    expect(add.disabled).toBe(true)
+    expect(screen.getByText(LIMIT_SENTENCE)).toBeTruthy()
+    fireEvent.click(add)
     expect(tabButtons().length).toBe(20)
-    expect(notifyInfo).toHaveBeenCalledTimes(1)
-    expect(String(notifyInfo.mock.calls[0]?.[0] ?? "")).toContain("20")
   })
 
-  it("shows the draft that came before the tabs as one tab named Query 1", async () => {
+  it("keeps the add button enabled with no limit sentence below 20 tabs", async () => {
+    stubServices()
+    seedTabs(
+      Array.from({ length: 19 }, (_, index) => ({
+        id: `t${index}`,
+        name: `Query ${index + 1}`,
+        sql: `SELECT ${index}`,
+        engine: "clickhouse",
+      })),
+      "t0"
+    )
+    render(<Harness />)
+
+    await waitFor(() => expect(tabButtons().length).toBe(19))
+    const add = screen.getByRole("button", { name: "Add query tab" }) as HTMLButtonElement
+    expect(add.disabled).toBe(false)
+    expect(screen.queryByText(LIMIT_SENTENCE)).toBeNull()
+  })
+
+  // QA LH-QS-1-04 (QS-8), decision 12: the entry every person on this
+  // browser shared before this release has no owner, so it is removed rather
+  // than shown to whoever signs in now. This replaces the test that pinned
+  // the opposite ("shows the draft that came before the tabs as one tab"),
+  // because the rule changed, not because the behaviour became untestable.
+  it("does not show the draft stored under the old shared key, and removes it", async () => {
     stubServices()
     window.localStorage.setItem(
-      QUERY_DRAFT_KEY,
+      LEGACY_QUERY_DRAFT_KEY,
       JSON.stringify({ sql: "SELECT 1", question: "", tab: "sql" })
     )
     render(<Harness />)
 
-    await waitFor(() => expect(openSql()).toBe("SELECT 1"))
-    expect(tabButtons().length).toBe(1)
-    expect(openTabName()).toBe("Query 1")
+    await waitFor(() => expect(tabButtons().length).toBe(1))
+    expect(openSql()).not.toBe("SELECT 1")
+    await waitFor(() => expect(window.localStorage.getItem(LEGACY_QUERY_DRAFT_KEY)).toBeNull())
   })
 
   it("finds the tabs and their SQL again after a reload", async () => {
@@ -241,7 +268,7 @@ describe("useQueryStudio results", () => {
   it("keeps the rows with the tab that ran them", async () => {
     stubServices()
     const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
-    const hook = renderHook(() => useQueryStudio())
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
 
     await act(async () => {
       hook.result.current.setSql("SELECT 1")
@@ -268,7 +295,7 @@ describe("useQueryStudio results", () => {
     spyOn(queryService, "run")
       .mockResolvedValueOnce(RESULT as never)
       .mockRejectedValueOnce(new ServiceError("invalid_request", "unknown column"))
-    const hook = renderHook(() => useQueryStudio())
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
 
     await act(async () => {
       hook.result.current.setSql("SELECT 1")

@@ -1,5 +1,6 @@
 import type {
   LakehouseCapacity,
+  LakehouseCompactionStatus,
   LakehouseMaintenance,
   LakehouseNamespace,
   LakehouseService,
@@ -9,9 +10,10 @@ import type {
   MaintenancePolicyResult,
 } from "../contracts/lakehouse"
 import { apiFetch } from "../http"
-import { ServiceError } from "../errors"
+import { ServiceError, deniedFor } from "../errors"
 import {
   lakehouseCapacityUrl,
+  lakehouseCompactionStatusUrl,
   lakehouseMaintenanceUrl,
   lakehouseNamespacesUrl,
   lakehouseTableDetailUrl,
@@ -32,14 +34,15 @@ async function request<T>(
   const res = await apiFetch(url, init)
   const json = await res.json()
   if (!res.ok) {
+    // QA TC-1724 (WEB-12): a refusal goes through deniedFor.
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
     const kind =
-      res.status === 401 || res.status === 403
-        ? "permission_denied"
-        : res.status === 404
-          ? "not_found"
-          : res.status >= 500 || res.status === 503
-            ? "unavailable"
-            : "invalid_request"
+      res.status === 404
+        ? "not_found"
+        : res.status >= 500 || res.status === 503
+          ? "unavailable"
+          : "invalid_request"
     throw new ServiceError(kind, json?.error ?? fallbackMessage)
   }
   return json as T
@@ -74,6 +77,13 @@ export const icebergLakehouseService: LakehouseService = {
       lakehouseTableDetailUrl(namespace, table),
       { cache: "no-store", signal },
       "Lakehouse table detail could not be loaded"
+    )
+  },
+  async getCompactionStatus(signal) {
+    return request<LakehouseCompactionStatus>(
+      lakehouseCompactionStatusUrl(),
+      { cache: "no-store", signal },
+      "Lakehouse compaction status could not be loaded"
     )
   },
   async getMaintenance(namespace, table, signal) {

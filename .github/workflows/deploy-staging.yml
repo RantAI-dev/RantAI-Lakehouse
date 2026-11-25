@@ -11,8 +11,105 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ── The Rust release build happens HERE, in CI ────────────────────────────
+  #
+  # Why this job exists: `lakehouse-api`'s image is built by
+  # `rust/Dockerfile`, which runs `cargo build --release --locked -p
+  # lakehouse-api`. Until now that compile ran ON the staging VM, in the
+  # middle of `docker compose up --build`, NEXT TO the whole running
+  # stack -- the API, Postgres, Trino, ClickHouse, Kafka, the Dagster code
+  # location and the Dagster webserver and daemon, on 8 vCPU and 8 GiB.
+  # That is what the deploy's build used to starve on: the bake stopped
+  # right after its last "exporting attestation manifest" line and sat in
+  # `futex_wait` until the run was cancelled (runs 44596923569 and
+  # 44666444411, 17 and 28 minutes of a 120-minute budget).
+  #
+  # The same build, on a GitHub-hosted runner, takes the same CPU away
+  # from the VM. The image arrives as an artifact, is loaded into the
+  # VM's docker, and the deploy starts it WITHOUT building it again.
+  build-api-image:
+    name: Build the API image (in CI, not on the VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # The same build `ci.yml`'s `images` job makes, with the same
+      # arguments and the same layer cache, so it is a cache hit and takes
+      # a couple of minutes instead of a quarter of an hour:
+      #
+      #   * `GIT_SHA` is deliberately NOT passed (the same reason as in
+      #     `ci.yml`): `ARG GIT_SHA` sits near the top of `rust/Dockerfile`,
+      #     so a per-commit value would invalidate every layer below it and
+      #     the cache would never hit. The image therefore carries
+      #     `GIT_SHA=unknown`, and the deploy sets the real commit at RUN
+      #     time: `docker-compose.yml`'s `lakehouse-api` service carries
+      #     `GIT_SHA` in its `environment:` block, which overrides the
+      #     image's `ENV`, and `check_commit` reads the run-time value, not
+      #     the baked one. `scripts/compose.sh` exports
+      #     `GIT_SHA=$(git rev-parse HEAD)` -- the SAME value the code
+      #     location's image is built with -- so the API and the code
+      #     location agree, and the console's op-source view still matches.
+      #     The "Verify the API and the code location run the same commit"
+      #     step below proves that on the VM instead of assuming it.
+      #   * `CARGO_TARGET_DIR` and the `pipeline_src` build context are the
+      #     same as in `ci.yml` and in `docker-compose.yml`, so the GHA
+      #     cache hits. The cache is READ here and never written: the
+      #     repository's Actions cache is capped at 10 GB and `ci.yml`'s
+      #     `images` job is the one that keeps it.
+      - name: Build the lakehouse-api image
+        uses: docker/build-push-action@v7
+        with:
+          context: rust
+          file: rust/Dockerfile
+          build-contexts: |
+            pipeline_src=dagster/dispar_orchestrate
+          build-args: |
+            CARGO_TARGET_DIR=/build/target-layer
+          tags: rantai-lakehouse-api:ci
+          outputs: type=docker,dest=${{ runner.temp }}/lakehouse-api.tar
+          cache-from: type=gha,scope=api-image
+
+      # `zstd` and `compression-level: 0`: the artifact service would
+      # otherwise deflate an already-compressed file a second time for
+      # nothing.
+      #
+      # `-o` names the output EXPLICITLY. It is not decoration: zstd's
+      # positional arguments are all INPUT files, and the output name is
+      # derived from the input. Writing `zstd --rm a.tar a.tar.zst` asks
+      # zstd to compress TWO inputs -- `a.tar` and `a.tar.zst` -- and the
+      # second one is the output of the first, so it gets compressed a
+      # second time into `a.tar.zst.zst` and `--rm` then deletes the
+      # `a.tar.zst` the artifact step needs. That is exactly what the
+      # first run of this workflow did (run 44686403380): the archive
+      # compressed fine, the file it produced was gone, and the deploy
+      # job never started.
+      - name: Compress the image archive
+        run: |
+          cd "$RUNNER_TEMP"
+          zstd -T0 -3 --rm -o lakehouse-api.tar.zst lakehouse-api.tar
+          ls -l lakehouse-api.tar.zst
+          # The archive has to survive the round trip: the VM pipes it
+          # straight into `docker load`, and a truncated archive there
+          # looks like a corrupt image rather than a broken upload.
+          zstd -dc lakehouse-api.tar.zst | wc -c
+
+      - name: Upload the API image
+        uses: actions/upload-artifact@v7
+        with:
+          name: staging-api-image
+          path: ${{ runner.temp }}/lakehouse-api.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
   deploy:
     name: Deploy to staging VM
+    needs: build-api-image
     # Runs on the VM via self-hosted runner registered with label "staging"
     runs-on: [self-hosted, staging]
     environment:
@@ -72,16 +169,50 @@ jobs:
             sed -i "/^$name=/d" .env
             printf '\n%s=%s\n' "$name" "$value" >> .env
           done
-          # TENANT_WAREHOUSE_S3_* used to fall back to the RustFS credentials in .env.example (the
-          # same value as the RustFS keys, ADR 0002 Addendum 2 "may equal,
-          # must never alias"); keep staging's tenant provisioning working.
+          # SEC-78: the console's runtime role's password, DERIVED from the
+          # superuser's password instead of being a new repository secret
+          # (owner's decision): the role's password follows the
+          # superuser's, and a leak of the superuser password already opens
+          # the whole database. The derivation is one-way, so the derived
+          # value cannot be turned back into the superuser's password, and
+          # `lakehouse-db-migrate` sets the role's password on every run —
+          # a rotation of STAGING_POSTGRES_PASSWORD carries through on the
+          # next deploy.
+          #
+          # base64url (`urlsafe_b64encode`), not plain base64: a plain base64
+          # value can hold `/` or `+`, and compose builds a DSN out of this
+          # value.
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "::error::python3 is not available on this host; it derives the console's database role password (SEC-78)"
+            exit 1
+          fi
+          # The key comes from the environment, never from the command line:
+          # a command-line argument is readable by every local user through
+          # /proc while the process runs.
+          app_pw="$(printf %s lakehouse_app | python3 -c 'import base64, hashlib, hmac, os, sys; key = os.environ["STAGING_POSTGRES_PASSWORD"].encode(); print(base64.urlsafe_b64encode(hmac.new(key, sys.stdin.buffer.read(), hashlib.sha256).digest()).decode())')"
+          # Masked before anything can print it. The value itself is never
+          # echoed, and this step runs without `set -x`.
+          echo "::add-mask::$app_pw"
+          sed -i '/^LAKEHOUSE_DB_APP_PASSWORD=/d' .env
+          printf '\nLAKEHOUSE_DB_APP_PASSWORD=%s\n' "$app_pw" >> .env
+          # The same derivation for Dagster's role, with its own label. A
+          # separate password per role: one value would give the code
+          # location the console's rights too.
+          dagster_pw="$(printf %s lakehouse_dagster | python3 -c 'import base64, hashlib, hmac, os, sys; key = os.environ["STAGING_POSTGRES_PASSWORD"].encode(); print(base64.urlsafe_b64encode(hmac.new(key, sys.stdin.buffer.read(), hashlib.sha256).digest()).decode())')"
+          echo "::add-mask::$dagster_pw"
+          sed -i '/^LAKEHOUSE_DB_DAGSTER_PASSWORD=/d' .env
+          printf '\nLAKEHOUSE_DB_DAGSTER_PASSWORD=%s\n' "$dagster_pw" >> .env
+          # TENANT_WAREHOUSE_S3_* are empty in the fresh-install template
+          # (they used to fall back to the RustFS credentials, the same
+          # value as the RustFS keys, ADR 0002 Addendum 2 "may equal, must
+          # never alias"); keep staging's tenant provisioning working.
           sed -i '/^TENANT_WAREHOUSE_S3_ACCESS_KEY=/d;/^TENANT_WAREHOUSE_S3_SECRET_KEY=/d' .env
           printf '\nTENANT_WAREHOUSE_S3_ACCESS_KEY=%s\nTENANT_WAREHOUSE_S3_SECRET_KEY=%s\n' \
             "$STAGING_RUSTFS_ACCESS_KEY" "$STAGING_RUSTFS_SECRET_KEY" >> .env
           # File upload storage (DATA-9, DATA-17): compose defaults
           # RUSTFS_ACCESS_KEY_SECRET_REF / RUSTFS_SECRET_KEY_SECRET_REF to
           # env:UPLOAD_S3_ACCESS_KEY / env:UPLOAD_S3_SECRET_KEY, and since SEC-18
-          # (#83) .env.example ships both empty, so on staging every upload
+          # (#83) the template leaves both empty, so on staging every upload
           # answered "Upload storage is not configured." Same RustFS keys as the
           # tenant warehouse above; a separate upload key may replace them later.
           sed -i '/^UPLOAD_S3_ACCESS_KEY=/d;/^UPLOAD_S3_SECRET_KEY=/d' .env
@@ -89,7 +220,7 @@ jobs:
             "$STAGING_RUSTFS_ACCESS_KEY" "$STAGING_RUSTFS_SECRET_KEY" >> .env
           # Paid provider credential, kept OUT of the repo (this repo is
           # public): inject it as the ONLY LLM_KEY= line in the file.
-          # .env.example ships an empty `LLM_KEY=` too; compose resolves
+          # .env.example leaves `LLM_KEY` commented out; compose resolves
           # a duplicated .env key last-wins, but the line must actually
           # START a line — .env.staging historically ended without a
           # trailing newline, so a naive append glued LLM_KEY= onto its
@@ -116,7 +247,9 @@ jobs:
           missing=""
           for name in AUTH_BOOTSTRAP_PASSWORD AGENT_RUN_TOKEN GOLD_EXPORT_RUN_TOKEN \
                       INGEST_SERVICE_TOKEN ALERTS_RUN_TOKEN PIPELINE_RUN_TOKEN \
-                      LAKEHOUSE_MAINTENANCE_TOKEN EMBED_SECRET CONNECTOR_SECRETS_KEY; do
+                      LAKEHOUSE_MAINTENANCE_TOKEN EMBED_SECRET CONNECTOR_SECRETS_KEY \
+                      KEYCLOAK_ADMIN_PASSWORD OIDC_CLIENT_SECRET \
+                      SSO_USER_A_PASSWORD SSO_USER_B_PASSWORD SSO_USER_C_PASSWORD; do
             var="STAGING_${name}"
             value="${!var}"
             if [ -z "$value" ]; then
@@ -134,6 +267,85 @@ jobs:
           # here: without the repo secret PDF export is simply not set up on staging.
           printf '\nRENDER_TOKEN_SECRET=%s\n' "$STAGING_RENDER_TOKEN_SECRET" >> .env
           printf '\nCONSOLE_INTERNAL_URL=%s\n' 'http://lakehouse-frontend:3000' >> .env
+          # ── Single sign-on (Keycloak) ─────────────────────────────────────
+          # The staging deployment signs in through the Keycloak this workflow
+          # starts (`ops/sso/docker-compose.staging-keycloak.override.yml`).
+          #
+          # The ADDRESS is not a secret and not in the repository: it is this
+          # deployment's own address, and `AGENTS.md` rule 12 keeps real
+          # hostnames, IPs and ports out of the code and the docs. It comes
+          # from the `staging` environment's variable `SSO_PUBLIC_BASE_URL`.
+          # It is required, not optional: without it the stack would come up
+          # with SSO silently off, and the next person would read "the login
+          # button is missing" as a bug in the console instead of a missing
+          # address here. Fail closed instead.
+          if [ -z "$SSO_PUBLIC_BASE_URL" ]; then
+            echo "::error::the staging environment variable SSO_PUBLIC_BASE_URL is not set (Settings > Environments > staging > Configuration variables); it is the address the browser reaches Keycloak on"
+            exit 1
+          fi
+          # The realm's name is the last segment of the issuer
+          # (`{base}/realms/{realm}`), and the API compares a token's `iss`
+          # with the configured issuer byte for byte -- so the realm, the
+          # issuer and Keycloak's own hostname are all built from this one
+          # value.
+          sso_realm="${SSO_REALM:-lakehouse}"
+          sso_issuer="${SSO_PUBLIC_BASE_URL%/}/realms/${sso_realm}"
+          # The console's own address is where the browser comes back to, and
+          # the session cookie is set on THAT origin -- so the callback is
+          # the console's address, not the API's. The console proxies
+          # `/api/*` to the API (`next.config.ts`'s rewrites), so the callback
+          # reaches the API through the same origin the person signed in on.
+          sso_console="${SSO_CONSOLE_URL:-${SSO_PUBLIC_BASE_URL%/}}"
+          sso_redirect="${sso_console%/}/api/auth/oidc/callback"
+          # Every setting the browser flow needs is written here, because the
+          # console's own SSO form refuses an issuer that is not `https://`
+          # and an address that resolves inside the deployment's network
+          # (the SSRF guard) -- see "Internal IdP via .env" in
+          # docs/OPERATIONS.md. Staging is plain HTTP on the office LAN, so
+          # the connection is owned by the environment.
+          for name in OIDC_ISSUER OIDC_CLIENT_ID OIDC_PROVIDER_NAME \
+                      OIDC_AUTHORIZE_URL OIDC_TOKEN_URL OIDC_JWKS_URL \
+                      OIDC_REDIRECT_URI OIDC_GROUPS_CLAIM OIDC_ROLE_MAP \
+                      OIDC_JIT_PROVISIONING OIDC_TRUST_EMAIL OIDC_PROMPT \
+                      OIDC_POST_LOGOUT_REDIRECT_URI \
+                      SSO_PUBLIC_BASE_URL SSO_REALM; do
+            sed -i "/^${name}=/d" .env
+          done
+          {
+            printf '\nSSO_PUBLIC_BASE_URL=%s\n' "$SSO_PUBLIC_BASE_URL"
+            printf 'SSO_REALM=%s\n' "$sso_realm"
+            printf 'OIDC_ISSUER=%s\n' "$sso_issuer"
+            printf 'OIDC_CLIENT_ID=lakehouse\n'
+            printf 'OIDC_PROVIDER_NAME=keycloak\n'
+            printf 'OIDC_AUTHORIZE_URL=%s/protocol/openid-connect/auth\n' "$sso_issuer"
+            printf 'OIDC_TOKEN_URL=%s/protocol/openid-connect/token\n' "$sso_issuer"
+            # Not `{issuer}/.well-known/jwks.json`: Keycloak publishes its
+            # keys at the discovery document's `jwks_uri`.
+            printf 'OIDC_JWKS_URL=%s/protocol/openid-connect/certs\n' "$sso_issuer"
+            printf 'OIDC_REDIRECT_URI=%s\n' "$sso_redirect"
+            printf 'OIDC_GROUPS_CLAIM=groups\n'
+            # The two groups the realm's mapper emits (bare names, because the
+            # mapper runs with full.path=false) and the roles they map to.
+            printf 'OIDC_ROLE_MAP=analysts=Analyst,lakehouse-admins=Platform Admin\n'
+            # First sign-in creates the local account: the realm's users have
+            # no `auth_identity` row in the API's database.
+            printf 'OIDC_JIT_PROVISIONING=true\n'
+            # The provider confirms the email address (`email_verified`), so
+            # the safer default stays: a sign-in never joins an existing
+            # account on an unconfirmed address.
+            printf 'OIDC_TRUST_EMAIL=false\n'
+            # The provider shows its login form on every sign-in, so the
+            # account is the person's choice: without it, "sign out, then
+            # sign in" lands on whoever used that browser last, because the
+            # provider still holds the session it created for it.
+            printf 'OIDC_PROMPT=login\n'
+            # Where the provider sends the browser back to after the sign-out
+            # ends the provider's session too. The provider refuses a
+            # logout whose return address it does not know, so the realm's
+            # client carries the same address (the realm renderer injects
+            # it).
+            printf 'OIDC_POST_LOGOUT_REDIRECT_URI=%s/login\n' "$sso_console"
+          } >> .env
           if [ -n "$missing" ]; then
             echo "::error::staging secrets not set:$missing (Settings > Secrets and variables > Actions)"
             exit 1
@@ -158,25 +370,228 @@ jobs:
           STAGING_CONNECTOR_SECRETS_KEY: ${{ secrets.STAGING_CONNECTOR_SECRETS_KEY }}
           STAGING_EMBED_SECRET: ${{ secrets.STAGING_EMBED_SECRET }}
           STAGING_RENDER_TOKEN_SECRET: ${{ secrets.STAGING_RENDER_TOKEN_SECRET }}
+          # Single sign-on: the provider's admin password, the confidential
+          # client's secret (the same value the realm renderer injects), and
+          # the three test users' passwords. All required: the realm renderer
+          # refuses to render a realm without them, and compose refuses to
+          # start the provider without its admin password.
+          STAGING_KEYCLOAK_ADMIN_PASSWORD: ${{ secrets.STAGING_KEYCLOAK_ADMIN_PASSWORD }}
+          STAGING_OIDC_CLIENT_SECRET: ${{ secrets.STAGING_OIDC_CLIENT_SECRET }}
+          STAGING_SSO_USER_A_PASSWORD: ${{ secrets.STAGING_SSO_USER_A_PASSWORD }}
+          STAGING_SSO_USER_B_PASSWORD: ${{ secrets.STAGING_SSO_USER_B_PASSWORD }}
+          STAGING_SSO_USER_C_PASSWORD: ${{ secrets.STAGING_SSO_USER_C_PASSWORD }}
+          # The address the browser reaches Keycloak on (not a secret; it is
+          # an environment variable, not a repository secret).
+          SSO_PUBLIC_BASE_URL: ${{ vars.SSO_PUBLIC_BASE_URL }}
+          # The console's own address, when it differs from the provider's
+          # (the callback returns to the console's origin, so the session
+          # cookie is set where the person signed in).
+          SSO_CONSOLE_URL: ${{ vars.SSO_CONSOLE_URL }}
+          SSO_REALM: ${{ vars.SSO_REALM }}
 
-      - name: Build & start backend stack (core + seaweedfs + dagster + trino)
+      # The build below writes a new BuildKit cache and a new image layer
+      # set on every deploy. On a 146 GB disk that adds up, and a disk
+      # that fills mid-build is a build that dies halfway with an error
+      # that looks like a network problem.
+      #
+      # This step reclaims the room WITHOUT touching the build cache: only
+      # DANGLING images older than a week go, and those are the layers of
+      # the deployments before the last one. An image a container uses --
+      # running or stopped -- is never removed by `docker image prune`, and
+      # the image the stack runs is tagged, so it is not dangling at all.
+      # The base images the builds need (`rust:1.99.1-slim`,
+      # `python:3.12-slim`, `oven/bun:1-alpine`, `node:22-alpine`) are
+      # tagged too, so this never makes a build re-download its base.
+      #
+      # NOT `docker system prune`: that removes stopped containers, and
+      # with them their logs. NOT `docker volume prune`: that removes
+      # volumes, and with them the data.
+      - name: Reclaim disk from images the previous deploys left behind
+        run: |
+          docker image prune --force --filter until=168h
+          df -h / | tail -1
+
+      # The API image comes from the `build-api-image` job above: the
+      # `cargo build --release` that used to run ON this VM, next to the
+      # whole stack, now runs on a GitHub-hosted runner and arrives here
+      # as an artifact.
+      #
+      # `continue-on-error` on the download, and the check afterwards, are
+      # the FALLBACK: if the artifact is not there (the upload failed, the
+      # artifact expired, the network broke), the deploy builds the image
+      # here as it did before. A staging deploy must not be blocked by an
+      # artifact service, and it must not come up with a stale API image
+      # either -- so the fallback builds, it does not skip.
+      - name: Download the API image CI built
+        id: download_api_image
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: staging-api-image
+          path: ${{ runner.temp }}/staging-api-image
+
+      - name: Load the API image (no Rust compile on this VM)
+        id: api_image
+        shell: bash
+        run: |
+          set -uo pipefail
+          tarball="$RUNNER_TEMP/staging-api-image/lakehouse-api.tar.zst"
+          if [ ! -f "$tarball" ]; then
+            echo "::warning::the CI-built API image is not available; this deploy builds it here, as it did before"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # `zstd -dc | docker load` -- streamed, the same shape `ci.yml`'s
+          # acceptance jobs use. The archive is never written to disk as a
+          # plain tar first: the VM's disk is the tightest resource on it
+          # and the extra copy buys nothing.
+          if ! zstd -dc "$tarball" | docker load; then
+            echo "::warning::the downloaded archive could not be loaded; this deploy builds the image here"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! docker image inspect rantai-lakehouse-api:ci >/dev/null 2>&1; then
+            echo "::warning::the downloaded archive did not carry rantai-lakehouse-api:ci; this deploy builds the image here"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          docker image inspect rantai-lakehouse-api:ci --format 'loaded {{.Id}} ({{.Size}} bytes)'
+
+      - name: Build & start backend stack (core + seaweedfs + dagster + trino + sso)
         working-directory: ${{ github.workspace }}
+        env:
+          # The tag the CI-built image carries. When the artifact was not
+          # available this stays EMPTY, and the compose default
+          # (`${LAKEHOUSE_API_IMAGE:-rantai-lakehouse-api:local}`) takes
+          # over -- so the fallback path builds and runs the image the
+          # deploy has always built.
+          LAKEHOUSE_API_IMAGE: ${{ steps.api_image.outputs.available == 'true' && 'rantai-lakehouse-api:ci' || '' }}
         # Retry: transient registry/PyPI flakes fail the whole compose build;
         # each retry reuses BuildKit layer cache, so a re-attempt is cheap.
+        #
+        # `-f docker-compose.yml` is named explicitly because `-f` REPLACES
+        # the default file list; the second `-f` is the Keycloak the staging
+        # deployment signs in through (its own services, its own profile).
+        #
+        # `timeout-minutes: 45`, down from 120. The build used to hang: it
+        # stopped right after its last "exporting attestation manifest"
+        # line and sat in `futex_wait` until someone cancelled the run
+        # (runs 44596923569 and 44666444411, 17 and 28 minutes of a
+        # 120-minute budget). The stall is contention, not a broken
+        # buildkit: the same bake returns 0 in a second on an idle box.
+        # The longest build that DID succeed took 22 minutes (a cold
+        # `cargo build --release`), so 45 leaves room for a cold build and
+        # stops a hung one from holding the self-hosted runner for two
+        # hours -- the runner this deployment runs on cannot serve a
+        # second job while it is stuck.
         run: |
-          for attempt in 1 2 3; do
-            echo "=== compose up attempt ${attempt}/3 ==="
-            if scripts/compose.sh \
+          compose() {
+            scripts/compose.sh \
+              -f docker-compose.yml \
+              -f ops/sso/docker-compose.staging-keycloak.override.yml \
+              --profile sso \
               --profile seaweedfs \
               --profile dagster \
               --profile trino \
-              up -d --build --remove-orphans; then
-              exit 0
+              "$@"
+          }
+
+          # Which images this deploy has to build HERE. Everything whose
+          # image is NOT the API image CI built. One service per image:
+          # `dagster-code-location`, `dagster-daemon` and `dagster-webserver`
+          # share ONE image (and one build block), so building all three
+          # would build the same image three times.
+          #
+          # The list is read out of compose's own resolved configuration
+          # rather than written out here, so a service added to the compose
+          # file is picked up automatically. If it is not built, `up
+          # --no-build` fails loudly with "image not found" -- the deploy
+          # cannot come up with a stale image by accident.
+          build_list="$(compose config --format json | python3 -c "
+          import json, os, sys
+          cfg = json.load(sys.stdin)
+          api = os.environ.get('LAKEHOUSE_API_IMAGE') or ''
+          project = cfg.get('name', '')
+          one_per_image = {}
+          for name, svc in cfg['services'].items():
+              if not svc.get('build'):
+                  continue
+              if api and svc.get('image') == api:
+                  continue
+              image = svc.get('image') or (project + '-' + name)
+              one_per_image.setdefault(image, name)
+          print(' '.join(sorted(one_per_image.values())))
+          ")"
+          echo "images built on this VM: ${build_list}"
+
+          for attempt in 1 2 3; do
+            echo "=== compose attempt ${attempt}/3 ==="
+            if [ -n "${LAKEHOUSE_API_IMAGE:-}" ]; then
+              # The API image is already here (loaded above): build the
+              # REST here and start everything WITHOUT building again.
+              # `--no-build` is what makes the API image CI built the one
+              # that runs, instead of a second local build of the same
+              # code.
+              #
+              # The whole chain is the CONDITION of the `if`, never a
+              # standalone statement: with the runner's default
+              # `bash -e`, a standalone `a && b` that fails aborts the
+              # step on the spot, and the retry below would never run.
+              if compose build ${build_list} \
+                 && compose up -d --no-build --remove-orphans; then
+                exit 0
+              fi
+            else
+              # The fallback: no image from CI, so build everything here,
+              # exactly as the deploy did before this change.
+              if compose up -d --build --remove-orphans; then
+                exit 0
+              fi
             fi
-            [ "$attempt" = 3 ] && exit 1
+            if [ "$attempt" = 3 ]; then
+              break
+            fi
             sleep 10
           done
-        timeout-minutes: 120
+
+          # Three attempts with the CI-built image failed. Fall back to
+          # what this deploy did before this change: build the API image
+          # HERE as well. Unsetting the variable is what makes compose
+          # go back to its default image name, so the API is rebuilt
+          # rather than left pointing at an image that is there but
+          # broken.
+          if [ -n "${LAKEHOUSE_API_IMAGE:-}" ]; then
+            echo "::warning::the CI-built API image path failed three times; building the API image on this VM instead"
+            unset LAKEHOUSE_API_IMAGE
+            compose up -d --build --remove-orphans
+          fi
+        timeout-minutes: 45
+
+      # The cache this build just wrote is what makes the NEXT deploy fast,
+      # so it is kept; what grows without bound is the cache of the builds
+      # BEFORE it. On a 146 GB disk the build cache reached 50 GB and
+      # the box was at 94% before it was pruned by hand.
+      #
+      # `--max-used-space 8GB` is the bound: the LEAST recently used cache
+      # goes first, so the cache of the build that just ran -- the one the
+      # next deploy needs -- is the last to be touched. `--reserved-space
+      # 4GB` says that at least 4 GB of cache always stays, so a burst of
+      # deploys can never prune the cache away and turn the next build
+      # into a cold 20-minute `cargo build --release` again. Measured on
+      # the staging VM: this freed 4.37 GB and left 11.27 GB (the shared
+      # and in-use records cannot be pruned, so the effective ceiling is
+      # a little above the number).
+      #
+      # `docker builder prune` removes BuildKit build cache and NOTHING
+      # else: not containers, not their logs, not images, not volumes. That
+      # is exactly why it is used here and `docker system prune` is not --
+      # the latter removes stopped containers and with them the logs of the
+      # containers QA still has to read.
+      - name: Prune the build cache back to its budget
+        run: |
+          docker builder prune --all --max-used-space 8GB --reserved-space 4GB --force
+          docker system df
 
       - name: Health-check lakehouse-api
         run: |
@@ -191,6 +606,84 @@ jobs:
           echo "::error::lakehouse-api did not become healthy"
           exit 1
 
+      # The API and the code location have to carry the SAME commit: the
+      # console's pipeline page serves an op's source text only when the
+      # commit the code location stamped on the op equals the API's own
+      # `GIT_SHA` (`rust/crates/lakehouse-api/src/pipeline_source.rs`'s
+      # `check_commit`; "unknown" on either side means "no real commit was
+      # ever recorded here", and the route refuses).
+      #
+      # The API's image is built in CI WITHOUT a `GIT_SHA`, so the commit
+      # reaches the API through compose's `environment:` block, while the
+      # code location carries it in its own image. Two different paths for
+      # one value -- and they drift apart silently: the symptom is a
+      # console that says "source unavailable" on every pipeline, which
+      # reads as a missing feature rather than as a broken deployment.
+      # (It already happened once: the first CI-built deploy left the API
+      # with `GIT_SHA=unknown` while the code location ran the real
+      # commit, because nothing put the commit into the API's container.)
+      #
+      # This compares the two values on the RUNNING containers and fails
+      # the deploy when they differ or when neither carries a real one.
+      - name: Verify the API and the code location run the same commit
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -uo pipefail
+          compose() {
+            scripts/compose.sh \
+              -f docker-compose.yml \
+              -f ops/sso/docker-compose.staging-keycloak.override.yml \
+              --profile sso \
+              --profile seaweedfs \
+              --profile dagster \
+              --profile trino \
+              "$@"
+          }
+          api_container="$(compose ps -q lakehouse-api | head -1)"
+          code_container="$(compose ps -q dagster-code-location | head -1)"
+          if [ -z "$api_container" ] || [ -z "$code_container" ]; then
+            echo "::error::the API or the code location is not running; cannot compare the commits they run"
+            exit 1
+          fi
+          api_sha="$(docker exec "$api_container" printenv GIT_SHA || true)"
+          code_sha="$(docker exec "$code_container" printenv GIT_SHA || true)"
+          echo "checkout                $(git rev-parse HEAD)"
+          echo "lakehouse-api           ${api_sha}"
+          echo "dagster-code-location   ${code_sha}"
+          if [ "$api_sha" != "$code_sha" ]; then
+            echo "::error::the API (${api_sha}) and the code location (${code_sha}) do not run the same commit; the console's op-source view will refuse to serve source"
+            exit 1
+          fi
+          if [ -z "$api_sha" ] || [ "$api_sha" = "unknown" ]; then
+            echo "::error::neither image carries a real commit (GIT_SHA='${api_sha}'); the console's op-source view will refuse to serve source"
+            exit 1
+          fi
+          echo "the API and the code location both run ${api_sha}"
+
+      # The provider answers a browser, not the API: the API fetches the key
+      # set lazily on the first sign-in, so it is up before Keycloak is. This
+      # step waits for the realm's discovery document, which is the address
+      # the sign-in flow starts from -- a provider that never publishes it
+      # (a wrong `KC_HOSTNAME`, an import that failed) is a deploy failure,
+      # not something to discover at the login form.
+      - name: Health-check Keycloak (the SSO provider)
+        env:
+          SSO_PUBLIC_BASE_URL: ${{ vars.SSO_PUBLIC_BASE_URL }}
+          SSO_REALM: ${{ vars.SSO_REALM }}
+        run: |
+          realm="${SSO_REALM:-lakehouse}"
+          discovery="${SSO_PUBLIC_BASE_URL%/}/realms/${realm}/.well-known/openid-configuration"
+          for i in $(seq 1 60); do
+            if curl -sf "$discovery" > /dev/null; then
+              echo "keycloak discovery reachable"
+              exit 0
+            fi
+            echo "waiting for keycloak ... ${i}/60"
+            sleep 5
+          done
+          echo "::error::keycloak did not publish its discovery document at ${discovery}"
+          exit 1
+
       # Postgres gets its 20 migrations from the API entrypoint, but
       # ClickHouse has no equivalent - without this step every analytics
       # page (and the builtin BI dashboards) query tables that don't
@@ -203,8 +696,16 @@ jobs:
 
       - name: Build frontend image
         working-directory: ${{ github.workspace }}
+        # `NEXT_PUBLIC_SSO_ENABLED` is a BUILD-time flag: the login page
+        # renders the SSO button only when it is baked into the bundle
+        # (`src/features/auth/login-page.tsx`). The value is read from the
+        # `.env` this deploy wrote, so the standalone image and the compose
+        # `console` service (which reads the same variable through its build
+        # args) agree on one flag.
         run: |
-          docker build -f Dockerfile.frontend -t lakehouse-frontend:staging .
+          sso_flag="$(sed -n 's/^NEXT_PUBLIC_SSO_ENABLED=//p' .env | tail -n 1)"
+          docker build -f Dockerfile.frontend -t lakehouse-frontend:staging \
+            --build-arg NEXT_PUBLIC_SSO_ENABLED="$sso_flag" .
         timeout-minutes: 20
 
       - name: Deploy frontend

@@ -31,6 +31,12 @@ export type Policy = {
   // value may be free-text prose rather than JSON — never assume it parses
   // and never crash the policy list page on a `JSON.parse` failure.
   conditions?: string
+  // The catalog asset id of the table the policy governs (WEB-3 S3a-D1),
+  // resolved by the API from `conditions.table`: a Silver/Serving table is
+  // its own id, a Bronze table is its registry slug. Absent when the
+  // conditions do not parse or name no table the catalog addresses — show
+  // the table as plain text then, never a link to an invented page.
+  assetId?: string
 }
 
 export type ClassificationRule = {
@@ -224,15 +230,21 @@ export type UsedByChart = ColumnChart & { via: "direct" | "sql_source" | "metric
  * (T3 of the BI-14 plan); the field names are the console's choice and are the
  * contract for T3.
  */
-export type UsedBy = {
-  supported: boolean
-  table: string
-  charts: UsedByChart[]
-  /** Charts the caller cannot see ("and 3 more you do not have access to"). */
-  hiddenCount: number
-  /** True when more than 200 charts matched and only the first 200 are listed. */
-  truncated?: boolean
-}
+export type UsedBy =
+  | {
+      supported: true
+      table: string
+      charts: UsedByChart[]
+      /** Charts the caller cannot see ("and 3 more you do not have access to"). */
+      hiddenCount: number
+      /** True when more than 200 charts matched and only the first 200 are listed. */
+      truncated?: boolean
+    }
+  | {
+      /** The caller gets no list: `reason` says why (the shared-catalog rule, `SEC-20`). */
+      supported: false
+      reason: string
+    }
 
 export type LineageGraph = {
   focus: string
@@ -253,18 +265,103 @@ export type AuditEvent = {
   id: string
   at: string
   actor: string
+  /**
+   * The principal id behind `actor` (plan D2) — what the person filter
+   * sends as `actor`. `null` for an event nobody signed in caused (a
+   * sign-in form row): its actor is not a filter, so it is not clickable.
+   * Always present on the wire, `null` when empty.
+   */
+  actorId: string | null
   actorKind: ActorKind
   delegatedActor?: string
-  tenant: string
   action: string
   resource: string
   outcome: AuditOutcome
+  /**
+   * The stored outcome value behind the four-word `outcome` (plan D4):
+   * one of the eight the server filters on (`allowed`, `executed`,
+   * `refused`, `needs_confirmation`, `needs_approval`, `approved`,
+   * `rejected`, `failed`). Always present; the detail view shows it.
+   */
+  outcomeDetail: string
   policyDecision: string
   obligations: string[]
   engineCategory?: EngineCategory
   estimatedCost?: number
   actualCost?: number
   approvalId?: string
+  /**
+   * One sentence on what the action did, set by `routes::governance` for a
+   * catalog grant or revoke ("Granted query:read to Name <email> until
+   * 2026-12-06"); absent for other actions (QA LH-DATA-15-03 F1, plan D9).
+   */
+  detail?: string
+  /**
+   * The row's stored detail column (plan D4b): a refusal reason, a
+   * Central status code, or a failed assistant tool's fixed sentence;
+   * `null` when the row stored none. The derived `detail` above is a
+   * different thing. Always present on the wire, `null` when empty.
+   */
+  reason: string | null
+}
+
+/**
+ * What the audit search narrows by (`GET /api/governance/audit/events`, `GOV-1`).
+ * Every field is optional and an empty one means no filter. `actor` is a
+ * principal id; `action` is the whole action, or a family when it ends in
+ * `.` (`dashboard.`); `outcome` is a stored outcome (`allowed`, `executed`,
+ * `refused`, `needs_confirmation`, `needs_approval`, `approved`, `rejected`,
+ * `failed`); `from` is inclusive and `to` exclusive, both RFC 3339. `limit` is
+ * 1 to 500 (the server's default is 100); `cursor` is the `nextCursor` of the
+ * page before. The export takes the same filters and ignores `limit` and
+ * `cursor`.
+ */
+export type AuditSearchQuery = {
+  actor?: string
+  action?: string
+  resourceKind?: string
+  resourceId?: string
+  outcome?: "allowed" | "executed" | "refused" | "needs_confirmation" | "needs_approval" | "approved" | "rejected" | "failed" | string
+  from?: string
+  to?: string
+  limit?: number
+  cursor?: string
+}
+
+/** One page of the audit search, newest first; `nextCursor` is `null` on the last page. */
+export type AuditPage = {
+  events: AuditEvent[]
+  nextCursor: string | null
+}
+
+/**
+ * One principal that acted in the trail (`GET /api/governance/audit/actors`,
+ * plan D2): the distinct `(principal_id, actor, principal_kind)` the
+ * trail records, newest-seen first, at most 500.
+ */
+export type AuditActor = {
+  /** The principal id the person filter sends as `actor`. */
+  actorId: string
+  /** The name the trail shows for it (the events' `actor`). */
+  actor: string
+  actorKind: ActorKind
+}
+
+/** The answer of the actors route: one list, no paging. */
+export type AuditActorsPage = {
+  actors: AuditActor[]
+}
+
+/**
+ * The audit trail as a CSV file. The server holds at most the newest 100,000
+ * events in one file; when more match it says so, and `total` is how many did.
+ */
+export type AuditExport = {
+  blob: Blob
+  fileName: string
+  truncated: boolean
+  /** How many events matched, known only when the file was cut. */
+  total: number | null
 }
 
 export type CreatePolicyInput = {
@@ -276,6 +373,23 @@ export type CreatePolicyInput = {
   conditions?: string
   activate?: boolean
   owner?: string
+}
+
+/**
+ * The functions, operators and forms a row filter accepts
+ * (`GET /api/governance/row-filter-grammar`, `WEB-8` S2 D8; forms added by
+ * S2 review round 1, S2). The server builds this from the constants its
+ * validator checks against (the forms are its match arms, held by the
+ * route's test), so the console's help line cannot drift from what a save
+ * will accept; never hard-code a copy here.
+ */
+export type RowFilterGrammar = {
+  /** Function names, as the validator spells them. */
+  functions: string[]
+  /** Operator tokens, as the validator spells them. */
+  operators: string[]
+  /** Expression forms, as the validator spells them (`LIKE`, `BETWEEN`, …). */
+  forms: string[]
 }
 
 export type CreateQualityRuleInput = {
@@ -321,7 +435,7 @@ export type MaintenanceRun = {
 /**
  * One row of `GET /api/governance/replication` — a point-in-time snapshot
  * of one Postgres logical-replication slot backing a CDC connector
- * (Debezium Server, P5). `status` is `"ok" | "warning" | "critical"`,
+ * (Debezium on Kafka Connect, `SRC-4`). `status` is `"ok" | "warning" | "critical"`,
  * computed in `dagster/dispar_orchestrate/replication_metrics.py` from WAL
  * retention thresholds and whether the slot is still `active` — an
  * inactive slot is flagged `critical` regardless of byte thresholds,
@@ -350,7 +464,12 @@ export type DatasetSla = {
 
 export interface GovernanceService {
   listPolicies(signal?: AbortSignal): Promise<Policy[]>
-  listClassifications(signal?: AbortSignal): Promise<ClassificationRule[]>
+  /**
+   * The functions and operators a row filter accepts; needs `policy:read`.
+   * A failed read must leave the console with no help line, never a guessed
+   * list.
+   */
+  getRowFilterGrammar(signal?: AbortSignal): Promise<RowFilterGrammar>
   listQuality(signal?: AbortSignal): Promise<QualityRule[]>
   getLineage(focusId: string, signal?: AbortSignal): Promise<LineageGraph>
   /**
@@ -366,7 +485,25 @@ export interface GovernanceService {
     direction: "up" | "down",
     signal?: AbortSignal
   ): Promise<ColumnLineage>
-  listAudit(signal?: AbortSignal): Promise<AuditEvent[]>
+  /**
+   * Search the audit trail on the server, of any age, newest first
+   * (`GET /api/governance/audit/events`); needs `audit:read`.
+   */
+  searchAudit(query: AuditSearchQuery, signal?: AbortSignal): Promise<AuditPage>
+  /**
+   * The distinct principals that acted in the trail, newest-seen first, at
+   * most 500 (`GET /api/governance/audit/actors`, plan D2); needs
+   * `audit:read`, not `identity:read`. The audit page's person filter
+   * picks from this list.
+   */
+  listAuditActors(signal?: AbortSignal): Promise<AuditActorsPage>
+  /** One audit event by id, or `null` when no event has it; needs `audit:read`. */
+  getAuditEvent(id: string, signal?: AbortSignal): Promise<AuditEvent | null>
+  /**
+   * The events a search picks as a CSV file (`GET /api/governance/audit/export.csv`);
+   * needs `audit:read`. The caller saves `blob`.
+   */
+  exportAuditCsv(query: AuditSearchQuery, signal?: AbortSignal): Promise<AuditExport>
   /** Bronze Iceberg maintenance runs (P4/P6) — `GET /api/governance/maintenance`. */
   listMaintenanceRuns(signal?: AbortSignal): Promise<MaintenanceRun[]>
   /** CDC replication slot health (P5/P6) — `GET /api/governance/replication`. */
@@ -421,6 +558,11 @@ export interface GovernanceService {
     input: SetQualityScheduleInput,
     signal?: AbortSignal
   ): Promise<QualitySchedule>
+  /**
+   * Put a table back on the default schedule (WEB-3 S3a-D3); needs
+   * `governance:write`. `listQualitySchedules` then carries no row for it.
+   */
+  resetQualitySchedule(asset: string, signal?: AbortSignal): Promise<void>
   /** Whether a table's volume and freshness anomalies are being raised yet. */
   getQualityLearning(asset: string, signal?: AbortSignal): Promise<QualityLearning>
   createClassificationRule(

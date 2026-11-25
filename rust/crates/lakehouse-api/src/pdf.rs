@@ -79,7 +79,9 @@ impl Paper {
         }
     }
 
-    /// Width and height in inches, portrait (Gotenberg's unit).
+    /// Width and height in inches, portrait (Gotenberg's unit). The print
+    /// view's own width is these less the margins below, at 96 px per inch
+    /// (`paperContentWidth` in `src/lib/render-summary.ts`).
     const fn inches(self) -> (&'static str, &'static str) {
         match self {
             Self::A4 => ("8.27", "11.7"),
@@ -256,6 +258,9 @@ pub async fn convert_url(
         "landscape",
         &(orientation == Orientation::Landscape).to_string(),
     );
+    // The two side margins are what `paperContentWidth` in
+    // `src/lib/render-summary.ts` subtracts from the paper's width; whoever
+    // changes one changes the other (BI-53, D17).
     for margin in ["marginTop", "marginBottom", "marginLeft", "marginRight"] {
         form.text(
             margin,

@@ -184,6 +184,17 @@ export function formatSql(sql: string, options?: FormatOptions): string {
       continue
     }
     const token = tokens[i]
+    if (token.kind === "punctuation" && token.text === ";") {
+      // A semicolon ends the statement: it sits against the last token, and
+      // whatever follows is a new statement on a new line at the margin, even
+      // when it starts with a word that is no clause (`DROP TABLE x`). The
+      // tokenizer only emits `;` outside strings and comments (QS-1 QA of
+      // 2026-11-05).
+      line += ";"
+      startLine(0)
+      i += 1
+      continue
+    }
     let text = token.text
     if (token.kind === "word" && INLINE_KEYWORDS.includes(text.toUpperCase())) {
       text = keywordText(text, keywordCase)

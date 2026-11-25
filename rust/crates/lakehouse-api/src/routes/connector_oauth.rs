@@ -58,7 +58,6 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
-use lakehouse_store::audit as store_audit;
 use lakehouse_store::connector_oauth as store_oauth;
 use lakehouse_store::connectors::{self, ConnectorDialInfo};
 use lakehouse_store::ingest_spec::{Dial, RestAuth, SaasAuth};
@@ -70,6 +69,7 @@ use super::connectors::{
     connector_audit_event, parse_body, pool, remove_refresh_token, store_refresh_token,
 };
 use super::schema_changes::require_orchestrator;
+use crate::audit_coverage;
 use crate::connector_oauth::{self, TokenFailure};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
@@ -799,11 +799,7 @@ async fn audit(
     args: serde_json::Value,
 ) {
     let event = connector_audit_event(principal, action, connector_id, args, "executed");
-    if let Some(pool) = state.pg.as_deref()
-        && let Err(err) = store_audit::insert(pool, event).await
-    {
-        tracing::warn!(%err, connector_id = %connector_id, action, "failed to record an OAuth audit event");
-    }
+    audit_coverage::record_best_effort(state, event).await;
 }
 
 #[cfg(test)]

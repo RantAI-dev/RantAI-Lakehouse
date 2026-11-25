@@ -52,6 +52,17 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "invalid JSON body: {err}",
         "serde error over the caller's own request body",
     ),
+    // ADM-11 review 1 B4: password rule validation error messages are written in this repo
+    (
+        "auth.rs",
+        ".map_err(|err| ApiError::BadRequest(err.to_string()))?;",
+        "password::check_rules validation error text, written in this repository (ADM-11 D4)",
+    ),
+    (
+        "identity.rs",
+        ".map_err(|err| ApiError::BadRequest(err.to_string()))?;",
+        "password::check_rules validation error text, written in this repository (ADM-11 D4)",
+    ),
     (
         "catalog_query.rs",
         "invalid `filters` JSON: {err}",
@@ -107,32 +118,34 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "invalid retry body: {err}",
         "serde error over the caller's own request body",
     ),
-    // SEC-11, product owner decision 2026-10-10: Query Studio (`/api/query/run`
-    // for both engines, and the cost estimate) shows the signed-in author the
-    // engine's diagnosis of their own statement, trimmed. Only this file.
+    // SEC-11, product owner decision 2026-10-10, ended for the console by the
+    // owner on 2026-11-12 (LH-QS-2-08): the console's `run` and cost estimate
+    // answer a fixed sentence and a reference (`_for_console`). The assistant's
+    // paths in this file still give the model the trimmed engine diagnosis so
+    // it can correct its SQL: `run_statement` (`FailureText::Assistant`) and
+    // `check_statement_would_run`. Only this file.
     (
         "query.rs",
         "_for_author(",
-        "query-author exception: the author of the statement is shown the trimmed engine diagnosis",
+        "query-author exception, assistant paths only: the model is shown the trimmed engine diagnosis to correct its SQL",
     ),
     (
         "query.rs",
         ".map_err(|err| err.to_string())?;",
         "rewrite_sql_for_principal's ApiError: the policy's own non-leaking message, written in this repository",
     ),
-    // D3 (plan 39): `run` records every answered run. Both lines write the
-    // history row for a refused or failed run; each `err` is an `ApiError`
-    // (`rewrite_sql_for_principal_with_headers` and
-    // `execute_query_against_engine` both return `Result<_, ApiError>`), so
-    // its `to_string()` is the same fixed text the adjacent
-    // `return Err(err.into())` hands the response. The row goes to the
-    // caller's own history, not into a response, and the marker test in
-    // `tests/query_history_recording.rs` pins that the engine's raw text
-    // never reaches it.
+    // `run` records every answered run. This line writes the history row for a
+    // run the policy rewrite refused or failed: its `err` is the `ApiError`
+    // `rewrite_sql_for_principal_with_headers` returns, so `to_string()` is
+    // the same fixed text the adjacent `return Err(err.into())` hands the
+    // response. The row goes to the caller's own history, not into a
+    // response. An engine failure no longer passes here: `EngineFailure`
+    // carries the classified sentence the row keeps, never the engine's text
+    // (`tests/query_history.rs` pins that).
     (
         "query.rs",
         "&err.to_string(),",
-        "the history row keeps the classified ApiError text the response itself carries (plan 39 D3)",
+        "the history row keeps the policy rewrite's own fixed ApiError text, the same the response carries",
     ),
     (
         "query.rs",
@@ -170,6 +183,13 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "the tenant gate's own fixed sentence (SEC-20's 404 or D6's 422), written in this repository",
     ),
     (
+        // `BI-45` (QA `LH-BI-5-01`): the assistant's reply for a save the gate
+        // refused. The same gate error `run_spec_sql` shows in its tile above.
+        "support.rs",
+        "SpecRunFailure::Gated(err) => json!({ \"error\": err.to_string() }),",
+        "the tenant gate's own fixed sentence (SEC-20's 404 or D6's 422), written in this repository",
+    ),
+    (
         "quality.rs",
         "Invalid request body: {err}",
         "serde error over the caller's own request body",
@@ -190,11 +210,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     // Our own validators: the text is written in this repository.
     (
         "authored_pipelines.rs",
-        "invalid transform at transforms[{index}]: {err}",
-        "transform_grammar's own validation message",
-    ),
-    (
-        "pipelines.rs",
         "invalid transform at transforms[{index}]: {err}",
         "transform_grammar's own validation message",
     ),
@@ -255,23 +270,13 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     (
         "connectors.rs",
+        "The connection settings are not valid: {source}",
+        "IngestSpecError::InvalidDial's source: a fixed sentence of ingest_spec.rs or serde's field text about the caller's own dial; nothing is dialled before it, so it holds no upstream text and no resolved address (it can repeat a host the caller typed)",
+    ),
+    (
+        "connectors.rs",
         "\"dial: {err}\"",
         "IngestSpecError never echoes the dial's values (ingest_spec module doc)",
-    ),
-    (
-        "connectors.rs",
-        "dial does not parse as its own adapter {adapter:?}: {err}",
-        "IngestSpecError never echoes the dial's values",
-    ),
-    (
-        "connectors.rs",
-        "dial does not parse as a mongodb dial: {err}",
-        "IngestSpecError never echoes the dial's values",
-    ),
-    (
-        "connectors.rs",
-        "fields are invalid: {err}",
-        "debezium template validation's own message",
     ),
     (
         "connectors.rs",
@@ -321,10 +326,22 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         ".map_err(|err| json!({ \"error\": err.to_string() }))",
         "an ApiError from routes::dashboard_access (viewer_for, scope_for_write, require_board_level): fixed texts written in this repository, a store failure is already \"database error\" through From<StoreError>",
     ),
+    // BI-18 D review round 2, BLOCKER 3: the report and template tools' one
+    // error helper.
+    (
+        "ai/tools/written.rs",
+        "json!({ \"error\": err.to_string() })",
+        "an ApiError from routes::dashboard_reports, dashboard_templates and dashboard_access (the routes' own functions): fixed texts written in this repository, a store failure is already \"database error\" or upstream_error::internal_error, a ClickHouse failure goes through classify_ch_error / classify_dashboard_ch_error / board_write_error / calc_fields::classify_ch (upstream_error), and BiError::Validation is lakehouse_bi's own text",
+    ),
     (
         "ai/tools/alerts.rs",
         "json!({ \"error\": err.to_string() })",
         "an ApiError from routes::alerts' scope checks and visible_rules: fixed texts written in this repository, a store failure is already \"database error\"",
+    ),
+    (
+        "ai/tools/alerts.rs",
+        "The rule could not be read: {err}",
+        "serde error over the model's own tool arguments (BI-65): it names the unknown or mistyped field, not an upstream payload",
     ),
     (
         "ai/tools/connectors.rs",
@@ -615,7 +632,8 @@ fn the_scan_flags_the_shapes_the_audit_found() {
 
 #[test]
 fn the_scan_flags_the_query_author_exception_wherever_it_is_called() {
-    let line = "        .map_err(|e| upstream_error::ch_error_for_author(&DATABASE, &e))?;";
+    let line =
+        "        .map_err(|e| upstream_error::ch_failure_for_author(&DATABASE, &e).response)?;";
     assert_eq!(scan("dashboard.rs", line).len(), 1);
 }
 

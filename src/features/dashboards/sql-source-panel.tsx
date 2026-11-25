@@ -6,78 +6,11 @@ import { SqlEditor } from "@/components/sql-editor";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { formatCell, sourceNameProblem, type SqlRunPhase } from "@/lib/sql-source-draft";
-import type { SqlSourcePreview } from "@/services/contracts/dashboards";
+import { SqlColumnChips } from "@/components/patterns/sql-rows-table";
+import { sourceNameProblem, type SqlRunPhase } from "@/lib/sql-source-draft";
 import { cn } from "@/lib/utils";
 import type { SqlSourceDraft } from "./use-sql-source-draft";
 
-/** The columns a Run returned, with their types. */
-function SqlColumnChips({ result }: { result: SqlSourcePreview }) {
-  return (
-    <div className="grid gap-1.5">
-      <div className="flex flex-wrap gap-1.5" aria-label="Columns">
-        {result.columns.map((c) => (
-          <span key={c.name} className="rounded border border-border px-1.5 py-0.5 font-mono text-[11px]">
-            {c.name} <span className="text-muted-foreground">{c.type}</span>
-          </span>
-        ))}
-      </div>
-      {result.rows.length === 0 ? <p className="text-xs text-muted-foreground">The SQL ran and returned no rows.</p> : null}
-    </div>
-  );
-}
-
-/**
- * The first rows a Run returned. Lives in the Preview pane only; the panel
- * under the editor lists just the columns, so the rows are never shown twice.
- */
-export function SqlRowsTable({ result, stale, className }: {
-  result: SqlSourcePreview;
-  /** The SQL was edited after this result: say so, since the rows are of the earlier text. */
-  stale?: boolean;
-  className?: string;
-}) {
-  return (
-    <div className={cn("grid min-h-0 content-start gap-2", className)}>
-      <p className="text-xs text-muted-foreground">
-        {result.rows.length === 0
-          ? "The SQL ran and returned no rows."
-          : `First ${result.rows.length.toLocaleString("en-US")} row${result.rows.length === 1 ? "" : "s"}.`}
-        {stale ? " These are the rows of the SQL before your last edit." : ""}
-      </p>
-      {result.rows.length ? (
-        <div className={cn("min-h-0 overflow-auto rounded-md border border-border", stale && "opacity-60")}>
-          <table className="w-full text-left text-xs">
-            <thead className="sticky top-0 bg-muted">
-              <tr>
-                {result.columns.map((c) => (
-                  <th key={c.name} scope="col" className="px-2 py-1 font-medium whitespace-nowrap">{c.name}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {result.rows.map((row, i) => (
-                <tr key={i} className="border-t border-border">
-                  {result.columns.map((c) => {
-                    const text = formatCell(row[c.name]);
-                    return (
-                      <td
-                        key={c.name} title={text}
-                        className={cn("max-w-56 truncate px-2 py-1 font-mono", row[c.name] == null && "text-muted-foreground italic")}
-                      >
-                        {text}
-                      </td>
-                    );
-                  })}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      ) : null}
-    </div>
-  );
-}
 
 const PHASE_NOTE: Partial<Record<SqlRunPhase, string>> = {
   unrun: "Run the SQL to see its columns and rows.",
@@ -135,9 +68,11 @@ export function SqlSourcePanel({ draft, onCancelEdit }: { draft: SqlSourceDraft;
         </p>
       ) : null}
 
+      {/* UX-4: both inputs on this form (SQL, source name) are required, so
+          no star and no legend; each keeps its `required` semantics. */}
       <div className="grid gap-1.5">
-        <Label>SQL <span aria-hidden className="text-destructive">*</span></Label>
-        <SqlEditor value={draft.sql} onChange={draft.setSql} minHeight="200px" wrap />
+        <Label id="sql-source-label">SQL</Label>
+        <SqlEditor labelledBy="sql-source-label" required value={draft.sql} onChange={draft.setSql} minHeight="200px" wrap />
         <p className="text-xs text-muted-foreground" id="sql-source-hint">
           One read-only SELECT over <span className="font-mono">serving</span> tables, written as{" "}
           <span className="font-mono">serving.&lt;table&gt;</span>. {limits
@@ -164,9 +99,9 @@ export function SqlSourcePanel({ draft, onCancelEdit }: { draft: SqlSourceDraft;
       ) : null}
 
       <div className="grid gap-1.5">
-        <Label htmlFor="ch-source-name">Source name <span aria-hidden className="text-destructive">*</span></Label>
+        <Label htmlFor="ch-source-name">Source name</Label>
         <Input
-          id="ch-source-name" value={draft.name} onChange={(e) => draft.setName(e.target.value)}
+          id="ch-source-name" aria-required value={draft.name} onChange={(e) => draft.setName(e.target.value)}
           placeholder="e.g. Visitors by region and month"
           aria-invalid={nameInvalid ? true : undefined}
         />

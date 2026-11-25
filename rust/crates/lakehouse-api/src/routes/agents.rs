@@ -10,21 +10,31 @@
 //! create, 404 on a missing id, 409 on a duplicate name or a re-decided
 //! approval, 400 on a malformed body, 503 with no database pool.
 //!
-//! # Scope: no execution runtime
+//! # Scope: no general agent runtime
 //!
-//! `AgentService` has no "run this agent"/"invoke this tool" method, and
-//! this module does not add one. `listRuns`/`getRun` serve historical run
-//! *records* (seeded the same way every other Phase 2 domain seeds its
-//! fixtures) — nothing here launches an agent or a tool. See
-//! `lakehouse_store::agents`'s module doc comment.
+//! `getRun` serves a historical run *record* — nothing here launches an
+//! arbitrary agent or tool. The one real execution door is the headless
+//! employee run (`POST /api/agents/employees/{id}/run`), which dispatches
+//! only the registered copilot tools. See `lakehouse_store::agents`'s
+//! module doc comment.
 //!
-//! # Console surface removed
+//! # Retired and retained surfaces (`WEB-4`)
 //!
-//! `WS1` task 1.11 removed the Agent Workflows and Tool Registry pages:
-//! nothing executes an authored workflow, and the agent runtime never
-//! reads the tool registry. `/api/agents/workflows` still serves real
-//! `Postgres` CRUD, stays registered and `POLICY_TABLE`-classified, and is
-//! left for a later workstream to reuse or retire.
+//! `WS1` task 1.11 removed the Agent Workflows and Tool Registry pages,
+//! and `WEB-3` slice 1 removed the employee and runs-list pages. `WEB-4`
+//! audited every caller before retiring the routes those pages used:
+//! workflows (GET/POST), employee creation and the suspend/resume/revoke
+//! lifecycle, and the runs LIST had no assistant tool, console page, CLI or
+//! script caller, so their handlers, policy entries, audit entries and
+//! tests were removed with them.
+//!
+//! Three `/api/agents/employees*` routes stayed because they are **live**,
+//! not console leftovers: `GET /employees` is read at code-load by Dagster's
+//! schedule factory (`dagster/dispar_orchestrate/agent_runs.py`), `GET
+//! /employees/{id}` names the employee on the retained run-detail page, and
+//! `POST /employees/{id}/run` is the scheduled/manual trigger that same
+//! job calls. `GET /runs/{id}` stays because an assistant approval creates
+//! a real `agent_run` and `/agents/runs/[runId]` shows its trace.
 //!
 //! `GET /api/agents/tools` (WS7 item G4) no longer serves that unread
 //! `agent_tool` Postgres table — it now reflects
@@ -41,19 +51,19 @@
 
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::HeaderMap;
 use lakehouse_auth::{PermissionSet, Principal};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::agents::{
-    self, AgentRun, AgentWorkflow, ApprovalItem, CreateEmployeeInput, CreateWorkflowInput,
-    Decision, DigitalEmployee, LinkedApprovalRequest, RunStep,
+    self, AgentRun, ApprovalItem, Decision, DigitalEmployee, LinkedApprovalRequest, RunStep,
 };
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::ai::{
@@ -77,67 +87,17 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiErro
     serde_json::from_slice(body).map_err(|err| ApiError::BadRequest(format!("invalid JSON: {err}")))
 }
 
-fn required(field: &str, value: &str) -> Result<String, ApiError> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(ApiError::BadRequest(format!("{field} is required")));
-    }
-    Ok(trimmed.to_owned())
-}
-
-const VALID_AUTONOMY: [&str; 4] = ["L1", "L2", "L3", "L4"];
-
-/// `agent_employee.mode`'s `CHECK` constraint values
-/// (`0025_agent_schedule.sql`) — a headless run uses this to pick the
-/// copilot's `SYSTEM_ASK_SUFFIX`/`SYSTEM_BUILD_SUFFIX` equivalent.
-const VALID_MODE: [&str; 2] = ["ask", "build"];
-
-// ── Workflows ──────────────────────────────────────────────────────────
-
-/// `GET /api/agents/workflows`.
+/// The detail a run's step, or a run's outcome, keeps of a tool's result.
 ///
-/// # Errors
-///
-/// 503 if no pool is configured; 500 on a database failure.
-pub async fn list_workflows(
-    State(state): State<AppState>,
-) -> ApiResult<ApiJson<Vec<AgentWorkflow>>> {
-    Ok(ApiJson(agents::list_workflows(pool(&state)?).await?))
-}
-
-/// The `POST /api/agents/workflows` body. Mirrors `CreateWorkflowInput`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateWorkflowBody {
-    name: String,
-    trigger: String,
-    #[serde(default)]
-    step_kinds: Vec<String>,
-    approval_required: bool,
-    #[serde(default)]
-    owner: Option<String>,
-}
-
-/// `POST /api/agents/workflows` — create a workflow. Returns 201.
-///
-/// # Errors
-///
-/// 400 on a malformed body or a blank required field; 409 if the name is
-/// taken; 503/500 as above.
-pub async fn create_workflow(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> ApiResult<(StatusCode, ApiJson<AgentWorkflow>)> {
-    let body: CreateWorkflowBody = parse_body(&body)?;
-    let input = CreateWorkflowInput {
-        name: required("name", &body.name)?,
-        trigger: required("trigger", &body.trigger)?,
-        step_count: i64::try_from(body.step_kinds.len()).unwrap_or(i64::MAX),
-        approval_required: body.approval_required,
-        owner: body.owner,
-    };
-    let created = agents::create_workflow(pool(&state)?, &input).await?;
-    Ok((StatusCode::CREATED, ApiJson(created)))
+/// A run's detail is read by a browser on the run page, so it takes the
+/// browser's copy of the result (`crate::routes::ai::split_tool_result`,
+/// owner rule LH-QS-2-08, 2026-11-12): an engine failure is stored as a fixed
+/// sentence and a reference, never as the engine's own text. The model that
+/// drives the run reads the model's copy, which keeps the engine's
+/// diagnosis, and that copy is never stored. A result with no engine failure
+/// is stored as the tool returned it.
+fn stored_tool_detail(shown: &Value) -> String {
+    serde_json::to_string(shown).unwrap_or_default()
 }
 
 // ── Employees ──────────────────────────────────────────────────────────
@@ -171,134 +131,11 @@ pub async fn get_employee(
     Ok(ApiJson(employee))
 }
 
-/// The `POST /api/agents/employees` body. Mirrors `CreateEmployeeInput`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateEmployeeBody {
-    name: String,
-    purpose: String,
-    autonomy: String,
-    #[serde(default)]
-    allowed_tools: Vec<String>,
-    data_scope: String,
-    budget_limit: f64,
-    #[serde(default)]
-    owner: Option<String>,
-    #[serde(default)]
-    prompt: Option<String>,
-    #[serde(default)]
-    schedule_cron: Option<String>,
-    #[serde(default)]
-    mode: Option<String>,
-    #[serde(default)]
-    permissions: Option<String>,
-}
-
-/// `POST /api/agents/employees` — create a digital employee. Returns 201.
-///
-/// # T3.2 fix: `mode` used to reach the database unvalidated
-///
-/// `agent_employee.mode` carries a `CHECK (mode IN ('ask', 'build'))`
-/// constraint (`0025_agent_schedule.sql`), but nothing validated `body.mode`
-/// before this handler handed it to [`agents::create_employee`] — an
-/// invalid value (`{"mode": "sleep"}`) surfaced as a raw Postgres
-/// constraint-violation error (an opaque 500) instead of a clean 400,
-/// exactly the gap [`VALID_MODE`] closes here, the same way [`VALID_AUTONOMY`]
-/// already does for `autonomy`.
-///
-/// # Errors
-///
-/// 400 on a malformed body, a blank required field, an unrecognized
-/// `autonomy`, or an unrecognized `mode`; 409 if the name is taken;
-/// 503/500 as above.
-pub async fn create_employee(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> ApiResult<(StatusCode, ApiJson<DigitalEmployee>)> {
-    let body: CreateEmployeeBody = parse_body(&body)?;
-    let autonomy = required("autonomy", &body.autonomy)?;
-    if !VALID_AUTONOMY.contains(&autonomy.as_str()) {
-        return Err(ApiError::BadRequest(format!(
-            "autonomy must be one of {VALID_AUTONOMY:?}, got {autonomy:?}"
-        ))
-        .into());
-    }
-    if let Some(mode) = &body.mode
-        && !VALID_MODE.contains(&mode.as_str())
-    {
-        return Err(ApiError::BadRequest(format!(
-            "mode must be one of {VALID_MODE:?}, got {mode:?}"
-        ))
-        .into());
-    }
-    let input = CreateEmployeeInput {
-        name: required("name", &body.name)?,
-        purpose: required("purpose", &body.purpose)?,
-        autonomy,
-        allowed_tools: body.allowed_tools,
-        data_scope: required("dataScope", &body.data_scope)?,
-        budget_limit: body.budget_limit,
-        owner: body.owner,
-        prompt: body.prompt,
-        schedule_cron: body.schedule_cron,
-        mode: body.mode,
-        permissions: body.permissions,
-    };
-    let created = agents::create_employee(pool(&state)?, &input).await?;
-    Ok((StatusCode::CREATED, ApiJson(created)))
-}
-
-fn map_transition_result(
-    id: &str,
-    result: Result<DigitalEmployee, lakehouse_store::StoreError>,
-) -> ApiResult<ApiJson<DigitalEmployee>> {
-    match result {
-        Ok(updated) => Ok(ApiJson(updated)),
-        Err(lakehouse_store::StoreError::NotFound) => {
-            Err(ApiError::NotFound(format!("Employee {id} not found")).into())
-        }
-        Err(err) => Err(ApiError::from(err).into()),
-    }
-}
-
-/// `POST /api/agents/employees/{id}/suspend`.
-///
-/// # Errors
-///
-/// 404 if `id` is unknown; 503/500 as above.
-pub async fn suspend_employee(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<ApiJson<DigitalEmployee>> {
-    let result = agents::suspend_employee(pool(&state)?, &id).await;
-    map_transition_result(&id, result)
-}
-
-/// `POST /api/agents/employees/{id}/resume`.
-///
-/// # Errors
-///
-/// 404 if `id` is unknown; 503/500 as above.
-pub async fn resume_employee(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<ApiJson<DigitalEmployee>> {
-    let result = agents::resume_employee(pool(&state)?, &id).await;
-    map_transition_result(&id, result)
-}
-
-/// `POST /api/agents/employees/{id}/revoke`.
-///
-/// # Errors
-///
-/// 404 if `id` is unknown; 503/500 as above.
-pub async fn revoke_employee(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<ApiJson<DigitalEmployee>> {
-    let result = agents::revoke_employee(pool(&state)?, &id).await;
-    map_transition_result(&id, result)
-}
+// `POST /api/agents/employees` and the `{id}/{suspend,resume,revoke}` routes
+// were retired by WEB-4 (no caller outside the removed console pages). The
+// `CreateEmployeeBody`, the `agent:manage` permission ceiling and the
+// transition-result mapper went with them; the store functions stay, so a
+// future scheduler or operator tool can reuse them without a migration.
 
 // ── Tools ──────────────────────────────────────────────────────────────
 
@@ -379,47 +216,60 @@ fn list_tools_body(usage_counts: &[(String, i64)]) -> Vec<RegistryTool> {
 /// `agent_tool`-table "register a tool" endpoint) is removed entirely —
 /// see this module's doc comment.
 ///
+/// `SEC-20` (plan 100): the counts are the caller's own organisation's, so
+/// a count never says how often another organisation ran a tool.
+///
 /// # Errors
 ///
-/// 503 if no pool is configured; 500 on a database failure.
-pub async fn list_tools(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<RegistryTool>>> {
-    let usage_counts = agents::tool_usage_counts_30d(pool(&state)?).await?;
+/// 404 for a forged `X-Tenant` header. 503 if no pool is configured; 500 on a
+/// database failure.
+pub async fn list_tools(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Vec<RegistryTool>>> {
+    let scope =
+        crate::routes::audit_scope::scope_for_principal(&state, &principal, &headers).await?;
+    let usage_counts = agents::tool_usage_counts_30d(pool(&state)?, &scope).await?;
     Ok(ApiJson(list_tools_body(&usage_counts)))
 }
 
 // ── Runs ───────────────────────────────────────────────────────────────
 
-/// Query parameters shared by `GET /api/agents/runs` and
-/// `GET /api/agents/approvals`.
+/// Query parameters for `GET /api/agents/approvals`.
+///
+/// The runs LIST was retired by WEB-4 (no caller), so this filter is now
+/// only the approvals inbox's `?employeeId=`.
 #[derive(Debug, Deserialize)]
 pub struct EmployeeQuery {
     /// `?employeeId=<id>` — restrict to one employee.
     employee_id: Option<String>,
 }
 
-/// `GET /api/agents/runs?employeeId=` — mirrors `AgentService::listRuns`.
-///
-/// # Errors
-///
-/// 503 if no pool is configured; 500 on a database failure.
-pub async fn list_runs(
-    State(state): State<AppState>,
-    Query(query): Query<EmployeeQuery>,
-) -> ApiResult<ApiJson<Vec<AgentRun>>> {
-    Ok(ApiJson(
-        agents::list_runs(pool(&state)?, query.employee_id.as_deref()).await?,
-    ))
-}
-
 /// `GET /api/agents/runs/{id}`.
 ///
+/// `SEC-20` (plan ai-118): the run history is the deployment's, so the
+/// shared catalog's own rule decides who reads it. A caller the rule
+/// refuses gets the unknown 404, so the answer says nothing about whether
+/// the run exists. This route stays: an assistant approval creates a real
+/// `agent_run` and `/agents/runs/[runId]` shows its trace (`WEB-3` D3).
+///
 /// # Errors
 ///
-/// 404 if `id` is unknown; 503/500 as above.
+/// 404 if `id` is unknown, and for a caller the shared catalog's rule
+/// refuses; 503/500 as above.
 pub async fn get_run(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<AgentRun>> {
+    if crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers)
+        .await?
+        .is_some()
+    {
+        return Err(ApiError::NotFound(format!("Run {id} not found")).into());
+    }
     let run = agents::get_run(pool(&state)?, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Run {id} not found")))?;
@@ -465,10 +315,13 @@ pub struct DecideApprovalBody {
 /// type both routes already share — so there is ONE check, not two
 /// (AGENTS.md rule 4: duplicated guards are a finding).
 ///
-/// The refusal is `403 permission_denied`, and NOTHING is written when it
-/// fires: both routes call this BEFORE their store call, so a refused
-/// decision leaves the approval `pending`, writes no audit row and grants
-/// nothing.
+/// The refusal is `403 permission_denied` and NOTHING is decided or run
+/// when it fires: both routes call this BEFORE their store call, so the
+/// approval stays `pending`, the run stays `waiting_approval`, and no
+/// grant or execution follows. `AI-28` / `LH-AI-18-10` adds ONE `refused`
+/// audit row on the tool-call decide route (the approval's own action,
+/// `resource_kind: "approval"`, the approval id, detail naming the
+/// refusal); the catalog access route is out of scope for that row.
 ///
 /// The message is one sentence for BOTH kinds — the access route's own
 /// wording minus the word "akses", which would not fit a tool call
@@ -522,7 +375,10 @@ pub(crate) fn refuse_own_request(
 ///    checked — `agent:approve` (this route's own policy) does NOT imply
 ///    the approver may perform the underlying action. A missing
 ///    permission means the tool is NEVER executed: the run is recorded
-///    `failed`/"not executed", audited, and this returns 403.
+///    `failed`/"not executed", audited, and this returns 200 with
+///    `executed: false` and a `notExecuted.reason` of `"permission"`
+///    (`AI-28`, `LH-AI-18-07`: the decision was recorded, so the answer
+///    must say so rather than fail).
 /// 2. The linked run's stored tool call (`lakehouse_store::agents::
 ///    pending_tool_call`, recorded verbatim by `gate::create_write_high_approval`
 ///    at request time) is replayed through the SAME tool dispatch
@@ -543,9 +399,11 @@ pub(crate) fn refuse_own_request(
 /// 400: see `lakehouse_store::agents::decide_approval`'s doc comment);
 /// 403 if the approver IS the human who requested this approval
 /// (`SEC-57`: the requester may not decide their own request — refused
-/// BEFORE any write, so the approval stays `pending` and nothing runs);
-/// 403 if the approval was approved but the approver lacks the underlying
-/// tool's own permission (the tool is never executed in that case);
+/// before the decision's own writes, so the approval stays `pending` and
+/// nothing runs; `AI-28`/`LH-AI-18-10` writes one `refused` audit row);
+/// 200 with `executed: false` if the approval was approved but the
+/// approver lacks the underlying tool's own permission (the tool is never
+/// executed, but the decision was recorded — `AI-28`, `LH-AI-18-07`);
 /// 503/500 as above.
 /// The `NewAuditEvent` [`decide_approval`]'s approval-decision audit write
 /// builds — extracted as a pure, unit-tested function (WS5 item D2),
@@ -573,6 +431,7 @@ fn decide_approval_audit_event(
     comment: Option<&str>,
     outcome: &str,
     run_id: Option<&str>,
+    detail: Option<&str>,
 ) -> NewAuditEvent {
     ai_audit::build_event(
         principal.kind_for_audit(),
@@ -583,11 +442,19 @@ fn decide_approval_audit_event(
         Some(approval_id),
         &json!({ "comment": comment }),
         outcome,
-        None,
+        detail,
         run_id,
         Some(approval_id),
     )
 }
+
+/// The name `crate::audit_coverage::AUDIT_TABLE` gives `POST
+/// /api/agents/approvals/{id}/decide`, and the action of the `refused` row
+/// `auth_gate` writes when it turns the call away (`GOV-1`). The row a
+/// decision itself writes carries the approval's own action (the tool the
+/// approval is for), which is chosen at run time and so cannot be the table's
+/// name.
+pub(crate) const APPROVAL_DECIDE_ACTION: &str = "agent.approval_decide";
 
 #[allow(
     clippy::too_many_lines,
@@ -625,18 +492,42 @@ pub async fn decide_approval(
     //
     // SEC-57: the requester of a tool call may not decide their own
     // request. The check runs HERE — after the kind check, before the store
-    // call — so a refused decision writes nothing at all: the approval
-    // stays `pending`, the run stays `waiting_approval`, the tool never
-    // runs.
-    match agents::get_approval(pg, &id).await {
-        Ok(Some(existing)) if existing.kind != "tool_call" => {
-            return Err(ApiError::NotFound(format!("Approval {id} not found")).into());
-        }
+    // call — so a refused decision decides nothing and runs nothing: the
+    // approval stays `pending`, the run stays `waiting_approval`, the tool
+    // never runs. AI-28 / LH-AI-18-10: the ONE row the route writes on that
+    // refusal is an audit row with outcome `refused` (the approval's own
+    // action, resource_kind "approval", the approval id).
+    //
+    // Keep `existing` for the Conflict path below too: a second decision
+    // writes the same `refused` row with detail "already decided" (AI-28).
+    let existing = match agents::get_approval(pg, &id).await {
         Ok(Some(existing)) => {
-            refuse_own_request(&existing, &principal)?;
+            if existing.kind != "tool_call" {
+                return Err(ApiError::NotFound(format!("Approval {id} not found")).into());
+            }
+            Some(existing)
         }
-        Ok(_) => {}
+        Ok(_) => None,
         Err(err) => return Err(ApiError::from(err).into()),
+    };
+
+    if let Some(existing) = existing.as_ref()
+        && let Err(err) = refuse_own_request(existing, &principal)
+    {
+        audit_coverage::record_best_effort(
+            &state,
+            decide_approval_audit_event(
+                &principal,
+                &existing.action,
+                &id,
+                body.comment.as_deref(),
+                "refused",
+                existing.run_id.as_deref(),
+                Some("the requester may not decide their own request"),
+            ),
+        )
+        .await;
+        return Err(err.into());
     }
 
     let approval = match agents::decide_approval(pg, &id, decision, body.comment.as_deref()).await {
@@ -645,6 +536,24 @@ pub async fn decide_approval(
             return Err(ApiError::NotFound(format!("Approval {id} not found")).into());
         }
         Err(lakehouse_store::StoreError::Conflict) => {
+            // AI-28 / LH-AI-18-10: the 409 is unchanged, but a decision that
+            // lost the pending→decided race writes one `refused` audit row
+            // naming why, instead of silently returning.
+            if let Some(existing) = existing.as_ref() {
+                audit_coverage::record_best_effort(
+                    &state,
+                    decide_approval_audit_event(
+                        &principal,
+                        &existing.action,
+                        &id,
+                        body.comment.as_deref(),
+                        "refused",
+                        existing.run_id.as_deref(),
+                        Some("already decided"),
+                    ),
+                )
+                .await;
+            }
             return Err(
                 ApiError::Conflict(format!("Approval {id} has already been decided")).into(),
             );
@@ -668,15 +577,9 @@ pub async fn decide_approval(
         body.comment.as_deref(),
         decide_outcome,
         approval.run_id.as_deref(),
+        None,
     );
-    if let Err(err) = store_audit::insert(pg, decide_audit_event).await {
-        tracing::warn!(
-            %err,
-            action = %approval.action,
-            outcome = decide_outcome,
-            "failed to record approval-decision audit event"
-        );
-    }
+    audit_coverage::record_best_effort(&state, decide_audit_event).await;
 
     // Approvals the copilot creates always carry a `run_id` (see
     // `create_pending_approval`); one that doesn't (a manually-inserted or
@@ -766,9 +669,22 @@ pub async fn decide_approval(
             Some(&id),
         )
         .await;
-        return Err(ApiError::PermissionDenied(detail).into());
+        // AI-28 / LH-AI-18-07 (feature decision 5, ADR 0012 decision 3):
+        // the decision IS recorded — the approval is `approved`, the run is
+        // `failed`, both audit rows are written exactly as before — so the
+        // answer reports that, not a failure. A 403 here made the console
+        // show "Failed to record decision" for a decision it had recorded.
+        return Ok(ApiJson(json!({
+            "approval": approval,
+            "executed": false,
+            "notExecuted": { "reason": "permission", "required": spec.permission },
+        })));
     }
     let result = ai_tools::run_tool(&state, Some(&principal), &pending.tool, &args).await;
+    // LH-QS-2-08 (owner 2026-11-12): this run's outcome is read by a browser,
+    // and so is this route's answer, so both carry the browser's copy of an
+    // engine failure. No model reads the result here.
+    let (result, shown) = crate::routes::ai::split_tool_result(result);
     let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
     let status = if ok { "succeeded" } else { "failed" };
     if let Err(err) = agents::record_run_outcome(
@@ -776,7 +692,7 @@ pub async fn decide_approval(
         &run_id,
         status,
         "Executed after approval",
-        &serde_json::to_string(&result).unwrap_or_default(),
+        &stored_tool_detail(&shown),
     )
     .await
     {
@@ -791,14 +707,17 @@ pub async fn decide_approval(
         approval.resource.as_deref(),
         &json!({}),
         if ok { "executed" } else { "failed" },
-        None,
+        // The browser's copy of the failure, the fixed sentence and the
+        // reference (plan 111): the row says why the call failed, and the
+        // engine's own text stays out of the audit trail.
+        shown.get("error").and_then(Value::as_str),
         Some(&run_id),
         Some(&id),
     )
     .await;
 
     Ok(ApiJson(
-        json!({ "approval": approval, "executed": true, "result": result }),
+        json!({ "approval": approval, "executed": true, "result": shown }),
     ))
 }
 
@@ -918,8 +837,7 @@ fn check_employee_run_auth(
 
 /// The headless loop's own iteration cap — same value as `routes::ai`'s
 /// `MAX_ITER` (kept as an independent constant rather than importing that
-/// private one: see the module doc comment on why this route cannot reach
-/// into `routes::ai::gate`).
+/// private one: `routes::ai` keeps it to itself).
 const MAX_HEADLESS_ITER: u32 = 8;
 
 /// How one headless run's tool-calling loop ended.
@@ -981,7 +899,7 @@ async fn append_step(pg: &PgPool, run_id: &str, id: &str, label: &str, status: &
     reason = "one flat record of what happened, mirroring routes::ai::audit::record's own justification"
 )]
 async fn write_headless_audit(
-    pg: &PgPool,
+    state: &AppState,
     principal_id: Option<String>,
     principal_kind: &str,
     actor_label: &str,
@@ -1008,9 +926,7 @@ async fn write_headless_audit(
         approval_id: approval_id.map(str::to_owned),
         session_id: None,
     };
-    if let Err(err) = store_audit::insert(pg, event).await {
-        tracing::warn!(%err, action, outcome, "headless run: failed to write audit_event");
-    }
+    audit_coverage::record_best_effort(state, event).await;
 }
 
 /// A short, deterministic system prompt for the headless loop — NOT a
@@ -1151,7 +1067,7 @@ async fn run_headless_loop(
 #[allow(
     clippy::too_many_lines,
     reason = "one straight-line reimplementation of routes::ai::chat's own tool-calling loop \
-              plus the three gate checks routes::ai::gate keeps private; splitting it up would \
+              plus the three gate checks a headless run reimplements; splitting it up would \
               scatter one sequential loop across helpers with no independent reuse, matching \
               routes::ai::chat's own identical justification"
 )]
@@ -1241,7 +1157,7 @@ async fn run_headless_loop_inner(
             )
             .await;
             write_headless_audit(
-                pg,
+                state,
                 principal_id.clone(),
                 principal_kind,
                 actor_label,
@@ -1267,8 +1183,11 @@ async fn run_headless_loop_inner(
             return HeadlessOutcome::Terminal("budget_exhausted");
         }
 
-        let msg = match state
-            .llm
+        // `ADM-9`: the client comes from the resolver, which rebuilds it
+        // when the effective provider settings change.
+        let assistant = crate::runtime_settings::assistant(state).await;
+        let msg = match assistant
+            .client
             .chat_with_tools_metered(&messages, &tools, ChatOptions::default())
             .await
         {
@@ -1312,7 +1231,7 @@ async fn run_headless_loop_inner(
                 )
                 .await;
                 write_headless_audit(
-                    pg,
+                    state,
                     principal_id.clone(),
                     principal_kind,
                     actor_label,
@@ -1345,7 +1264,7 @@ async fn run_headless_loop_inner(
             )
             .await;
             write_headless_audit(
-                pg,
+                state,
                 principal_id.clone(),
                 principal_kind,
                 actor_label,
@@ -1388,7 +1307,7 @@ async fn run_headless_loop_inner(
                 )
                 .await;
                 write_headless_audit(
-                    pg,
+                    state,
                     principal_id.clone(),
                     principal_kind,
                     actor_label,
@@ -1412,8 +1331,8 @@ async fn run_headless_loop_inner(
 
             // Ask-mode gate: identical semantics to `routes::ai::gate::decide`'s
             // first check, reimplemented here rather than called there — see
-            // the module doc comment on why this route cannot reach the
-            // private `routes::ai::gate` module.
+            // the module doc comment on why this route reimplements the
+            // gate's checks itself.
             if !is_build && is_write {
                 step_no += 1;
                 let detail = format!(
@@ -1430,7 +1349,7 @@ async fn run_headless_loop_inner(
                 )
                 .await;
                 write_headless_audit(
-                    pg,
+                    state,
                     principal_id.clone(),
                     principal_kind,
                     actor_label,
@@ -1476,7 +1395,7 @@ async fn run_headless_loop_inner(
                 )
                 .await;
                 write_headless_audit(
-                    pg,
+                    state,
                     principal_id.clone(),
                     principal_kind,
                     actor_label,
@@ -1530,8 +1449,13 @@ async fn run_headless_loop_inner(
                         tool: spec.name,
                         resource: resource_id.as_deref(),
                         reason: &reason,
-                        risk: "High-risk action (WriteHigh): cannot be undone once \
-                               executed.",
+                        // The sentence the chat's approval card shows for
+                        // this tool (`ai_gate::risk_for_write_high`): a
+                        // deleted chart goes to the trash and stays
+                        // restorable, so the generic "cannot be undone"
+                        // text was false on this very card (`AI-1`,
+                        // `GOV-13`).
+                        risk: ai_gate::risk_for_write_high(spec),
                         redacted_args: &redacted,
                         // SEC-57: the approval names the HUMAN who started
                         // this run, when a person started it — so the API
@@ -1551,7 +1475,7 @@ async fn run_headless_loop_inner(
                             tracing::warn!(%err, run_id, "headless run: failed to mark waiting_approval");
                         }
                         write_headless_audit(
-                            pg,
+                            state,
                             principal_id.clone(),
                             principal_kind,
                             actor_label,
@@ -1573,7 +1497,7 @@ async fn run_headless_loop_inner(
                             "headless run: failed to create WriteHigh approval"
                         );
                         write_headless_audit(
-                            pg,
+                            state,
                             principal_id.clone(),
                             principal_kind,
                             actor_label,
@@ -1608,6 +1532,11 @@ async fn run_headless_loop_inner(
             // requiring tool (`run_saved_query`) is responsible for
             // refusing `None` with a named reason rather than a bare 401.
             let result = ai_tools::run_tool(state, principal, &call.function.name, &args).await;
+            // LH-QS-2-08 (owner 2026-11-12): the step's detail is read by a
+            // browser, so it stores the browser's copy of an engine failure
+            // (`shown`), while the model that drives this run is fed the
+            // model's copy (`result`), which keeps the engine's diagnosis.
+            let (result, shown) = crate::routes::ai::split_tool_result(result);
             let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
             let (resource_kind, resource_id) =
                 ai_audit::resource_for(&call.function.name, &args, &result);
@@ -1617,11 +1546,11 @@ async fn run_headless_loop_inner(
                 &format!("step-{step_no}"),
                 &call.function.name,
                 if ok { "succeeded" } else { "failed" },
-                &serde_json::to_string(&result).unwrap_or_default(),
+                &stored_tool_detail(&shown),
             )
             .await;
             write_headless_audit(
-                pg,
+                state,
                 principal_id.clone(),
                 principal_kind,
                 actor_label,
@@ -1630,7 +1559,11 @@ async fn run_headless_loop_inner(
                 resource_id.as_deref(),
                 &Value::Object(args.clone()),
                 if ok { "executed" } else { "failed" },
-                None,
+                // The browser's copy of the failure, the fixed sentence and
+                // the reference (plan 111): the row says why the call
+                // failed, and the engine's own text stays out of the audit
+                // trail.
+                shown.get("error").and_then(Value::as_str),
                 run_id,
                 None,
             )
@@ -1683,17 +1616,20 @@ fn push_tool_result(
 /// # Why this can't just call into `routes::ai`
 ///
 /// `routes::ai::gate` (mode + permission gate, `WriteLow` confirmation,
-/// `WriteHigh` approval creation) is a PRIVATE module of `routes::ai`
-/// (`mod gate;`, not `pub(in crate::routes)`) — only `routes::ai::chat`
-/// and `routes::ai::tool_call` can call it. This handler reimplements the
-/// same three checks (ask-mode refusal, permission-ceiling refusal,
-/// `WriteHigh` → approval) directly in [`run_headless_loop`] rather than
-/// editing that module's visibility, and reuses everything that IS already
-/// shared across `routes::ai`'s sibling modules: [`ai_tools::run_tool`]
-/// (the actual dispatch), [`ai_registry::find`]/[`ai_registry::tool_schemas_for`]
-/// (the tool table), and [`ai_audit::redact`]/[`ai_audit::resource_for`]
-/// (the redaction/resource-inference rules) — never a second, divergent
-/// copy of THOSE.
+/// `WriteHigh` approval creation) is `pub(in crate::routes)`, so a sibling
+/// module of `routes::ai` can call it, and this route reuses its
+/// [`ai_gate::permission_granted`] and [`ai_gate::risk_for_write_high`].
+/// The three checks themselves (ask-mode refusal, permission-ceiling
+/// refusal, `WriteHigh` → approval) are reimplemented directly in
+/// [`run_headless_loop`], because a headless run has no chat turn to
+/// confirm in and creates its own linked approval. Everything that IS
+/// already shared across `routes::ai`'s sibling modules is reused:
+/// [`ai_tools::run_tool`] (the actual dispatch),
+/// [`ai_registry::find`]/[`ai_registry::tool_schemas_for`] (the tool table),
+/// and [`ai_audit::redact`]/[`ai_audit::resource_for`] (the
+/// redaction/resource-inference rules) — never a second, divergent copy of
+/// THOSE. The system prompt's constants are private to `routes::ai`, so the
+/// headless run has a prompt of its own.
 ///
 /// # Auth (see [`check_employee_run_auth`])
 ///
@@ -1830,7 +1766,7 @@ mod tests {
     use std::collections::HashMap;
 
     use axum::body::to_bytes;
-    use axum::http::Request;
+    use axum::http::{Request, StatusCode};
     use lakehouse_auth::PrincipalId;
     use serde_json::Value;
     use tower::ServiceExt;
@@ -1846,12 +1782,13 @@ mod tests {
 
     #[tokio::test]
     async fn every_database_backed_route_returns_503_without_a_pool() {
+        // Only the routes WEB-4 kept: the retired workflows, employee
+        // create/lifecycle and runs-list paths are asserted 404 in
+        // `tests/route_auth.rs`'s WEB-4 regression instead.
         let paths = [
-            "/api/agents/workflows",
             "/api/agents/employees",
             "/api/agents/employees/emp-x",
             "/api/agents/tools",
-            "/api/agents/runs",
             "/api/agents/runs/run-x",
             "/api/agents/approvals",
         ];
@@ -1919,30 +1856,64 @@ mod tests {
     }
 
     #[test]
-    fn create_employee_body_rejects_unknown_autonomy() {
-        let body = CreateEmployeeBody {
-            name: "n".to_owned(),
-            purpose: "p".to_owned(),
-            autonomy: "L9".to_owned(),
-            allowed_tools: vec![],
-            data_scope: "d".to_owned(),
-            budget_limit: 0.0,
-            owner: None,
-            prompt: None,
-            schedule_cron: None,
-            mode: None,
-            permissions: None,
-        };
-        assert!(!VALID_AUTONOMY.contains(&body.autonomy.as_str()));
-    }
-
-    #[test]
     fn decide_approval_body_rejects_unknown_decision() {
         let body = DecideApprovalBody {
             decision: "maybe".to_owned(),
             comment: None,
         };
         assert!(!matches!(body.decision.as_str(), "approved" | "rejected"));
+    }
+
+    /// A run's step detail is read by a browser, so for an engine failure it
+    /// holds the fixed sentence and the reference (LH-QS-2-08), never the
+    /// engine's diagnosis, which only the model reads. The server-only key
+    /// the browser's copy travelled in is gone from it too.
+    #[test]
+    fn a_stored_tool_detail_holds_the_fixed_sentence_and_not_the_engine_diagnosis() {
+        let result = json!({
+            "error": "Unknown expression identifier 'pengunjungg' in scope. (UNKNOWN_IDENTIFIER) Reference: dc51a4b585",
+            "_browserError": "This query names a column that does not exist. Reference: dc51a4b585",
+        });
+
+        let (model, shown) = crate::routes::ai::split_tool_result(result);
+        let detail = stored_tool_detail(&shown);
+
+        let stored: Value = serde_json::from_str(&detail).expect("the detail is JSON");
+        assert_eq!(
+            stored["error"],
+            json!("This query names a column that does not exist. Reference: dc51a4b585"),
+        );
+        for text in [
+            "UNKNOWN_IDENTIFIER",
+            "Code:",
+            "pengunjungg",
+            "_browserError",
+        ] {
+            assert!(!detail.contains(text), "{text} in {detail}");
+        }
+        // The model's copy keeps the diagnosis, with the same reference.
+        assert!(
+            model["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("UNKNOWN_IDENTIFIER")
+                    && text.ends_with("Reference: dc51a4b585")),
+            "{model}"
+        );
+    }
+
+    /// A result with no browser copy (a success, or a failure whose message
+    /// is already fixed) is stored as the tool returned it.
+    #[test]
+    fn a_stored_tool_detail_of_a_result_without_a_browser_copy_is_the_result() {
+        for result in [
+            json!({ "columns": ["n"], "rows": [[5]], "rowCount": 1 }),
+            json!({ "error": "The database request failed. Reference: ab12cd34ef" }),
+        ] {
+            let (_, shown) = crate::routes::ai::split_tool_result(result.clone());
+            let stored: Value =
+                serde_json::from_str(&stored_tool_detail(&shown)).expect("the detail is JSON");
+            assert_eq!(stored, result);
+        }
     }
 
     /// A logged-in human principal — `PrincipalId::User`. Mirrors
@@ -1992,6 +1963,7 @@ mod tests {
             Some("looks fine"),
             "approved",
             Some("run-1"),
+            None,
         );
         assert_eq!(event.principal_kind.as_deref(), Some("user"));
         assert_eq!(
@@ -2018,6 +1990,7 @@ mod tests {
             "appr-2",
             None,
             "rejected",
+            None,
             None,
         );
         assert_eq!(event.principal_kind.as_deref(), Some("service"));
@@ -2070,28 +2043,6 @@ mod tests {
         assert_eq!(principal_id, None);
         assert_eq!(principal_kind, "schedule");
         assert_eq!(actor, "Nightly Ingest Bot");
-    }
-
-    /// D (T3.2's fix): `create_employee` must validate `mode` the same way
-    /// it already validates `autonomy` — an unrecognized value never
-    /// reaches `agents::create_employee` to surface as a raw DB `CHECK`
-    /// violation.
-    #[test]
-    fn create_employee_body_rejects_unknown_mode() {
-        let body = CreateEmployeeBody {
-            name: "n".to_owned(),
-            purpose: "p".to_owned(),
-            autonomy: "L1".to_owned(),
-            allowed_tools: vec![],
-            data_scope: "d".to_owned(),
-            budget_limit: 0.0,
-            owner: None,
-            prompt: None,
-            schedule_cron: None,
-            mode: Some("sleep".to_owned()),
-            permissions: None,
-        };
-        assert!(!VALID_MODE.contains(&body.mode.as_deref().unwrap()));
     }
 
     fn admin_perms() -> PermissionSet {
@@ -2363,7 +2314,7 @@ mod tests {
 
             let state = state_for(&pool, &server.uri());
 
-            let input = CreateEmployeeInput {
+            let input = store_agents::CreateEmployeeInput {
                 name: "budget-test-employee".to_owned(),
                 purpose: "p".to_owned(),
                 autonomy: "L2".to_owned(),
@@ -2442,7 +2393,7 @@ mod tests {
 
             let state = state_for(&pool, &server.uri());
 
-            let input = CreateEmployeeInput {
+            let input = store_agents::CreateEmployeeInput {
                 name: "under-budget-employee".to_owned(),
                 purpose: "p".to_owned(),
                 autonomy: "L2".to_owned(),
@@ -2515,7 +2466,7 @@ mod tests {
 
             let state = state_for(&pool, &server.uri());
 
-            let input = CreateEmployeeInput {
+            let input = store_agents::CreateEmployeeInput {
                 name: "unconfigured-budget-employee".to_owned(),
                 purpose: "p".to_owned(),
                 autonomy: "L2".to_owned(),

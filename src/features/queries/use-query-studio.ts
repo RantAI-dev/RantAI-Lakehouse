@@ -5,19 +5,30 @@ import * as React from "react"
 import { Prec } from "@codemirror/state"
 import { EditorView, keymap } from "@codemirror/view"
 
-import { assetQueryTarget } from "@/lib/asset-query"
+import { assetQueryTarget, BRONZE_NAMESPACE, trinoBronzeName } from "@/lib/asset-query"
+import { isIcebergCandidate } from "@/lib/lakehouse-view"
 import { useDebouncedCallback } from "@/hooks/use-debounced-callback"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { levelAtLeast } from "@/lib/access-level"
 import { catalogRefusal } from "@/lib/catalog-refusal"
-import { notifyInfo } from "@/lib/notify"
+import { readableErrorMessage } from "@/lib/notify-message"
 import { newRunId } from "@/lib/run-id"
 import {
+  dropLegacyDraft,
   MAX_QUERY_TABS,
   readTabs,
   writeTabs,
   type QueryTab,
   type QueryTabs,
 } from "@/lib/query-draft"
+import {
+  activeParameters,
+  fieldsNamedBy,
+  firstMissingValueName,
+  paramInputs,
+  reconcileDefinitions,
+  replaceDefinition,
+} from "@/lib/query-param-names"
 import {
   tablesInStatement,
   type ColumnState,
@@ -29,13 +40,17 @@ import {
   splitStatements,
   type SqlStatement,
 } from "@/lib/sql-text"
-import { assetService, queryService } from "@/services"
+import { assetService, lakehouseService, queryService } from "@/services"
 import { toServiceError, type ServiceError } from "@/services/errors"
 import type {
   NlAnswer,
   QueryEngine,
+  QueryParamDef,
+  QueryParamInputs,
+  QueryParamValue,
+  QueryHistoryItem,
   QueryResult,
-  SaveQueryInput,
+  SavedQuery,
   SqlFixOutcome,
 } from "@/services/contracts/queries"
 import {
@@ -44,8 +59,12 @@ import {
 } from "./sql-completion-source"
 import { useQueryDownload } from "./use-query-download"
 
-/** What the editor holds before anyone types. */
-export const STARTER_SQL = "-- Write SQL here, or generate it from a question"
+/**
+ * QS-11 (LH-QS-1-01), D7: a new tab holds the empty string; this is a grey
+ * CodeMirror placeholder, never text in the document. The old starter text
+ * was real SQL that a run would send as a comment-only statement.
+ */
+export const SQL_PLACEHOLDER = "Write SQL here, or generate it from a question"
 
 /** How long to wait after the last keystroke before asking for an estimate. */
 const ESTIMATE_DEBOUNCE_MS = 500
@@ -53,12 +72,36 @@ const ESTIMATE_DEBOUNCE_MS = 500
 /** How long to wait before writing the draft to storage. */
 const DRAFT_DEBOUNCE_MS = 400
 
+/** What a tab without definitions or values holds; one object, so the memo that reads it stays put. */
+const NO_DEFINITIONS: QueryParamDef[] = []
+const NO_VALUES: Record<string, QueryParamValue> = {}
+/** What a request carries for SQL with no placeholder: nothing, one object so a memo that reads it stays put. */
+const NO_INPUTS: QueryParamInputs = {}
+const NO_NAMES: ReadonlySet<string> = new Set()
+
 /**
  * The id of the tab that is there before anything is read from storage.
  * The draft that came before this had tabs is read as the tab with this
  * id, so the two live side by side in the browser.
  */
 const FIRST_TAB_ID = "tab-1"
+
+/**
+ * What the studio says when a `?saved=` link names a query the caller may
+ * not see (or one that is in the trash).
+ *
+ * The console's own sentence, not the server's: the link is the same for
+ * a query that was deleted and for one nobody may read, and the person
+ * following it learns that the query is not there for them (`QS-3` C5).
+ */
+export const SAVED_QUERY_UNAVAILABLE = "This query is not available to you."
+
+/**
+ * QS-12 (LH-QS-4-07), D15: a `/query-studio?run=<id>` link whose run is not in
+ * the caller's own last-14-day history. One sentence for "not there" and for
+ * "not yours", so the link never reveals which it was.
+ */
+export const RUN_LINK_UNAVAILABLE = "This run is not in your history of the last 14 days."
 
 /**
  * The shape of a catalog id that is a SQL table name: `silver.orders`.
@@ -69,6 +112,20 @@ const FIRST_TAB_ID = "tab-1"
 const SQL_TABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$/
 
 export type StudioTab = "nl" | "sql"
+
+/**
+ * What the studio knows about a Bronze table's Iceberg table: that it is
+ * there (`there`), that it is not (`missing` — a read that answered "not
+ * found"), or that the read itself failed (`failed`), which says nothing
+ * about the table and is tried again the next time the entry opens.
+ *
+ * A table with no proof yet has none either: the registry's `tableName`
+ * says a Bronze table might exist, not that it does, and a Trino tab on a
+ * table that is not there answers "table does not exist" (QS-4 D3, owner
+ * 2026-11-09). Holding a failed read as `missing` would state as fact
+ * what was only a failed request (#448 review SHOULD-FIX).
+ */
+export type TableProof = { status: "there" | "missing" | "failed" }
 
 /**
  * What one statement of a run did.
@@ -93,7 +150,16 @@ export type StatementRun =
       runId: string
     }
   | { status: "error"; statement: SqlStatement; error: ServiceError }
-  | { status: "not-run"; statement: SqlStatement }
+  | {
+      status: "not-run"
+      statement: SqlStatement
+      /**
+       * QA LH-QS-4-10: why it did not run. A failure of an earlier statement
+       * stops the batch; so does the person's Stop, and the page must not
+       * tell them a failure did it.
+       */
+      reason: "failure" | "stopped"
+    }
 
 /** A range of the buffer, in the buffer's own offsets. */
 type BufferRange = { from: number; to: number }
@@ -149,6 +215,12 @@ type Batch = {
 }
 
 /**
+ * How many Bronze tables are proven at once when the list loads (LH-QS-4-08).
+ * Four keeps a long list moving without a burst of requests from one page.
+ */
+const MAX_PROOF_READS = 4
+
+/**
  * The name a new tab gets: the first "Query N" nobody is using, so a name
  * is never handed out twice after a tab was closed.
  */
@@ -188,12 +260,32 @@ function newTabId(): string {
  * of mixed concerns, and because the rules that matter here — don't
  * estimate on every keystroke, don't estimate a buffer that holds only a
  * comment — are easy to lose sight of inside JSX.
+ *
+ * `draftKey` is the storage key of the person whose tabs these are
+ * (`queryDraftKey`), or `null` while the signed-in person is not known. One
+ * hook instance has one owner for its whole life (`QS-8`, decision 12): a
+ * later, different key is ignored here because the page mounts a new
+ * workspace for it — the old one flushes its tabs under its own key as it
+ * unmounts. `null` reads and writes nothing (fail closed).
  */
-export function useQueryStudio() {
+export function useQueryStudio(draftKey: string | null) {
+  // The owner is latched: the session may answer after this hook has mounted,
+  // so the first non-null key is taken and every later one is not.
+  const [ownKey, setOwnKey] = React.useState<string | null>(draftKey)
+  React.useEffect(() => {
+    if (ownKey === null && draftKey !== null) setOwnKey(draftKey)
+  }, [ownKey, draftKey])
   const [tab, setTab] = React.useState<StudioTab>("nl")
   const [question, setQuestion] = React.useState("")
   const [tabs, setTabs] = React.useState<QueryTab[]>(() => [
-    { id: FIRST_TAB_ID, name: "Query 1", sql: STARTER_SQL, engine: "clickhouse" },
+    {
+      id: FIRST_TAB_ID,
+      name: "Query 1",
+      sql: "",
+      engine: "clickhouse",
+      parameters: [],
+      values: {},
+    },
   ])
   const [activeTabId, setActiveTabId] = React.useState(FIRST_TAB_ID)
   // What every statement of every run did. It belongs to the tab that ran
@@ -231,6 +323,36 @@ export function useQueryStudio() {
   const sql = activeTab?.sql ?? ""
   const engine = activeTab?.engine ?? "clickhouse"
 
+  // The `{{name}}` parameters of the open tab (`QS-5`). The tab keeps every
+  // definition it has had; the fields are the ones whose name the SQL uses
+  // now, so a name cut out of the SQL loses its field and not its
+  // definition or value. Read on `sql` and the definitions only, so a
+  // keystroke that changes neither the names nor the definitions does not
+  // rebuild the list the fields are drawn from.
+  const parameterDefinitions = activeTab?.parameters ?? NO_DEFINITIONS
+  const parameterValues = activeTab?.values ?? NO_VALUES
+  const parameters = React.useMemo(
+    () => activeParameters(sql, parameterDefinitions),
+    [sql, parameterDefinitions]
+  )
+  // What a run carries for them: the values and the definitions of the names
+  // the SQL uses, or nothing when it uses none (`paramInputs`).
+  const runInputs = React.useMemo(
+    () => (parameters.length === 0 ? NO_INPUTS : paramInputs(parameters, parameterValues)),
+    [parameters, parameterValues]
+  )
+
+  // The saved query the open tab came from, when it came from one (`QS-3`
+  // C4). Its level says what "Save" may do with it.
+  const activeSaved = React.useMemo(() => {
+    const savedId = activeTab?.savedId
+    if (!savedId) return null
+    return { id: savedId, level: activeTab?.level }
+  }, [activeTab])
+  // "Save" changes the saved query when the caller may edit it, and makes a
+  // copy of it otherwise: a level the console cannot read widens nothing.
+  const savesSavedQuery = activeSaved !== null && levelAtLeast(activeSaved.level, "edit")
+
   // A proposal is a diff against the editor as it was when it came back.
   // Once the editor changes, the diff describes something else, so it goes.
   const [fixResult, setFixResult] = React.useState<SqlFixOutcome | null>(null)
@@ -242,15 +364,77 @@ export function useQueryStudio() {
   const [explainResult, setExplainResult] = React.useState<string | null>(null)
   const [explainBusy, setExplainBusy] = React.useState(false)
   const [explainError, setExplainError] = React.useState<ServiceError | null>(null)
+  // QS-11 (LH-QS-1-12), D9: a refused batch is said on the page until the
+  // person changes the SQL or opens another tab — a toast would be gone by
+  // the time they look for the reason nothing ran.
+  const [batchRefusal, setBatchRefusal] = React.useState<string | null>(null)
   const setSql = React.useCallback(
     (next: string) => {
       setTabs((previous) =>
-        previous.map((open) => (open.id === activeTabId ? { ...open, sql: next } : open))
+        previous.map((open) =>
+          open.id === activeTabId
+            ? {
+                ...open,
+                sql: next,
+                parameters: reconcileDefinitions(next, open.parameters, open.values),
+              }
+            : open
+        )
       )
       setFixResult(null)
       setFixStatement(null)
+      setBatchRefusal(null)
     },
     [activeTabId]
+  )
+  // The fields the server's last refusal of a run named (`QS-5`). The wire
+  // gives a sentence and no field, so `fieldsNamedBy` reads the names out of
+  // it. A field is marked until its value or definition changes, and every
+  // mark goes when the next run starts.
+  const [refused, setRefused] = React.useState<{
+    tabId: string
+    names: ReadonlySet<string>
+  } | null>(null)
+  const unmark = React.useCallback(
+    (name: string) => {
+      setRefused((previous) => {
+        if (!previous || previous.tabId !== activeTabId || !previous.names.has(name)) return previous
+        const names = new Set(previous.names)
+        names.delete(name)
+        return names.size === 0 ? null : { tabId: previous.tabId, names }
+      })
+    },
+    [activeTabId]
+  )
+  /** Gives the parameter a value; `undefined` takes the value away (the default applies). */
+  const setParameterValue = React.useCallback(
+    (name: string, value: QueryParamValue | undefined) => {
+      unmark(name)
+      setTabs((previous) =>
+        previous.map((open) => {
+          if (open.id !== activeTabId) return open
+          const values = { ...open.values }
+          if (value === undefined) delete values[name]
+          else values[name] = value
+          return { ...open, values }
+        })
+      )
+    },
+    [activeTabId, unmark]
+  )
+  /** Replaces the definition of the parameter it names; a value that no longer fits its type goes. */
+  const setParameterDefinition = React.useCallback(
+    (def: QueryParamDef) => {
+      unmark(def.name)
+      setTabs((previous) =>
+        previous.map((open) =>
+          open.id === activeTabId
+            ? { ...open, ...replaceDefinition(open.parameters, open.values, def) }
+            : open
+        )
+      )
+    },
+    [activeTabId, unmark]
   )
   const setEngine = React.useCallback(
     (next: QueryEngine) => {
@@ -264,12 +448,24 @@ export function useQueryStudio() {
   const generateAct = useServiceAction((signal, q: string) =>
     queryService.generateSql(q, signal)
   )
-  const estimateAct = useServiceAction((signal, s: string) =>
-    queryService.estimate(s, signal)
+  const estimateAct = useServiceAction((signal, s: string, inputs: QueryParamInputs) =>
+    // Only a ClickHouse tab gets this far (M2 of the round-3 rulings, after
+    // #482): the console names no engine, so the request is the one sent
+    // before `QS-6` — no options, or the inputs alone.
+    queryService.estimate(s, inputs.definitions ? inputs : undefined, signal)
   )
-  const saveAct = useServiceAction((signal, input: SaveQueryInput) =>
-    queryService.saveQuery(input, signal)
-  )
+  // The fields to mark: the ones the last run's refusal named, and the ones
+  // the estimate's refusal names. An estimate's mark goes with its error,
+  // when the next estimate starts.
+  const estimateError = estimateAct.error
+  const invalidParameters = React.useMemo<ReadonlySet<string>>(() => {
+    const marked = new Set(refused && refused.tabId === activeTabId ? refused.names : NO_NAMES)
+    if (estimateError?.code === "invalid_request") {
+      const names = parameters.map((def) => def.name)
+      for (const name of fieldsNamedBy(estimateError.message, names)) marked.add(name)
+    }
+    return marked.size === 0 ? NO_NAMES : marked
+  }, [refused, activeTabId, estimateError, parameters])
   const savedState = useService((s) => queryService.listSaved(s), [])
   const historyState = useService((s) => queryService.listHistory(undefined, s), [])
 
@@ -280,41 +476,86 @@ export function useQueryStudio() {
   // is a nicety, and Query Studio works without it.
   const assetsState = useService((s) => assetService.listAssets({}, s), [])
 
+  // Whether the page is still there: a request that comes back after the
+  // person left it must not set state.
+  const mountedRef = React.useRef(true)
+  React.useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
+
+  // Whether a table's Iceberg table is there, by catalog id. It is read
+  // once, with the table's own detail, and kept for the session: a Bronze
+  // table's Trino name is offered only for a table that is proven to be
+  // there (QS-4 D3).
+  const [proofs, setProofs] = React.useState<Record<string, TableProof>>({})
+  const rememberProof = React.useCallback((id: string, proof: TableProof) => {
+    // The person may have left the page while the request was in flight.
+    if (!mountedRef.current) return
+    setProofs((previous) => ({ ...previous, [id]: proof }))
+  }, [])
+
   // The query target a table's detail named, keyed by the catalog id. The
   // detail is already fetched for a table a person expands or a statement
   // names; the same answer carries the SQL form.
+  // A Bronze table also keeps its registry `tableName`: that is what its
+  // Trino name is built from, and it is only on the detail.
   const [targets, setTargets] = React.useState<
-    Record<string, ReturnType<typeof assetQueryTarget>>
+    Record<string, { target: ReturnType<typeof assetQueryTarget>; bronzeTable: string | null }>
   >({})
 
   // The tables in the shape the completion needs: the SQL name to insert,
   // the name a person reads, and every name the table answers to.
   //
   // A Bronze asset's registry slug is not a SQL name, so such a table has
-  // no reference until its detail is loaded; the target the detail names
-  // is offered on the engine it serves — a Trino-only name on a Trino tab
-  // only. An id that reads as a SQL name keeps being the reference, as it
-  // always was.
+  // no reference until its detail is loaded. A Bronze table has two names:
+  // the ClickHouse one the server names (`queryTarget`, for the catalog
+  // page) and its Trino name, built here from the detail. The studio offers
+  // only the Trino one, and only on a Trino tab; on a ClickHouse tab the
+  // reference stays empty (`trinoOnly` tells the schema browser why). An id
+  // that reads as a SQL name keeps being the reference, as it always was.
+  // (QS-4 QA of 2026-11-05)
   const tables = React.useMemo<CompletionTable[]>(() => {
     if (assetsState.status !== "success") return []
     return assetsState.data.map((asset) => {
-      const fallback = SQL_TABLE_NAME.test(asset.id) ? asset.id : ""
-      const target = targets[asset.id]
-      const reference =
-        fallback !== ""
-          ? fallback
-          : target && (target.engine !== "trino" || engine === "trino")
-            ? target.table
-            : ""
+      const names = [asset.id, `${asset.namespace}.${asset.name}`]
+      if (SQL_TABLE_NAME.test(asset.id)) {
+        return { id: asset.id, label: asset.name, reference: asset.id, layer: asset.layer, names }
+      }
+      const detail = targets[asset.id]
+      // Before the detail, the layer is all there is to tell a Bronze table.
+      const trinoOnly = detail
+        ? detail.bronzeTable !== null
+        : asset.layer === "raw" || asset.layer === "bronze"
+      if (trinoOnly) {
+        const trino = detail?.bronzeTable ? trinoBronzeName(detail.bronzeTable) : ""
+        // Both spellings of a Trino name resolve to this table, whatever its id.
+        if (detail?.bronzeTable) names.push(trino, `bronze.${detail.bronzeTable}`)
+        // The Trino name is offered only once the Iceberg table is proven to
+        // be there: the registry's `tableName` says a Bronze table might
+        // exist, not that it does (QS-4 D3, owner 2026-11-09).
+        const proven = proofs[asset.id]?.status === "there"
+        return {
+          id: asset.id,
+          label: asset.name,
+          reference: engine === "trino" && proven ? trino : "",
+          layer: asset.layer,
+          names,
+          trinoOnly: true,
+        }
+      }
+      const target = detail?.target
       return {
         id: asset.id,
         label: asset.name,
-        reference,
+        reference: target && (target.engine !== "trino" || engine === "trino") ? target.table : "",
         layer: asset.layer,
-        names: [asset.id, `${asset.namespace}.${asset.name}`],
+        names,
       }
     })
-  }, [assetsState.status, assetsState.data, targets, engine])
+  }, [assetsState.status, assetsState.data, targets, proofs, engine])
 
   // The columns of the tables the buffer names: fetched once each and kept
   // for the session. A table that cannot be read is kept as a failure too,
@@ -325,7 +566,6 @@ export function useQueryStudio() {
   // state update is not there yet at that point.
   const [columns, setColumns] = React.useState<Record<string, ColumnState>>({})
   const columnsRef = React.useRef<Record<string, ColumnState>>({})
-  const mountedRef = React.useRef(true)
   const rememberColumns = React.useCallback((id: string, state: ColumnState) => {
     columnsRef.current[id] = state
     // The person may have left the page while the request was in flight.
@@ -333,24 +573,38 @@ export function useQueryStudio() {
     setColumns((previous) => ({ ...previous, [id]: state }))
   }, [])
 
-  React.useEffect(() => {
-    mountedRef.current = true
-    return () => {
-      mountedRef.current = false
-    }
-  }, [])
+  // The Iceberg table itself: a Bronze table's Trino name is offered only
+  // once the table is proven to be there, and only a read that answered
+  // "not found" proves it is not (QS-4 D3). Any other rejection failed, and
+  // is held as failed so the entry offers a retry instead of a false "not
+  // there" (#448 review SHOULD-FIX). The promise settles when the proof is
+  // kept, which is what the list-load queue below waits for.
+  const readProof = React.useCallback(
+    (id: string, bronzeTable: string): Promise<void> =>
+      lakehouseService.getTableDetail(BRONZE_NAMESPACE, bronzeTable).then(
+        () => rememberProof(id, { status: "there" }),
+        (error: unknown) =>
+          rememberProof(
+            id,
+            toServiceError(error).code === "not_found" ? { status: "missing" } : { status: "failed" }
+          )
+      ),
+    [rememberProof]
+  )
 
-  // Fetches one table's columns and keeps what came back.
+  // Fetches one table's columns and keeps what came back. The promise
+  // settles once the columns, and for a Bronze table its proof, are kept; it
+  // never rejects.
   //
   // The tenant gate answers a refusal with `200` and a body that has no
   // `schema`, so a refusal is read before the schema is. Without that, the
   // `.map` below threw inside the handler and the table stayed "loading"
   // for good.
   const fetchColumns = React.useCallback(
-    (id: string) => {
+    (id: string): Promise<void> => {
       rememberColumns(id, { status: "loading" })
-      void assetService.getAsset(id).then(
-        (detail) => {
+      return assetService.getAsset(id).then(
+        (detail): Promise<void> | void => {
           const refusal = catalogRefusal(detail)
           if (refusal) {
             rememberColumns(id, { status: "failed", reason: refusal.reason })
@@ -359,8 +613,14 @@ export function useQueryStudio() {
           // A slug id names no table, so the answer is asked for the SQL
           // form; an id that already reads as one keeps being the
           // reference and the answer is not read for names.
+          let proving: Promise<void> | undefined
           if (!SQL_TABLE_NAME.test(id)) {
-            setTargets((previous) => ({ ...previous, [id]: assetQueryTarget(detail) }))
+            const bronzeTable = isIcebergCandidate(detail) ? (detail.tableName ?? null) : null
+            setTargets((previous) => ({
+              ...previous,
+              [id]: { target: assetQueryTarget(detail), bronzeTable },
+            }))
+            if (bronzeTable) proving = readProof(id, bronzeTable)
           }
           rememberColumns(id, {
             status: "ready",
@@ -369,13 +629,14 @@ export function useQueryStudio() {
               dataType: column.dataType,
             })),
           })
+          return proving
         },
         // The request failed: the table is kept as a failure, and the
         // editor says so instead of asking again.
         () => rememberColumns(id, { status: "failed" })
       )
     },
-    [rememberColumns]
+    [rememberColumns, readProof]
   )
 
   React.useEffect(() => {
@@ -385,21 +646,77 @@ export function useQueryStudio() {
       // named twice is fetched once, and a table that failed is not asked
       // for again on a keystroke.
       if (named.id in columnsRef.current) continue
-      fetchColumns(named.id)
+      void fetchColumns(named.id)
     }
   }, [sql, tables, assetsState.status, fetchColumns])
+
+  // Bronze rows are proven when the list loads (LH-QS-4-08), so a
+  // Bronze row is insertable on a Trino tab without being expanded. It is
+  // the read `fetchColumns` makes for a table a statement names, through the
+  // same caches, so a table is read once however it was asked for. A
+  // ClickHouse tab offers no Bronze name, so it reads nothing here, and a
+  // keystroke reads nothing beyond the statement's own tables.
+  //
+  // At most `MAX_PROOF_READS` rows are read at a time, taken in list order
+  // from a queue: a catalog with hundreds of Bronze tables would otherwise
+  // open hundreds of requests at once from one page, and a row waiting its
+  // turn is simply not insertable yet, which is what a row being proven
+  // already is. The queue and the counter live in refs because they outlive
+  // any one run of the effect; leaving the Trino tab stops the pump, and
+  // coming back starts it again.
+  const proofQueueRef = React.useRef<string[]>([])
+  const proofReadsRef = React.useRef(0)
+  const onTrinoTabRef = React.useRef(false)
+  const pumpProofReads = React.useCallback(() => {
+    while (
+      onTrinoTabRef.current &&
+      mountedRef.current &&
+      proofReadsRef.current < MAX_PROOF_READS
+    ) {
+      const id = proofQueueRef.current.shift()
+      if (id === undefined) return
+      // A statement or an expand may have asked for it while it waited.
+      if (id in columnsRef.current) continue
+      proofReadsRef.current += 1
+      void fetchColumns(id).finally(() => {
+        proofReadsRef.current -= 1
+        pumpProofReads()
+      })
+    }
+  }, [fetchColumns])
+  React.useEffect(() => {
+    onTrinoTabRef.current = engine === "trino"
+    if (engine !== "trino" || assetsState.status !== "success") return
+    for (const asset of assetsState.data) {
+      // A SQL-named id is its own reference, and only a Bronze layer has a
+      // table to prove; the same test the rows use before their detail loads.
+      if (SQL_TABLE_NAME.test(asset.id)) continue
+      if (asset.layer !== "raw" && asset.layer !== "bronze") continue
+      if (asset.id in columnsRef.current || proofQueueRef.current.includes(asset.id)) continue
+      proofQueueRef.current.push(asset.id)
+    }
+    pumpProofReads()
+  }, [engine, assetsState.status, assetsState.data, pumpProofReads])
 
   // The schema browser asks for a table's columns when a person expands it.
   // It shares the cache above, so a table the statement already named is not
   // fetched twice. Only a person pressing "Retry" (`retry`) may fetch a
-  // failed table again: a keystroke never does.
+  // failed table again: a keystroke never does. An entry whose proof read
+  // failed is read again whenever it opens — the open is its retry — while
+  // a keystroke still never is (#448 review SHOULD-FIX).
   const loadColumns = React.useCallback(
     (id: string, options: { retry?: boolean } = {}) => {
       const cached = columnsRef.current[id]
-      if (cached && !(options.retry && cached.status === "failed")) return
-      fetchColumns(id)
+      if (
+        cached &&
+        !(options.retry && cached.status === "failed") &&
+        proofs[id]?.status !== "failed"
+      ) {
+        return
+      }
+      void fetchColumns(id)
     },
-    [fetchColumns]
+    [fetchColumns, proofs]
   )
 
   // The editor's view is kept in a ref: the browser needs it at click time
@@ -443,6 +760,14 @@ export function useQueryStudio() {
     return { from, to }
   }, [])
 
+  // The names `{{` completes: every definition the open tab holds, the ones
+  // whose name is not in the SQL yet included. The source is built once, so
+  // it reads the names through this ref.
+  const parameterNamesRef = React.useRef<string[]>([])
+  React.useEffect(() => {
+    parameterNamesRef.current = parameterDefinitions.map((def) => def.name)
+  }, [parameterDefinitions])
+
   // The suggestions the editor offers. The source is built once and reads
   // the cache when it is asked, so a keystroke never waits for the network.
   const completionSource = React.useMemo(
@@ -450,6 +775,7 @@ export function useQueryStudio() {
       createSqlCompletionSource({
         tables,
         columns: () => columnsRef.current,
+        parameters: () => parameterNamesRef.current,
       }),
     [tables]
   )
@@ -498,13 +824,25 @@ export function useQueryStudio() {
   // exist on the server, and reading it in render would make the first
   // paint differ from the markup Next sent.
   const hydratedRef = React.useRef(false)
+  // Mirrors `hydratedRef` into state: the effects that must wait for the
+  // owner's tabs to be in place (the `?saved=` link, below) read this one, so
+  // they run in the same render the restored tabs land in.
+  const [hydrated, setHydrated] = React.useState(false)
   // Whether the tab bar still holds the empty tab that was there before
   // anything was read. A link that arrives while it does takes its place
   // instead of leaving a blank tab next to the query it opened.
   const placeholderRef = React.useRef(true)
   React.useEffect(() => {
     if (hydratedRef.current) return
+    // Nothing is read while the owner is not known (`QS-8`, `LH-QS-1-04` F1):
+    // a key invented here would be somebody else's draft.
+    if (ownKey === null) return
     hydratedRef.current = true
+    // Same render as the restored tabs: the `?saved=` effect waits on this.
+    setHydrated(true)
+    // The entry every person shared before `QS-8` holds tabs whose owner
+    // cannot be known: it is removed, not handed to this person.
+    dropLegacyDraft()
     // A `?sql=` link (e.g. an asset's "Open in Query Studio") names the
     // query the user came here to run, so it opens in a tab of its own and
     // the draft it finds stays where it was.
@@ -517,7 +855,7 @@ export function useQueryStudio() {
     const linkedEngine = params.get("engine")
     const engine: QueryEngine = linkedEngine === "trino" ? "trino" : "clickhouse"
     const hasLink = Boolean(linkedSql && hasStatement(linkedSql))
-    const stored = readTabs()
+    const stored = readTabs(ownKey)
 
     if (stored) {
       placeholderRef.current = false
@@ -529,6 +867,8 @@ export function useQueryStudio() {
           name: nextTabName(stored.tabs),
           sql: linkedSql,
           engine,
+          parameters: [],
+          values: {},
         }
         setTabs([...stored.tabs, linked])
         setActiveTabId(linked.id)
@@ -546,21 +886,23 @@ export function useQueryStudio() {
         name: "Query 1",
         sql: linkedSql,
         engine,
+        parameters: [],
+        values: {},
       }
       placeholderRef.current = false
       setTabs([linked])
       setActiveTabId(linked.id)
       setTab("sql")
     }
-  }, [])
+  }, [ownKey])
 
-  const persistDraft = useDebouncedCallback((next: QueryTabs) => {
-    writeTabs(next)
+  const persistDraft = useDebouncedCallback((key: string, next: QueryTabs) => {
+    writeTabs(key, next)
   }, DRAFT_DEBOUNCE_MS)
   React.useEffect(() => {
-    if (!hydratedRef.current) return
-    persistDraft({ tabs, activeId: activeTabId, question, tab })
-  }, [tabs, activeTabId, question, tab, persistDraft])
+    if (!hydratedRef.current || ownKey === null) return
+    persistDraft(ownKey, { tabs, activeId: activeTabId, question, tab })
+  }, [tabs, activeTabId, question, tab, ownKey, persistDraft])
 
   // ── Statements ───────────────────────────────────────────────────────
   // The statements of the open tab. The server runs one statement per
@@ -576,30 +918,95 @@ export function useQueryStudio() {
   )
   // Whether there is anything to run at all.
   const runnable = statements.length > 0
+  // What a save of that statement keeps: the definitions of the names it
+  // uses. A save is checked against the SQL it holds, so a name only another
+  // statement uses, or one that left the SQL, would be refused.
+  const saveParameters = React.useMemo(
+    () => activeParameters(targetStatement?.text ?? "", parameterDefinitions),
+    [targetStatement, parameterDefinitions]
+  )
 
   // ── Estimate ─────────────────────────────────────────────────────────
   const runEstimate = estimateAct.run
-  const estimateDebounced = useDebouncedCallback((next: string) => {
-    void runEstimate(next)
-  }, ESTIMATE_DEBOUNCE_MS)
+  const resetEstimate = estimateAct.reset
+  // `null` inputs mean "skip": the statement has a name with nothing to run
+  // with, so no estimate is asked for and the one on screen goes.
+  const estimateDebounced = useDebouncedCallback(
+    (next: string, inputs: QueryParamInputs | null) => {
+      if (inputs === null) resetEstimate()
+      else void runEstimate(next, inputs)
+    },
+    ESTIMATE_DEBOUNCE_MS
+  )
   // The estimate is asked for one statement at a time: the server plans a
   // statement, not a buffer with several of them.
-  const estimatable = targetStatement !== null
   const targetText = targetStatement?.text ?? null
+  // The names the statement itself uses (`QS-5`): a name that only another
+  // statement of the tab uses is not this estimate's business.
+  const estimateDefinitions = React.useMemo(
+    () => activeParameters(targetText ?? "", parameterDefinitions),
+    [targetText, parameterDefinitions]
+  )
+  const estimateInputs = React.useMemo(
+    () =>
+      estimateDefinitions.length === 0 ? NO_INPUTS : paramInputs(estimateDefinitions, parameterValues),
+    [estimateDefinitions, parameterValues]
+  )
+  // A name with no value and no default would only be refused ("Fill in
+  // ..."). The estimate waits for it instead, and the panel names it
+  // (QS-5-AC14). SQL with no placeholder is never held back.
+  const estimateWaitsFor = firstMissingValueName(estimateDefinitions, parameterValues)
+  const estimateWaits = estimateWaitsFor !== null
+  const estimatable = targetStatement !== null && !estimateWaits
+  // Only ClickHouse has an estimate: the server runs `EXPLAIN ESTIMATE`,
+  // which a Trino statement is not valid in, so asking for one on a Trino
+  // tab got a refusal that read as the query's fault (`LH-QS-4-08`). A
+  // Trino tab asks nothing and drops what an earlier ClickHouse statement
+  // left, so no answer for another engine shows.
+  const estimateSupported = engine === "clickhouse"
   React.useEffect(() => {
+    if (!estimateSupported) {
+      // Drop what an earlier ClickHouse statement left: an ask in flight, a
+      // pending debounced ask, and the estimate on screen. The skip input
+      // replaces the pending debounced ask; the reset acts now, so no
+      // answer for another engine shows after the switch.
+      estimateDebounced("", null)
+      resetEstimate()
+      return
+    }
     // A buffer holding only the starter comment has nothing to estimate,
     // and asking anyway put an EXPLAIN ESTIMATE on ClickHouse for every
     // keystroke, including the ones that typed the comment.
-    if (targetText !== null) estimateDebounced(targetText)
-  }, [targetText, estimateDebounced])
+    if (targetText !== null) estimateDebounced(targetText, estimateWaits ? null : estimateInputs)
+  }, [
+    estimateSupported,
+    targetText,
+    estimateWaits,
+    estimateInputs,
+    estimateDebounced,
+    resetEstimate,
+  ])
 
   // ── Actions ──────────────────────────────────────────────────────────
+  /**
+   * Puts `next` in the open tab. A saved query's `definitions` come with its
+   * SQL (`QS-5`) and every field starts at its default; a statement from
+   * History has none to bring, and the tab's own stay.
+   */
   const loadSql = React.useCallback(
-    (next: string) => {
+    (next: string, definitions?: QueryParamDef[]) => {
       setSql(next)
+      if (definitions) {
+        setTabs((previous) =>
+          previous.map((open) =>
+            open.id === activeTabId ? { ...open, parameters: definitions, values: {} } : open
+          )
+        )
+        setRefused(null)
+      }
       setTab("sql")
     },
-    [setSql]
+    [setSql, activeTabId]
   )
 
   /**
@@ -613,8 +1020,10 @@ export function useQueryStudio() {
       const opened: QueryTab = {
         id: newTabId(),
         name: nextTabName(tabs),
-        sql: options?.sql ?? STARTER_SQL,
+        sql: options?.sql ?? "",
         engine: options?.engine ?? "clickhouse",
+        parameters: [],
+        values: {},
       }
       setTabs((previous) =>
         previous.length >= MAX_QUERY_TABS ? previous : [...previous, opened]
@@ -679,6 +1088,7 @@ export function useQueryStudio() {
   const setActiveTab = React.useCallback((id: string) => {
     setActiveTabId(id)
     setFixResult(null)
+    setBatchRefusal(null)
   }, [])
 
   const generate = React.useCallback(async () => {
@@ -700,10 +1110,16 @@ export function useQueryStudio() {
    * after the first one is a call that must not cancel the one before it.
    */
   const runBatch = React.useCallback(
-    async (tabId: string, list: SqlStatement[], runEngine: QueryEngine) => {
+    async (
+      tabId: string,
+      list: SqlStatement[],
+      runEngine: QueryEngine,
+      inputs: QueryParamInputs
+    ) => {
       // A run means the person has moved on from the proposal; its diff is stale.
       setFixResult(null)
       setFixStatement(null)
+      setRefused(null)
       setRuns((previous) => ({
         ...previous,
         [tabId]: list.map(
@@ -728,13 +1144,13 @@ export function useQueryStudio() {
       batchRef.current = batch
       setRunning(true)
 
-      const markNotRun = (from: number) => {
+      const markNotRun = (from: number, reason: "failure" | "stopped") => {
         setRuns((previous) => {
           const current = previous[tabId] ?? []
           return {
             ...previous,
             [tabId]: current.map((run, at) =>
-              at >= from ? { status: "not-run", statement: run.statement } : run
+              at >= from ? { status: "not-run", statement: run.statement, reason } : run
             ),
           }
         })
@@ -743,7 +1159,7 @@ export function useQueryStudio() {
       try {
         for (let index = 0; index < list.length; index += 1) {
           if (controller.signal.aborted) {
-            markNotRun(index)
+            markNotRun(index, "stopped")
             break
           }
           batch.index = index
@@ -758,7 +1174,10 @@ export function useQueryStudio() {
             batch.runId = runId
             const result = await queryService.run(
               list[index].text,
-              { engine: runEngine, runId },
+              // Every statement gets the tab's values and definitions: the
+              // server reads the names its own statement uses and ignores
+              // the rest. Nothing is added when the tab has no placeholder.
+              { engine: runEngine, runId, ...inputs },
               controller.signal
             )
             setRuns((previous) => ({
@@ -773,10 +1192,17 @@ export function useQueryStudio() {
             if (controller.signal.aborted) {
               // The person stopped the batch: the statement that was in
               // flight did not finish, and neither did the ones after it.
-              markNotRun(index)
+              markNotRun(index, "stopped")
               break
             }
             const serviceError = toServiceError(error)
+            if (serviceError.code === "invalid_request") {
+              const names = fieldsNamedBy(
+                serviceError.message,
+                (inputs.definitions ?? []).map((def) => def.name)
+              )
+              setRefused(names.size > 0 ? { tabId, names } : null)
+            }
             const isPermissionRefusal = serviceError.code === "permission_denied"
             // A permission refusal denies execution rights for the entire
             // batch, so subsequent statements are marked refused without
@@ -793,7 +1219,7 @@ export function useQueryStudio() {
                   : run
               ),
             }))
-            if (!isPermissionRefusal) markNotRun(index + 1)
+            if (!isPermissionRefusal) markNotRun(index + 1, "failure")
             break
           }
         }
@@ -823,14 +1249,15 @@ export function useQueryStudio() {
   const runQuery = React.useCallback(async () => {
     if (statements.length === 0) return
     if (statements.length > MAX_STATEMENTS_PER_RUN) {
-      notifyInfo(
-        `At most ${MAX_STATEMENTS_PER_RUN} statements are run at once`,
-        "Split the buffer into smaller queries and run them one after another."
+      // QS-11 (LH-QS-1-12), D9: the refusal stays on the page, beside Run.
+      setBatchRefusal(
+        `At most ${MAX_STATEMENTS_PER_RUN} statements are run at once. Split the buffer into smaller queries and run them one after another.`
       )
       return
     }
-    await runBatch(activeTabId, statements, engine)
-  }, [statements, activeTabId, engine, runBatch])
+    setBatchRefusal(null)
+    await runBatch(activeTabId, statements, engine, runInputs)
+  }, [statements, activeTabId, engine, runBatch, runInputs])
 
   /**
    * Runs the selection when there is one, and the whole tab otherwise.
@@ -851,13 +1278,14 @@ export function useQueryStudio() {
         await runBatch(
           activeTabId,
           [{ text: picked, from: selection.from, to: selection.to }],
-          engine
+          engine,
+          runInputs
         )
         return
       }
     }
     await runQuery()
-  }, [readSelection, sql, activeTabId, engine, runBatch, runQuery])
+  }, [readSelection, sql, activeTabId, engine, runBatch, runQuery, runInputs])
 
   /**
    * Stops the batch: the statement in flight and the ones after it did not
@@ -886,7 +1314,7 @@ export function useQueryStudio() {
       return {
         ...previous,
         [batch.tabId]: current.map((run, at) =>
-          at >= batch.index ? { status: "not-run", statement: run.statement } : run
+          at >= batch.index ? { status: "not-run", statement: run.statement, reason: "stopped" } : run
         ),
       }
     })
@@ -896,15 +1324,6 @@ export function useQueryStudio() {
       historyState.reload()
     }
   }, [historyState, stopDownload])
-
-  const save = React.useCallback(
-    async (input: SaveQueryInput) => {
-      const saved = await saveAct.run(input)
-      if (saved) savedState.reload()
-      return saved
-    },
-    [saveAct, savedState]
-  )
 
   // Agentic ask: one call to the chat's engine, which writes the SQL, runs
   // it as the caller (masking and row filters apply), corrects itself on
@@ -1006,34 +1425,129 @@ export function useQueryStudio() {
   // Handoff from Saved Queries: /query-studio?saved=<id> opens that query
   // in a tab of its own, so the tabs that were there stay where they were.
   // Read from window.location to avoid a useSearchParams Suspense boundary.
+  //
+  // The query is asked for by id, not looked for in the list the console
+  // holds (`QS-3` C4): the list may not hold that query at all, and a query
+  // the caller may not see is a 404 rather than a missing row.
+  const [linkedSaved, setLinkedSaved] = React.useState<SavedQuery | null>(null)
+  const [savedLinkError, setSavedLinkError] = React.useState<string | null>(null)
   const appliedSavedRef = React.useRef(false)
   React.useEffect(() => {
-    if (appliedSavedRef.current || savedState.status !== "success") return
-    appliedSavedRef.current = true
+    if (appliedSavedRef.current) return
     const savedId = new URLSearchParams(window.location.search).get("saved")
     if (!savedId) return
-    const match = savedState.data.find((q) => q.id === savedId)
-    if (!match) return
-    const opened: QueryTab = {
-      id: newTabId(),
-      // The saved query's own name is a better one than "Query 3".
-      name: match.title.trim() || nextTabName(tabs),
-      sql: match.sql,
-      engine: "clickhouse",
-    }
-    if (placeholderRef.current && tabs.length === 1) {
-      // Nothing was stored and no link came first: the saved query takes
-      // the empty tab's place instead of sitting next to it.
-      placeholderRef.current = false
-      setTabs([{ ...tabs[0], sql: opened.sql, name: opened.name }])
-      setActiveTabId(tabs[0].id)
-    } else {
-      placeholderRef.current = false
-      setTabs([...tabs, opened])
-      setActiveTabId(opened.id)
-    }
+    // The link is read once: StrictMode runs this effect a second time
+    // right after the first one, and the second run must not ask for the
+    // query again.
+    appliedSavedRef.current = true
+    void queryService.getSaved(savedId).then(
+      (saved) => {
+        // The hook's own "mounted" flag and not one of this effect's own:
+        // StrictMode's second run would take a flag of this effect's own
+        // down with it, and the answer of the only request that was made
+        // would be dropped with it.
+        if (mountedRef.current) setLinkedSaved(saved)
+      },
+      (error: unknown) => {
+        if (!mountedRef.current) return
+        const failure = toServiceError(error)
+        // A query the caller may not see and one in the trash are the same
+        // answer for them: the studio says so and opens no tab (C5).
+        setSavedLinkError(
+          failure.code === "not_found"
+            ? SAVED_QUERY_UNAVAILABLE
+            : readableErrorMessage(failure.message)
+        )
+      }
+    )
+  }, [])
+
+  React.useEffect(() => {
+    // `QS-8` (`LH-QS-1-04` F1): a restored draft must not replace a tab the
+    // link opened, so this waits until the owner's tabs are in place.
+    if (!hydrated || !linkedSaved) return
+    const openedId = newTabId()
+    // The empty tab that was there before anything was read takes the saved
+    // query's place instead of sitting next to it.
+    const takesPlaceholder = placeholderRef.current
+    placeholderRef.current = false
+    setTabs((previous) => {
+      const name = linkedSaved.title.trim() || nextTabName(previous)
+      const opened: QueryTab = {
+        id: openedId,
+        name,
+        sql: linkedSaved.sql,
+        engine: "clickhouse",
+        // Its definitions, and no values: each field starts at its default.
+        parameters: linkedSaved.parameters,
+        values: {},
+        savedId: linkedSaved.id,
+        level: linkedSaved.level,
+      }
+      if (takesPlaceholder && previous.length === 1 && previous[0].id === FIRST_TAB_ID) {
+        return [opened]
+      }
+      return [...previous, opened]
+    })
+    setActiveTabId(openedId)
     setTab("sql")
-  }, [savedState, tabs])
+  }, [hydrated, linkedSaved])
+
+  // Handoff from History: /query-studio?run=<id> asks the server for that one
+  // run (the caller's own, last 14 days — the same scope as the list) and
+  // opens its SQL on the engine it ran on. Mirrors the `?saved=` handoff,
+  // including its StrictMode read-once guard and its wait for hydration.
+  const [linkedRun, setLinkedRun] = React.useState<QueryHistoryItem | null>(null)
+  const [runLinkError, setRunLinkError] = React.useState<string | null>(null)
+  const appliedRunRef = React.useRef(false)
+  React.useEffect(() => {
+    if (appliedRunRef.current) return
+    const id = new URLSearchParams(window.location.search).get("run")
+    if (!id) return
+    appliedRunRef.current = true
+    void queryService.listHistoryPage({ id, page: 1 }).then(
+      (answer) => {
+        if (!mountedRef.current) return
+        // An id outside the caller's scope or window is answered with an
+        // empty page, not a 404 — the list and this lookup share that rule.
+        const run = answer.runs[0]
+        if (run) setLinkedRun(run)
+        else setRunLinkError(RUN_LINK_UNAVAILABLE)
+      },
+      (error: unknown) => {
+        if (!mountedRef.current) return
+        const failure = toServiceError(error)
+        setRunLinkError(
+          failure.code === "not_found" || failure.code === "invalid_request"
+            ? RUN_LINK_UNAVAILABLE
+            : readableErrorMessage(failure.message)
+        )
+      }
+    )
+  }, [])
+
+  React.useEffect(() => {
+    if (!hydrated || !linkedRun) return
+    const openedId = newTabId()
+    const takesPlaceholder = placeholderRef.current
+    placeholderRef.current = false
+    setTabs((previous) => {
+      const opened: QueryTab = {
+        id: openedId,
+        name: nextTabName(previous),
+        sql: linkedRun.sql,
+        engine: linkedRun.engine === "trino" ? "trino" : "clickhouse",
+        parameters: [],
+        values: {},
+      }
+      if (takesPlaceholder && previous.length === 1 && previous[0].id === FIRST_TAB_ID) {
+        return [opened]
+      }
+      return [...previous, opened]
+    })
+    setActiveTabId(openedId)
+    setTab("sql")
+  }, [hydrated, linkedRun])
 
   // The rows on screen for each tab: the result of the statement that is
   // open on it. The per-statement state behind it is `runs`.
@@ -1076,8 +1590,23 @@ export function useQueryStudio() {
     setSql,
     engine,
     setEngine,
+    /** The parameters whose `{{name}}` the open tab's SQL uses, in order, with their definitions. */
+    parameters,
+    /** The open tab's values by name; a parameter without one is not given. */
+    parameterValues,
+    setParameterValue,
+    setParameterDefinition,
+    /** The parameters the last refusal of a run or an estimate named, by name. */
+    invalidParameters,
+    /**
+     * The definitions a save of the statement in `targetStatement` carries:
+     * the ones its SQL uses, defaults included, and never a current value.
+     */
+    saveParameters,
     tabs,
     activeTabId,
+    /** Why a batch of too many statements was refused, until the SQL changes. */
+    batchRefusal,
     addTab,
     renameTab,
     closeTab,
@@ -1108,15 +1637,21 @@ export function useQueryStudio() {
     assetsState,
     tables,
     columns,
+    /**
+     * Whether a table's Iceberg table is there, by catalog id. A table
+     * with no entry has no proof yet, and is offered nothing (QS-4 D3).
+     */
+    proofs,
     loadColumns,
     setEditorView,
     insertAtCursor,
     completionSource,
     editorExtensions,
     estimatable,
+    estimateWaitsFor,
+    estimateSupported,
     generateAct,
     estimateAct,
-    saveAct,
     savedState,
     historyState,
     agent: { busy: agentBusy, result: agentResult, error: agentError, ask },
@@ -1140,8 +1675,32 @@ export function useQueryStudio() {
     runQuery,
     runSelectionOrAll,
     reEstimate: () => {
-      if (targetText !== null) void runEstimate(targetText)
+      if (estimateSupported && targetText !== null && !estimateWaits) {
+        void runEstimate(targetText, estimateInputs)
+      }
     },
-    save,
+    /**
+     * What the Save button on the open tab does: "Save" changes the saved
+     * query the tab came from, "Save as new" makes a copy of it. The write
+     * itself is the Save query page's (`save-query-page.tsx`, through
+     * `savedQueryRequest`); this hook reads only what the button offers
+     * (`WEB-7` D5 — its own unused `save` left in the S2 review, S3).
+     */
+    saveTarget: {
+      mode: savesSavedQuery ? ("update" as const) : ("create" as const),
+      label: savesSavedQuery ? ("Save" as const) : ("Save as new" as const),
+      savedId: activeSaved?.id ?? null,
+      level: activeSaved?.level,
+    },
+    /**
+     * What a `?saved=` link answered: the sentence the studio shows when
+     * the query is not there for the caller, or `null` when it opened.
+     */
+    savedLinkError,
+    /**
+     * What a `?run=` link answered: the sentence the studio shows when the
+     * run is not in the caller's last 14 days, or `null` when it opened.
+     */
+    runLinkError,
   }
 }

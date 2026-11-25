@@ -32,6 +32,15 @@ the time-travel picker offered the half-loaded table to whoever picked one of th
 upgrade changes the job, the marker is not produced, the load goes back to the old path, and
 `test_load_memory.py` fails: the memory test is the guard of this module.
 
+# Who the commit is recorded as (`DATA-52`)
+
+`dlt` calls this write from its own load threads, with no argument of ours to hand it the
+load's author, so the author travels in the module-level `_snapshot_properties` table: the
+caller fills it with `snapshot_properties_for` for the length of its `pipeline.run`, and the
+write reads the entry of the table it is writing. It is keyed by the table's name because
+`dlt` may run two tables' writes at once, and one load's author must never be written into
+another table's snapshot. QA `LH-DATA-15-08`: a version written by an upload said "unknown".
+
 # The schemas of the files (`PR #186 review SHOULD-FIX 2`)
 
 The files of one load do not all have the same schema: `dlt` starts a new normalized file when a
@@ -47,6 +56,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import pyarrow as pa
@@ -63,6 +73,26 @@ READ_ROWS = 20_000
 # `sink.RETYPE_FLUSH_BYTES`). Measured in plan section 11: the peak of a load is about this,
 # twice, plus `dlt`'s own steps, whatever the size of the file.
 FLUSH_BYTES = 32 * 1024 * 1024
+
+
+# The snapshot properties of each table's in-flight write (`DATA-52`), by table name: see
+# "Who the commit is recorded as" in this module's docstring. Filled on entry of
+# `snapshot_properties_for` and emptied on exit, so a failed load leaves nothing behind.
+_snapshot_properties: dict[str, dict[str, str]] = {}
+
+
+@contextmanager
+def snapshot_properties_for(table: str, properties: dict[str, str]) -> Iterator[None]:
+    """Carry `properties` into the snapshot of the write of `table` made inside the block.
+
+    `dlt` calls the write from its own threads with no argument of ours, so the properties
+    are handed over here; one entry per table, so two loads at once cannot read each
+    other's. The entry is removed on exit, also when the load raised."""
+    _snapshot_properties[table] = dict(properties)
+    try:
+        yield
+    finally:
+        _snapshot_properties.pop(table, None)
 
 
 class _Streamed:
@@ -186,6 +216,10 @@ def _write(table: Any, data: Any, write_disposition: str, original: Any) -> None
             transaction,
             (ensure_iceberg_compatible_arrow_data(group) for group in groups(data.dataset, schema)),
             replace=write_disposition == "replace",
+            # `DATA-52`: the author the caller registered for this table, if any. `table`
+            # is a `pyiceberg` table, whose name is the identifier tuple; its last part is
+            # the table's name, which is what the caller keyed the properties by.
+            snapshot_properties=_snapshot_properties.get(table.name()[-1]),
         )
 
 

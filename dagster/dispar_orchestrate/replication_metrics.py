@@ -67,7 +67,15 @@ import requests
 from dagster import DefaultScheduleStatus, Definitions, ScheduleDefinition, job, op
 
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget
+from dispar_orchestrate.ingest_factory import job_tags
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
+
+# How long one run of this job may run, in seconds. The schedule fires
+# every 15 minutes, so the limit IS the interval: a run that hung is ended
+# before the next one piles up behind it. The longest run measured on
+# staging on 2026-11-16 was 24 s.
+RUN_LIMIT_ENV = "DAGSTER_RUN_LIMIT_REPLICATION_SLOT_CHECK_JOB_SECONDS"
+DEFAULT_RUN_LIMIT_SECONDS = 900
 
 
 def _env(name: str, default: str) -> str:
@@ -285,7 +293,7 @@ def _fetch_ingestible_connectors(cfg: ReplicationConfig) -> tuple[list[dict[str,
 
 def _slot_to_connector_id(connectors: list[dict[str, Any]]) -> dict[str, str]:
     """`{dial.slotName: id}` for every `adapter == "cdc"` connector — the
-    slot-name shape is registry-owned (`lakehouse_store::cdc::render_debezium_properties`
+    slot-name shape is registry-owned (`lakehouse_store::cdc::render_connect_config` (SRC-4 S2 review SHOULD-FIX 2)
     now takes the slot/publication names explicitly rather than deriving
     them from the connector id), so this lookup is the only correct way to
     attribute a live `pg_replication_slots` row; a slot name is no longer
@@ -310,7 +318,7 @@ def check_replication_slots(cfg: ReplicationConfig) -> list[dict[str, Any]]:
     /api/connectors/ingestible` (WS3 plan review X4) — never by
     string-stripping the slot name. That stripped-suffix guess
     (`slot_name[: -len("_slot")]`) was a fabricated attribution (AGENTS.md
-    rule 2: "Never fabricate"): `lakehouse_store::cdc::render_debezium_properties`
+    rule 2: "Never fabricate"): `lakehouse_store::cdc::render_connect_config` (SRC-4 S2 review SHOULD-FIX 2)
     now takes the slot/publication names explicitly (WS3 plan review X4),
     so a CDC connector's slot name is registry-owned and need not resemble
     its connector id at all.
@@ -442,7 +450,11 @@ def run_replication_slot_check(context) -> list[dict[str, Any]]:
     return slots
 
 
-@job
+# The `dagster/max_runtime` tag is what run monitoring enforces: a run
+# whose process died is cancelled and failed by the daemon, so it does not
+# hold a run-queue slot forever (`OPS-35`). `ingest_factory.py` says why it
+# is a tag and not `run_monitoring.max_runtime_seconds`.
+@job(tags=job_tags("replication_slot_check_job", RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def replication_slot_check_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `replication_slot_check_job`."""
     run_replication_slot_check()

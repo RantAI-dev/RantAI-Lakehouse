@@ -41,6 +41,10 @@ struct ErrorBody {
     /// branch on this, never on `error`'s text (`PR #105 CI fix`).
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<&'static str>,
+    /// Unknown permission tokens refused by the identity create/update
+    /// routes (`WEB-8` D3). Present only for [`lakehouse_core::ApiError::UnknownPermissions`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unknown: Option<Vec<String>>,
 }
 
 impl IntoResponse for ApiRejection {
@@ -56,6 +60,10 @@ impl IntoResponse for ApiRejection {
             error: self.0.to_string(),
             code: match &self.0 {
                 lakehouse_core::ApiError::NotReady { code, .. } => Some(code),
+                _ => None,
+            },
+            unknown: match &self.0 {
+                lakehouse_core::ApiError::UnknownPermissions(unknown) => Some(unknown.clone()),
                 _ => None,
             },
         };
@@ -183,6 +191,20 @@ mod tests {
                 .get(axum::http::header::CONTENT_TYPE)
                 .unwrap(),
             "application/json;charset=utf-8"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_permissions_renders_400_with_unknown_field() {
+        let resp = ApiRejection(ApiError::UnknownPermissions(vec![
+            "foo:bar".to_owned(),
+            "baz:qux".to_owned(),
+        ]))
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(resp).await,
+            json!({"error": "unknown permissions", "unknown": ["foo:bar", "baz:qux"]})
         );
     }
 
