@@ -1843,3 +1843,159 @@ Owner answers, 2026-11-07:
    - Record the results in RESULT as a dated update. A miss is written with its number.
    - Update the feature page (`docs/core/features/landing-page.md`): what the user can do,
      decisions, and checklist rows for the contact page, smooth scroll and footer.
+
+### §10 continued: the product-design pass (owner, 2026-11-07)
+
+The owner asked whether the site meets UI/UX and product-design practice. The planner's audit
+found the craft strong: the story, the motion fallbacks, SEO, i18n, performance and honesty.
+Four product-level gaps were found, and the owner chose to close all four before the deadline:
+- the brief (who visits, the five-second test, the actions we want, how we measure);
+- the real product;
+- the install path on the page;
+- reassurance at the point of action.
+
+The brief is `docs/core/specs/web-5-brief.md`, a draft until the owner signs it.
+
+### D19. Show the real product
+
+- **Today:** visitors never see the actual console, only the creature and illustrations. Add
+  real product UI, framed in the lake style: a window frame with the site's border, glass and
+  glow, not a generic browser mock-up.
+- **Source:** the screenshots on rantai-page (`public/products/lake-home.webp`,
+  `lake-dashboard.webp`, read only; copy them into `site/public/`).
+  - Before using one, check that it shows nothing `WEB-3` removed: Digital Employees, Agent
+    Runs, Observability, Workloads, Activity, the Create Policy wizard, the SSO page.
+  - Check that it shows no real people or customer data. Any data in it must be made up.
+  - Where a screenshot fails either check, crop it, or leave it out and report it. Never paint
+    over a UI to fake one.
+- **Placement** is the developer's choice inside the D14 story. Suggested: the dashboards
+  section, "Answers come back up", shows the real dashboard surfacing, and the assistant or
+  open-source section shows the console home.
+- **Labels:** a real screenshot needs no "Illustration" label, but the alt text and the caption
+  say what it shows.
+- **Performance:**
+  - WebP at the displayed size, with a `srcset` for 1x and 2x;
+  - `loading="lazy"` and `decoding="async"`, with width and height set (CLS 0);
+  - never the LCP element.
+
+### D20. Get started in three steps
+
+- **Where:** a section near the surface, after open source and before the final call. Its
+  anchor is `#get-started`.
+- **The three steps,** traced to the README's Quickstart:
+  1. clone, with `git clone https://github.com/RantAI-dev/RantAI-Lakehouse.git` then
+     `cd RantAI-Lakehouse`;
+  2. configure, with `sh ops/init-env.sh`, then set `AUTH_BOOTSTRAP_EMAIL` and
+     `AUTH_BOOTSTRAP_PASSWORD` in `.env`;
+  3. start, with `scripts/compose.sh up --build`, then open `http://localhost:3000`.
+- **Prerequisite:** "Needs Docker".
+- **The terminal look:**
+  - each command sits in a terminal block (monospace is allowed here: DESIGN.md);
+  - a copy button per command gives designed "Copied" feedback and is reachable by keyboard;
+  - the command text can be selected, and it wraps cleanly on a phone with no horizontal page
+    scroll.
+- **Links and claims:**
+  - a link reads "Full Quickstart, configuration and troubleshooting" and goes to the README's
+    Quickstart;
+  - each step is a claim in `claims.ts`.
+- **"Install it"** in the top bar and in the hero now go to `#get-started` on the page, which
+  links on to the README. This replaces D8's direct README link (planner default, 2026-11-07):
+  the visitor stays on the page and sees the whole path first. Lenis anchors keep the offset.
+
+### D21. Answer the doubts where people decide
+
+- **The reassurance line.** Under the hero's buttons, one quiet line: "Free and open source ·
+  AGPL-3.0 · Runs on your servers". In Indonesian: "Gratis dan open source · AGPL-3.0 · Jalan di
+  server Anda". Each part is a claim.
+- **The home FAQ:**
+  - 4 questions, before the final call: is it free and open source, can it run on our servers,
+    what does it connect to, what does installing it take;
+  - the same component and the same claims as `/contact/`;
+  - it links "All questions" to `/contact/#faq`;
+  - `FAQPage` JSON-LD stays on `/contact/` only.
+- **The form label (O4):** the contact form's "Work email" becomes "Email". Open-source
+  evaluators often write from a personal address.
+
+### Tasks P6–P8 (after P4, before the P5 docs; one commit each)
+
+1. **P6 The real product** (D19). *Accept:* one desktop and one phone shot of each placement,
+   plus the screenshot audit in the handoff: what each image shows, and its WEB-3 and
+   real-data check.
+2. **P7 Get started** (D20). *Accept:*
+   - a desktop and phone shot;
+   - the copy buttons work, checked in a test or a probe;
+   - "Install it" scrolls to `#get-started` with and without Lenis.
+3. **P8 Reassurance, the home FAQ and O4** (D21). *Accept:*
+   - a desktop and phone shot of the hero line and the FAQ, EN and ID;
+   - the hero still passes the R12 gap probe at 360×640 and 375×667.
+
+## 11. Addendum: the technical pass (owner, 2026-11-25)
+
+The owner approved the site's look on 2026-11-25 ("landing page untuk lakehouse udah bagus").
+Per the hub rule "the visible first, the technical last", what is left is invisible work.
+Our scope ends at an open PR with green CI; the team merges.
+
+### D22. Hosting is GitHub Pages at `lakehouse.rantai.dev` (closes D2)
+
+While WEB-5 was in review, `main` published the old in-console landing page to GitHub Pages
+(`.github/workflows/deploy-landing.yml`, `ops/landing-pages/`, `scripts/build-landing-pages.ts`,
+`bun run build:landing`).
+- That export renders `src/features/landing`, which WEB-5 deletes. Once WEB-5 merges, the same
+  workflow must publish `site/out` instead, or the next push to `main` breaks the live site.
+- GitHub Pages serves files only and cannot set response headers. The security policy is
+  therefore a `<meta http-equiv="Content-Security-Policy">` in the site's layout, plus a
+  `referrer` meta. HSTS, `frame-ancestors` and `X-Content-Type-Options` cannot be set on Pages.
+  RESULT records them as limits of the host, not as passes.
+- The site stays host-agnostic (D1). `CNAME` and `.nojekyll` are written by the workflow into
+  `site/out`; they are not added to `site/public/`.
+
+### Tasks T1–T5 (one commit each, in order)
+
+1. **T1 Merge `origin/main`.** Resolve hunk by hunk (AGENTS.md rule 9).
+   - `src/features/landing/**` and `src/app/landing/**` stay deleted. `main` changed
+     `landing-copy.ts`, `use-reduced-motion.ts` and `app/landing/page.tsx` since the base:
+     check that nothing `main` added still imports them.
+   - Delete `ops/landing-pages/`, `scripts/build-landing-pages.ts` and the `build:landing`
+     script, because their source is gone.
+   - Then grep the repo for `build:landing`, `landing-pages`, `features/landing` and
+     `out-landing`, and fix or remove every hit: docs, `.dockerignore`, `ci.yml`, `docs/CI.md`.
+   - *Accept:* no conflict markers, and the grep above is clean outside history notes. In the
+     site: typecheck, lint and the site tests. In the console: `bun run typecheck` under the
+     memory wrapper; if it is killed for memory, write *not verified, CI runs it*.
+2. **T2 Publish `site/` to Pages** (D22). Rewrite `deploy-landing.yml`:
+   - Trigger on `site/**` and the workflow file. Install with Bun 1.3.12 and
+     `--frozen-lockfile` in `site/`.
+   - Build with `NEXT_PUBLIC_SITE_URL=https://lakehouse.rantai.dev`.
+   - Write `CNAME` and `.nojekyll` into `site/out`, then verify: `index.html`, `id/index.html`,
+     `contact/index.html`, `404.html`, `CNAME` = `lakehouse.rantai.dev`, `.nojekyll`, `_next/`,
+     and the English hero headline in `index.html`.
+   - Upload `site/out`. Keep the permissions, concurrency and deploy job.
+   - *Accept:* `actionlint` if available, otherwise a YAML parse, and the same steps run
+     locally against a fresh export.
+3. **T3 Performance.** Lighthouse on mobile (the hub command) measured `/` at 49–67 and `/id/`
+   at 86–87. LCP was 4.5 s against 1.5 s with the same FCP, and TBT 0.5–3.2 s.
+   - Find why the English LCP waits, from the trace's LCP element and its render delay.
+   - Cut the main-thread work: what hydrates or runs before the LCP, the code that is not
+     needed for the first view, and legacy JS.
+   - The look must not change. A change that alters motion or the first view is shown to the
+     owner first.
+   - *Accept:* performance ≥ 90 on both pages, the median of 3 runs on a quiet VM, before and
+     after recorded in RESULT. A miss is written with its number (principle 5).
+4. **T4 SEO, accessibility and the meta policy.**
+   - Production canonical, hreflang (en, id, x-default), sitemap and robots on
+     `lakehouse.rantai.dev`; OG and Twitter cards; JSON-LD `SoftwareApplication` and
+     `Organization`.
+   - Fix the color-contrast audit (a11y 97). A colour change is a visible change: show it to
+     the owner.
+   - The CSP meta (D22): `default-src 'self'`, and only the sources the site really loads. Any
+     inline script hash is generated at build time, not hand-written.
+   - Update `next` in `site/` to the console's patched line with `bun add` and Bun 1.3.12;
+     never `next upgrade`.
+   - *Accept:* SEO 100, best practices 100, accessibility 100 or every remaining audit named.
+     No CSP violation in the console of a headless run of `/`, `/id/` and `/contact/`.
+5. **T5 Docs.** Record the RESULT update and the hosting limits.
+   - `docs/core/features/landing-page.md`: hosting, decisions and checklist.
+   - `docs/core/BACKLOG.md`: the WEB-5 row's PR and status text, left for the merger to flip.
+   - `ops/landing-pages` notes that are now history.
+
+Then push, wait for CI to go green, and mark #379 ready. The team merges.
