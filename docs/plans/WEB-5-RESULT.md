@@ -552,7 +552,7 @@ Earlier interleaved sets, for the spread (the VM is shared): `/` before 89 / 81 
 ### Not done (would need the owner, or a visible change)
 
 - `content-visibility` on assistant, open, final and the footer: their heights follow the viewport height and width (final is 825 px at 1190x800 and 900 px at 1440x900), so the page would be a few pixels off until each had been seen.
-- **Day-mode LCP:** between 06:00 and 18:00 local time the LCP is the reassurance line (the hero headline's first paint is smaller than that line's), so a daytime visitor's LCP is about 2.9 s real, 4.7 s simulated. A fix needs the line to paint with the headline, which changes the intro's beats.
+- **Day-mode LCP:** between 06:00 and 18:00 local time the LCP is the reassurance line (the hero headline's first paint is smaller than that line's), so a daytime visitor's LCP is about 2.9 s real, 4.7 s simulated. Fixed afterwards without touching the beats, see "Day-mode LCP" below.
 - Lazy hydration of the sections below the fold, and moving static markup out of client trees (not attempted here).
 
 ### Owner QA 2026-11-25: the DOM hero, then a jump to the 3D lake (`5a6a6549e`)
@@ -569,3 +569,50 @@ Earlier interleaved sets, for the spread (the VM is shared): `/` before 89 / 81 
   - First visit with the intro, with and without `lk-gl`: same as before. Reduced motion with `lk-gl` = `1`: the creature is visible at once.
   - Zero CSP violations (the new inline script is hashed by the build step); Lighthouse LCP 1.66 s in every run of the table above (a fresh profile has no `lk-gl`).
 - **Not verified here:** the 3D path itself (no GPU in the VM): the real lake appearing without a DOM hero in between, on the Mac and the iPhone; the 4 s timeout with a slow real scene.
+
+## 2026-11-25 Day-mode LCP
+
+Goal: `/` by day (06:00 to 17:59 local) back to LCP at FCP (about 1.7 s) and performance in line with night, with no visible change. Result: **reached, `/` by day 74 to 91 (median of 6), LCP 4.7 s to 1.66 s.**
+
+### Cause
+
+- The hypothesis "the headline is painted at opacity 0 by day" is **wrong**. In both modes the headline is masked, not transparent, and it is reported as an LCP candidate at the first contentful paint (360 ms, 22,440 px at 412 px wide).
+- By day the hero's reassurance line (`ul > li`) has `text-shadow` with a 26 px blur (the pale wash that keeps it readable over the reflections). Chrome counts a text's shadow in its painted area, so the line's area is **28,086 px**, larger than the headline's 22,440. When the intro reveals the line (beat 3, about 2.2 s), it is a new, larger candidate and becomes the LCP (3.1 s observed on a 4x throttled run, 4.7 s simulated). At night the line has no shadow, so its area stays below the headline's and the LCP stays at FCP.
+- Evidence (Chrome `largest-contentful-paint` entries, 412x823, 4x CPU, fresh profile per run, 8 runs each): day always `[H1 22,440 at ~0.6 s, LI 28,086 at ~3.2 s]`, night always `[H1 22,440]`. With `text-shadow: none` on the line by day the candidates are only the H1, and with a transparent blurred shadow on the headline they are only the H1 (33,000 px). Lighthouse (trace `LargestContentfulPaint::Candidate`, `lcp-breakdown-insight`): the element is `ul.lk-ii > li.whitespace-nowrap`, render delay 2.74 s.
+- It did not show on every run before: Lighthouse stops observing at the end of the load, so when the late candidate arrived after that the run was clean. Interleaved, `/` by day was 91 / 75 / 95 then 68 / 73 / 73 (LCP 4.69 s in four of six).
+- `/id/` (lite intro) and the refresh path (no intro) show the line within the first 0.5 s (LCP is the line at about 0.25 to 0.4 s), so their LCP is already at FCP.
+
+### Fix
+
+One rule in `globals.css`, in the day headline rule: `text-shadow: 0 0 64px transparent`. A fully transparent shadow draws nothing, and Chrome counts its blur in the headline's area (33,440 px at 412, more at other widths), so the headline is the largest candidate again. The intro, its beats and its look are untouched. Tried and dropped: a zero-blur shadow (not counted), a larger blur (same area), vertical offsets (no help).
+
+### Before and after (mobile, Lighthouse 13.6.0, `TZ=Etc/GMT-3` for day, `TZ=Etc/GMT+9` for night; builds on :3402 and :3401)
+
+Day `/` (six runs each, three interleaved):
+
+| Build | Performance (runs) | Median | LCP (runs) | TBT median |
+| --- | --- | --- | --- | --- |
+| before | 91 / 75 / 95 / 68 / 73 / 73 | **74** | 1.66 / 4.69 / 1.66 / 4.69 / 4.70 / 4.70 s | 336 ms |
+| after | 92 / 89 / 86 / 92 / 88 / 94 | **90.5** | 1.66 s in all six | 337 ms |
+
+Other cases (three runs each, sequential builds):
+
+| Case | Build | Performance (runs) | Median | LCP |
+| --- | --- | --- | --- | --- |
+| day `/id/` | before | 93 / 94 / 94 | 94 | 1.66 s |
+| day `/id/` | after | 92 / 93 / 89 | 92 | 1.66 s |
+| night `/` | before | 94 / 91 / 93 | 93 | 1.66 s |
+| night `/` | after | 93 / 84 / 93 | 93 | 1.66 s |
+
+Accessibility, best practices: 100 in every run. The spread in performance is TBT on a shared VM (the CSS rule does not touch it).
+
+### Checks
+
+- No visible change: 48 intro frames (animations paused and set to 0, 300, 700, 1100, 1500 and 2500 ms), day and night, 1190x800 and 390x844, `/` and `/id/`, before against after: **0 differing pixels**.
+- Largest-paint element after the fix is the H1 at 320 (see below), 360, 390, 412, 600, 768, 1190 and 1440 px wide, by day, with the first-visit intro.
+- Zero CSP violations (`/` and `/id/` by day, `/` at night). `typecheck`, `lint` pass; `bun run size` 193.8 KB (budget 200); `bun test` 93 of 94 in the copy outside the repo (the claims test reads `docs/`; it passes in the repo, 8 of 8).
+
+### Not verified, not done
+
+- At 320 px wide the headline's area (25,344 px) is still below the line's (28,086 px), so the line still becomes the LCP there by day. That is a 2013-size phone; the next step would be a different hero text size or a shorter line, both visible changes.
+- The option that was not taken: showing the reassurance line with the headline (beat 3 earlier) or removing its halo by day. Both change what the visitor sees.
