@@ -29,6 +29,9 @@ type Bento = HomeCopy["governance"]["bento"];
 const tile =
   "lk-mb-tile relative flex flex-col overflow-hidden rounded-3xl bg-[var(--lk-n-surface)] p-6 outline-none focus-visible:ring-2 focus-visible:ring-[#44A6FA]/70 md:px-8 md:py-6";
 
+/** WEB-5 M3: a tile in the phone's swipe row: most of the screen wide, snapping to the left edge. */
+const swipe = "max-md:w-[80vw] max-md:max-w-[22rem] max-md:shrink-0 max-md:snap-start";
+
 function Words({ title, line }: { title: string; line: string }) {
   return (
     <div className="mt-auto pt-5 md:pt-4">
@@ -49,22 +52,36 @@ export function GovernanceBento({ copy }: { copy: Bento }) {
         <ColumnLineage />
         <Words title={copy.lineage.title} line={copy.lineage.line} />
       </LiveTile>
-      <LiveTile label={copy.proof.title} className={`${tile} md:col-span-2`}>
-        <Proof badge={copy.proof.badge} />
-        <Words title={copy.proof.title} line={copy.proof.line} />
-      </LiveTile>
-      <LiveTile label={copy.audit.title} className={`${tile} md:col-span-2`}>
-        <Audit text={copy.audit} />
-        <Words title={copy.audit.title} line={copy.audit.line} />
-      </LiveTile>
-      <LiveTile label={copy.catalog.title} className={`${tile} md:col-span-2`}>
-        <Catalog text={copy.catalog} />
-        <Words title={copy.catalog.title} line={copy.catalog.line} />
-      </LiveTile>
-      <LiveTile label={copy.access.title} className={`${tile} md:col-span-2`}>
-        <Access text={copy.access} />
-        <Words title={copy.access.title} line={copy.access.line} />
-      </LiveTile>
+      {/* WEB-5 M3 (phone pass): below 768 px the four small tiles are one row the visitor swipes,
+          a tile at a time with the next one peeking in, edges that fade only where a tile is
+          hidden, and dots that follow the row (all CSS, ".lk-gv-swipe" in app/globals.css). From
+          768 px this item and its list are `display: contents`, so the four tiles sit in the
+          bento grid exactly as before. */}
+      <li className="lk-gv-swipe-wrap min-w-0 md:contents">
+        <ul className="lk-gv-swipe -mx-4 flex snap-x snap-mandatory scroll-px-4 gap-3 overflow-x-auto px-4 py-1 [scrollbar-width:none] md:contents [&::-webkit-scrollbar]:hidden">
+          <LiveTile label={copy.proof.title} className={`${tile} ${swipe} md:col-span-2`}>
+            <Proof badge={copy.proof.badge} />
+            <Words title={copy.proof.title} line={copy.proof.line} />
+          </LiveTile>
+          <LiveTile label={copy.audit.title} className={`${tile} ${swipe} md:col-span-2`}>
+            <Audit text={copy.audit} />
+            <Words title={copy.audit.title} line={copy.audit.line} />
+          </LiveTile>
+          <LiveTile label={copy.catalog.title} className={`${tile} ${swipe} md:col-span-2`}>
+            <Catalog text={copy.catalog} />
+            <Words title={copy.catalog.title} line={copy.catalog.line} />
+          </LiveTile>
+          <LiveTile label={copy.access.title} className={`${tile} ${swipe} md:col-span-2`}>
+            <Access text={copy.access} />
+            <Words title={copy.access.title} line={copy.access.line} />
+          </LiveTile>
+        </ul>
+        <ol aria-hidden="true" className="lk-dash-dots lk-gv-dots mt-4 flex justify-center gap-1.5 md:hidden">
+          {[0, 1, 2, 3].map((i) => (
+            <li key={i} style={{ "--i": i } as React.CSSProperties} />
+          ))}
+        </ol>
+      </li>
     </ul>
     </div>
   );
