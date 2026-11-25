@@ -3493,3 +3493,166 @@ html[data-tod="day"] footer .lk-wm [class*="text-[#E8F4FF]/[0.12]"] {
     column-gap: 10px;
   }
 }
+
+/* Owner QA 2026-11-25 ("aku pengen dia muncul satu satu pas di scroll ... sama kek section Answer
+   become dashboards"): "Yours to keep" on a phone is the desktop showcase's mechanism fitted to a
+   phone: one sticky stage under the top bar with the heading, the current promise (title and line)
+   and its picture, and four position dots; vertical scroll steps through the four markers
+   (open-showcase.tsx lights the one at the middle of the screen) and each promise holds still for
+   45svh of scroll. The marker heights put the three switches and the release 45svh apart once the
+   stage is pinned: the first and last also cover the half screen before the middle line. Only with
+   JavaScript (`html[data-scene]`) and motion; otherwise the four stack, everything visible. */
+.lk-show-dots {
+  display: none;
+}
+@media (max-width: 63.98rem) and (prefers-reduced-motion: no-preference) {
+  html[data-scene] .lk-show {
+    grid-template-rows: repeat(4, auto);
+    row-gap: 0;
+  }
+  html[data-scene] .lk-show-mark {
+    display: block;
+    grid-column: 1;
+    height: 45svh;
+  }
+  html[data-scene] .lk-show-mark[data-i="0"] {
+    grid-row: 1;
+    height: calc(95svh - 4rem);
+  }
+  html[data-scene] .lk-show-mark[data-i="1"] {
+    grid-row: 2;
+  }
+  html[data-scene] .lk-show-mark[data-i="2"] {
+    grid-row: 3;
+  }
+  html[data-scene] .lk-show-mark[data-i="3"] {
+    grid-row: 4;
+    height: 95svh;
+  }
+  html[data-scene] .lk-show-pin {
+    grid-column: 1;
+    grid-row: 1 / -1;
+    align-self: start;
+    position: -webkit-sticky;
+    position: sticky;
+    top: 4rem;
+    height: calc(100svh - 4rem);
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding-block: 12px 14px;
+  }
+  html[data-scene] .lk-show-head {
+    margin-bottom: 0;
+  }
+  html[data-scene] .lk-show-head > h2 {
+    font-size: clamp(2rem, 9vw, 2.6rem);
+  }
+  html[data-scene] .lk-show-cols {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    flex-direction: column;
+    gap: 12px;
+  }
+  html[data-scene] .lk-show-list,
+  html[data-scene] .lk-show-stage {
+    display: grid;
+  }
+  html[data-scene] .lk-show-stage {
+    flex: 1;
+    min-height: 0;
+    align-content: start;
+  }
+  /* The promises and the pictures each share one cell; the current one shows. */
+  html[data-scene] .lk-show-item,
+  html[data-scene] .lk-show-visual {
+    grid-area: 1 / 1;
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(10px);
+    transition:
+      opacity 0.4s ease,
+      transform 0.55s var(--lk-ease),
+      visibility 0s linear 0.4s;
+  }
+  html[data-scene] .lk-show-item[data-on],
+  html[data-scene] .lk-show-visual[data-on] {
+    opacity: 1;
+    visibility: visible;
+    transform: none;
+    transition:
+      opacity 0.4s ease 0.08s,
+      transform 0.55s var(--lk-ease) 0.08s,
+      visibility 0s;
+  }
+  html[data-scene] .lk-show-item {
+    border-left-color: #44a6fa;
+  }
+  html[data-scene] .lk-show-item .lk-show-title {
+    font-size: 20px;
+    line-height: 28px;
+  }
+  html[data-scene] .lk-show-item .lk-show-line {
+    margin-top: 2px;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  html[data-scene] .lk-show-visual {
+    align-self: start;
+    min-height: 0;
+    max-height: 100%;
+    max-width: none;
+    margin: 0;
+  }
+  html[data-scene] .lk-show-visual:not([data-on]) *,
+  html[data-scene] .lk-show-visual:not([data-on]) *::after {
+    animation-play-state: paused !important;
+  }
+  html[data-scene] .lk-show-dots {
+    display: flex;
+    justify-content: center;
+    gap: 6px;
+  }
+  html[data-scene] .lk-show-dots > li {
+    --lk-near: 0;
+    transition:
+      width 0.3s var(--lk-ease),
+      background-color 0.3s ease;
+  }
+  html[data-scene] .lk-show[data-active="0"] .lk-show-dots > li[data-i="0"],
+  html[data-scene] .lk-show[data-active="1"] .lk-show-dots > li[data-i="1"],
+  html[data-scene] .lk-show[data-active="2"] .lk-show-dots > li[data-i="2"],
+  html[data-scene] .lk-show[data-active="3"] .lk-show-dots > li[data-i="3"] {
+    --lk-near: 1;
+  }
+  /* The tallest pictures, compacted to fit the stage at 360x740: the tables' storage list goes
+     (the files are what the "Apache Iceberg underneath" line says), and the stack's cards and
+     gaps are tighter. */
+  html[data-scene] .lk-show-visual .lk-otr-a-store {
+    display: none;
+  }
+  html[data-scene] .lk-show-visual .lk-hs-card {
+    padding-block: 6px;
+  }
+}
+/* Short phones (iPhone SE, 375x667): the stage is about 420 px, so the pin's gaps and the stack's
+   cards are tighter still, and every picture fits without being cut. */
+@media (max-width: 63.98rem) and (max-height: 700px) and (prefers-reduced-motion: no-preference) {
+  html[data-scene] .lk-show-pin {
+    gap: 8px;
+    padding-block: 6px 8px;
+  }
+  html[data-scene] .lk-show-cols {
+    gap: 8px;
+  }
+  html[data-scene] .lk-show-head > h2 {
+    font-size: 1.9rem;
+  }
+  html[data-scene] .lk-show-visual .lk-hs {
+    gap: 6px;
+  }
+  html[data-scene] .lk-show-visual .lk-hs-card {
+    padding-block: 3px;
+  }
+}

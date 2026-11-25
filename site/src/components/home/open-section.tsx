@@ -117,6 +117,12 @@ export function OpenSection({ copy, cta, contactHref }: { copy: HomeCopy["open"]
                 </div>
               ))}
             </div>
+            {/* Owner QA 2026-11-25: the phone sequence's place, one dot per promise (CSS, from `data-active`). */}
+            <ol className="lk-show-dots lk-dash-dots" aria-hidden="true">
+              {items.map((item, i) => (
+                <li key={item.title} data-i={i} />
+              ))}
+            </ol>
             </div>
             </div>
           </div>

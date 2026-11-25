@@ -21,7 +21,11 @@ import { ENGINES, OneTableView, ROUND, type Copy } from "./open-tables-view";
  */
 
 
-const SHOWCASE = "(min-width: 64rem) and (min-height: 44rem)";
+/**
+ * Where only the current panel is on show: the desktop showcase, and (owner QA 2026-11-25) the phone
+ * sequence, which runs below 1024 px with motion allowed (app/globals.css, "the phone sequence").
+ */
+const SHOWCASE = "(min-width: 64rem) and (min-height: 44rem), (max-width: 63.98rem) and (prefers-reduced-motion: no-preference)";
 
 /** True while the picture is on screen and, in the desktop showcase, the panel shown; never under reduced motion. */
 function useLive(ref: React.RefObject<HTMLElement | null>): boolean {
