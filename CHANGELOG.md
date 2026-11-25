@@ -9,6 +9,10 @@ once a first release is tagged.
 
 ## [Unreleased]
 
+### Fixed
+
+- Embeds look right on the host page (backlog `BI-64`, from `BI-26-AC2` and `AC5`). With `background=transparent` the frame is transparent: the root layout's `body` background was what stayed opaque, and it is now cleared (with `html`) while the option is on; tiles keep their cards. The height posted to the host page now includes the 8 px padding, so the frame no longer scrolls by 16 px. A year (an integer from 1000 to 9999) in a column named `year`, `tahun`, `yr`, or ending `_year` / `_tahun` prints as "2020", not "2,020", in raw tables and table tiles, in the console too; an explicit thousands setting still wins.
+
 ### Added
 
 - **Air-gapped installation now has a self-contained runbook and permanent completeness guards** (backlog `OPS-2`, delivered through `OPS-26` #295, `REL-12` #693 and `REL-16` #711). `docs/OPERATIONS.md`, "Air-gapped installation (no internet access)", covers downloading every release asset, checking `SHA256SUMS`, joining the `.part-*` files in name order and checking the joined archive's `.sha256` on a connected staging machine; offline verification with the embedded `ops/release/release.pub` key, `lakehousectl install --bundle` and the bundled `rantai-lakehouse-init` image on the air-gapped host; and `lakehousectl update --bundle` with automatic backup and rollback, plus `lakehousectl rollback`. The honest limits are written down: external LLM, OIDC, SMTP and S3 integrations need internal endpoints or stay off, and the runbook lists exactly which Compose profiles the release bundle carries and which gate/test profiles it drops. `ops/release/test_ops2_airgap_completeness.py` guards that no rendered release service installs a package or downloads from an external host at start, that every image the release runs is named by the signed manifest, that the runbook keeps its required assets and commands, and that `lakehousectl` pre-flight stays local under `--bundle` (with a new Rust unit test in `preflight.rs`). An audit of the rendered Compose, the bundle script, the image mapping and the installer found no remaining runtime internet dependency to fix.

@@ -18,6 +18,22 @@ export type EmbedLook = {
 
 export const DEFAULT_EMBED_LOOK: EmbedLook = { theme: "dashboard", showName: true, transparent: false }
 
+/**
+ * The class `<html>` carries while an embed is transparent (`BI-64`). Its rules
+ * live in `src/app/globals.css` only; the root layout puts it on the server
+ * render from {@link EMBED_TRANSPARENT_HEADER}, and `EmbedView` keeps it right
+ * in the browser (`PR #648 review 1`).
+ */
+export const EMBED_TRANSPARENT_CLASS = "embed-transparent"
+
+/**
+ * The request header the proxy sets for an embed whose address asks
+ * `background=transparent`, so the root layout can put
+ * {@link EMBED_TRANSPARENT_CLASS} on `<html>` before the first paint instead of
+ * after hydration (`PR #648 review 1`).
+ */
+export const EMBED_TRANSPARENT_HEADER = "x-embed-transparent"
+
 type Params = Record<string, string | string[] | undefined>
 
 function one(params: Params, key: string): string | undefined {
