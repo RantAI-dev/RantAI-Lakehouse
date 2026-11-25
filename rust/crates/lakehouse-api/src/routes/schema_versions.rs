@@ -68,7 +68,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use lakehouse_clickhouse::{ChClient, ChError};
+use lakehouse_clickhouse::{ChClient, ChError, ChTableEnsured};
 use lakehouse_core::ident::SqlLiteral;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -220,21 +220,18 @@ fn entries(versions: &[StoredVersion]) -> Vec<Entry> {
 
 // ── console.table_schema_version ──────────────────────────────────────
 
-static TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+static TABLE_ENSURED: ChTableEnsured = ChTableEnsured::new();
 
-/// Creates the store on first use. A failed attempt is not cached, so a
-/// `ClickHouse` that was down at the first pass does not wedge the later
-/// ones.
+/// Creates the store on first use, per `ClickHouse` URL. A failed attempt is
+/// not cached, so a `ClickHouse` that was down at the first pass does not
+/// wedge the later ones.
 async fn ensure_table(ch: &ChClient) -> Result<(), ChError> {
     ensure_table_once(&TABLE_ENSURED, ch).await
 }
 
-async fn ensure_table_once(
-    ensured: &tokio::sync::OnceCell<()>,
-    ch: &ChClient,
-) -> Result<(), ChError> {
+async fn ensure_table_once(ensured: &ChTableEnsured, ch: &ChClient) -> Result<(), ChError> {
     ensured
-        .get_or_try_init(|| async {
+        .ensure(ch, || async {
             ch.exec("CREATE DATABASE IF NOT EXISTS console", None)
                 .await?;
             ch.exec(
@@ -249,7 +246,6 @@ async fn ensure_table_once(
             .await
         })
         .await
-        .map(drop)
 }
 
 /// Why a read of the engine did not give an answer to act on. Logged, never
@@ -1012,7 +1008,7 @@ mod tests {
         let server = MockServer::start().await;
         mount_writes(&server).await;
         let ch = client(&server);
-        let ensured = tokio::sync::OnceCell::const_new();
+        let ensured = ChTableEnsured::new();
 
         ensure_table_once(&ensured, &ch).await.unwrap();
         ensure_table_once(&ensured, &ch).await.unwrap();
@@ -1042,7 +1038,7 @@ mod tests {
             .await;
         mount_writes(&server).await;
         let ch = client(&server);
-        let ensured = tokio::sync::OnceCell::const_new();
+        let ensured = ChTableEnsured::new();
 
         assert!(ensure_table_once(&ensured, &ch).await.is_err());
         ensure_table_once(&ensured, &ch).await.unwrap();
