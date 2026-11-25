@@ -154,6 +154,55 @@ no dev server. CHANGELOG entry per PR. Do not push.
 
 ---
 
+## Handoff, PR 1 (`BI-63`)
+
+Branch `fix/bi-63-stop-in-history`, not pushed. Commits:
+
+- `390422932` `BI-63 fix(api)`: decisions 1, 2 and the Rust half of 4.
+  `run_statement_with` now builds an owned `DetachedRun` and awaits
+  `run_engine_detached`, which `tokio::spawn`s the engine call
+  (`execute_query_against_engine`) and the `record_uncompleted_run` write.
+  After the call, `QueryRun::is_stopped()` turns any answer (success, failure,
+  Trino's completed run) into `EngineFailure::stopped()` before the write. A
+  panicked task answers a fixed 500 sentence; its error text goes to the log
+  only. The completed run's history and audit writes stay in the handler
+  (the plan asks for the failed or stopped row; a completed run dropped with
+  no Stop is not covered).
+- `d8719814a` `BI-63 fix(console)`: decision 3 and the console half of 4, plus
+  the CHANGELOG entry. `stopRun` sets the local "Stopped" at once, calls
+  `cancel` for every engine (the `engine === "clickhouse"` test is gone), and
+  aborts after the answer or 2 s (`CANCEL_WAIT_MS`). A new `Batch.stopped`
+  flag makes the loop and the statement in flight treat the batch as stopped
+  before the abort lands (a late answer would otherwise overwrite "not run" or
+  start the next statement). The history reloads once more after the cancel.
+
+Tests added: `tests/query_run_limits.rs`
+`a_run_whose_connection_is_dropped_after_a_stop_is_recorded_as_stopped`
+(delayed `wiremock` engine, request dropped by `tokio::time::timeout`,
+`mark_stopped`, polls `query_history` for status `stopped`; added to the
+existing file, so no `tests/it.rs` change); `use-query-studio.test.ts` "asks
+the server to cancel a Trino run too, and aborts the request only after the
+answer"; `query-studio-stop.test.tsx` now holds the cancel's answer and
+asserts the abort follows it (the other two tests wait for the abort).
+
+Commands run on the VM:
+
+- `rustfmt --edition 2024 --check` on `routes/query.rs` and
+  `tests/query_run_limits.rs`: clean.
+- `bun x tsc --noEmit -p .`: no errors.
+- `bun x eslint` on the three changed TS files: no output (clean).
+- `bun test src/features/queries/use-query-studio.test.ts
+  src/features/queries/query-studio-stop.test.tsx
+  src/features/queries/query-studio-download.test.tsx`: 81 pass, 0 fail.
+
+**Not verified:** every Rust compile, clippy, and test, including the new
+integration test (no cargo on the VM; CI is the first compile). The new test
+relies on the engine answering after 3 s and the request being dropped at
+0.8 s, and on the stopped mark being read after the engine answers, so it is
+timing-based: if CI shows it flaky, widen the gap. Full `bun run test` and
+lint, not run by rule. The real behaviour in a browser (Stop then History) was
+not run.
+
 ## Handoff, PR 2 (`BI-64`)
 
 Branch `fix/bi-64-embed-polish`, not pushed.
