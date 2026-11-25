@@ -99,11 +99,12 @@ describe("TableFinder, SQL sources", () => {
     )
     const { container } = render(<Harness adapter="sql" dial={{ driver: "postgres" }} />)
     fireEvent.click(screen.getByRole("button", { name: "List schemas" }))
-    await waitFor(() => expect(container.querySelectorAll("#discover-schemas option").length).toBe(2))
-    expect([...container.querySelectorAll("#discover-schemas option")].map((o) => o.getAttribute("value"))).toEqual([
-      "public",
-      "sales",
-    ])
+    // The console's own list (`UX-7`), not the browser's `datalist`.
+    const field = await screen.findByLabelText("Schema")
+    await waitFor(() => expect(container.querySelector("input#discover-schema")).not.toBeNull())
+    fireEvent.keyDown(field, { key: "ArrowDown" })
+    expect((await screen.findAllByRole("option")).map((o) => o.textContent)).toEqual(["public", "sales"])
+    expect(container.ownerDocument.querySelector("datalist")).toBeNull()
     // No schema is asked for: that is how the API knows to answer the schemas.
     expect(calls[0]?.body).toEqual({})
     fireEvent.change(screen.getByLabelText("Schema"), { target: { value: "typed_schema" } })

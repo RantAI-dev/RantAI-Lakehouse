@@ -6,7 +6,7 @@ import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import type { ReportSchedule } from "@/services/contracts/reports";
 import { clock, WEEKDAYS } from "./report-words";
-import { TimeZoneSelect } from "./time-zone-select";
+import { TimeZoneSelect } from "@/components/patterns/time-zone-select";
 
 /**
  * The "when is it sent" fields of a report subscription and of a dashboard

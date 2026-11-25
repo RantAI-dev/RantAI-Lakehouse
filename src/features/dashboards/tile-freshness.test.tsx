@@ -7,6 +7,8 @@ import { ReportingProvider } from "./reporting-context"
 // BI-4 part B (feature decision 5): the tile's footer says when its data was computed, and "remembered" when it came from memory.
 mock.module("./echart", () => ({ EChart: () => <div data-testid="chart" /> }))
 const { TileBody } = await import("./tile-body")
+const { TileCard } = await import("./tile-card")
+const { tileFreshness } = await import("./tile-freshness")
 afterEach(cleanup)
 
 const spec = { id: "c_1", title: "Visits", kind: "bar", mart: "m", x: "p", y: "v", source: "ui" } as unknown as ChartRenderSpec
@@ -34,5 +36,26 @@ describe("a tile's footer says when its data is from", () => {
     show(rows)
     expect(screen.getByTestId("chart")).toBeTruthy()
     expect(screen.queryByText(/Data from/)).toBeNull()
+  })
+})
+
+// BI-4-AC1, owner acceptance 2026-11-16: the dashboard page's tile (hover chip and ⋯ note) says "remembered" too.
+describe("the dashboard page's tile chip and ⋯ note (BI-4-AC1)", () => {
+  const card = (remembered: boolean) => {
+    const f = tileFreshness("2026-10-24T03:42:10Z", "Asia/Jakarta", remembered, "mart_wisman", "Reads mart_wisman.")
+    render(<TileCard item={{ id: "c_1", title: "Visits", body: <div />, menu: [], ...f }} editable={false} look="soft" />)
+    return f
+  }
+
+  it("says remembered in the chip, the ⋯ line and its tooltip", () => {
+    const f = card(true)
+    expect(document.querySelector("[data-slot='tile-data-from']")?.textContent).toBe("Data from 10:42 · remembered")
+    expect(f.menuNote).toEqual({ label: "10:42 · remembered · mart_wisman", detail: "Data from 10:42, remembered. Reads mart_wisman." })
+  })
+
+  it("says nothing of it for a fresh result", () => {
+    const f = card(false)
+    expect(document.querySelector("[data-slot='tile-data-from']")?.textContent).toBe("Data from 10:42")
+    expect(f.menuNote).toEqual({ label: "10:42 · mart_wisman", detail: "Data from 10:42. Reads mart_wisman." })
   })
 })

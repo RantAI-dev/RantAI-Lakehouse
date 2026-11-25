@@ -474,6 +474,18 @@ export const clickhouseDashboardService: DashboardService = {
       "The permissions could not be loaded"
     )
   },
+  // BI-72, PR #651 review 1: the route needs a session, so the card asks only
+  // on a page that has one (`isPublicPath` in `WebCard` decides). A 401 that
+  // still happens — a session that expired while the page was open — is
+  // `apiFetch`'s redirect to `/login`, the standard expiry behaviour, never
+  // a value this method returns. Any other refusal is "no claim" (`null`):
+  // the frame stays as it was.
+  async frameCheck(url, signal) {
+    const res = await apiFetch(`/api/dashboard/frame-check?url=${encodeURIComponent(url)}`, { cache: "no-store", signal })
+    if (!res.ok) return null
+    const json = (await res.json().catch(() => null)) as { framable?: unknown } | null
+    return typeof json?.framable === "boolean" ? json.framable : null
+  },
   async saveAccess(input, signal) {
     const res = await apiFetch("/api/dashboard/access", {
       method: "PUT",

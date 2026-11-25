@@ -220,7 +220,7 @@ export function buildCombinedOption(input: CombinedInput, dark: boolean): Combin
     yAxis: sides.map((side) => ({
       type: "value",
       position: side,
-      axisLabel: { color: ink, fontSize: 11, formatter: (v: number) => formatAxisValue(v, input.style?.format, locale, decimals[side]) },
+      axisLabel: { color: ink, fontSize: 11, hideOverlap: true, formatter: (v: number) => formatAxisValue(v, input.style?.format, locale, decimals[side]) },
       splitLine: { show: side === sides[0], lineStyle: { color: split } },
       axisLine: { show: false }, axisTick: { show: false },
       // The two axes have different scales (visitors against a rate).
