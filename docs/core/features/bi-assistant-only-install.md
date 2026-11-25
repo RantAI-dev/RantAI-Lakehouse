@@ -66,6 +66,18 @@ from them.
   guard (503 / unsupported), not by dialing a service that was not
   installed.
 - Peak memory numbers are unmeasured until the slice 4 gate.
+- Slice 3 moves unsaved dashboard SQL-source preview and the assistant's
+  `run_sql` / dataset tools to the active engine. It does **not** add a
+  metadata store: saved SQL sources, charts and boards still live in
+  `ClickHouse` tables, which a `bi-only+trino` install does not deploy. Those
+  persistence routes answer a fixed 503 naming the missing store instead of
+  dialing it; only a preview over unsaved SQL works there. Inline chart
+  previews are refused honestly for the same reason — the chart builder
+  still emits `ClickHouse` `SETTINGS` text. No persistence is fabricated.
+- The assistant tool schemas and
+  `tests/fixtures/tool_schemas.json` are unchanged by slice 3: the engine
+  context is appended to the system prompt only in `bi-only` mode, so every
+  `AI-32` full-mode prompt pin stays byte-identical.
 
 ## Acceptance checklist
 
