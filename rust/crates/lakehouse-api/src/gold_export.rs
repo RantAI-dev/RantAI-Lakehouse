@@ -82,7 +82,10 @@ use iceberg::spec::{DataFile, NestedField, PrimitiveType, Type};
 use lakehouse_clickhouse::{ChClient, ChColumn, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_core::secret::SecretValue;
-use lakehouse_iceberg::{IcebergClient, IcebergClientConfig, IcebergError, gold};
+use lakehouse_iceberg::{
+    IcebergClient, IcebergClientConfig, IcebergError,
+    gold::{self, PublishZone},
+};
 use serde_json::{Map, Value};
 use thiserror::Error;
 use time::Date;
@@ -963,6 +966,11 @@ fn exported_at_column(now_micros: i64, batch_rows: usize) -> ArrayRef {
               indirection away from every call site, not reduce what a caller must \
               supply"
 )]
+#[allow(
+    dead_code,
+    reason = "the pre-DATA-65 Gold-only export entry point is kept for backward compatibility \
+              and its own gate/round-trip tests; production callers now pass an explicit zone"
+)]
 pub(crate) async fn export_mart(
     state: &AppState,
     actor: crate::routes::query::GateActor<'_>,
@@ -976,7 +984,50 @@ pub(crate) async fn export_mart(
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &crate::policy_engine::PolicyEngineObligations<'_>,
 ) -> Result<GoldExportResult, GoldExportError> {
-    let namespace = gold::GOLD_NAMESPACE.to_owned();
+    export_mart_for_zone(
+        state,
+        actor,
+        ch,
+        iceberg_config,
+        source_table,
+        mart_name,
+        max_rows,
+        batch_size,
+        roles,
+        placeholders,
+        obligations,
+        PublishZone::Gold,
+    )
+    .await
+}
+
+/// DATA-65: the zone-aware export behind [`export_mart`]. `source_table`
+/// is the fully-qualified `ClickHouse` table the caller chose from `zone` —
+/// `silver.<mart>` for Silver, `{gold_source_schema}.<mart>` for Gold — so
+/// the SEC-50 gate and every batch read name exactly the table being
+/// published. The Iceberg table is created/loaded in `zone`'s namespace
+/// through the same format-v2, `day(_exported_at)`, single-snapshot
+/// `append_batches` mechanics ADR 0010/DATA-63 established for Gold.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "same parameter set as export_mart plus the DATA-65 zone; grouping them \
+              into a struct would only add indirection at every call site"
+)]
+pub(crate) async fn export_mart_for_zone(
+    state: &AppState,
+    actor: crate::routes::query::GateActor<'_>,
+    ch: &ChClient,
+    iceberg_config: &IcebergClientConfig,
+    source_table: &str,
+    mart_name: &str,
+    max_rows: u64,
+    batch_size: u64,
+    roles: &[String],
+    placeholders: &crate::sql_rewrite::PlaceholderValues,
+    obligations: &crate::policy_engine::PolicyEngineObligations<'_>,
+    zone: PublishZone,
+) -> Result<GoldExportResult, GoldExportError> {
+    let namespace = zone.namespace_name().to_owned();
     let sanitized_table =
         gold::sanitize_mart_name(mart_name).map_err(|e| GoldExportError::Batch(e.to_string()))?;
 
@@ -1051,7 +1102,7 @@ pub(crate) async fn export_mart(
 
     let client = IcebergClient::connect(iceberg_config).await?;
     let mut table = client
-        .create_or_load_gold_table(mart_name, domain_fields)
+        .create_or_load_published_table(zone, mart_name, domain_fields)
         .await?;
     // DATA-6 D7: a mart whose own Iceberg table is ANOTHER mart's
     // latest-copy table (the `rantai.latest-copy-of` marker the Dagster op
@@ -1071,7 +1122,13 @@ pub(crate) async fn export_mart(
     // `select` in the `gold` namespace — and only there. The namespace
     // exists now (the export just created or loaded its table in it),
     // so the grant can be made.
-    grant_outside_readers_select(state, &client).await;
+    // ADR 0016 point 3's door serves the `gold` namespace only: a Silver
+    // publish gets the same table mechanics but no Silver namespace grant,
+    // because the door's own path guard would refuse a `silver` read
+    // anyway. Granting it here would widen access the door cannot use.
+    if zone == PublishZone::Gold {
+        grant_outside_readers_select(state, &client).await;
+    }
 
     let arrow_schema = Arc::new(
         iceberg::arrow::schema_to_arrow_schema(table.schema())
@@ -1259,8 +1316,26 @@ pub async fn read_back_row_count(
     iceberg_config: &IcebergClientConfig,
     mart_name: &str,
 ) -> Result<Option<GoldReadBack>, GoldExportError> {
+    read_back_row_count_for_zone(iceberg_config, mart_name, PublishZone::Gold).await
+}
+
+/// DATA-65: read back the published table in `zone`'s namespace. The
+/// mechanics are identical to [`read_back_row_count`]; only the namespace
+/// changes.
+///
+/// # Errors
+///
+/// See [`read_back_row_count`].
+pub async fn read_back_row_count_for_zone(
+    iceberg_config: &IcebergClientConfig,
+    mart_name: &str,
+    zone: PublishZone,
+) -> Result<Option<GoldReadBack>, GoldExportError> {
     let client = IcebergClient::connect(iceberg_config).await?;
-    let Some(table) = client.load_gold_table_if_exists(mart_name).await? else {
+    let Some(table) = client
+        .load_published_table_if_exists(zone, mart_name)
+        .await?
+    else {
         return Ok(None);
     };
     let format_version = table.format_version() as u8;

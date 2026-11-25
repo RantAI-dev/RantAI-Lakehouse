@@ -747,7 +747,10 @@ export function hasProblems(problems: EditorProblems): boolean {
 }
 
 /** One reason the page cannot save yet, and where to go to fix it. */
-export type SaveBlocker = { text: string; target: EditorSelection | { kind: "name" } | { kind: "schedule" } }
+export type SaveBlocker = {
+  text: string
+  target: EditorSelection | { kind: "name" } | { kind: "schedule" } | { kind: "materialization" }
+}
 
 /**
  * Why Save is disabled, in the order of the page, each with where to go
