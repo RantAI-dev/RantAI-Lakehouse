@@ -44,7 +44,7 @@ work again.
 | 6 | **Refresh.** The dashboard's Refresh and a tile's "Refresh this tile" compute fresh for that request and replace what is remembered. Anyone who can view the dashboard may refresh it. Auto-refresh (`BI-18` B) follows the rule and does not force fresh results. | Planner default — owner to confirm at QA |
 | 7 | **Memory.** At most 256 MB of remembered results per API process (an operator can change it with `RESULT_CACHE_MAX_MB`); the least used go first. A single result over 8 MB is not remembered. | Planner default — owner to confirm at QA |
 | 8 | **Embeds, public links, PDFs and scheduled reports** read through the same memory, by the same rule (decision 4 keeps the embed viewer's masks apart). | Planner default — owner to confirm at QA |
-| 9 | **Measured.** A RESULT document (`docs/plans/BI-4-RESULT.md`) records a 12-tile dashboard's open time before, with parallel tiles, and on remembered results, with the machine and the data size. The 3-second target is reported as met or not met, never adjusted. | Planner default — owner to confirm at QA |
+| 9 | **Measured.** A RESULT document (`docs/plans/BI-4-RESULT.md`) records a 12-tile dashboard's open time before, with parallel tiles, and on remembered results, with the machine and the data size. **Superseded by `BI-56` D3 (owner, 2026-11-21):** "before" and "after" are cold (no remembered result) and remembered, not a pre-cache and post-cache build; section 5 of the RESULT records both. The 3-second target is reported as met or not met, never adjusted. | Planner default — owner to confirm at QA |
 
 ## Limits to tell a customer
 
@@ -69,7 +69,7 @@ Run by the product owner on a running console. A step not performed is never a p
 
 - `BI-4-AC1` A second open of a dashboard is served from remembered results and its tiles say so, with the time the data was computed.
 - `BI-4-AC2` Two users with different masks on one column open the same dashboard one after the other; each sees only their own masked values.
-- `BI-4-AC3` `docs/plans/BI-4-RESULT.md` records the before and after timings of a 12-tile dashboard.
+- `BI-4-AC3` `docs/plans/BI-4-RESULT.md` records the before and after timings of a 12-tile dashboard. **Superseded by `BI-56` D3 (owner, 2026-11-21):** "before" and "after" mean cold (no remembered result) and remembered, not a pre-cache and post-cache build; section 5 records both.
 - `BI-4-AC4` A user without `settings:write` cannot change the install's rule, a viewer without `dashboard:write` cannot change a dashboard's, and a failure shows a plain sentence.
 - `BI-4-AC5` *(proposed)* After a Gold build changes a table, the next open of a chart on it shows the new data without pressing Refresh.
 - `AI-x-AC1` "Make this chart always fresh" asks for approval and then sets the rule.

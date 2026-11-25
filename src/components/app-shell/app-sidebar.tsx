@@ -8,6 +8,7 @@ import { ChevronDown, ChevronRight, FileText } from "lucide-react"
 import { BrandPicture } from "@/components/brand-picture"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useBranding, type BrandingView } from "@/hooks/use-branding"
+import { useDeploymentSettings } from "@/hooks/use-deployment-settings"
 import { rememberTableHref } from "@/hooks/use-table-memory"
 import {
   Sidebar,
@@ -30,7 +31,14 @@ import { useDashboardsRow } from "@/features/dashboards/dashboards-row"
 import { useSidebarGroups } from "@/hooks/use-sidebar-groups"
 import { PRODUCT_LOGO_DARK, PRODUCT_LOGO_LIGHT } from "@/lib/product-branding"
 import { cn } from "@/lib/utils"
-import { NAV_GROUPS, activeNavHref, canOpen, type NavGroup, type NavItem } from "./nav-config"
+import {
+  NAV_GROUPS,
+  activeNavHref,
+  canOpen,
+  filterNavSectionsForInstallMode,
+  type NavGroup,
+  type NavItem,
+} from "./nav-config"
 import { UserMenu } from "./user-menu"
 
 /*
@@ -138,12 +146,23 @@ export function AppSidebar() {
   const iconMode = state === "collapsed"
   const dashboardsRow = useDashboardsRow()
   const { user, hasPermission, logout } = useAuth()
+  // The workspace's own name and logo (`ADM-2`); the product's own stand
+  // in for whatever it did not set.
+  const branding = useBranding()
+  // `BI-44`: the deployment route is `settings:write`-gated, so only a
+  // holder of that permission asks for it. Everyone else — and a request
+  // still in flight — gets the unchanged menu; a 403 on every page load
+  // for a non-admin role is not an acceptable way to learn the mode
+  // (`WEB-11` / `ADM-13`). The pure filter does the hiding once answered.
+  const deployment = useDeploymentSettings(hasPermission("settings:write"))
   const groups = React.useMemo(() => {
-    return NAV_GROUPS.map((g) => ({
-      ...g,
-      items: g.items.filter((it) => canOpen(it.href, hasPermission)),
-    })).filter((g) => g.items.length > 0)
-  }, [hasPermission])
+    return filterNavSectionsForInstallMode(NAV_GROUPS, deployment?.installMode)
+      .map((g) => ({
+        ...g,
+        items: g.items.filter((it) => canOpen(it.href, hasPermission)),
+      }))
+      .filter((g) => g.items.length > 0)
+  }, [hasPermission, deployment?.installMode])
   const activeGroup = groups.find((g) => g.items.some((it) => it.href === activeHref))
   const defaultOpenLabels = React.useMemo(
     () => groups.filter((g) => g.defaultOpen).map((g) => g.label),

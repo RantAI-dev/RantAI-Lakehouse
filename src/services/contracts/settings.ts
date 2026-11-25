@@ -434,10 +434,27 @@ export type DeploymentFeature = {
 /**
  * `GET /api/settings/deployment` (`ADM-6`): which of the deployment's
  * features are set up, and what is missing for the ones that are not.
+ *
+ * `BI-44` adds three top-level answers from `routes::settings`: the install
+ * mode and the query engine this deployment was installed with, and, only
+ * in `bi-only`, the external source types the active engine can read in
+ * place. All three are OPTIONAL: an older server sends only `features`, and
+ * a full install never sends `supportedInPlaceSources`. A console that
+ * cannot read them shows no installation summary rather than guessing from
+ * a health probe.
  */
 export type DeploymentSettings = {
   /** One entry per feature. */
   features: DeploymentFeature[]
+  /** How this deployment was installed; absent on an older server. */
+  installMode?: "full" | "bi-only" | string
+  /** The one engine a `bi-only` install reads through; absent on an older server. */
+  queryEngine?: "clickhouse" | "trino" | string
+  /**
+   * External source types the active engine can read in place (`BI-44`).
+   * Sent only in `bi-only`; not a claim that a source was registered.
+   */
+  supportedInPlaceSources?: string[]
 }
 
 /**

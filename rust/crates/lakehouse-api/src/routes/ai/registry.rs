@@ -1608,17 +1608,19 @@ fn kill_query_schema() -> Value {
 
 fn export_gold_mart_schema() -> Value {
     json!({ "type": "function", "function": { "name": "export_gold_mart",
-        "description": "Export one Gold mart (serving.<mart>) to its Iceberg Gold table through Lakekeeper. Append-only: running it again adds the rows again with a new _exported_at; it does not replace them.",
+        "description": "Export one Silver (silver.<mart>) or Gold (serving.<mart>) mart to its Iceberg table through Lakekeeper. Append-only: running it again adds the rows again with a new _exported_at; it does not replace them.",
         "parameters": { "type": "object", "properties": {
-            "mart": { "type": "string", "description": "Gold mart name, e.g. mart_sales" } },
+            "mart": { "type": "string", "description": "Mart name, e.g. mart_sales" },
+            "zone": { "type": "string", "enum": ["silver", "gold"], "description": "Publication zone (default gold): silver reads silver.<mart> and writes silver.<mart>." } },
             "required": ["mart"] } } })
 }
 
 fn get_gold_export_schema() -> Value {
     json!({ "type": "function", "function": { "name": "get_gold_export",
-        "description": "Read a Gold Iceberg table back (by mart) through Lakekeeper: its row count and format version, independent of ClickHouse.",
+        "description": "Read a Silver or Gold Iceberg table back (by mart and zone) through Lakekeeper: its row count and format version, independent of ClickHouse.",
         "parameters": { "type": "object", "properties": {
-            "mart": { "type": "string", "description": "Gold mart name, e.g. mart_sales" } },
+            "mart": { "type": "string", "description": "Mart name, e.g. mart_sales" },
+            "zone": { "type": "string", "enum": ["silver", "gold"], "description": "Publication zone (default gold)." } },
             "required": ["mart"] } } })
 }
 
@@ -1653,7 +1655,13 @@ fn draft_policy_schema() -> Value {
             "subjects": { "type": "string", "description": "who or what the policy applies to" },
             "resources": { "type": "string", "description": "which data the policy covers" },
             "effect": { "type": "string", "description": "e.g. \"Permit with obligation\", \"Require approval\"" },
-            "conditions": { "type": "string" },
+            "conditions": { "type": "object", "description": "what it enforces: needs a mask or a rowFilter; without conditions the draft enforces nothing",
+                "properties": {
+                    "roles": { "type": "array", "items": { "type": "string" }, "description": "role names it applies to" },
+                    "table": { "type": "string", "description": "table it governs, e.g. \"serving.mart_x\"" },
+                    "mask": { "type": "array", "items": { "type": "string" }, "description": "columns to mask" },
+                    "rowFilter": { "type": "string", "description": "SQL condition rows must meet" } },
+                "required": ["roles", "table"] },
             "owner": { "type": "string" } },
             "required": ["name", "kind", "subjects", "resources", "effect"] } } })
 }
@@ -1773,7 +1781,11 @@ fn create_pipeline_schema() -> Value {
             "targetZone": { "type": "string", "enum": ["silver", "serving"] },
             "targetTable": { "type": "string" },
             "transforms": { "type": "array", "items": { "type": "string" } },
-            "incrementalColumn": { "type": "string", "description": "optional column for incremental loads" },
+            "kind": { "type": "string", "enum": ["batch", "incremental"], "description": "batch (default) rebuilds the whole target each run; incremental materializes only new or changed rows" },
+            "incrementalColumn": { "type": "string", "description": "required when kind is incremental: the cursor column; letters digits and underscores, not starting with a digit, at most 128 characters" },
+            "incrementalStrategy": { "type": "string", "enum": ["append", "partition_replace"], "description": "incremental only, default append: append adds rows newer than the watermark; partition_replace rewrites entire day or month partitions and tolerates late-arriving data" },
+            "partitionGranularity": { "type": "string", "enum": ["day", "month"], "description": "partition_replace only, default day" },
+            "lookbackHours": { "type": "integer", "minimum": 0, "maximum": 720, "description": "partition_replace only, default 0: hours before the watermark included in the replaced window" },
             "schedule": { "type": "string", "description": "\"manual\" or a cron expression" } },
             "required": ["name", "targetZone", "targetTable"] } } })
 }

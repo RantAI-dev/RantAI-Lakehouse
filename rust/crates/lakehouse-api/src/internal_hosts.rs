@@ -68,7 +68,10 @@ impl InternalHosts {
 
 /// An IPv4-mapped IPv6 address as the IPv4 address it wraps, so
 /// `::ffff:192.168.18.5` matches `192.168.18.0/24`.
-fn canonical(ip: &IpAddr) -> IpAddr {
+///
+/// `pub(crate)`: `client_source` (SEC-75) matches a trusted proxy the
+/// same way, and one implementation of the rule is better than two.
+pub(crate) fn canonical(ip: &IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(*ip, IpAddr::V4),
         IpAddr::V4(_) => *ip,

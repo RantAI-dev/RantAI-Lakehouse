@@ -216,6 +216,7 @@ async fn duplicate_employee_name_is_a_conflict(pool: PgPool) -> sqlx::Result<()>
         schedule_cron: None,
         mode: None,
         permissions: None,
+        read_roles: Vec::new(),
     };
     let err = create_employee(&pool, &input).await.unwrap_err();
     assert!(matches!(err, StoreError::Conflict));
@@ -380,6 +381,7 @@ async fn new_columns_round_trip(pool: PgPool) -> sqlx::Result<()> {
         schedule_cron: Some("0 6 * * *".to_owned()),
         mode: Some("ask".to_owned()),
         permissions: Some("alert:write, query:read".to_owned()),
+        read_roles: Vec::new(),
     };
     let created = create_employee(&pool, &input).await.unwrap();
     assert_eq!(
@@ -411,6 +413,7 @@ async fn new_columns_default_when_absent(pool: PgPool) -> sqlx::Result<()> {
         schedule_cron: None,
         mode: None,
         permissions: None,
+        read_roles: Vec::new(),
     };
     let created = create_employee(&pool, &input).await.unwrap();
     assert_eq!(created.prompt, None);
@@ -457,6 +460,7 @@ async fn list_scheduled_employees_returns_only_cron_set(pool: PgPool) -> sqlx::R
         schedule_cron: Some("0 2 * * *".to_owned()),
         mode: Some("build".to_owned()),
         permissions: Some("gold:export".to_owned()),
+        read_roles: Vec::new(),
     };
     let created = create_employee(&pool, &input).await.unwrap();
 
@@ -588,6 +592,7 @@ async fn get_employee_run_config_round_trips(pool: PgPool) -> sqlx::Result<()> {
         schedule_cron: None,
         mode: Some("ask".to_owned()),
         permissions: Some("query:read".to_owned()),
+        read_roles: Vec::new(),
     };
     let created = create_employee(&pool, &input).await.unwrap();
     let config = get_employee_run_config(&pool, &created.id)
@@ -958,6 +963,7 @@ async fn get_employee_run_config_includes_budget_limit(pool: PgPool) -> sqlx::Re
         schedule_cron: None,
         mode: Some("build".to_owned()),
         permissions: None,
+        read_roles: Vec::new(),
     };
     let created = create_employee(&pool, &input).await.unwrap();
     let config = get_employee_run_config(&pool, &created.id)
@@ -1207,6 +1213,7 @@ async fn unmeasured_employee_metrics_are_none_not_insert_time_defaults(
         schedule_cron: None,
         mode: None,
         permissions: None,
+        read_roles: Vec::new(),
     };
     let created = create_employee(&pool, &input).await.unwrap();
     assert_eq!(created.budget_spent, None);
@@ -1383,6 +1390,7 @@ async fn seed_metrics_employee(pool: &PgPool, name: &str, budget_limit: f64) -> 
         schedule_cron: None,
         mode: None,
         permissions: None,
+        read_roles: Vec::new(),
     };
     create_employee(pool, &input).await.unwrap().id
 }

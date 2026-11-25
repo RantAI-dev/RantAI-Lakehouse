@@ -131,6 +131,9 @@ async fn seed_pipeline(pool: &PgPool, run_as: Option<Uuid>, tenant_id: Option<Uu
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: vec![pipelines::PipelineInput {
                 name: "orders".to_owned(),
                 zone: "bronze".to_owned(),
@@ -191,6 +194,9 @@ async fn seed_pipeline_with(
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs,
             steps,
             name: format!("lineage-probe-{}", Uuid::new_v4()),

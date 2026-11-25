@@ -21,12 +21,14 @@ Run with: `cd dagster && python -m unittest dispar_orchestrate.test_maintenance 
 
 from __future__ import annotations
 
+import logging
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import requests
 from dagster import build_op_context
+from pyiceberg.table.refs import SnapshotRefType
 
 from dispar_orchestrate import maintenance
 
@@ -42,6 +44,28 @@ def _cfg() -> maintenance.MaintenanceConfig:
         api_url="http://lakehouse-api.invalid:8080",
         maintenance_token="unit-test-maintenance-token",
         trino_url="http://trino.invalid:8080",
+    )
+
+
+def _cfg_with_catalog_identity() -> maintenance.MaintenanceConfig:
+    """The shared fixture plus the `dlt` principal's catalog identity — the
+    one the pyiceberg fallback needs to reach Lakekeeper at all. Without it
+    the fallback records an honest skip ("no catalog identity on this
+    stack"), which is a different case and has its own test."""
+    return maintenance.MaintenanceConfig(
+        ch=maintenance.ClickHouseTarget(url="http://ch.invalid", user="default", password=""),
+        lakekeeper_catalog_uri="http://lakekeeper.invalid/catalog",
+        lakekeeper_warehouse="default",
+        rustfs_endpoint="http://rustfs.invalid:9000",
+        ch_oauth_client_id="",
+        ch_oauth_server_uri="",
+        api_url="http://lakehouse-api.invalid:8080",
+        maintenance_token="unit-test-maintenance-token",
+        trino_url="http://trino.invalid:8080",
+        lakekeeper_token_file="/tokens/dlt.jwt",
+        lakekeeper_token="unit-test-lakekeeper-token",
+        rustfs_access_key="unit-test-access-key",
+        rustfs_secret_key="unit-test-secret-key",
     )
 
 
@@ -188,7 +212,7 @@ class MeasureSnapshotGrowthTest(unittest.TestCase):
 class FetchPolicyIndexTest(unittest.TestCase):
     """`_fetch_policy_index` fetches every configured maintenance policy
     ONCE per run and indexes it by `(namespace, tableName)` — see the
-    module doc's "Per-table policy + Trino verbs" section. A policy-fetch
+    module doc's "Per-table policy + maintenance verbs" section. A policy-fetch
     failure (401/403, a server error, an unreachable API, or no token
     configured) is fail-closed for auth (raises `Failure`) or recorded as
     a skip for everything else, never silently treated as "no policy
@@ -322,7 +346,7 @@ class ComputeRetentionThresholdTest(unittest.TestCase):
 
 
 class CadenceAllowsTest(unittest.TestCase):
-    """Per-table `schedule` cadence for the Trino verbs only."""
+    """Per-table `schedule` cadence for the expiry and compaction verbs only."""
 
     def test_a_null_schedule_always_allows_a_run(self) -> None:
         now = datetime(2026, 1, 10, tzinfo=timezone.utc)
@@ -378,7 +402,7 @@ class ExpireSnapshotsResultTest(unittest.TestCase):
     ) -> None:
         with mock.patch.object(maintenance, "_trino_execute", return_value=[]) as mocked:
             skip, verb_run = maintenance._expire_snapshots_result(
-                _cfg(), "bronze", "orders", None, "Code: 48 ... transactional catalog",
+                _cfg(), "bronze", "orders", None,
                 datetime.now(timezone.utc), None,
             )
         self.assertIsNone(skip)
@@ -392,22 +416,43 @@ class ExpireSnapshotsResultTest(unittest.TestCase):
             'ALTER TABLE iceberg.bronze."orders" EXECUTE expire_snapshots(retention_threshold => \x277d\x27)',
         )
 
-    def test_table_without_policy_records_trino_unreachable_as_skipped(
+    def test_a_table_without_a_policy_falls_back_to_pyiceberg_when_trino_is_unreachable(
         self,
     ) -> None:
+        """Trino being unreachable is no longer the outcome of this verb:
+        the pyiceberg fallback takes over and applies the SAME default
+        retention (7 days, OPS-1 D1) the Trino path used. Only the
+        snapshots older than that go — the ones the operator's policy
+        keeps are untouched."""
+        now = datetime(2026, 1, 10, tzinfo=timezone.utc)
+        snapshots = [
+            _FakeSnapshot(3, int((now - timedelta(seconds=10)).timestamp() * 1000)),
+            _FakeSnapshot(2, int((now - timedelta(days=8)).timestamp() * 1000)),
+            _FakeSnapshot(1, int((now - timedelta(days=20)).timestamp() * 1000)),
+        ]
+        calls: dict = {}
+        catalog = _FakeCatalog(_FakeTable(snapshots, {}, calls))
         with mock.patch.object(
             maintenance,
             "_trino_execute",
             side_effect=maintenance.TrinoUnavailableError("trino unreachable: connection refused"),
-        ):
+        ), mock.patch.object(
+            maintenance, "_pyiceberg_catalog", return_value=catalog
+        ) as mocked_catalog:
             skip, verb_run = maintenance._expire_snapshots_result(
-                _cfg(), "bronze", "orders", None, "Code: 48 ... transactional catalog",
-                datetime.now(timezone.utc), None,
+                _cfg_with_catalog_identity(),
+                "bronze",
+                "orders",
+                None,
+                now,
+                None,
             )
-        self.assertEqual(skip, "expire_snapshots/optimize skipped: trino unreachable")
+        self.assertIsNone(skip)
         self.assertIsNotNone(verb_run)
-        self.assertEqual(verb_run["outcome"], "skipped")
-        self.assertEqual(verb_run["detail"], "trino unreachable")
+        self.assertEqual(verb_run["engine"], "pyiceberg")
+        self.assertEqual(verb_run["outcome"], "applied")
+        self.assertEqual(calls["by_ids"], [2, 1])
+        mocked_catalog.assert_called_once()
 
     def test_table_without_policy_records_a_trino_refusal_as_refused(
         self,
@@ -418,7 +463,7 @@ class ExpireSnapshotsResultTest(unittest.TestCase):
             side_effect=maintenance.TrinoQueryError("Query failed: retention shorter than min retention"),
         ):
             skip, verb_run = maintenance._expire_snapshots_result(
-                _cfg(), "bronze", "orders", None, "Code: 48 ... transactional catalog",
+                _cfg(), "bronze", "orders", None,
                 datetime.now(timezone.utc), None,
             )
         self.assertIsNotNone(skip)
@@ -431,7 +476,7 @@ class ExpireSnapshotsResultTest(unittest.TestCase):
         policy = {"snapshotsToKeep": None, "compactSmallFiles": False, "schedule": None}
         with mock.patch.object(maintenance, "_trino_execute", return_value=[]) as mocked:
             skip, verb_run = maintenance._expire_snapshots_result(
-                _cfg(), "bronze", "orders", policy, "ch probe reason",
+                _cfg(), "bronze", "orders", policy,
                 datetime.now(timezone.utc), None,
             )
         self.assertIsNone(skip)
@@ -452,7 +497,7 @@ class ExpireSnapshotsResultTest(unittest.TestCase):
             maintenance, "_trino_execute", return_value=[["2026-01-09 00:00:00.000 UTC"]]
         ) as mocked:
             skip, verb_run = maintenance._expire_snapshots_result(
-                _cfg(), "bronze", "orders", policy, "unused", now, None
+                _cfg(), "bronze", "orders", policy, now, None
             )
         self.assertIn("nothing to expire", skip or "")
         self.assertEqual(verb_run and verb_run["outcome"], "skipped")
@@ -475,7 +520,7 @@ class ExpireSnapshotsResultTest(unittest.TestCase):
             maintenance, "_trino_execute", side_effect=fake_trino_execute
         ) as mocked:
             skip, verb_run = maintenance._expire_snapshots_result(
-                _cfg(), "bronze", "orders", policy, "unused", now, None
+                _cfg(), "bronze", "orders", policy, now, None
             )
         self.assertIsNotNone(skip)
         self.assertIn("refused", skip or "")
@@ -494,7 +539,7 @@ class ExpireSnapshotsResultTest(unittest.TestCase):
 
         with mock.patch.object(maintenance, "_trino_execute", side_effect=fake_trino_execute) as mocked:
             skip, verb_run = maintenance._expire_snapshots_result(
-                _cfg(), "bronze", "orders", policy, "unused", now, None
+                _cfg(), "bronze", "orders", policy, now, None
             )
         self.assertIsNone(skip)
         self.assertEqual(verb_run and verb_run["outcome"], "applied")
@@ -504,18 +549,31 @@ class ExpireSnapshotsResultTest(unittest.TestCase):
             'ALTER TABLE iceberg.bronze."orders" EXECUTE expire_snapshots(retention_threshold => \x2760s\x27)',
         )
 
-    def test_trino_being_unreachable_is_a_degraded_skip_not_a_failure(self) -> None:
+    def test_trino_being_unreachable_falls_back_and_never_raises(self) -> None:
+        """Trino being unreachable is a degraded state, not a job failure:
+        the pyiceberg fallback takes over, and when the catalog is
+        unreachable too the honest `failed` outcome is RECORDED — the
+        call still returns, so one table's broken catalog cannot take the
+        whole maintenance run down."""
         policy = {"snapshotsToKeep": 1, "schedule": None}
         with mock.patch.object(
             maintenance,
             "_trino_execute",
             side_effect=maintenance.TrinoUnavailableError("trino unreachable: connection refused"),
+        ), mock.patch.object(
+            maintenance, "_pyiceberg_catalog", side_effect=ConnectionError("catalog unreachable")
         ):
             skip, verb_run = maintenance._expire_snapshots_result(
-                _cfg(), "bronze", "orders", policy, "unused", datetime.now(timezone.utc), None
+                _cfg_with_catalog_identity(),
+                "bronze",
+                "orders",
+                policy,
+                datetime.now(timezone.utc),
+                None,
             )
-        self.assertEqual(skip, "expire_snapshots/optimize skipped: trino unreachable")
-        self.assertEqual(verb_run and verb_run["outcome"], "skipped")
+        self.assertIsNotNone(skip)
+        self.assertEqual(verb_run and verb_run["outcome"], "failed")
+        self.assertEqual(verb_run and verb_run["engine"], "pyiceberg")
 
     def test_a_weekly_schedule_still_within_its_window_skips_without_a_trino_call(
         self,
@@ -524,11 +582,500 @@ class ExpireSnapshotsResultTest(unittest.TestCase):
         policy = {"snapshotsToKeep": 1, "schedule": "weekly"}
         with mock.patch.object(maintenance, "_trino_execute") as mocked:
             skip, verb_run = maintenance._expire_snapshots_result(
-                _cfg(), "bronze", "orders", policy, "unused", now, now - timedelta(days=1)
+                _cfg(), "bronze", "orders", policy, now, now - timedelta(days=1)
             )
         self.assertIsNotNone(skip)
         self.assertEqual(verb_run and verb_run["outcome"], "skipped")
         mocked.assert_not_called()
+
+
+class _FakeSnapshot:
+    """The two attributes `maintenance.py` reads off a pyiceberg `Snapshot`
+    (`snapshot_id`, `timestamp_ms`) — the rest of the real object is
+    irrelevant to the expiry and is deliberately absent."""
+
+    def __init__(self, snapshot_id: int, timestamp_ms: int) -> None:
+        self.snapshot_id = snapshot_id
+        self.timestamp_ms = timestamp_ms
+
+
+class _FakeRef:
+    """A pyiceberg `SnapshotRef`: the head snapshot of a branch or a tag.
+    Both are PROTECTED — `pyiceberg`'s `ExpireSnapshots.by_id` raises on
+    them, so the code under test must filter them out itself."""
+
+    def __init__(self, snapshot_id: int, ref_type: SnapshotRefType) -> None:
+        self.snapshot_id = snapshot_id
+        self.snapshot_ref_type = ref_type
+
+
+class _FakeExpireSnapshots:
+    def __init__(self, calls: dict, commit_error: Exception | None = None) -> None:
+        self._calls = calls
+        self._commit_error = commit_error
+
+    def by_ids(self, snapshot_ids: list[int]) -> "_FakeExpireSnapshots":
+        self._calls["by_ids"] = list(snapshot_ids)
+        return self
+
+    def commit(self) -> None:
+        if self._commit_error is not None:
+            raise self._commit_error
+        self._calls["committed"] = True
+
+
+class _FakeMaintenance:
+    def __init__(self, calls: dict, commit_error: Exception | None = None) -> None:
+        self._calls = calls
+        self._commit_error = commit_error
+
+    def expire_snapshots(self) -> _FakeExpireSnapshots:
+        self._calls["expire_snapshots"] = True
+        return _FakeExpireSnapshots(self._calls, self._commit_error)
+
+
+class _FakeTable:
+    """A pyiceberg `Table` stand-in: `snapshots()`, `refs()`,
+    `current_snapshot()` and `maintenance.expire_snapshots()` — the whole
+    surface the fallback touches.
+
+    `current_snapshot` defaults to `None` (a table with no current
+    snapshot) and `commit_error` makes the expiry commit raise, so the
+    two failure paths are reachable without a network."""
+
+    def __init__(
+        self,
+        snapshots: list[_FakeSnapshot],
+        refs: dict[str, _FakeRef],
+        calls: dict,
+        current_snapshot: _FakeSnapshot | None = None,
+        commit_error: Exception | None = None,
+    ) -> None:
+        self._snapshots = snapshots
+        self._refs = refs
+        self._current_snapshot = current_snapshot
+        self.maintenance = _FakeMaintenance(calls, commit_error)
+
+    def snapshots(self) -> list[_FakeSnapshot]:
+        return list(self._snapshots)
+
+    def refs(self) -> dict[str, _FakeRef]:
+        return dict(self._refs)
+
+    def current_snapshot(self) -> _FakeSnapshot | None:
+        return self._current_snapshot
+
+
+class _FakeCatalog:
+    def __init__(self, table: _FakeTable) -> None:
+        self._table = table
+        self.loaded: list[tuple[str, str]] = []
+
+    def load_table(self, identifier: tuple[str, str]) -> _FakeTable:
+        self.loaded.append(identifier)
+        return self._table
+
+
+class PyIcebergExpiryFallbackTest(unittest.TestCase):
+    """OPS-20: with Trino absent (its compose profile is off), the
+    snapshot expiry falls back to `pyiceberg` — the same REST catalog the
+    ingest job already writes through. Trino keeps the path when it
+    answers; only an unreachable Trino switches engines."""
+
+    NOW = datetime(2026, 1, 10, tzinfo=timezone.utc)
+
+    def setUp(self) -> None:
+        self.calls: dict = {}
+
+    def _table_with_six_snapshots(
+        self,
+        current_snapshot: _FakeSnapshot | None = None,
+        commit_error: Exception | None = None,
+    ) -> _FakeTable:
+        """Six snapshots of different ages, plus a branch head and a tag
+        head that are BOTH old — the two protected ids a naive expiry
+        would try to remove (and that `pyiceberg` refuses to expire)."""
+        ages = {
+            6: timedelta(seconds=10),
+            5: timedelta(days=1),
+            4: timedelta(days=2),
+            3: timedelta(days=3),
+            2: timedelta(days=10),
+            1: timedelta(days=20),
+        }
+        snapshots = [
+            _FakeSnapshot(snapshot_id, int((self.NOW - age).timestamp() * 1000))
+            for snapshot_id, age in ages.items()
+        ]
+        refs = {
+            "main": _FakeRef(6, SnapshotRefType.BRANCH),
+            "old-branch": _FakeRef(2, SnapshotRefType.BRANCH),
+            "release-1": _FakeRef(1, SnapshotRefType.TAG),
+        }
+        return _FakeTable(
+            snapshots,
+            refs,
+            self.calls,
+            current_snapshot=current_snapshot,
+            commit_error=commit_error,
+        )
+
+    def test_the_fallback_expires_the_old_snapshots_minus_the_kept_and_the_protected_ones(
+        self,
+    ) -> None:
+        """With Trino unreachable, the pyiceberg path removes exactly the
+        snapshots that are older than the threshold AND neither among the
+        newest `snapshotsToKeep` nor a branch/tag head: with keep=2 the
+        2-day-old and the 3-day-old snapshots go, while the 10-day-old
+        branch head and the 20-day-old tag head stay (protected)."""
+        table = self._table_with_six_snapshots()
+        catalog = _FakeCatalog(table)
+        policy = {"snapshotsToKeep": 2, "schedule": None}
+        with mock.patch.object(
+            maintenance,
+            "_trino_execute",
+            side_effect=maintenance.TrinoUnavailableError("trino unreachable: connection refused"),
+        ), mock.patch.object(
+            maintenance, "_pyiceberg_catalog", return_value=catalog
+        ) as mocked_catalog:
+            skip, verb_run = maintenance._expire_snapshots_result(
+                _cfg_with_catalog_identity(),
+                "bronze",
+                "orders",
+                policy,
+                self.NOW,
+                None,
+            )
+        self.assertIsNone(skip)
+        self.assertEqual(verb_run and verb_run["engine"], "pyiceberg")
+        self.assertEqual(verb_run and verb_run["outcome"], "applied")
+        self.assertEqual(self.calls["by_ids"], [4, 3])
+        self.assertTrue(self.calls["committed"])
+        mocked_catalog.assert_called_once()
+        self.assertEqual(catalog.loaded, [("bronze", "orders")])
+
+    def test_the_result_detail_carries_the_count_the_threshold_and_the_reclaim_note(
+        self,
+    ) -> None:
+        """The recorded detail says how many snapshots went, which
+        threshold decided it, and that the FILES are reclaimed later by
+        `remove_orphan_files` — whose 3-day age floor delays the space
+        reclaim by about three days."""
+        catalog = _FakeCatalog(self._table_with_six_snapshots())
+        policy = {"snapshotsToKeep": 2, "schedule": None}
+        with mock.patch.object(
+            maintenance,
+            "_trino_execute",
+            side_effect=maintenance.TrinoUnavailableError("trino unreachable: connection refused"),
+        ), mock.patch.object(maintenance, "_pyiceberg_catalog", return_value=catalog):
+            _skip, verb_run = maintenance._expire_snapshots_result(
+                _cfg_with_catalog_identity(),
+                "bronze",
+                "orders",
+                policy,
+                self.NOW,
+                None,
+            )
+        detail = (verb_run or {}).get("detail", "")
+        self.assertIn("2", detail)
+        self.assertIn("86400s", detail)
+        self.assertIn(str(maintenance.ORPHAN_FILE_AGE_FLOOR_SECONDS), detail)
+        self.assertIn("remove_orphan_files", detail)
+
+    def test_a_snapshot_committed_exactly_at_the_cutoff_survives_the_expiry(self) -> None:
+        """The cutoff is EXCLUSIVE: a snapshot whose commit instant is
+        exactly `now - threshold` is not OLDER than the threshold, so it
+        survives. Iceberg's own expiry is strict on that boundary —
+        `pyiceberg` 0.12.0's `ExpireSnapshots.older_than` expires a
+        snapshot only when `snapshot.timestamp_ms < expire_from`
+        (`pyiceberg/table/update/snapshot.py:1335`), and Iceberg's Java
+        `RemoveSnapshots` (what Trino's `expire_snapshots` calls) keeps a
+        snapshot while `timestampMillis() >= expireOlderThan`.
+
+        With no `snapshotsToKeep` the threshold is the default 7 days, so
+        the snapshot committed exactly 7 days ago lands exactly ON the
+        cutoff: it must survive, while the 8-day-old one goes."""
+        cutoff = self.NOW - timedelta(days=7)
+        snapshots = [
+            _FakeSnapshot(3, int((self.NOW - timedelta(seconds=10)).timestamp() * 1000)),
+            _FakeSnapshot(2, int(cutoff.timestamp() * 1000)),
+            _FakeSnapshot(1, int((self.NOW - timedelta(days=8)).timestamp() * 1000)),
+        ]
+        catalog = _FakeCatalog(_FakeTable(snapshots, {}, self.calls))
+        with mock.patch.object(
+            maintenance,
+            "_trino_execute",
+            side_effect=maintenance.TrinoUnavailableError("trino unreachable: connection refused"),
+        ), mock.patch.object(maintenance, "_pyiceberg_catalog", return_value=catalog):
+            skip, verb_run = maintenance._expire_snapshots_result(
+                _cfg_with_catalog_identity(),
+                "bronze",
+                "orders",
+                None,
+                self.NOW,
+                None,
+            )
+        self.assertIsNone(skip)
+        self.assertEqual(verb_run and verb_run["outcome"], "applied")
+        self.assertEqual(self.calls["by_ids"], [1])
+
+    def test_a_snapshot_tied_with_the_nth_newest_in_the_same_millisecond_survives(self) -> None:
+        """`snapshotsToKeep=2`, and the 2nd- and 3rd-newest snapshots share
+        ONE millisecond — which is exactly the cutoff, because the
+        threshold is the 2nd-newest's age in whole seconds. The 3rd is
+        not one of the two the policy keeps, so only the strict
+        comparison keeps it: "the newest N survive" becomes "AT LEAST N
+        survive". That is Iceberg's own behaviour at a tie, and it is
+        why the comparison is strict."""
+        tied = self.NOW - timedelta(seconds=100)
+        snapshots = [
+            _FakeSnapshot(4, int((self.NOW - timedelta(seconds=10)).timestamp() * 1000)),
+            _FakeSnapshot(3, int(tied.timestamp() * 1000)),
+            _FakeSnapshot(2, int(tied.timestamp() * 1000)),
+            _FakeSnapshot(1, int((self.NOW - timedelta(seconds=200)).timestamp() * 1000)),
+        ]
+        catalog = _FakeCatalog(_FakeTable(snapshots, {}, self.calls))
+        policy = {"snapshotsToKeep": 2, "schedule": None}
+        with mock.patch.object(
+            maintenance,
+            "_trino_execute",
+            side_effect=maintenance.TrinoUnavailableError("trino unreachable: connection refused"),
+        ), mock.patch.object(maintenance, "_pyiceberg_catalog", return_value=catalog):
+            skip, verb_run = maintenance._expire_snapshots_result(
+                _cfg_with_catalog_identity(),
+                "bronze",
+                "orders",
+                policy,
+                self.NOW,
+                None,
+            )
+        self.assertIsNone(skip)
+        self.assertEqual(verb_run and verb_run["outcome"], "applied")
+        self.assertEqual(self.calls["by_ids"], [1])
+
+    def test_the_current_snapshot_is_never_expired_however_old_it_is(self) -> None:
+        """The table's CURRENT snapshot is protected by its own id, not
+        only through the branch heads: a format-version-1 table has no
+        refs at all, and `pyiceberg`'s `RemoveSnapshotsUpdate` drops a
+        snapshot from the metadata without touching `current_snapshot_id`
+        — expiring it would leave the table pointing at a snapshot that
+        no longer exists. Here the current snapshot is 5 days old, the
+        threshold is 2 days and no branch protects it; the OTHER old
+        snapshot still goes, so the guard is selective."""
+        current = _FakeSnapshot(7, int((self.NOW - timedelta(days=5)).timestamp() * 1000))
+        snapshots = [
+            _FakeSnapshot(9, int((self.NOW - timedelta(seconds=10)).timestamp() * 1000)),
+            _FakeSnapshot(8, int((self.NOW - timedelta(days=2)).timestamp() * 1000)),
+            current,
+            _FakeSnapshot(6, int((self.NOW - timedelta(days=20)).timestamp() * 1000)),
+        ]
+        catalog = _FakeCatalog(_FakeTable(snapshots, {}, self.calls, current_snapshot=current))
+        policy = {"snapshotsToKeep": 2, "schedule": None}
+        with mock.patch.object(
+            maintenance,
+            "_trino_execute",
+            side_effect=maintenance.TrinoUnavailableError("trino unreachable: connection refused"),
+        ), mock.patch.object(maintenance, "_pyiceberg_catalog", return_value=catalog):
+            skip, verb_run = maintenance._expire_snapshots_result(
+                _cfg_with_catalog_identity(),
+                "bronze",
+                "orders",
+                policy,
+                self.NOW,
+                None,
+            )
+        self.assertIsNone(skip)
+        self.assertEqual(verb_run and verb_run["outcome"], "applied")
+        self.assertEqual(self.calls["by_ids"], [6])
+
+    def test_a_failed_expiry_records_the_exception_type_and_not_its_message(self) -> None:
+        """The recorded detail reaches
+        `lake.bronze_meta.maintenance_verb_run` and is served by the
+        API, so upstream (Lakekeeper/pyiceberg) text must never reach
+        it: the detail carries the exception TYPE only — the same rule
+        this module follows for the policy fetch (`f"{type(exc).__name__}"`)."""
+        upstream_text = "lakekeeper refused the request: bearer token not-a-real-token-value"
+        catalog = _FakeCatalog(self._table_with_six_snapshots(commit_error=RuntimeError(upstream_text)))
+        policy = {"snapshotsToKeep": 2, "schedule": None}
+        with mock.patch.object(
+            maintenance,
+            "_trino_execute",
+            side_effect=maintenance.TrinoUnavailableError("trino unreachable: connection refused"),
+        ), mock.patch.object(maintenance, "_pyiceberg_catalog", return_value=catalog):
+            skip, verb_run = maintenance._expire_snapshots_result(
+                _cfg_with_catalog_identity(),
+                "bronze",
+                "orders",
+                policy,
+                self.NOW,
+                None,
+            )
+        self.assertEqual(verb_run and verb_run["outcome"], "failed")
+        detail = (verb_run or {}).get("detail", "")
+        self.assertEqual(detail, "RuntimeError")
+        self.assertNotIn(upstream_text, detail)
+        self.assertNotIn("not-a-real-token-value", detail)
+        self.assertNotIn("not-a-real-token-value", skip or "")
+
+    def test_a_reachable_trino_keeps_the_trino_path_and_never_reaches_pyiceberg(self) -> None:
+        """Trino answering is the normal case: its path stays exactly as it
+        was and the catalog is never even built."""
+        policy = {"snapshotsToKeep": 2, "schedule": None}
+        rows = [
+            ["2026-01-09 00:00:00.000 UTC"],
+            ["2026-01-08 00:00:00.000 UTC"],
+            ["2026-01-01 00:00:00.000 UTC"],
+        ]
+        with mock.patch.object(
+            maintenance, "_trino_execute", return_value=rows
+        ) as mocked_trino, mock.patch.object(
+            maintenance, "_pyiceberg_catalog"
+        ) as mocked_catalog:
+            skip, verb_run = maintenance._expire_snapshots_result(
+                _cfg_with_catalog_identity(),
+                "bronze",
+                "orders",
+                policy,
+                self.NOW,
+                None,
+            )
+        self.assertIsNone(skip)
+        self.assertEqual(verb_run and verb_run["engine"], "trino")
+        self.assertEqual(verb_run and verb_run["outcome"], "applied")
+        mocked_catalog.assert_not_called()
+        self.assertTrue(mocked_trino.called)
+
+    def test_a_table_with_no_more_snapshots_than_the_keep_count_is_skipped(self) -> None:
+        """A table with exactly `snapshotsToKeep` snapshots has nothing to
+        expire — skipped, never committed, and never a zero threshold."""
+        snapshots = [
+            _FakeSnapshot(2, int((self.NOW - timedelta(seconds=10)).timestamp() * 1000)),
+            _FakeSnapshot(1, int((self.NOW - timedelta(days=1)).timestamp() * 1000)),
+        ]
+        catalog = _FakeCatalog(_FakeTable(snapshots, {}, self.calls))
+        policy = {"snapshotsToKeep": 2, "schedule": None}
+        with mock.patch.object(
+            maintenance,
+            "_trino_execute",
+            side_effect=maintenance.TrinoUnavailableError("trino unreachable: connection refused"),
+        ), mock.patch.object(maintenance, "_pyiceberg_catalog", return_value=catalog):
+            skip, verb_run = maintenance._expire_snapshots_result(
+                _cfg_with_catalog_identity(),
+                "bronze",
+                "orders",
+                policy,
+                self.NOW,
+                None,
+            )
+        self.assertIn("nothing to expire", skip or "")
+        self.assertEqual(verb_run and verb_run["outcome"], "skipped")
+        self.assertEqual(verb_run and verb_run["engine"], "pyiceberg")
+        self.assertNotIn("committed", self.calls)
+
+    def test_a_stack_without_a_catalog_identity_skips_instead_of_calling_the_catalog(
+        self,
+    ) -> None:
+        """No `dlt` token on this stack means no catalog identity: an
+        honest skip, and the catalog is never built."""
+        with mock.patch.object(
+            maintenance,
+            "_trino_execute",
+            side_effect=maintenance.TrinoUnavailableError("trino unreachable: connection refused"),
+        ), mock.patch.object(
+            maintenance, "_pyiceberg_catalog"
+        ) as mocked_catalog:
+            skip, verb_run = maintenance._expire_snapshots_result(
+                _cfg(),
+                "bronze",
+                "orders",
+                {"snapshotsToKeep": 2, "schedule": None},
+                self.NOW,
+                None,
+            )
+        self.assertIsNotNone(skip)
+        self.assertEqual(verb_run and verb_run["outcome"], "skipped")
+        self.assertEqual(verb_run and verb_run["engine"], "pyiceberg")
+        mocked_catalog.assert_not_called()
+
+    def test_an_unreachable_catalog_is_recorded_as_failed_and_never_raises(self) -> None:
+        """A catalog that cannot be reached is an honest `failed` verb
+        run; it must not raise, because one table's broken catalog must
+        not take the whole maintenance run down."""
+        policy = {"snapshotsToKeep": 2, "schedule": None}
+        with mock.patch.object(
+            maintenance,
+            "_trino_execute",
+            side_effect=maintenance.TrinoUnavailableError("trino unreachable: connection refused"),
+        ), mock.patch.object(
+            maintenance, "_pyiceberg_catalog", side_effect=ConnectionError("catalog unreachable")
+        ):
+            skip, verb_run = maintenance._expire_snapshots_result(
+                _cfg_with_catalog_identity(),
+                "bronze",
+                "orders",
+                policy,
+                self.NOW,
+                None,
+            )
+        self.assertIsNotNone(skip)
+        self.assertEqual(verb_run and verb_run["outcome"], "failed")
+        self.assertEqual(verb_run and verb_run["engine"], "pyiceberg")
+
+    def test_an_unreadable_table_is_recorded_as_failed_and_never_raises(self) -> None:
+        """The id computation sits inside the catalog try: a table whose
+        snapshot metadata cannot be read is an honest `failed` verb run,
+        never an exception that takes the whole maintenance run down."""
+        policy = {"snapshotsToKeep": 2, "schedule": None}
+        with mock.patch.object(
+            maintenance,
+            "_trino_execute",
+            side_effect=maintenance.TrinoUnavailableError("trino unreachable: connection refused"),
+        ), mock.patch.object(
+            maintenance,
+            "_pyiceberg_catalog",
+            return_value=_FakeCatalog(self._table_with_six_snapshots()),
+        ), mock.patch.object(
+            maintenance,
+            "_snapshot_ids_to_expire",
+            side_effect=ValueError("metadata unreadable"),
+        ):
+            skip, verb_run = maintenance._expire_snapshots_result(
+                _cfg_with_catalog_identity(),
+                "bronze",
+                "orders",
+                policy,
+                self.NOW,
+                None,
+            )
+        self.assertIsNotNone(skip)
+        self.assertEqual(verb_run and verb_run["outcome"], "failed")
+        self.assertEqual(verb_run and verb_run["engine"], "pyiceberg")
+        self.assertEqual((verb_run or {}).get("detail"), "ValueError")
+
+    def test_a_cadence_refusal_does_not_fall_back_to_pyiceberg(self) -> None:
+        """The schedule cadence is a POLICY decision, not an engine
+        problem: a table inside its weekly window is skipped without
+        either engine being touched. The recorded run therefore names NO
+        engine (`none`), not a guess at the one that would have run."""
+        policy = {"snapshotsToKeep": 2, "schedule": "weekly"}
+        with mock.patch.object(
+            maintenance, "_trino_execute"
+        ) as mocked_trino, mock.patch.object(
+            maintenance, "_pyiceberg_catalog"
+        ) as mocked_catalog:
+            skip, verb_run = maintenance._expire_snapshots_result(
+                _cfg_with_catalog_identity(),
+                "bronze",
+                "orders",
+                policy,
+                self.NOW,
+                self.NOW - timedelta(days=1),
+            )
+        self.assertIsNotNone(skip)
+        self.assertEqual(verb_run and verb_run["outcome"], "skipped")
+        self.assertEqual(verb_run and verb_run["engine"], "none")
+        mocked_trino.assert_not_called()
+        mocked_catalog.assert_not_called()
 
 
 class OptimizeResultTest(unittest.TestCase):
@@ -555,6 +1102,26 @@ class OptimizeResultTest(unittest.TestCase):
         mocked.assert_called_once()
         sql = mocked.call_args.args[1]
         self.assertIn("EXECUTE optimize", sql)
+
+    def test_an_unreachable_trino_skips_only_the_optimize_verb(self) -> None:
+        """The recorded skip names the OPTIMIZE verb and nothing else: the
+        snapshot expiry is NOT skipped when Trino is unreachable — it
+        runs through the catalog — so a skip text that claims the expiry
+        was skipped too would put a false statement in the recorded
+        run."""
+        policy = {"compactSmallFiles": True, "schedule": None}
+        with mock.patch.object(
+            maintenance,
+            "_trino_execute",
+            side_effect=maintenance.TrinoUnavailableError("trino unreachable"),
+        ):
+            skip, verb_run = maintenance._optimize_result(
+                _cfg(), "bronze", "orders", policy, datetime.now(timezone.utc), None
+            )
+        self.assertEqual(skip, "optimize skipped: trino unreachable")
+        self.assertNotIn("expire_snapshots", skip or "")
+        self.assertEqual(verb_run and verb_run["outcome"], "skipped")
+        self.assertEqual(verb_run and verb_run["detail"], "trino unreachable")
 
     def test_a_failed_optimize_call_is_recorded_and_not_silently_dropped(self) -> None:
         policy = {"compactSmallFiles": True, "schedule": None}
@@ -660,6 +1227,51 @@ class RunBronzeMaintenanceTrinoIntegrationTest(unittest.TestCase):
             ],
         )
 
+    def test_the_snapshot_expiry_runs_before_the_orphan_file_removal(self) -> None:
+        """Decision 4 of OPS-20: the expiry runs FIRST, so the files the
+        expired snapshots referenced are orphans by the time
+        `remove_orphan_files` runs. The orphan verb itself is unchanged —
+        only the order moved."""
+        calls: list[str] = []
+
+        def note_trino(_cfg, _sql):
+            calls.append("expire_snapshots")
+            return []
+
+        def note_orphan(_cfg, _table_name, *, dry_run):
+            calls.append(f"remove_orphan_files(dry_run={dry_run})")
+            return {"table_name": "bronze.orders"}
+
+        with mock.patch.object(
+            maintenance, "probe_expire_snapshots_skip", return_value="ch refuses"
+        ), mock.patch.object(
+            maintenance, "_trino_execute", side_effect=note_trino
+        ), mock.patch.object(
+            maintenance, "run_remove_orphan_files", side_effect=note_orphan
+        ), mock.patch.object(
+            maintenance, "measure_snapshot_growth",
+            return_value={"measured": False, "snapshot_count": 0, "metadata_log_count": 0},
+        ), mock.patch.object(
+            maintenance, "record_maintenance_run"
+        ), mock.patch.object(
+            maintenance, "record_maintenance_verb_run"
+        ), mock.patch.object(
+            maintenance, "latest_maintenance_run_at", return_value=None
+        ):
+            maintenance._run_maintenance_for_table(
+                cfg=_cfg_with_catalog_identity(),
+                table_name="bronze.orders",
+                policy={"snapshotsToKeep": 2, "compactSmallFiles": False, "schedule": None, "orphanAgeHours": None},
+                policy_fetch_error=None,
+            )
+
+        self.assertIn("expire_snapshots", calls)
+        self.assertIn("remove_orphan_files(dry_run=False)", calls)
+        self.assertLess(
+            calls.index("expire_snapshots"),
+            calls.index("remove_orphan_files(dry_run=True)"),
+        )
+
     def test_a_401_policy_fetch_failure_is_a_whole_run_failure_not_a_per_table_skip(
         self,
     ) -> None:
@@ -712,6 +1324,130 @@ class RunBronzeMaintenanceTrinoIntegrationTest(unittest.TestCase):
         mocked_trino.assert_not_called()
         skipped_verbs = mocked_record_run.call_args.kwargs["skipped_verbs"]
         self.assertIn("policy fetch failed: HTTPError", skipped_verbs)
+
+
+class ExpireSnapshotsProbeOutcomeTest(unittest.TestCase):
+    """The ClickHouse probe's outcome must be SURFACED, never dropped.
+
+    `probe_expire_snapshots_skip` returns ClickHouse's OWN error body for
+    its own `expire_snapshots` verb. That text is upstream error text: it
+    may go to the operator-facing Dagster log, and NOWHERE else — not into
+    `skipped_verbs`, not into a `maintenance_verb_run` / `maintenance_run`
+    row, and so not into any API response
+    (`GET /api/governance/maintenance`,
+    `GET /api/lakehouse/tables/{ns}/{table}/maintenance`).
+
+    The probe's own contract says so: "the caller logs whatever this
+    returns either way". Before this change the caller computed the value,
+    handed it to a parameter nobody read, and dropped it — a ClickHouse
+    query per table per run whose result nobody could see.
+    """
+
+    # The marker is a distinctive fragment of ClickHouse's error body, so
+    # "the probe's outcome is nowhere in what was recorded" is a precise
+    # assertion and not a coincidence with the rest of the run's text.
+    MARKER = "Code: 48. NOT_SUPPORTED"
+    PROBE_OUTCOME = (
+        "unsupported this run — real ClickHouse error: "
+        f"{MARKER}: Iceberg expire_snapshots is not supported for Iceberg "
+        "tables backed by a transactional catalog"
+    )
+
+    def _run(self, context=None) -> tuple[dict, list]:
+        """The per-table body with every I/O boundary stubbed, plus what it
+        recorded (`maintenance_run` and `maintenance_verb_run`)."""
+        recorded_run: dict = {}
+        recorded_verb_runs: list = []
+        with mock.patch.object(
+            maintenance, "probe_expire_snapshots_skip", return_value=self.PROBE_OUTCOME
+        ), mock.patch.object(
+            maintenance, "run_remove_orphan_files", return_value={"table_name": "bronze.orders"}
+        ), mock.patch.object(
+            maintenance, "measure_snapshot_growth",
+            return_value={"measured": False, "snapshot_count": 0, "metadata_log_count": 0},
+        ), mock.patch.object(
+            maintenance, "record_maintenance_run",
+            side_effect=lambda **kw: recorded_run.update(kw),
+        ), mock.patch.object(
+            maintenance, "record_maintenance_verb_run",
+            side_effect=lambda **kw: recorded_verb_runs.append(kw),
+        ), mock.patch.object(
+            maintenance, "latest_maintenance_run_at", return_value=None
+        ), mock.patch.object(
+            maintenance, "_trino_execute", return_value=[]
+        ):
+            maintenance._run_maintenance_for_table(
+                cfg=_cfg(),
+                table_name="bronze.orders",
+                policy=None,
+                policy_fetch_error=None,
+                context=context,
+            )
+        return recorded_run, recorded_verb_runs
+
+    def test_the_probe_outcome_is_logged_for_the_operator(self) -> None:
+        """The probe's outcome reaches the Dagster log: the caller logs
+        whatever the probe returns, either way."""
+        log = mock.Mock()
+        context = mock.Mock()
+        context.log = log
+
+        self._run(context=context)
+
+        logged = " ".join(str(call.args[0]) for call in log.info.call_args_list)
+        self.assertIn(self.PROBE_OUTCOME, logged)
+
+    def test_the_probe_outcome_never_reaches_a_recorded_row(self) -> None:
+        """It is ClickHouse's own error body: it may not be recorded in
+        anything the API serves."""
+        log = mock.Mock()
+        context = mock.Mock()
+        context.log = log
+
+        recorded_run, recorded_verb_runs = self._run(context=context)
+
+        recorded = repr(recorded_run) + repr(recorded_verb_runs)
+        self.assertNotIn(self.MARKER, recorded)
+
+    def test_the_op_threads_its_own_context_into_the_per_table_body(self) -> None:
+        """The production path: the mapped `maintain_bronze_table` op hands
+        its own context down, so the probe's outcome reaches the run log of
+        the step that ran it (the helper alone cannot log without one)."""
+        context = build_op_context()
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        context.log.addHandler(_Capture())
+        with mock.patch.object(
+            maintenance, "probe_expire_snapshots_skip", return_value=self.PROBE_OUTCOME
+        ), mock.patch.object(
+            maintenance, "run_remove_orphan_files", return_value={"table_name": "bronze.orders"}
+        ), mock.patch.object(
+            maintenance, "measure_snapshot_growth",
+            return_value={"measured": False, "snapshot_count": 0, "metadata_log_count": 0},
+        ), mock.patch.object(
+            maintenance, "record_maintenance_run"
+        ), mock.patch.object(
+            maintenance, "record_maintenance_verb_run"
+        ), mock.patch.object(
+            maintenance, "latest_maintenance_run_at", return_value=None
+        ), mock.patch.object(
+            maintenance, "_trino_execute", return_value=[]
+        ):
+            maintenance.maintain_bronze_table(
+                context,
+                {
+                    "table_name": "bronze.orders",
+                    "policy": None,
+                    "policy_fetch_error": None,
+                },
+            )
+
+        logged = " ".join(record.getMessage() for record in records)
+        self.assertIn(self.PROBE_OUTCOME, logged)
 
 
 class BronzeMaintenanceFanOutTest(unittest.TestCase):
@@ -769,7 +1505,7 @@ class BronzeMaintenanceFanOutTest(unittest.TestCase):
         """One table's per-table body raises -> only that mapped step
         fails; the other table's `_run_maintenance_for_table` (and
         therefore its `record_maintenance_run` row) still runs."""
-        def fake_per_table(cfg, table_name, policy, policy_fetch_error):
+        def fake_per_table(cfg, table_name, policy, policy_fetch_error, context=None):
             if "orders" in table_name:
                 # `allow_retries=False` -- the canonical pattern from
                 # PART D, so the test doesn't burn the 60s default
