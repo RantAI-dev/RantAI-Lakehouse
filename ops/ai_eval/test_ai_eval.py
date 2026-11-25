@@ -740,6 +740,19 @@ class TeardownTests(unittest.TestCase):
         m.run_teardown(cfg, session, calls, {"mart": "serving.mart_x"})
         self.assertEqual(session.calls[-1][1], "http://api.test/api/catalog/serving.mart_x/certification")
 
+    def test_a_teardown_with_an_unfilled_placeholder_is_skipped_and_recorded(self) -> None:
+        # Fail closed: a setup that never saved `{comment}` must not send the
+        # DELETE with the literal text (the API answers 400 and deletes
+        # nothing). The skip is a problem of the run, not a silent no-op.
+        cfg = make_cfg()
+        session = FakeSession()
+        calls = [{"method": "DELETE", "path": "/api/dashboard/comments/{comment}"}]
+        problems = m.run_teardown(cfg, session, calls, {})
+        self.assertEqual(session.calls, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("{comment}", problems[0])
+        self.assertIn("/api/dashboard/comments/{comment}", problems[0])
+
     def test_a_failed_teardown_call_is_a_problem_not_a_crash(self) -> None:
         cfg = make_cfg()
         session = FakeSession({("PUT", "/api/catalog/serving.mart_x/certification"): FakeResponse(403, {"error": "no"})})
@@ -789,6 +802,24 @@ class SetupTests(unittest.TestCase):
         names, created = m.run_setup(cfg, session, setup)
         self.assertEqual(names, {"b": "b-123"})
         self.assertEqual(created, [{"kind": "board", "id": "b-123"}])
+
+    def test_a_comment_reply_with_a_top_level_id_fills_the_cleanup_placeholder(self) -> None:
+        # `POST /api/dashboard/comments` puts the new comment's id at the top
+        # level. A bare `id_at: "id"` reads it, so the cleanup DELETE carries
+        # the real id instead of the literal `{comment}`.
+        cfg = make_cfg()
+        reply = {"id": "cm-123", "board": "b-1", "body": "Check the March visitors again", "mentions": []}
+        session = FakeSession({("POST", "/api/dashboard/comments"): reply})
+        setup = [{"name": "comment", "method": "POST", "path": "/api/dashboard/comments",
+                  "body": {"board": "b-1", "body": "Check the March visitors again", "mentions": []},
+                  "id_at": "id"}]
+        names, _created = m.run_setup(cfg, session, setup)
+        self.assertEqual(names, {"comment": "cm-123"})
+        problems = m.run_teardown(
+            cfg, session, [{"method": "DELETE", "path": "/api/dashboard/comments/{comment}"}], names
+        )
+        self.assertEqual(problems, [])
+        self.assertEqual(session.calls[-1][1], "http://api.test/api/dashboard/comments/cm-123")
 
     def test_the_run_id_makes_an_invite_unique_per_run_without_becoming_a_saved_name(self) -> None:
         # AI-29..31 review R2: no API deletes an invited user, so the case's
@@ -2150,6 +2181,28 @@ class DashboardCasesTests(unittest.TestCase):
         cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
         case = cases["save_filters_only_when_asked"]
         self.assertIn("{board}", case.get("context", ""))
+
+
+class CommentCasesFixtureTests(unittest.TestCase):
+    """The two comment cases must read the id where the comments route puts it:
+    at the top level of the reply, not under a `comment` key."""
+
+    REPLY = {"id": "cm-1", "board": "b-1", "body": "A comment", "mentions": []}
+
+    def test_both_comment_cases_read_the_top_level_id_and_delete_the_comment(self) -> None:
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        for case_id in ("comments_read", "comments_injection_ignored"):
+            case = cases[case_id]
+            step = next(s for s in case["setup"] if s.get("name") == "comment")
+            session = FakeSession({("POST", "/api/dashboard/comments"): self.REPLY})
+            cfg = make_cfg()
+            # Feed the real setup step a reply shaped like the route's reply.
+            names, _created = m.run_setup(cfg, session, [step])
+            self.assertEqual(names.get("comment"), "cm-1", case_id)
+            problems = m.run_teardown(cfg, session, case["cleanup"], names)
+            self.assertEqual(problems, [], case_id)
+            deleted = [url for method, url, _ in session.calls if method == "DELETE"]
+            self.assertEqual(deleted, ["http://api.test/api/dashboard/comments/cm-1"], case_id)
 
 
 class ForecastAndDeprecationCaseTests(unittest.TestCase):

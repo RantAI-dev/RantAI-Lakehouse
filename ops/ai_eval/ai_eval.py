@@ -961,6 +961,18 @@ def run_cleanup(cfg: Config, session: requests.Session, created: list[dict[str, 
     return problems
 
 
+def unfilled_placeholders(value: Any) -> list[str]:
+    """`{name}` tokens left in a filled path or body: setup never saved those
+    names, so sending the call would reach the route with the literal text."""
+    if isinstance(value, str):
+        return [match.group(0) for match in re.finditer(r"\{(\w+)\}", value)]
+    if isinstance(value, list):
+        return [token for item in value for token in unfilled_placeholders(item)]
+    if isinstance(value, dict):
+        return [token for item in value.values() for token in unfilled_placeholders(item)]
+    return []
+
+
 def run_teardown(
     cfg: Config,
     session: requests.Session,
@@ -970,15 +982,23 @@ def run_teardown(
     """Undo what the case changed that deleting objects cannot undo: a mark it
     put on an asset. Each call is made the way a setup call is, so a case
     names it the same way; a call that fails is a problem of the run, not a
-    crash."""
+    crash. A name setup never saved is skipped, not sent as literal text."""
     problems: list[str] = []
     for call in calls:
         path = call.get("path", "?")
+        filled_path = fill_names(path, names)
+        filled_body = fill_value(call.get("body"), names)
+        unfilled = sorted(set(unfilled_placeholders(filled_path) + unfilled_placeholders(filled_body)))
+        if unfilled:
+            # Sending a literal `{name}` deletes nothing and gets a 400. Fail
+            # closed: skip the call and say why no DELETE happened.
+            problems.append(f"teardown {path}: skipped, unfilled {', '.join(unfilled)}")
+            continue
         try:
             resp = session.request(
                 call["method"],
-                f"{cfg.api_url}{fill_names(path, names)}",
-                json=fill_value(call.get("body"), names),
+                f"{cfg.api_url}{filled_path}",
+                json=filled_body,
                 timeout=60,
             )
         except requests.RequestException as err:
