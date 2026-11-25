@@ -28,7 +28,7 @@ diagram, a status page).
 
 - Part C of `BI-16` (Gantt, world maps, uploaded boundaries, spatial analysis, chart plugins).
 - Uploading an image file: images come from an address.
-- A web page that refuses to be shown inside another page (most sign-in pages and many large sites do); the card then offers "Open in a new tab".
+- A web page that refuses to be shown inside another page (most sign-in pages and many large sites do) still cannot be made to show; the card says so when the server can tell and offers "Open in a new tab" (`BI-72`, decision 11).
 
 ## Decisions
 
@@ -46,13 +46,18 @@ Planner defaults, all confirmed by the product owner on 2026-10-17 (phase 3 QA).
 | 8 | Progress, histogram and bullet take the dashboard's filters like any chart, and use the value formats of `BI-17` part A. | Planner, confirmed by the owner 2026-10-17 |
 | 9 | The coverage check is a list in this page and a test: every Metabase chart type maps to one of ours or to a decision that drops it. | Planner, confirmed by the owner 2026-10-17 |
 | 10 | Changing these cards needs `dashboard:write`; changing the allowed sites needs `settings:write`. | Planner, confirmed by the owner 2026-10-17 |
+| 11 | A web-page card asks the console once whether its site allows being framed (`GET /api/dashboard/frame-check?url=`, `dashboard:read`). A site that refuses (`X-Frame-Options: DENY` or `SAMEORIGIN`, or a `frame-ancestors` list without the console in it) gets one line, "This site doesn't allow being shown inside a dashboard.", and an "Open in a new tab" button instead of an empty frame. When the server cannot tell — the site did not answer, or a `frame-ancestors` list needs `CONSOLE_PUBLIC_URL`, which is not set — the frame shows as before, and public links and signed embeds, which have no session, do not ask at all. | Added by `BI-72` (PR #651), 2026-11-22 |
 
 ## Limits to tell a customer
 
 - Images and web pages come only from sites an administrator lists, and
   only over `https`.
-- Many sites refuse to be shown inside another page; the card then stays
-  blank and offers "Open in a new tab".
+- Many sites refuse to be shown inside another page. Where there is a
+  session the console reads the site's own headers and the card says so;
+  on a public link or a signed embed there is no session, so no question
+  is asked and the frame shows as before (it may still stay blank, the
+  way it always did). A site that does not answer tells nothing: no
+  claim, the frame shows.
 - The allowed-sites list is checked when a card is saved and when it is
   shown. The console does not yet send a Content-Security-Policy that
   would enforce it in the browser as well; that is a separate backlog item.
@@ -99,5 +104,6 @@ Run by the product owner on a running console. A step not performed is never a p
 - `BI-16-AC8` A histogram of a number column shows about 20 ranges automatically, and 10 when so set.
 - `BI-16-AC9` A bullet graph per province shows value, target and three bands.
 - `BI-16-AC10` An image card from an allowed site shows; an address on another site is refused; a web-page card from an allowed site shows with "Open in a new tab".
+- `BI-16-AC10b` (added by `BI-72`, PR #651) A web-page card whose site refuses framing (`X-Frame-Options: DENY`, or a CSP `frame-ancestors` without the console) shows "This site doesn't allow being shown inside a dashboard." with an "Open in a new tab" button, not an empty frame; a site the server could not reach still shows the frame; the same card on a public link or a signed embed shows the frame as before, with no request to the check.
 - `BI-16-AC6` A user without `dashboard:write` cannot add these cards, a user without `settings:write` cannot change the allowed sites, and a failure shows a plain sentence.
 - `AI-5` The assistant creates a progress bar and a histogram from the two requests above.

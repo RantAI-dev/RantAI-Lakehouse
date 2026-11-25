@@ -1,7 +1,8 @@
-import { cleanup, render, screen } from "@testing-library/react"
-import { afterEach, describe, expect, it, mock } from "bun:test"
+import { cleanup, render, screen, waitFor } from "@testing-library/react"
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 import type { ChartRenderSpec } from "@/lib/dashboard-specs"
 import type { Rows } from "./tile-dialogs"
+import { dashboardService } from "@/services"
 import { ReportingProvider } from "./reporting-context"
 
 // The chart itself needs a canvas; the option it is handed (what is drawn) does not.
@@ -194,9 +195,14 @@ describe("an image card", () => {
 
 describe("a web-page card", () => {
   const spec = { kind: "web", title: "Status page", def: { url: "https://img.example/status" } }
+  // BI-72: the card asks the server once whether the site allows framing; no real request is made.
+  let ask: ReturnType<typeof spyOn>
+  beforeEach(() => { ask = spyOn(dashboardService, "frameCheck").mockResolvedValue(true) })
+  afterEach(() => ask.mockRestore())
 
-  it("frames the page in a sandbox with scripts and pop-ups only, no referrer, and always offers a new tab", () => {
+  it("frames the page in a sandbox with scripts and pop-ups only, no referrer, and always offers a new tab", async () => {
     const { container } = tile(spec, undefined)
+    await waitFor(() => expect(container.querySelector("iframe")).not.toBeNull())
     const frame = container.querySelector("iframe")
     expect(frame?.getAttribute("src")).toBe("https://img.example/status")
     expect(frame?.getAttribute("sandbox")).toBe("allow-scripts allow-popups")

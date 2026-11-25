@@ -255,3 +255,42 @@ test("a donut's legend pages when its entries do not fit, like a rose's and a fu
     assert.equal(legend.type, "scroll", `${kind}: the legend pages`)
   }
 })
+
+type Mark = { series: { markLine?: { label: { formatter: (p: { name?: string; value?: unknown }) => string } } }[] }
+const labelOf = (label: string | undefined, value: number): string => {
+  const base = buildOption({ kind: "bar", x: "k", y: "v", source: "ui" } as never, [{ k: "a", v: 100 }], false)
+  const option = withReferenceLines(base, [{ value, label }], false, false) as unknown as Mark
+  return option.series[0].markLine!.label.formatter({ name: label ?? "", value })
+}
+
+test("BI-72: a goal label carries its number once", () => {
+  assert.equal(labelOf("Goal 1,000", 1000), "Goal 1,000")
+  assert.equal(labelOf("Goal 1000", 1000), "Goal 1000")
+  assert.equal(labelOf("Goal", 1000), "Goal 1,000")
+  assert.equal(labelOf("Q4 target", 1000), "Q4 target 1,000")
+  assert.equal(labelOf(undefined, 1000), "1,000")
+})
+
+test("BI-72, PR #651 review 2: a label holding another number still shows the line's number", () => {
+  // "Goal 21000" does not carry 1,000: the value sits inside another number,
+  // so the line's own number is still written once beside it.
+  assert.equal(labelOf("Goal 21000", 1000), "Goal 21000 1,000")
+  // A period after the number ends a sentence, not the number: the label
+  // still carries it and is not given a second copy.
+  assert.equal(labelOf("Q4 target 1,000. Due.", 1000), "Q4 target 1,000. Due.")
+})
+
+test("BI-72: a widened axis ends on a round tick and every value axis hides overlapping labels", () => {
+  const base = buildOption({ kind: "bar", x: "k", y: "v", source: "ui" } as never, [{ k: "a", v: 12000 }], false)
+  const option = withReferenceLines(base, [{ value: 15700, label: "Goal" }], false, false) as unknown as {
+    yAxis: { max: (r: { max: number }) => number; axisLabel: { hideOverlap?: boolean } }
+  }
+  assert.equal(option.yAxis.max({ max: 12000 }), 20000)
+  assert.equal(option.yAxis.max({ max: 90000 }), 90000, "a higher data max is kept")
+  for (const kind of ["bar", "line", "area", "hbar"] as const) {
+    const o = buildOption({ kind, x: "k", y: "v", source: "ui" } as never, [{ k: "a", v: 1 }], false) as unknown as Record<string, { type?: string; axisLabel?: { hideOverlap?: boolean } }>
+    const axis = kind === "hbar" ? o.xAxis : o.yAxis
+    assert.equal(axis.type, "value")
+    assert.equal(axis.axisLabel?.hideOverlap, true, kind)
+  }
+})
