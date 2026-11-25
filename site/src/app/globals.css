@@ -3496,3 +3496,11 @@ html[data-tod="day"] footer .lk-wm [class*="text-[#E8F4FF]/[0.12]"] {
     --lk-f: 3;
   }
 }
+
+/* M4: every line of the open-source excerpt fits the phone's panel (open-visuals.tsx), so the
+   right-edge fade that hid the long line goes; that line ends in an ellipsis instead. */
+@media (max-width: 1023.98px) {
+  .lk-open-pre {
+    mask-image: none;
+  }
+}

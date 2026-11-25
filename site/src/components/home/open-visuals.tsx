@@ -74,23 +74,26 @@ export function CodePanel({ copy, action }: { copy: OpenCopy["code"]; action?: R
       <div aria-hidden="true" className="flex h-9 items-center gap-2 border-b border-[#E8F4FF]/8 px-3.5">
         <FileCode2 className="size-3.5 text-[#E8F4FF]/55" strokeWidth={2} />
         <code className="!text-[12px] !leading-4 text-[#E8F4FF]/75">{CODE_FILE}</code>
-        <span className="lk-open-license ml-auto inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] leading-4 font-medium">
+        <span className="lk-open-license ml-auto inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] leading-4 font-medium max-lg:text-[12px]">
           {copy.license}
         </span>
       </div>
+      {/* WEB-5 M4 (phone pass): below 1024 px the gutter is narrower and every line fits the panel;
+          the one long line (the refusal's message) ends in an ellipsis, as an editor shows a line
+          wider than its pane, instead of being cut by the panel's edge. */}
       <pre aria-hidden="true" className="lk-open-pre relative overflow-hidden py-2.5 text-[12px] leading-[19px]">
         {/* The band that walks down to the lines that refuse. */}
         <span className="lk-open-band pointer-events-none absolute inset-x-0 top-2.5 h-[19px]" />
         {CODE.map((row, i) =>
           "fold" in row ? (
             <span key={i} className="relative flex">
-              <span className="w-11 shrink-0 pr-3 text-right text-[#E8F4FF]/30 select-none">⋯</span>
-              <span className="lk-open-fold truncate rounded px-1.5 text-[11px] leading-[19px]">{row.fold}</span>
+              <span className="w-11 shrink-0 pr-3 text-right text-[#E8F4FF]/30 select-none max-lg:w-9 max-lg:pr-2.5">⋯</span>
+              <span className="lk-open-fold truncate rounded px-1.5 text-[11px] leading-[19px] max-lg:text-[12px]">{row.fold}</span>
             </span>
           ) : (
             <span key={i} className="relative flex">
-              <span data-n={row.n} className="lk-open-ln w-11 shrink-0 pr-3 text-right text-[#E8F4FF]/30 tabular-nums select-none" />
-              <code className="!text-[12px] !leading-[19px] whitespace-pre text-[#E8F4FF]/80">{tokens(row.text)}</code>
+              <span data-n={row.n} className="lk-open-ln w-11 shrink-0 pr-3 text-right text-[#E8F4FF]/30 tabular-nums select-none max-lg:w-9 max-lg:pr-2.5" />
+              <code className="!text-[12px] !leading-[19px] whitespace-pre text-[#E8F4FF]/80 max-lg:min-w-0 max-lg:overflow-hidden max-lg:pr-3 max-lg:text-ellipsis">{tokens(row.text)}</code>
             </span>
           ),
         )}
