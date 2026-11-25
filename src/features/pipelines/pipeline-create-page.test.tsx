@@ -1587,7 +1587,7 @@ describe("BLD-12 materialization in the pipeline editor", () => {
 
     chooseOption(mode, "Incremental")
     await waitFor(() => expect(screen.getByRole("combobox", { name: "Strategy" })).toBeTruthy())
-    expect(screen.getByRole("combobox", { name: "Cursor column" })).toBeTruthy()
+    expect(screen.getByLabelText("Cursor column")).toBeTruthy()
     expect(screen.queryByRole("combobox", { name: "Partition by" })).toBeNull()
 
     chooseOption(screen.getByRole("combobox", { name: "Strategy" }), "Replace time partitions")
@@ -1605,7 +1605,7 @@ describe("BLD-12 materialization in the pipeline editor", () => {
     await waitFor(() => expect(button.disabled).toBe(true))
     expect(await screen.findByText(/cursor column is required/i)).toBeTruthy()
 
-    fireEvent.change(screen.getByRole("combobox", { name: "Cursor column" }), {
+    fireEvent.change(screen.getByLabelText("Cursor column"), {
       target: { value: "event_time" },
     })
     chooseOption(screen.getByRole("combobox", { name: "Strategy" }), "Replace time partitions")
@@ -1637,14 +1637,14 @@ describe("BLD-12 materialization in the pipeline editor", () => {
       })
     )
     await openTab("Schedule and settings")
-    expect((screen.getByRole("combobox", { name: "Cursor column" }) as HTMLInputElement).value).toBe("event_time")
+    expect((screen.getByLabelText("Cursor column") as HTMLInputElement).value).toBe("event_time")
     expect(screen.getByRole("combobox", { name: "Mode" }).textContent).toContain("Incremental")
     let body = await saveAndRead("PUT")
     expect(body.incrementalStrategy).toBe("partition_replace")
     expect(body.lookbackHours).toBe(12)
 
     chooseOption(screen.getByRole("combobox", { name: "Mode" }), "Full rebuild")
-    await waitFor(() => expect(screen.queryByRole("combobox", { name: "Cursor column" })).toBeNull())
+    await waitFor(() => expect(screen.queryByLabelText("Cursor column")).toBeNull())
     await saveAndRead("PUT")
     body = sent.filter((c) => c.method === "PUT").at(-1)?.body ?? {}
     expect(body.kind).toBe("batch")
