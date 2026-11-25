@@ -197,13 +197,12 @@ function targetStatementOf(
 }
 
 /**
- * The batch of requests that is in flight: which tab it belongs to, how
- * far it got, and whether the history has caught up with it already.
+ * The batch of requests that is in flight: which tab it belongs to, how far
+ * it got, and the statement it is on.
  */
 type Batch = {
   tabId: string
   index: number
-  reloaded: boolean
   active: boolean
   /**
    * BI-5 (plan D5): the id the statement in flight was sent under, which Stop
@@ -497,8 +496,6 @@ export function useQueryStudio(draftKey: string | null) {
     }
     return marked.size === 0 ? NO_NAMES : marked
   }, [refused, activeTabId, estimateError, parameters])
-  const savedState = useService((s) => queryService.listSaved(s), [])
-  const historyState = useService((s) => queryService.listHistory(undefined, s), [])
 
   // The tables the catalog shows, from the real catalog so suggestions
   // cannot drift from what exists.
@@ -1167,7 +1164,6 @@ export function useQueryStudio(draftKey: string | null) {
       const batch: Batch = {
         tabId,
         index: 0,
-        reloaded: false,
         active: true,
         runId: null,
         engine: runEngine,
@@ -1270,22 +1266,16 @@ export function useQueryStudio(draftKey: string | null) {
         // PR #649 review 1: the same deferred abort lets a stopped batch
         // reach this finally after a newer Run press has taken the tab
         // (`batchRef` points at the new batch). Only the owner clears the
-        // running state and reloads history; the old batch's rows and its
-        // reload were already handled when Stop was pressed.
+        // running state and its controller; the old batch's rows were
+        // already handled when Stop was pressed.
+        // PR #658 merge: UX-9 has no in-page history to reload; the History page reads the stopped run itself (BI-63).
         if (batchRef.current === batch) {
           setRunning(false)
           if (runControllerRef.current === controller) runControllerRef.current = null
-          // Every run is recorded, including the ones that failed, so the rail
-          // has to catch up — otherwise the query you just ran is missing from
-          // your own history until a reload. Once for the whole batch.
-          if (!batch.reloaded) {
-            batch.reloaded = true
-            historyState.reload()
-          }
         }
       }
     },
-    [historyState]
+    []
   )
 
   /**
@@ -1356,7 +1346,6 @@ export function useQueryStudio(draftKey: string | null) {
     // aborted only after the answer, or after 2 s. Aborting at once dropped
     // the request before the server could record the run. The "Stopped"
     // below still shows at once.
-    const live = batch?.active === true
     const asked =
       batch?.active && batch.runId
         ? cancelRunWithin(batch.runId, CANCEL_WAIT_MS)
@@ -1364,9 +1353,6 @@ export function useQueryStudio(draftKey: string | null) {
     if (batch?.active) batch.stopped = true
     void asked.then(() => {
       controller?.abort()
-      // The row is written once the server has the cancel, which is after the
-      // reload below, so the rail asks again.
-      if (live) historyState.reload()
     })
     if (!batch || !batch.active) return
     setRuns((previous) => {
@@ -1379,11 +1365,7 @@ export function useQueryStudio(draftKey: string | null) {
       }
     })
     setRunning(false)
-    if (!batch.reloaded) {
-      batch.reloaded = true
-      historyState.reload()
-    }
-  }, [historyState, stopDownload])
+  }, [stopDownload])
 
   // Agentic ask: one call to the chat's engine, which writes the SQL, runs
   // it as the caller (masking and row filters apply), corrects itself on
@@ -1450,7 +1432,7 @@ export function useQueryStudio(draftKey: string | null) {
     [sql, engine, readSelection]
   )
   // Accept puts the proposal in the editor. It does not run it: the person
-  // presses "Run query" to see its rows, as with any statement they typed.
+  // presses Run to see its rows, as with any statement they typed.
   //
   // Only the statement the proposal was made for is replaced. The rest of
   // the buffer is not the assistant's business.
@@ -1712,8 +1694,6 @@ export function useQueryStudio(draftKey: string | null) {
     estimateSupported,
     generateAct,
     estimateAct,
-    savedState,
-    historyState,
     agent: { busy: agentBusy, result: agentResult, error: agentError, ask },
     explain: {
       busy: explainBusy,

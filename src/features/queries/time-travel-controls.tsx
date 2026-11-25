@@ -3,12 +3,22 @@
 import * as React from "react"
 
 import { Button } from "@/components/ui/button"
+import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { useService } from "@/hooks/use-service"
 import { formatDateTime } from "@/lib/format"
 import { msToIso, snapshotsNewestFirst } from "@/lib/lakehouse-view"
 import { pinSnapshot, snapshotRetentionText } from "@/lib/snapshot-picker"
 import { lakehouseService } from "@/services"
+
+/** What the picker pinned, for the chip that shows it. */
+export type PinnedVersion = {
+  readonly snapshotId: string
+  /** `namespace.table`, as picked. */
+  readonly table: string
+  /** When the version was written, as an ISO time. */
+  readonly at: string
+}
 
 /**
  * Iceberg time-travel controls: the user picks a namespace, then a table
@@ -19,6 +29,11 @@ import { lakehouseService } from "@/services"
  * to every raw table the query reads (`DATA-16` F7). On Trino a version
  * belongs to one table, so the pin is written on that table's own
  * reference — `FROM bronze.orders FOR VERSION AS OF <id>` (`DATA-21` D5).
+ *
+ * `UX-9`: the controls are the body of Query Studio's "Time travel…" dialog
+ * (the ⋯ menu); the pin shows as a chip by the editor once it is in the SQL.
+ * Time travel works on both engines (`supported` below); the page comment
+ * that said Trino was switched off was stale and went with the old layout.
  */
 export function IcebergTimeTravelControls({
   sql,
@@ -27,11 +42,15 @@ export function IcebergTimeTravelControls({
 }: {
   sql: string
   engine: string
-  onApply: (nextSql: string) => void
+  onApply: (nextSql: string, pinned: PinnedVersion) => void
 }) {
   const [namespace, setNamespace] = React.useState<string | null>(null)
   const [table, setTable] = React.useState<string | null>(null)
   const [snapshotId, setSnapshotId] = React.useState<string | null>(null)
+  // A Trino statement that does not read the picked table cannot be pinned;
+  // the button says so instead of doing nothing.
+  const [notRead, setNotRead] = React.useState<string | null>(null)
+  const id = React.useId()
   const supported = engine === "clickhouse" || engine === "trino"
   // The table the version belongs to, as the statement names it: the
   // namespace and the table the picker holds. On Trino the pin is
@@ -56,26 +75,37 @@ export function IcebergTimeTravelControls({
       : []
 
   function handleApply() {
-    if (!snapshotId) return
+    if (!snapshotId || !tableRef) return
     const next = pinSnapshot(sql, engine, snapshotId, tableRef)
-    if (next !== null) onApply(next)
+    if (next === null) {
+      setNotRead(tableRef)
+      return
+    }
+    setNotRead(null)
+    const snap = snapshots.find((s) => s.id === snapshotId)
+    onApply(next, {
+      snapshotId,
+      table: tableRef,
+      at: snap ? msToIso(snap.timestampMs) : "",
+    })
   }
 
   return (
-    <div className="flex flex-col gap-1.5 rounded-md border border-dashed border-border p-2 text-xs">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="font-medium text-muted-foreground">Time travel</span>
+    <div role="group" aria-label="Time travel" className="grid gap-4 text-sm">
+      <div className="grid gap-1.5">
+        <Label htmlFor={`${id}-namespace`}>Namespace</Label>
         <Select
           value={namespace ?? ""}
           onValueChange={(v) => {
             setNamespace(v || null)
             setTable(null)
             setSnapshotId(null)
+            setNotRead(null)
           }}
           disabled={!supported}
         >
-          <SelectTrigger size="sm">
-            <SelectValue placeholder="Namespace" />
+          <SelectTrigger id={`${id}-namespace`} className="w-full">
+            <SelectValue placeholder="Choose a namespace" />
           </SelectTrigger>
           <SelectContent>
             {namespacesState.status === "success"
@@ -87,16 +117,20 @@ export function IcebergTimeTravelControls({
               : null}
           </SelectContent>
         </Select>
+      </div>
+      <div className="grid gap-1.5">
+        <Label htmlFor={`${id}-table`}>Table</Label>
         <Select
           value={table ?? ""}
           onValueChange={(v) => {
             setTable(v || null)
             setSnapshotId(null)
+            setNotRead(null)
           }}
           disabled={!supported || !namespace}
         >
-          <SelectTrigger size="sm">
-            <SelectValue placeholder="Table" />
+          <SelectTrigger id={`${id}-table`} className="w-full">
+            <SelectValue placeholder="Choose a table" />
           </SelectTrigger>
           <SelectContent>
             {tablesState.status === "success"
@@ -108,13 +142,19 @@ export function IcebergTimeTravelControls({
               : null}
           </SelectContent>
         </Select>
+      </div>
+      <div className="grid gap-1.5">
+        <Label htmlFor={`${id}-version`}>Version</Label>
         <Select
           value={snapshotId ?? ""}
-          onValueChange={(v) => setSnapshotId(v || null)}
+          onValueChange={(v) => {
+            setSnapshotId(v || null)
+            setNotRead(null)
+          }}
           disabled={!supported || snapshots.length === 0}
         >
-          <SelectTrigger size="sm">
-            <SelectValue placeholder="Version" />
+          <SelectTrigger id={`${id}-version`} className="w-full">
+            <SelectValue placeholder="Choose a version" />
           </SelectTrigger>
           <SelectContent>
             {snapshots.map((snap) => (
@@ -124,11 +164,8 @@ export function IcebergTimeTravelControls({
             ))}
           </SelectContent>
         </Select>
-        <Button size="sm" variant="outline" onClick={handleApply} disabled={!supported || !snapshotId}>
-          Query this version
-        </Button>
       </div>
-      <p className="text-muted-foreground">
+      <p className="text-xs text-muted-foreground">
         {supported
           ? engine === "clickhouse"
             ? "One version applies to every raw table in the query."
@@ -136,6 +173,16 @@ export function IcebergTimeTravelControls({
           : "Past versions can be queried on ClickHouse and Trino."}
         {supported && snapshots.length > 0 ? ` ${snapshotRetentionText(snapshots)}` : ""}
       </p>
+      {notRead ? (
+        <p role="alert" className="text-xs text-destructive">
+          The query does not read {notRead}: write it in the SQL first.
+        </p>
+      ) : null}
+      <div className="flex justify-end">
+        <Button onClick={handleApply} disabled={!supported || !snapshotId}>
+          Query this version
+        </Button>
+      </div>
     </div>
   )
 }

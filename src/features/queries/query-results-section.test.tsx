@@ -108,6 +108,29 @@ function renderSection(r: QueryResult) {
 }
 
 /**
+ * `UX-9`: the filters and the statistics are tools the reader opens — the
+ * filter button and the result's ⋯ menu — so the tests that use them open
+ * them first, the way a reader would.
+ */
+function renderWithFilters(r: QueryResult) {
+  const out = renderSection(r)
+  fireEvent.click(screen.getByRole("button", { name: "Filter rows" }))
+  return out
+}
+
+async function renderWithStatistics(r: QueryResult) {
+  const out = renderSection(r)
+  fireEvent.click(screen.getByRole("button", { name: "More result actions" }))
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Column statistics" }))
+  return out
+}
+
+/** The run's numbers in one line, above the grid. */
+function metricsLine(): string {
+  return screen.getByRole("region", { name: "Results" }).querySelector("p")?.textContent ?? ""
+}
+
+/**
  * The grid alone. The statistics panel shows the same values as the grid —
  * a column's smallest value and its most frequent ones — so a claim about
  * what the grid shows has to look at the grid.
@@ -123,13 +146,13 @@ function panel() {
 
 describe("the column filters", () => {
   it("gives every column a field of its own", () => {
-    renderSection(result())
+    renderWithFilters(result())
     expect(screen.getByLabelText("Filter city")).toBeTruthy()
     expect(screen.getByLabelText("Filter amount")).toBeTruthy()
   })
 
   it("narrows the grid to the rows that match", () => {
-    renderSection(result())
+    renderWithFilters(result())
     fireEvent.change(screen.getByLabelText("Filter city"), {
       target: { value: "jakarta" },
     })
@@ -142,7 +165,7 @@ describe("the column filters", () => {
   })
 
   it("combines two filters with AND", () => {
-    renderSection(result())
+    renderWithFilters(result())
     fireEvent.change(screen.getByLabelText("Filter city"), {
       target: { value: "jakarta" },
     })
@@ -155,7 +178,7 @@ describe("the column filters", () => {
   })
 
   it("shows the clear button only when a filter holds text, and clears every filter", () => {
-    renderSection(result())
+    renderWithFilters(result())
     expect(screen.queryAllByRole("button", { name: "Clear filters" })).toHaveLength(
       0
     )
@@ -177,12 +200,12 @@ describe("the column filters", () => {
   })
 
   it("says the query returned no rows when the result is empty", () => {
-    renderSection(result({ rows: [], rowCount: 0 }))
+    renderWithFilters(result({ rows: [], rowCount: 0 }))
     expect(screen.getByText("The query returned no rows.")).toBeTruthy()
   })
 
   it("says no row matches the filters when the filter leaves nothing", () => {
-    renderSection(result())
+    renderWithFilters(result())
     fireEvent.change(screen.getByLabelText("Filter city"), {
       target: { value: "surabaya" },
     })
@@ -197,24 +220,23 @@ describe("the result summary", () => {
   it("counts the rows shown and not the engine's rowCount when the result was cut", () => {
     renderSection(result({ rowCount: 65600, truncated: true }))
 
-    const value = screen.getByText("Rows").nextElementSibling
-    expect(value?.textContent).toBe("3 shown")
-    expect(screen.queryByText("65,600")).toBeNull()
+    expect(metricsLine()).toStartWith("3 rows shown · ")
+    expect(screen.queryByText(/65,600/)).toBeNull()
   })
 
   it("counts the rows shown with no suffix when nothing was cut", () => {
     renderSection(result())
 
-    expect(screen.getByText("Rows").nextElementSibling?.textContent).toBe("3")
+    expect(metricsLine()).toStartWith("3 rows · ")
   })
 })
 
 describe("the statistics panel", () => {
   // QS-11 (LH-QS-2-04), D14: a long value is cut inside its own cell and its
   // full text is in the cell's title.
-  it("keeps a long minimum in its cell's title and truncates the cell", () => {
+  it("keeps a long minimum in its cell's title and truncates the cell", async () => {
     const long = "x".repeat(200)
-    renderSection(
+    await renderWithStatistics(
       result({
         columns: ["note", "amount"],
         rows: [{ note: long, amount: 1 }],
@@ -230,32 +252,33 @@ describe("the statistics panel", () => {
     }
   })
 
-  it("says how many rows the grid shows", () => {
-    renderSection(result())
+  it("says how many rows the grid shows", async () => {
+    await renderWithStatistics(result())
     expect(screen.getByText(/of the 3 rows shown/)).toBeTruthy()
   })
 
-  it("says 'the 1 row shown' for one row", () => {
-    renderSection(result({ rows: [{ city: "Jakarta", amount: 10 }], rowCount: 1 }))
+  it("says 'the 1 row shown' for one row", async () => {
+    await renderWithStatistics(result({ rows: [{ city: "Jakarta", amount: 10 }], rowCount: 1 }))
     expect(screen.getByText(/of the 1 row shown/)).toBeTruthy()
     expect(screen.queryByText(/1 rows shown/)).toBeNull()
   })
 
-  it("says 'the 0 rows shown' for none", () => {
-    renderSection(result({ rows: [], rowCount: 0 }))
+  it("says 'the 0 rows shown' for none", async () => {
+    await renderWithStatistics(result({ rows: [], rowCount: 0 }))
     expect(screen.queryByText(/of the 0 rows shown/)).toBeTruthy()
   })
 
-  it("counts the rows that are left after the filter", () => {
-    renderSection(result())
+  it("counts the rows that are left after the filter", async () => {
+    await renderWithStatistics(result())
+    fireEvent.click(screen.getByRole("button", { name: "Filter rows" }))
     fireEvent.change(screen.getByLabelText("Filter city"), {
       target: { value: "jakarta" },
     })
     expect(screen.getByText(/of the 2 rows shown/)).toBeTruthy()
   })
 
-  it("shows the statistics of the chosen column", () => {
-    renderSection(result())
+  it("shows the statistics of the chosen column", async () => {
+    await renderWithStatistics(result())
     expect(panel().getByText("Empty cells")).toBeTruthy()
     expect(panel().getByText("Distinct values")).toBeTruthy()
     // The first column is chosen by default, and its smallest and largest
@@ -268,8 +291,8 @@ describe("the statistics panel", () => {
     )
   })
 
-  it("follows the column the reader picks", () => {
-    renderSection(result())
+  it("follows the column the reader picks", async () => {
+    await renderWithStatistics(result())
     chooseOption(screen.getByRole("combobox", { name: "Column" }), "amount")
     // The smallest amount is 10 and the largest is 30.
     expect(panel().getByText("Minimum").parentElement?.textContent).toContain(
@@ -280,22 +303,22 @@ describe("the statistics panel", () => {
     )
   })
 
-  it("says the histogram of a text column shows the most frequent values", () => {
-    renderSection(result())
+  it("says the histogram of a text column shows the most frequent values", async () => {
+    await renderWithStatistics(result())
     // The first column is a text one: its bars are values, not ranges.
     expect(panel().getByText("Most frequent values")).toBeTruthy()
     expect(panel().queryAllByText("Value range")).toHaveLength(0)
   })
 
-  it("says the histogram of a numeric column shows value ranges", () => {
-    renderSection(result())
+  it("says the histogram of a numeric column shows value ranges", async () => {
+    await renderWithStatistics(result())
     chooseOption(screen.getByRole("combobox", { name: "Column" }), "amount")
     expect(panel().getByText("Value range")).toBeTruthy()
     expect(panel().queryAllByText("Most frequent values")).toHaveLength(0)
   })
 
-  it("shows no histogram label when the column holds no value", () => {
-    renderSection(result({ rows: [{ city: null, amount: null }] }))
+  it("shows no histogram label when the column holds no value", async () => {
+    await renderWithStatistics(result({ rows: [{ city: null, amount: null }] }))
     expect(panel().queryAllByText("Value range")).toHaveLength(0)
     expect(panel().queryAllByText("Most frequent values")).toHaveLength(0)
   })
@@ -369,7 +392,7 @@ describe("copy as TSV", () => {
   })
 
   it("copies the rows that are left after the filter", async () => {
-    renderSection(result())
+    renderWithFilters(result())
     fireEvent.change(screen.getByLabelText("Filter city"), {
       target: { value: "bandung" },
     })
@@ -470,12 +493,6 @@ describe("the banner of a cut result", () => {
 // really ran, as the tab's picker spells it, and a Trino run states no
 // ClickHouse workload class.
 describe("the result summary engine", () => {
-  /** The value beside a metadata label, as the person reads it. */
-  function summaryValue(label: string): string {
-    const term = screen.getByText(label)
-    return term.parentElement?.querySelector("dd")?.textContent ?? ""
-  }
-
   it("names Trino as the engine of a Trino run and shows no workload class for it", () => {
     renderSection(
       result({
@@ -488,14 +505,120 @@ describe("the result summary engine", () => {
       })
     )
 
-    expect(summaryValue("Engine")).toBe("Trino")
-    expect(summaryValue("Workload")).toBe("—")
+    expect(metricsLine()).toBe("3 rows · 12 ms · 1.0 KB scanned · 0.0100 cu · Trino")
   })
 
   it("names ClickHouse as the engine of a ClickHouse run", () => {
     renderSection(result())
 
-    expect(summaryValue("Engine")).toBe("ClickHouse")
-    expect(summaryValue("Workload")).toBe("Hot analytics")
+    expect(metricsLine()).toBe("3 rows · 12 ms · 1.0 KB scanned · 0.0100 cu · ClickHouse · Hot analytics")
+  })
+})
+
+// UX-9: the result's header row and its ⋯ menu.
+describe("the result's header row", () => {
+  it("clears the filters when the filter row is hidden, so no row goes missing unseen", () => {
+    renderWithFilters(result())
+    fireEvent.change(screen.getByLabelText("Filter city"), { target: { value: "bandung" } })
+    expect(grid().queryAllByText("Jakarta")).toHaveLength(0)
+
+    fireEvent.click(screen.getByRole("button", { name: "Filter rows" }))
+
+    expect(screen.queryAllByLabelText("Filter city")).toHaveLength(0)
+    expect(grid().getByText("Jakarta")).toBeTruthy()
+  })
+
+  it("offers Make a chart only when the page hands it one, and calls it", async () => {
+    const onMakeChart = mock(() => {})
+    render(
+      <TableProviders>
+        <QueryResultsSection
+          result={result()}
+          runId="7f0c0f0e-3c7e-4a3e-9d4f-0a1b2c3d4e5f"
+          downloadBusy={null}
+          onDownload={() => {}}
+          onMakeChart={onMakeChart}
+        />
+      </TableProviders>
+    )
+    fireEvent.click(screen.getByRole("button", { name: "More result actions" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Make a chart" }))
+    expect(onMakeChart).toHaveBeenCalledTimes(1)
+  })
+
+  it("has no Make a chart item without one", async () => {
+    renderSection(result())
+    fireEvent.click(screen.getByRole("button", { name: "More result actions" }))
+    await screen.findByRole("menuitem", { name: "Column statistics" })
+    expect(screen.queryAllByRole("menuitem", { name: "Make a chart" })).toHaveLength(0)
+  })
+
+  it("links View in Audit to the run's audit event when the result has one", async () => {
+    renderSection(result({ auditEventId: "ev-1" }))
+    fireEvent.click(screen.getByRole("button", { name: "More result actions" }))
+    const item = await screen.findByRole("menuitem", { name: "View in Audit" })
+    expect(item.getAttribute("href")).toBe("/audit?event=ev-1")
+  })
+
+  it("keeps the pushdowns and policy obligations in the run details, said once", async () => {
+    renderSection(result())
+    fireEvent.click(screen.getByRole("button", { name: "Run details" }))
+    expect(await screen.findByText("Pushdowns")).toBeTruthy()
+    expect(screen.getByText("Policy obligations")).toBeTruthy()
+    expect(screen.getAllByText("Not measured").length).toBeGreaterThan(0)
+  })
+})
+
+// UX-9 browser review, SHOULD-FIX 2: numbers right-aligned in the console's
+// number format, sans with tabular figures, the inspector quiet at rest.
+describe("the grid's cells", () => {
+  const SUMS = result({
+    columns: ["kawasan", "jumlah"],
+    rows: [
+      { kawasan: "ASEAN", jumlah: "3010348" },
+      { kawasan: "Eropa", jumlah: "1037565" },
+    ],
+    rowCount: 2,
+  })
+
+  it("reads a column of numeric text as numbers, with separators, right-aligned", () => {
+    renderSection(SUMS)
+    const cell = grid().getByText("3,010,348")
+    expect(cell.className).toContain("tabular-nums")
+    expect(cell.className).not.toContain("font-mono")
+    expect(cell.parentElement?.className).toContain("justify-end")
+    // The text column stays text, in the sans face.
+    expect(grid().getByText("ASEAN").className).not.toContain("font-mono")
+  })
+
+  it("writes numbers in the deployment's number locale", () => {
+    render(
+      <TableProviders>
+        <QueryResultsSection
+          result={SUMS}
+          runId="7f0c0f0e-3c7e-4a3e-9d4f-0a1b2c3d4e5f"
+          downloadBusy={null}
+          onDownload={() => {}}
+          numberLocale="id-ID"
+        />
+      </TableProviders>
+    )
+    expect(grid().getByText("3.010.348")).toBeTruthy()
+  })
+
+  it("copies the value as the engine sent it, not as the grid writes it", async () => {
+    renderSection(SUMS)
+    fireEvent.click(screen.getByRole("button", { name: "Copy as TSV" }))
+    await waitFor(() =>
+      expect(copied).toEqual(["kawasan\tjumlah\r\nASEAN\t3010348\r\nEropa\t1037565"])
+    )
+  })
+
+  it("keeps the cell inspector hidden until the row is hovered or focused", () => {
+    renderSection(SUMS)
+    const inspect = screen.getByRole("button", { name: "Inspect jumlah, row 1" })
+    expect(inspect.className).toContain("opacity-0")
+    expect(inspect.className).toContain("group-hover/row:opacity-100")
+    expect(inspect.className).toContain("focus-visible:opacity-100")
   })
 })

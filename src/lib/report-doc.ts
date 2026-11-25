@@ -206,9 +206,10 @@ export type SlashEntry = {
 export const SLASH_GROUPS: readonly SlashGroup[] = ["Write with AI", "Text", "Insert"]
 
 /**
- * What "/" offers, in order. "Ask AI to write…" joins in PR B (D8). Every
- * entry's hint is the shortcut the editor really has (`report-doc.test.ts`
- * checks them against a live editor).
+ * What "/" offers, in order. Every entry's hint is the shortcut the editor
+ * really has (`report-editor-extensions.test.ts` checks them against a live
+ * editor). "Ask AI to write…" (`AI_SLASH_ITEM`) comes first for a person who
+ * may use the assistant.
  */
 export const SLASH_ITEMS: readonly SlashEntry[] = [
   { id: "text", label: "Text", group: "Text", keywords: "paragraph plain" },
@@ -220,6 +221,14 @@ export const SLASH_ITEMS: readonly SlashEntry[] = [
   { id: "chart", label: "Chart…", group: "Insert", keywords: "graph dashboard visual kpi table" },
   { id: "divider", label: "Divider", group: "Insert", keywords: "hr rule line separator", hint: "---" },
 ]
+
+/** "/" → Ask AI to write… (PR B, D8): first in the menu, so it is seen without scrolling (mockup D). */
+export const AI_SLASH_ITEM: SlashEntry = {
+  id: "ai",
+  label: "Ask AI to write…",
+  group: "Write with AI",
+  keywords: "ai copilot write draft summary summarise summarize assistant",
+}
 
 /** The items a query finds: by label or keyword, case-insensitive, in menu order. */
 export function matchSlashItems<T extends { label: string; keywords: string }>(items: readonly T[], query: string): T[] {

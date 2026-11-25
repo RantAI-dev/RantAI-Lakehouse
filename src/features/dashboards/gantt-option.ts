@@ -201,7 +201,9 @@ export function ganttOption(i: GanttInput): GanttDrawn {
       markLine: {
         silent: true, symbol: "none", animation: false,
         lineStyle: { color: t.today, type: "dashed", width: 1.5 },
-        label: { formatter: "Today", color: t.today, fontSize: 11 },
+        // BI-73 (d, review): the task axis is inverted (first task on top), so the line runs from the
+        // top of the plot (its start) to the date labels (its end); "start" puts the label at the top, clear of them.
+        label: { formatter: "Today", color: t.today, fontSize: 11, position: "start" },
         data: [{ xAxis: today }],
       },
     });
@@ -211,7 +213,7 @@ export function ganttOption(i: GanttInput): GanttDrawn {
     useUTC: true,
     textStyle: { color: t.axis, fontFamily: "inherit" },
     legend: grouped ? { data: groups, top: 0, textStyle: { color: t.axis, fontSize: 11 } } : undefined,
-    grid: { left: 8, right: 24, top: grouped ? 32 : 16, bottom: tasks.length > VISIBLE_TASKS ? 36 : 8, containLabel: true },
+    grid: { left: 8, right: 24, top: (grouped ? 32 : 16) + (todayDrawn ? 8 : 0), bottom: tasks.length > VISIBLE_TASKS ? 36 : 8, containLabel: true },
     tooltip: {
       trigger: "item", backgroundColor: t.tooltipBg, borderWidth: 0, textStyle: { color: t.tooltipText, fontSize: 12 },
       // Task and group names are customer data in an HTML tooltip: escaped.

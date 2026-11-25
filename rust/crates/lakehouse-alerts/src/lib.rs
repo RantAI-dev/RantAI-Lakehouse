@@ -27,6 +27,8 @@
 //! are part of this crate's public surface, mirroring the TypeScript
 //! module's actual export list exactly.
 
+use lakehouse_bi::export_format::format_text;
+use lakehouse_bi::style::{FormatStyle, ValueFormat};
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ident::{Ident, SqlLiteral};
 use lakehouse_notify::{DeliverResult, EmailSender, WebhookSender, deliver};
@@ -2151,41 +2153,29 @@ async fn metric_value(
     Ok(coerce_number(rows.first().and_then(|r| r.get("v"))))
 }
 
-/// `Math.round(n).toLocaleString("id-ID")` — round to the nearest integer,
-/// then group digits with `.` every three places (Indonesian locale
-/// convention). Ports `fmt`.
-///
-/// Not a full `Intl.NumberFormat` port: it handles the finite, mostly-
-/// positive aggregate values this module actually produces, and passes
-/// `NaN`/`±Infinity` through as their `Rust` `Display` text rather than
-/// throwing (`toLocaleString` on those `JavaScript` values would render
-/// `"NaN"`/`"∞"`, which this only approximates).
-fn fmt_id_id(n: f64) -> String {
-    let rounded = n.round();
-    let raw = format!("{rounded:.0}");
-    let (negative, digits) = raw
-        .strip_prefix('-')
-        .map_or((false, raw.as_str()), |d| (true, d));
-    if !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return raw; // NaN / inf: pass through rather than mis-group.
-    }
-    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
-    let len = digits.len();
-    for (i, c) in digits.bytes().enumerate() {
-        if i != 0 && (len - i) % 3 == 0 {
-            grouped.push('.');
-        }
-        grouped.push(c as char);
-    }
-    if negative {
-        format!("-{grouped}")
-    } else {
-        grouped
-    }
+/// A number as the console writes it for the deployment's number locale
+/// (Settings, Reporting: `en-US` `8,330,172`, `id-ID` `8.330.172`), rounded to
+/// a whole number, as the message always rounded. It is the console's own
+/// formatter ([`lakehouse_bi::export_format::format_text`], the one an export
+/// uses) with the `number` style and no decimals, so an e-mail and a chart
+/// write the same value alike (`BI-73`, finding e). `NaN` and `±Infinity` pass
+/// through as their `Rust` `Display` text instead of being grouped.
+fn fmt_number(n: f64, locale: &str) -> String {
+    let format = ValueFormat {
+        style: FormatStyle::Number,
+        decimals: Some(0),
+        ..ValueFormat::default()
+    };
+    format_text(n, &format, locale).unwrap_or_else(|| format!("{:.0}", n.round()))
 }
 
 /// Digest text for a board's `KPI`/gauge tiles. Ports `digestText`.
-async fn digest_text(ch: &ChClient, gate: &dyn SqlGate, board_id: &str) -> Result<String, ChError> {
+async fn digest_text(
+    ch: &ChClient,
+    gate: &dyn SqlGate,
+    board_id: &str,
+    locale: &str,
+) -> Result<String, ChError> {
     // A digest goes to whoever the rule names (a mailbox, a webhook), not to a
     // signed-in viewer, so it is read as nobody in particular: a dashboard in
     // a personal space, or in the trash, is "not found" here, and its charts
@@ -2262,7 +2252,7 @@ async fn digest_text(ch: &ChClient, gate: &dyn SqlGate, board_id: &str) -> Resul
         };
         if let Ok(rows) = ch.rows(&sql, None).await {
             let v = coerce_number(rows.first().and_then(|r| r.get("v")));
-            lines.push(format!("• {}: {}", chart.spec.title, fmt_id_id(v)));
+            lines.push(format!("• {}: {}", chart.spec.title, fmt_number(v, locale)));
         }
     }
     Ok(lines.join("\n"))
@@ -2739,7 +2729,7 @@ pub async fn evaluate_pipeline_behind_target(
     let text = format!(
         "Pipeline {pipeline_id} is behind its target lag (lag: {lag_str}, target: {target_str}{reason_clause}). View: {console_link}"
     );
-    let title_prefix = "⚠️ Pipeline behind target";
+    let title_prefix = "Pipeline behind target";
     deliver_one_kind(
         ch,
         http,
@@ -3095,9 +3085,9 @@ pub async fn run_rules(
     email: &EmailSender,
     only: Option<&str>,
     freshness: Option<&dyn FreshnessSource>,
-    silence: Option<&dyn SilenceSource>,
-    state: Option<&dyn StateSource>,
+    (silence, state): (Option<&dyn SilenceSource>, Option<&dyn StateSource>),
     gate: &dyn SqlGate,
+    locale: &str,
 ) -> Result<Vec<RunResult>, ChError> {
     let rules: Vec<AlertRule> = list_rules(ch)
         .await?
@@ -3112,10 +3102,21 @@ pub async fn run_rules(
         // sent whatever its schedule says and the schedule's clock does not
         // move. Only the every-rule tick is held to the schedule.
         if only.is_some() && rule.kind == AlertKind::Digest {
-            out.push(send_digest(ch, (http, email), silence, gate, rule).await);
+            out.push(send_digest(ch, (http, email), silence, gate, (rule, locale)).await);
             continue;
         }
-        out.push(run_one(ch, http, email, freshness, (silence, state), gate, rule).await);
+        out.push(
+            run_one(
+                ch,
+                http,
+                email,
+                freshness,
+                (silence, state),
+                gate,
+                (rule, locale),
+            )
+            .await,
+        );
     }
     Ok(out)
 }
@@ -3127,11 +3128,15 @@ async fn run_one(
     freshness: Option<&dyn FreshnessSource>,
     (silence, state): (Option<&dyn SilenceSource>, Option<&dyn StateSource>),
     gate: &dyn SqlGate,
-    rule: &AlertRule,
+    (rule, locale): (&AlertRule, &str),
 ) -> RunResult {
     match rule.kind {
-        AlertKind::Alert => run_alert(ch, (http, email), (silence, state), gate, rule).await,
-        AlertKind::Digest => run_digest(ch, (http, email), (silence, state), gate, rule).await,
+        AlertKind::Alert => {
+            run_alert(ch, (http, email), (silence, state), gate, (rule, locale)).await
+        }
+        AlertKind::Digest => {
+            run_digest(ch, (http, email), (silence, state), gate, (rule, locale)).await
+        }
         AlertKind::Freshness => {
             run_freshness(freshness, http, email, silence, rule, now_millis()).await
         }
@@ -3261,18 +3266,22 @@ pub struct Reading {
 impl Reading {
     /// A number compared with the rule's `op` and `threshold`.
     #[must_use]
-    pub fn against_threshold(rule: &AlertRule, watched: &str, value: f64) -> Self {
-        let line = format!("{} {}", rule.op.as_str(), fmt_id_id(rule.threshold));
+    pub fn against_threshold(rule: &AlertRule, watched: &str, value: f64, locale: &str) -> Self {
+        let line = format!(
+            "{} {}",
+            rule.op.as_str(),
+            fmt_number(rule.threshold, locale)
+        );
         Self {
             value,
             crossed: compare(value, rule.op, rule.threshold),
             breached: format!(
                 "{watched} = {} {line} (threshold breached)",
-                fmt_id_id(value)
+                fmt_number(value, locale)
             ),
             back: format!(
                 "{watched} = {} (back within the line: no longer {line})",
-                fmt_id_id(value)
+                fmt_number(value, locale)
             ),
         }
     }
@@ -3341,9 +3350,9 @@ pub async fn settle(
     };
     let (next, sending) = transition(previous, reading.crossed);
     let (title, text) = match sending {
-        Sending::Crossed => (format!("⚠️ Alert: {}", rule.name), Some(&reading.breached)),
+        Sending::Crossed => (format!("Alert: {}", rule.name), Some(&reading.breached)),
         Sending::Recovered => (
-            format!("✅ Back to normal: {}", rule.name),
+            format!("Back to normal: {}", rule.name),
             Some(&reading.back),
         ),
         Sending::Nothing => (String::new(), None),
@@ -3399,7 +3408,7 @@ async fn run_alert(
     (http, email): (&WebhookSender, &EmailSender),
     (silence, state): (Option<&dyn SilenceSource>, Option<&dyn StateSource>),
     gate: &dyn SqlGate,
-    rule: &AlertRule,
+    (rule, locale): (&AlertRule, &str),
 ) -> RunResult {
     // BI-19 part C (D12): the API reads a chart rule as its owner.
     if rule.chart.is_some() {
@@ -3420,7 +3429,7 @@ async fn run_alert(
         |m| format!("metric {m}"),
     );
     let reading = match read {
-        Ok(value) => Ok(Reading::against_threshold(rule, &watched, value)),
+        Ok(value) => Ok(Reading::against_threshold(rule, &watched, value, locale)),
         // `BI-39` D5: a person who may no longer run the rule stops it with the
         // reason, and nothing is sent.
         Err(ReadFailure::Stop(reason)) => return stop(state, rule, reason).await,
@@ -3447,7 +3456,7 @@ async fn run_digest(
     (http, email): (&WebhookSender, &EmailSender),
     (silence, state): (Option<&dyn SilenceSource>, Option<&dyn StateSource>),
     gate: &dyn SqlGate,
-    rule: &AlertRule,
+    (rule, locale): (&AlertRule, &str),
 ) -> RunResult {
     let Some(state) = state else {
         return skipped(rule, NO_DIGEST_CLOCK.to_owned());
@@ -3457,7 +3466,7 @@ async fn run_digest(
         Ok(DigestTurn::Wait) => return not_due(rule),
         Err(reason) => return skipped(rule, reason),
     };
-    let result = send_digest(ch, (http, email), silence, gate, rule).await;
+    let result = send_digest(ch, (http, email), silence, gate, (rule, locale)).await;
     // A digest that could not be built or delivered gives its claim back, so
     // the next tick tries again.
     if result.skipped.is_some() || result.delivered.as_ref().is_some_and(|d| !d.ok) {
@@ -3490,7 +3499,7 @@ async fn send_digest(
     (http, email): (&WebhookSender, &EmailSender),
     silence: Option<&dyn SilenceSource>,
     gate: &dyn SqlGate,
-    rule: &AlertRule,
+    (rule, locale): (&AlertRule, &str),
 ) -> RunResult {
     let board = rule.board.as_deref().unwrap_or("");
     // BI-19 B1 review R6: a restricted dashboard's digest is not sent outside
@@ -3502,7 +3511,7 @@ async fn send_digest(
                 .to_owned(),
         );
     }
-    match digest_text(ch, gate, board).await {
+    match digest_text(ch, gate, board, locale).await {
         Ok(text) => {
             let title = format!("📊 Digest: {}", rule.name);
             let delivered =
@@ -3857,7 +3866,16 @@ mod tests {
         let email = no_smtp_email_sender();
         let state = FakeState::default();
 
-        let result = run_one(&ch, &http, &email, None, (None, Some(&state)), &gate, &rule).await;
+        let result = run_one(
+            &ch,
+            &http,
+            &email,
+            None,
+            (None, Some(&state)),
+            &gate,
+            (&rule, "en-US"),
+        )
+        .await;
 
         assert_eq!(result.value, Some(7.0), "the read is the same as before");
         let seen = gate.seen.lock().unwrap().clone();
@@ -3882,7 +3900,16 @@ mod tests {
         let email = no_smtp_email_sender();
         let state = FakeState::default();
 
-        let result = run_one(&ch, &http, &email, None, (None, Some(&state)), &gate, &rule).await;
+        let result = run_one(
+            &ch,
+            &http,
+            &email,
+            None,
+            (None, Some(&state)),
+            &gate,
+            (&rule, "en-US"),
+        )
+        .await;
 
         assert_eq!(result.value, Some(7.0), "the read is the engine's answer");
         let seen = gate.seen.lock().unwrap().clone();
@@ -3904,7 +3931,16 @@ mod tests {
         let http = test_webhook_sender();
         let email = no_smtp_email_sender();
 
-        run_one(&ch, &http, &email, None, (None, None), &gate, &rule).await;
+        run_one(
+            &ch,
+            &http,
+            &email,
+            None,
+            (None, None),
+            &gate,
+            (&rule, "en-US"),
+        )
+        .await;
 
         let seen = gate.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 1, "{seen:?}");
@@ -3929,7 +3965,16 @@ mod tests {
         let mut rule = legacy_rule(&hook.uri());
         rule.owner_id = Some("u_gone".to_owned());
 
-        let result = run_one(&ch, &http, &email, None, (None, Some(&state)), &gate, &rule).await;
+        let result = run_one(
+            &ch,
+            &http,
+            &email,
+            None,
+            (None, Some(&state)),
+            &gate,
+            (&rule, "en-US"),
+        )
+        .await;
 
         assert!(!result.fired);
         assert_eq!(result.skipped.as_deref(), Some(GONE));
@@ -3967,7 +4012,16 @@ mod tests {
         let mut rule = legacy_rule(&hook.uri());
         rule.owner_id = Some("u_1".to_owned());
 
-        let result = run_one(&ch, &http, &email, None, (None, Some(&state)), &gate, &rule).await;
+        let result = run_one(
+            &ch,
+            &http,
+            &email,
+            None,
+            (None, Some(&state)),
+            &gate,
+            (&rule, "en-US"),
+        )
+        .await;
 
         // `BI-67`: a refusal means the rule could not be evaluated, so it is `failed`.
         assert_eq!(result.failed.as_deref(), Some(REFUSED));
@@ -4054,19 +4108,37 @@ mod tests {
         assert_eq!(coerce_number(Some(&serde_json::json!(42.5))), 42.5);
     }
 
-    // ── fmt_id_id ───────────────────────────────────────────────────────
+    // ── fmt_number ──────────────────────────────────────────────────────
 
     #[test]
-    fn fmt_id_id_groups_thousands_with_dots() {
-        assert_eq!(fmt_id_id(1_234_567.0), "1.234.567");
-        assert_eq!(fmt_id_id(999.0), "999");
-        assert_eq!(fmt_id_id(1000.0), "1.000");
+    fn fmt_number_groups_thousands_by_the_locale() {
+        assert_eq!(fmt_number(8_330_172.0, "en-US"), "8,330,172");
+        assert_eq!(fmt_number(8_330_172.0, "id-ID"), "8.330.172");
+        assert_eq!(fmt_number(999.0, "en-US"), "999");
+        assert_eq!(fmt_number(1000.0, "id-ID"), "1.000");
     }
 
     #[test]
-    fn fmt_id_id_rounds_and_handles_negative() {
-        assert_eq!(fmt_id_id(1234.6), "1.235");
-        assert_eq!(fmt_id_id(-1234.0), "-1.234");
+    fn fmt_number_rounds_and_handles_negative() {
+        assert_eq!(fmt_number(1234.6, "id-ID"), "1.235");
+        assert_eq!(fmt_number(-1234.0, "id-ID"), "-1.234");
+        assert_eq!(fmt_number(-1234.0, "en-US"), "-1,234");
+    }
+
+    #[test]
+    fn fmt_number_passes_a_value_that_is_not_finite_through() {
+        assert_eq!(fmt_number(f64::NAN, "en-US"), "NaN");
+    }
+
+    #[test]
+    fn a_reading_writes_its_numbers_in_the_workspace_locale() {
+        let rule = metric_rule("m", AlertOp::Gt, 1_000_000.0);
+        let en = Reading::against_threshold(&rule, "x", 8_330_172.0, "en-US");
+        assert!(en.breached.contains("8,330,172"), "{}", en.breached);
+        assert!(en.breached.contains("1,000,000"), "{}", en.breached);
+        let id = Reading::against_threshold(&rule, "x", 8_330_172.0, "id-ID");
+        assert!(id.breached.contains("8.330.172"), "{}", id.breached);
+        assert!(id.back.contains("8.330.172"), "{}", id.back);
     }
 
     // ── normalize_input (saveRule validation) ──────────────────────────
@@ -5543,7 +5615,16 @@ mod tests {
         let http = WebhookSender::new(std::sync::Arc::new(RefuseAll));
         let email = no_smtp_email_sender();
         let rule = metric_rule("gone", AlertOp::Gt, 0.0);
-        let result = run_one(&ch, &http, &email, None, (None, None), &RewriteGate, &rule).await;
+        let result = run_one(
+            &ch,
+            &http,
+            &email,
+            None,
+            (None, None),
+            &RewriteGate,
+            (&rule, "en-US"),
+        )
+        .await;
         assert!(!result.fired);
         assert_eq!(result.value, None);
         // `BI-67`: a metric whose source is gone could not be evaluated: `failed`, not `skipped`.
@@ -5565,7 +5646,7 @@ mod tests {
             None,
             (None, None),
             &RewriteGate,
-            &rule,
+            (&rule, "en-US"),
         )
         .await;
         assert!(!result.fired);
@@ -5630,7 +5711,7 @@ mod tests {
                 None,
                 (Some(&silence), None),
                 &PassGate,
-                &rule,
+                (&rule, "en-US"),
             )
             .await;
             eprintln!(
@@ -5652,7 +5733,7 @@ mod tests {
             None,
             (Some(&silence), None),
             &PassGate,
-            &gone,
+            (&gone, "en-US"),
         )
         .await;
         eprintln!(
@@ -6226,7 +6307,7 @@ mod tests {
             None,
             (None, Some(&state)),
             &RestrictedGate,
-            &rule,
+            (&rule, "en-US"),
         )
         .await;
         assert!(!result.fired);
@@ -6269,7 +6350,7 @@ mod tests {
             None,
             (None, Some(&waiting)),
             &PassGate,
-            &rule,
+            (&rule, "en-US"),
         )
         .await;
         assert!(!result.fired);
@@ -6278,7 +6359,16 @@ mod tests {
         assert!(waiting.given_back.lock().unwrap().is_empty());
         assert!(server.received_requests().await.unwrap().is_empty());
 
-        let none = run_one(&ch, &http, &email, None, (None, None), &PassGate, &rule).await;
+        let none = run_one(
+            &ch,
+            &http,
+            &email,
+            None,
+            (None, None),
+            &PassGate,
+            (&rule, "en-US"),
+        )
+        .await;
         assert_eq!(none.skipped.as_deref(), Some(NO_DIGEST_CLOCK));
         assert!(server.received_requests().await.unwrap().is_empty());
     }
@@ -6414,7 +6504,9 @@ mod tests {
             .mount(&server)
             .await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
-        let text = digest_text(&ch, &PassGate, "b_draft").await.unwrap();
+        let text = digest_text(&ch, &PassGate, "b_draft", "id-ID")
+            .await
+            .unwrap();
         assert_eq!(text, "Dashboard not found.");
         let sent = server.received_requests().await.unwrap();
         let reads: Vec<String> = sent
@@ -7105,7 +7197,7 @@ mod tests {
                 None,
                 (None, Some(&state)),
                 &PassGate,
-                &rule,
+                (&rule, "en-US"),
             )
             .await;
             assert_eq!(r.skipped, None);
@@ -7145,7 +7237,7 @@ mod tests {
                 None,
                 (None, Some(&state)),
                 &PassGate,
-                &rule,
+                (&rule, "en-US"),
             )
             .await;
             recoveries += usize::from(r.recovered);
@@ -7160,8 +7252,29 @@ mod tests {
             .map(|r| String::from_utf8_lossy(&r.body).into_owned())
             .collect();
         assert_eq!(bodies.len(), 2, "{bodies:?}");
-        assert!(bodies[0].contains("Alert:"), "{}", bodies[0]);
-        assert!(bodies[1].contains("Back to normal"), "{}", bodies[1]);
+        // PR #654 review 1: the subjects are pinned exactly, so a reintroduced
+        // "⚠️ Alert: …" / "✅ Back to normal: …" (BI-73, finding e) fails here.
+        // The webhook body carries the subject as its `title` field; a body
+        // that does not parse fails closed (an empty subject matches neither
+        // prefix).
+        let subject = |body: &str| {
+            serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| {
+                    v.get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default()
+        };
+        assert!(subject(&bodies[0]).starts_with("Alert: "), "{}", bodies[0]);
+        assert!(
+            subject(&bodies[1]).starts_with("Back to normal: "),
+            "{}",
+            bodies[1]
+        );
+        assert!(!bodies[0].contains('⚠'), "{}", bodies[0]);
+        assert!(!bodies[1].contains('✅'), "{}", bodies[1]);
         assert_eq!(state.states.lock().unwrap()["al_1"], AlertState::Ok);
     }
 
@@ -7191,7 +7304,7 @@ mod tests {
             None,
             (None, Some(&state)),
             &PassGate,
-            &rule,
+            (&rule, "en-US"),
         )
         .await;
         assert_eq!(r.failed.as_deref(), Some("the value could not be read."));
@@ -7213,7 +7326,7 @@ mod tests {
             None,
             (None, Some(&state)),
             &PassGate,
-            &rule,
+            (&rule, "en-US"),
         )
         .await;
         assert!(!r.fired);
@@ -7230,7 +7343,16 @@ mod tests {
         let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let rule = legacy_rule(&hook.uri());
-        let none = run_one(&ch, &http, &email, None, (None, None), &PassGate, &rule).await;
+        let none = run_one(
+            &ch,
+            &http,
+            &email,
+            None,
+            (None, None),
+            &PassGate,
+            (&rule, "en-US"),
+        )
+        .await;
         assert_eq!(none.skipped.as_deref(), Some(STATE_UNAVAILABLE));
         let broken = FakeState {
             unreadable: true,
@@ -7243,7 +7365,7 @@ mod tests {
             None,
             (None, Some(&broken)),
             &PassGate,
-            &rule,
+            (&rule, "en-US"),
         )
         .await;
         assert_eq!(
@@ -7270,7 +7392,7 @@ mod tests {
             None,
             (None, Some(&state)),
             &PassGate,
-            &rule,
+            (&rule, "en-US"),
         )
         .await;
         assert!(r.fired);
@@ -7293,7 +7415,7 @@ mod tests {
         let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let rule = legacy_rule(&hook.uri());
-        let reading = || Reading::against_threshold(&rule, "x", 150.0);
+        let reading = || Reading::against_threshold(&rule, "x", 150.0, "en-US");
         let state = FakeState::default();
         let first = settle((&http, &email), None, Some(&state), &rule, Ok(reading())).await;
         assert!(first.fired, "{first:?}");
@@ -7626,7 +7748,7 @@ mod tests {
             None,
             (None, Some(&state)),
             &PassGate,
-            &rule,
+            (&rule, "en-US"),
         )
         .await;
         assert_eq!(r.skipped.as_deref(), Some(CHART_SKIPPED));
