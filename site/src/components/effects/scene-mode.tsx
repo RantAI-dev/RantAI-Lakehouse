@@ -49,26 +49,64 @@ const LandingModeContext = React.createContext<LandingModeValue>({
 let webglAnswer: "unknown" | "yes" | "no" = "unknown";
 const webglListeners = new Set<() => void>();
 let webglScheduled = false;
+
+/** The answer is kept for the next visit: hero-intro.tsx reads it before the first paint (`lk-gl-wait`). */
+function rememberAnswer(yes: boolean): void {
+  try {
+    localStorage.setItem("lk-gl", yes ? "1" : "0");
+  } catch {
+    /* private window or blocked storage: the next visit simply starts without it */
+  }
+}
+
 function subscribeWebgl(onChange: () => void): () => void {
   webglListeners.add(onChange);
   if (!webglScheduled) {
     webglScheduled = true;
+    const root = document.documentElement;
+    const early = (window as unknown as { __lkFastGL?: unknown }).__lkFastGL;
     const answer = () => {
-      webglAnswer = hasFastWebGL() ? "yes" : "no";
+      if (webglAnswer !== "unknown") return;
+      const yes = hasFastWebGL();
+      webglAnswer = yes ? "yes" : "no";
+      rememberAnswer(yes);
+      // The DOM hero's creature, sun and moon were held back for a lake that is not coming.
+      if (!yes) root.classList.remove("lk-gl-wait");
       for (const l of webglListeners) l();
     };
-    // WEB-5 O52: on the first-load intro's 3D path (hero-intro.tsx has
-    // probed already and holds the page until the scene's first frame), the
-    // answer is given at hydration and the scene's chunk is requested at
-    // once, so the hold stays short. Everywhere else, after the first paint.
-    // The probe runs just after the first paint (so it never delays it); if hydration
-    // beat it, the page takes the ordinary path below.
-    if (
-      document.documentElement.classList.contains("lk-intro-3d") &&
-      (window as unknown as { __lkFastGL?: unknown }).__lkFastGL === true
-    ) {
-      void import("./scene/lake-scene");
-      queueMicrotask(answer);
+    // Owner QA 2026-11-25: one hero, not the DOM hero and then a jump to the lake. The scene's chunk
+    // is requested the moment the answer is "yes", and the answer is given right after the first
+    // paint (never before it, so the LCP is not delayed) on every path where the lake is expected:
+    // - the first-visit intro's 3D path (hero-intro.tsx holds the page on black): the intro's own
+    //   probe answers, or, if hydration came first, the probe calls `__lkGLHook` when it has;
+    // - a machine that answered "yes" last time (`lk-gl-wait`): probe one task after the first paint.
+    // Everywhere else, after load and an idle period.
+    const w = window as unknown as { __lkGLHook?: (ok: boolean) => void };
+    const probeSoon = () => {
+      requestAnimationFrame(() =>
+        setTimeout(() => {
+          if (webglAnswer !== "unknown") return;
+          if (hasFastWebGL()) void import("./scene/lake-scene");
+          answer();
+        }, 0),
+      );
+    };
+    if (root.classList.contains("lk-intro-3d")) {
+      if (early === true) {
+        void import("./scene/lake-scene");
+        queueMicrotask(answer);
+      } else if (typeof early === "boolean") {
+        afterPaint(answer);
+      } else {
+        w.__lkGLHook = (ok) => {
+          if (ok) void import("./scene/lake-scene");
+          queueMicrotask(answer);
+        };
+        // If the intro gives up on its probe (its 1.5 s timer), the ordinary path takes over.
+        afterPaint(answer);
+      }
+    } else if (root.classList.contains("lk-gl-wait")) {
+      probeSoon();
     } else {
       afterPaint(answer);
     }
@@ -147,7 +185,10 @@ export function LandingModeProvider({ children }: { children: React.ReactNode })
     webgl === "unknown" ? "pending" : webgl === "no" || failed ? "none" : reduced ? "still" : "full";
 
   const markReady = React.useCallback(() => setReadyFor(mode), [mode]);
-  const markFailed = React.useCallback(() => setFailed(true), []);
+  const markFailed = React.useCallback(() => {
+    document.documentElement.classList.remove("lk-gl-wait");
+    setFailed(true);
+  }, []);
 
   // WEB-5 D14 S1: the mode on <html>, for CSS that depends on it (the hero
   // is longer while the live lake runs, app/globals.css). Written when the

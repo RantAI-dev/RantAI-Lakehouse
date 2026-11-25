@@ -79,8 +79,28 @@ function go(){if(went||done)return;went=true;clearTimeout(timer);d.classList.add
 window.__lkIntroGo=go;
 d.classList.add("lk-intro","lk-intro-3d");
 timer=setTimeout(function(){d.classList.remove("lk-intro-3d");go();},1500);
-function probe(){if(done||went)return;var gl=window.__lkFastGL=${forceGL ? "true" : PROBE};if(!gl){d.classList.remove("lk-intro-3d");go();}}
+function probe(){if(done||went)return;var gl=window.__lkFastGL=${forceGL ? "true" : PROBE};if(window.__lkGLHook)window.__lkGLHook(gl);if(!gl){d.classList.remove("lk-intro-3d");go();}}
 requestAnimationFrame(function(){setTimeout(probe,0);});
+}catch(e){}})();`;
+
+/**
+ * WEB-5 owner QA 2026-11-25 (DOM hero, then a jump to the 3D lake): on a
+ * machine that has answered "yes" to the WebGL test before (`lk-gl` = `1` in
+ * localStorage, written by scene-mode.tsx), the DOM hero's creature, sun, moon
+ * and reflection stay hidden (`lk-gl-wait`, CSS below) until the live lake's
+ * first frame, so the visitor sees one hero. The sky and sea, the headline,
+ * the copy and the buttons are untouched (the LCP is the headline). Safety:
+ * after 4 s, or if the test or the scene fails (scene-mode.tsx), the class
+ * goes and the DOM hero fades in. Not on the first-visit intro (its hold
+ * already does this), not under reduced motion, and never without the stored
+ * answer (a first visit, or a machine without a GPU).
+ */
+const GL_BOOT = `(function(){try{
+var d=document.documentElement;
+if(window.matchMedia&&matchMedia("(prefers-reduced-motion: reduce)").matches)return;
+if(d.classList.contains("lk-intro")||localStorage.getItem("lk-gl")!=="1")return;
+d.classList.add("lk-gl-wait");
+setTimeout(function(){d.classList.remove("lk-gl-wait");},4000);
 }catch(e){}})();`;
 
 const CSS = `
@@ -95,6 +115,12 @@ const CSS = `
   html.lk-intro:not(.lk-intro-go) .lk-root > header { transform: translateY(-100%) !important; }
   /* 3D path: the live lake plays the sea and the whale; the DOM picture never shows. */
   html.lk-intro-3d [data-intro-backdrop], html.lk-intro-3d [data-hero-room] { opacity: 0 !important; transition: none; }
+
+  /* Owner QA 2026-11-25: with the lake about to appear, the DOM creature, sun, moon and reflection wait
+     (the sky, the sea and the text are not touched). Their own opacity transitions fade them in if the lake does not come. */
+  html.lk-gl-wait [data-hero-room],
+  html.lk-gl-wait [data-intro-backdrop] > :nth-child(n + 3):nth-child(-n + 8) { opacity: 0 !important; }
+  [data-intro-backdrop] > .lk-waterline { transition: opacity 0.4s ease; }
 
   /* Beat 1, the open sea. */
   html.lk-intro-go [data-intro-backdrop], html.lk-intro-go .lk-water { animation: lk-i-sky 0.6s ease-out backwards; }
@@ -164,6 +190,7 @@ export function HeroIntro({ variant = "home" }: { variant?: "home" | "lite" }) {
     <>
       <style dangerouslySetInnerHTML={{ __html: CSS }} />
       <script dangerouslySetInnerHTML={{ __html: BOOT(variant, FORCE_GL) }} />
+      {variant === "home" && <script dangerouslySetInnerHTML={{ __html: GL_BOOT }} />}
     </>
   );
 }
