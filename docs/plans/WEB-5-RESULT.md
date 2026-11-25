@@ -592,7 +592,7 @@ Day `/` (six runs each, three interleaved):
 
 | Build | Performance (runs) | Median | LCP (runs) | TBT median |
 | --- | --- | --- | --- | --- |
-| before | 91 / 75 / 95 / 68 / 73 / 73 | **74** | 1.66 / 4.69 / 1.66 / 4.69 / 4.70 / 4.70 s | 336 ms |
+| before | 91 / 75 / 95 / 68 / 73 / 73 | **74** | 1.66 / 4.69 / 1.66 / 4.69 / 4.70 / 4.70 s | 364 ms |
 | after | 92 / 89 / 86 / 92 / 88 / 94 | **90.5** | 1.66 s in all six | 337 ms |
 
 Other cases (three runs each, sequential builds):
