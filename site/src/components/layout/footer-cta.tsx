@@ -39,7 +39,10 @@ export function FooterCta({
         </div>
         <CopyButton text={CLONE} label={copy.copy} copiedLabel={copy.copied} failedLabel={copy.copyFailed} ariaLabel={copy.copyCommand} />
       </div>
-      <p className="mt-4 max-w-3xl text-[14px] leading-6 text-[#E8F4FF]/60">
+      {/* WEB-5 M9 (phone pass): on the home page, below 1024 px, this line goes: it repeats the Get
+          started steps just above, and ran to three lines. The contact page keeps it (nothing above
+          says it there); its guide link gets a 40 px tap area that does not move the line (M11). */}
+      <p className={`mt-4 max-w-3xl text-[14px] leading-6 text-[#E8F4FF]/60 ${page === "home" ? "max-lg:hidden" : ""}`}>
         {copy.then}{" "}
         <code className="rounded bg-white/[0.07] px-1.5 py-0.5 !text-[12.5px]">sh ops/init-env.sh</code> {copy.and}{" "}
         <code className="rounded bg-white/[0.07] px-1.5 py-0.5 !text-[12.5px]">scripts/compose.sh up --build</code>
@@ -48,7 +51,7 @@ export function FooterCta({
           href={LINKS.guide}
           target="_blank"
           rel="noopener noreferrer"
-          className="rounded text-[#8fcbff] underline decoration-[#8fcbff]/30 underline-offset-4 transition-[color,text-decoration-color] duration-200 ease-out outline-none hover:text-white hover:decoration-white/60 focus-visible:ring-2 focus-visible:ring-[#44A6FA]"
+          className="rounded text-[#8fcbff] underline decoration-[#8fcbff]/30 underline-offset-4 transition-[color,text-decoration-color] duration-200 ease-out outline-none hover:text-white hover:decoration-white/60 focus-visible:ring-2 focus-visible:ring-[#44A6FA] max-lg:py-[11px]"
         >
           {copy.guide} →
         </a>
