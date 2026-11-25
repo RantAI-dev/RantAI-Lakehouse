@@ -37,7 +37,7 @@
 //! refusal text) goes to the log only, never into the row or the
 //! response: the row's `reason` is the fixed `"not_started"`.
 
-use lakehouse_clickhouse::{ChClient, ChError};
+use lakehouse_clickhouse::{ChClient, ChError, ChTableEnsured};
 use lakehouse_core::ident::SqlLiteral;
 use lakehouse_dagster::DgClient;
 use lakehouse_iceberg::gold;
@@ -86,11 +86,11 @@ pub fn run_config(req: &LatestCopyRequest<'_>) -> Value {
     }}}})
 }
 
-/// Cached "has `console.gold_latest_copy_run` been created this process"
-/// flag, same pattern as `gold_export_history::TRIM_TABLE_ENSURED` — a
-/// failed attempt is not cached, so a transient `ClickHouse` outage
-/// doesn't permanently wedge every later call.
-static LATEST_COPY_TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+/// Cached per-URL "has `console.gold_latest_copy_run` been created" answer
+/// (`lakehouse_clickhouse::ChTableEnsured`) — a failed attempt is not
+/// cached, so a transient `ClickHouse` outage doesn't permanently wedge
+/// every later call.
+static LATEST_COPY_TABLE_ENSURED: ChTableEnsured = ChTableEnsured::new();
 
 /// Idempotently create `console.gold_latest_copy_run` (D12). The DDL is
 /// identical to the Python writer's
@@ -102,9 +102,8 @@ static LATEST_COPY_TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceC
 /// Returns [`ChError`] if the DDL statement fails.
 pub async fn ensure_gold_latest_copy_run_table(ch: &ChClient) -> Result<(), ChError> {
     LATEST_COPY_TABLE_ENSURED
-        .get_or_try_init(|| ensure_gold_latest_copy_run_table_uncached(ch))
+        .ensure(ch, || ensure_gold_latest_copy_run_table_uncached(ch))
         .await
-        .map(drop)
 }
 
 async fn ensure_gold_latest_copy_run_table_uncached(ch: &ChClient) -> Result<(), ChError> {

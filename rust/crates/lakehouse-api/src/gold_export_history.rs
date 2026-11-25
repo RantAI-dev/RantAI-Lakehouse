@@ -35,22 +35,23 @@
 //! [`last_trim`] reads the latest trim record per mart for inclusion in
 //! `GET /api/gold/export/{mart}/publication`.
 
-use lakehouse_clickhouse::{ChClient, ChError};
+use lakehouse_clickhouse::{ChClient, ChError, ChTableEnsured};
 use lakehouse_core::ident::SqlLiteral;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::routes::support::{nullable_i64_col, nullable_u64_col};
 
-/// Cached "has the table been created this process" flag, same pattern as
-/// `lakehouse_bi::store::BI_TABLE_ENSURED` (a failed attempt is not
+/// Cached "has the table been created" answer, keyed by `ClickHouse` URL
+/// (`lakehouse_clickhouse::ChTableEnsured`) — a failed attempt is not
 /// cached, so a transient `ClickHouse` outage doesn't permanently wedge
-/// every later call).
-static TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+/// every later call, and an engine ensured earlier in this process (a test
+/// stand-in, say) does not speak for another one.
+static TABLE_ENSURED: ChTableEnsured = ChTableEnsured::new();
 
-/// Idempotently create the `console` database (if `lakehouse-bi` has not
-/// Cached flag for `console.gold_trim_run`.
-static TRIM_TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+/// Cached per-URL "has `console.gold_trim_run` been created" answer; same
+/// contract as [`TABLE_ENSURED`].
+static TRIM_TABLE_ENSURED: ChTableEnsured = ChTableEnsured::new();
 
 /// Idempotently create `console.gold_trim_run` (DATA-2 D5 + A1).
 ///
@@ -59,9 +60,8 @@ static TRIM_TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::co
 /// Returns [`ChError`] if any DDL statement fails.
 pub async fn ensure_gold_trim_run_table(ch: &ChClient) -> Result<(), ChError> {
     TRIM_TABLE_ENSURED
-        .get_or_try_init(|| ensure_gold_trim_run_table_uncached(ch))
+        .ensure(ch, || ensure_gold_trim_run_table_uncached(ch))
         .await
-        .map(drop)
 }
 
 async fn ensure_gold_trim_run_table_uncached(ch: &ChClient) -> Result<(), ChError> {
@@ -100,9 +100,8 @@ async fn ensure_gold_trim_run_table_uncached(ch: &ChClient) -> Result<(), ChErro
 /// Returns [`ChError`] if any DDL statement fails.
 pub async fn ensure_gold_export_run_table(ch: &ChClient) -> Result<(), ChError> {
     TABLE_ENSURED
-        .get_or_try_init(|| ensure_gold_export_run_table_uncached(ch))
+        .ensure(ch, || ensure_gold_export_run_table_uncached(ch))
         .await
-        .map(drop)
 }
 
 async fn ensure_gold_export_run_table_uncached(ch: &ChClient) -> Result<(), ChError> {
