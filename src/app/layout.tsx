@@ -9,6 +9,7 @@ import { TableProviders } from "@/components/app-shell/table-providers";
 import { AuthProvider } from "@/features/auth/auth-provider";
 import { ReactGrabDev } from "@/components/app-shell/react-grab-dev";
 import { NONCE_HEADER } from "@/lib/csp";
+import { HOME_BACKGROUND_SCRIPT } from "@/lib/home-background";
 import { EMBED_TRANSPARENT_CLASS, EMBED_TRANSPARENT_HEADER } from "@/lib/embed-look";
 import {
   readWorkspaceBranding,
@@ -98,6 +99,10 @@ export default async function RootLayout({
             media={link.media}
           />
         ))}
+        {/* WEB-17 T5: Home's Background choice is known before the first
+            paint, so its loading look shows the band's colour only when
+            there will be art (`HOME_BACKGROUND_SCRIPT`, a constant). */}
+        <script nonce={nonce} dangerouslySetInnerHTML={{ __html: HOME_BACKGROUND_SCRIPT }} />
       </head>
       {/* Browser extensions (Grammarly, ColorZilla, password managers) put
           their own attributes on <body> before React hydrates; in dev that

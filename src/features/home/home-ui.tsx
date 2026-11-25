@@ -2,64 +2,117 @@
 
 import * as React from "react"
 import Link from "next/link"
+import { ArrowRight, type LucideIcon } from "lucide-react"
 
 import { Skeleton } from "@/components/ui/skeleton"
+import { EASE, FOCUS } from "@/features/dashboards/dashboard-header"
 import type { CardRead } from "@/lib/home-cards"
+import { cn } from "@/lib/utils"
 
-/** The small uppercase heading over each card on Home's second screen. */
-export function SectionTitle({ children }: { children: React.ReactNode }) {
+export { EASE, FOCUS }
+
+/**
+ * The surface every Home widget sits on (`WEB-17`): the dashboard page's
+ * soft tile (`SOFT_TILE_FRAME`, `BI-61`), so Home and a dashboard read as
+ * one product. No border, a fill a step off the page, a large radius
+ * (DESIGN.md §3, cards without borders). The card itself is not clickable,
+ * so it has no hover of its own; its rows and links do.
+ */
+export const WIDGET = "flex min-w-0 flex-col rounded-2xl bg-muted/45 p-4 dark:bg-card"
+
+/** A widget's title row: an icon and the name, and at most one quiet link at the right. */
+export function WidgetHead({
+  title,
+  icon: Icon,
+  action,
+  className,
+}: {
+  title: React.ReactNode
+  icon?: LucideIcon
+  action?: React.ReactNode
+  className?: string
+}) {
   return (
-    <h2 className="px-1 text-xs font-semibold tracking-[0.08em] text-muted-foreground uppercase">
-      {children}
-    </h2>
+    <div className={cn("flex h-6 shrink-0 items-center justify-between gap-2", className)}>
+      <h2 className="flex min-w-0 items-center gap-1.5 text-[13px] leading-5 font-medium tracking-normal text-foreground">
+        {Icon ? <Icon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" /> : null}
+        <span className="truncate">{title}</span>
+      </h2>
+      {action}
+    </div>
   )
 }
 
+/** The quiet link at the right of a widget's title ("Open", "All chats"). */
+export function WidgetLink({ href, children }: { href: string; children: React.ReactNode }) {
+  return (
+    <Link
+      href={href}
+      className={cn(
+        "-mr-1.5 inline-flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 text-xs text-muted-foreground hover:bg-muted hover:text-foreground active:scale-[0.97] dark:hover:bg-muted/60",
+        EASE,
+        FOCUS,
+      )}
+    >
+      {children}
+      <ArrowRight aria-hidden className="size-3" />
+    </Link>
+  )
+}
+
+/** One clickable line in a widget list: soft hover, the press scale, the focus ring. */
+export const ROW = cn(
+  "flex min-w-0 items-center gap-2.5 rounded-lg px-1.5 text-left hover:bg-muted active:scale-[0.99] dark:hover:bg-muted/50",
+  EASE,
+  FOCUS,
+)
+
 /**
- * The chrome the list cards share: a title (with an optional link at its
- * end) over a bordered panel. `PipelineRuns` and `RecentList` keep their
- * own markup, which this matches, so a new card sits among them without a
- * visible seam.
+ * The optional list cards (Sources, Open alerts, Saved queries) in the
+ * widget look: the title row with its link, then the list straight on the
+ * surface (no panel inside the panel).
  */
 export function CardSection({
   title,
+  icon,
   link,
   children,
 }: {
   title: string
+  icon?: LucideIcon
   link?: { href: string; label: string }
   children: React.ReactNode
 }) {
   return (
-    <section className="flex min-w-0 flex-col gap-3">
-      {link ? (
-        <div className="flex items-baseline justify-between gap-3 px-1">
-          <SectionTitle>{title}</SectionTitle>
-          <Link
-            href={link.href}
-            className="shrink-0 text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
-          >
-            {link.label}
-          </Link>
-        </div>
-      ) : (
-        <SectionTitle>{title}</SectionTitle>
-      )}
-      <div className="rounded-xl border border-border bg-card p-2">{children}</div>
+    <section className={WIDGET}>
+      <WidgetHead
+        title={title}
+        icon={icon}
+        action={link ? <WidgetLink href={link.href}>{link.label}</WidgetLink> : undefined}
+      />
+      {/* Micro-interaction audit 2026-11-14: the rows fade in when they land; the placeholder rows
+          (`aria-hidden`, the same ones the loading shell drew) do not, so loading never blinks. */}
+      <div className="mt-2 -mx-1.5 [&>:not([aria-hidden])]:transition-opacity [&>:not([aria-hidden])]:duration-200 [&>:not([aria-hidden])]:ease-ui starting:[&>:not([aria-hidden])]:opacity-0">{children}</div>
     </section>
   )
 }
 
-/** The panel text for an empty or failed card. */
+/** The text for an empty or failed widget: one short line. */
 export function CardNote({ children }: { children: React.ReactNode }) {
-  return <p className="px-2 py-2 text-xs text-muted-foreground">{children}</p>
+  return <p className="px-1.5 py-1.5 text-xs leading-5 text-muted-foreground">{children}</p>
 }
 
-export function CardSkeleton() {
+/** A list widget's loading look: rows in the shape of the rows to come. */
+export function CardSkeleton({ rows = 3 }: { rows?: number }) {
   return (
-    <div className="flex flex-col gap-2 p-2">
-      <Skeleton className="h-5 w-full" />
-      <Skeleton className="h-5 w-4/5" />
+    <div aria-hidden className="flex flex-col">
+      {Array.from({ length: rows }, (_, i) => (
+        <div key={i} className="flex h-9 items-center gap-2.5 px-1.5">
+          <Skeleton className="size-2 rounded-full" />
+          <Skeleton className={cn("h-3", i % 2 ? "w-1/2" : "w-2/3")} />
+          <Skeleton className="ml-auto h-3 w-10" />
+        </div>
+      ))}
     </div>
   )
 }
@@ -78,9 +131,7 @@ export function ReadNote({
 }) {
   return (
     <CardNote>
-      {read === "denied"
-        ? `You don't have access to ${what}.`
-        : `Couldn't load ${what}.`}
+      {read === "denied" ? `You don't have access to ${what}.` : `Couldn't load ${what}.`}
     </CardNote>
   )
 }

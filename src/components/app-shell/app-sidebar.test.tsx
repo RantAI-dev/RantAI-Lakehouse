@@ -279,7 +279,6 @@ function pictures(container: HTMLElement): HTMLImageElement[] {
   return Array.from(container.querySelectorAll("img"))
 }
 
-
 describe("the sidebar header shows the workspace's own branding (ADM-2)", () => {
   it("shows the workspace name and logo from settings, not a fixed product name", async () => {
     stubApi({
