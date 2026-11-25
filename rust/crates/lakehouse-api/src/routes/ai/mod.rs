@@ -116,6 +116,11 @@ pub async fn build_status(
 
 const MAX_ITER: u32 = 8;
 
+/// The note the answer carries when the loop used all of its tool-calling
+/// rounds. Also the signal that the final answer followed the tool-call limit,
+/// so a chart claim in it can be checked against what the trace really did.
+const TOOL_LIMIT_NOTE: &str = "tool-call limit reached";
+
 /// How many times the same call with the same arguments may fail before the
 /// chat loop stops calling tools (plan 111, the parking lot's item 6).
 ///
@@ -1649,7 +1654,8 @@ async fn run_chat(
     // The iteration budget is exhausted, or the same call failed too many
     // times — ask once more for a final answer, tool-free.
     report(progress, json!({ "type": "status", "phase": "thinking" }));
-    let stop_note = stop_note.unwrap_or("tool-call limit reached");
+    let stop_note = stop_note.unwrap_or(TOOL_LIMIT_NOTE);
+    let hit_tool_limit = stop_note == TOOL_LIMIT_NOTE;
     let reason = if stop_note == REPEATED_CALL_NOTE {
         REPEATED_CALL_REASON
     } else {
@@ -1707,6 +1713,20 @@ async fn run_chat(
         };
         return Ok(chat_response_body(
             &reply,
+            &tool_trace,
+            build_run_id.as_deref(),
+            chart_created,
+            Some(stop_note),
+        ));
+    }
+    // AI-36 F1: a model that spent every round on chart writes that did not
+    // take effect may still claim it made a chart. The trace, not the model's
+    // wording, decides: no successful or drafted `create_chart`/`update_chart`
+    // means no chart exists, so the claim is replaced by a fixed sentence. The
+    // limit note stays, and a turn that drafted or saved a chart is untouched.
+    if hit_tool_limit && chart_write_attempted_without_effect(&tool_trace) {
+        return Ok(chat_response_body(
+            &chart_not_saved_reply(&tool_trace),
             &tool_trace,
             build_run_id.as_deref(),
             chart_created,
@@ -1817,10 +1837,10 @@ async fn before_turn_end<T>(
     tokio::time::timeout(remaining, round).await.ok()
 }
 
-/// The reply of a turn that stopped for time (`AI-34`): one sentence that
-/// says so, and names the tools that ran before the stop. Fixed text, and it
-/// claims nothing about what the results show.
-fn timed_out_reply(tool_trace: &[Value]) -> String {
+/// The tools a turn ran, each backticked, in the order they were first seen.
+/// Shared by the time-out reply and the chart-not-saved reply so both name
+/// the same trace the same way.
+fn ran_tool_names(tool_trace: &[Value]) -> String {
     let mut ran: Vec<&str> = Vec::new();
     for step in tool_trace {
         if let Some(tool) = step["tool"].as_str()
@@ -1829,13 +1849,51 @@ fn timed_out_reply(tool_trace: &[Value]) -> String {
             ran.push(tool);
         }
     }
-    if ran.is_empty() {
+    ran.iter()
+        .map(|tool| format!("`{tool}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The reply of a turn that stopped for time (`AI-34`): one sentence that
+/// says so, and names the tools that ran before the stop. Fixed text, and it
+/// claims nothing about what the results show.
+fn timed_out_reply(tool_trace: &[Value]) -> String {
+    let names = ran_tool_names(tool_trace);
+    if names.is_empty() {
         return "The question took too long to answer in the time allowed, and no tool ran before the time ran out.".to_owned();
     }
-    let names: Vec<String> = ran.iter().map(|tool| format!("`{tool}`")).collect();
     format!(
-        "The question took too long to answer in the time allowed, so it stops after these tools ran: {}.",
-        names.join(", ")
+        "The question took too long to answer in the time allowed, so it stops after these tools ran: {names}."
+    )
+}
+
+/// Whether a chart write was attempted in the turn but none took effect. A
+/// call took effect when it succeeded (`ok`) or it is a `needs_confirmation`
+/// draft the console shows — the same draft test `take_next_step` reads.
+fn chart_write_attempted_without_effect(tool_trace: &[Value]) -> bool {
+    let mut attempted = false;
+    for step in tool_trace {
+        if !matches!(step["tool"].as_str(), Some("create_chart" | "update_chart")) {
+            continue;
+        }
+        attempted = true;
+        if step["ok"].as_bool() == Some(true)
+            || step["result"]["needs_confirmation"].as_bool() == Some(true)
+        {
+            return false;
+        }
+    }
+    attempted
+}
+
+/// The reply when a chart write was attempted but none took effect before the
+/// tool-call limit stopped the turn. Fixed text, never a claim the trace does
+/// not back. The caller has seen a chart tool in the trace, so a name is here.
+fn chart_not_saved_reply(tool_trace: &[Value]) -> String {
+    format!(
+        "No chart was made because the request used up its tool calls before the chart could be saved, after these tools ran: {}.",
+        ran_tool_names(tool_trace)
     )
 }
 
@@ -4320,6 +4378,27 @@ mod tests {
         ];
         let reply = unfinished_reply(&trace, BUDGET_REASON);
         assert!(reply.contains("`create_chart`: no reason given"), "{reply}");
+    }
+
+    /// A chart write is unbacked only when `create_chart` or `update_chart`
+    /// was tried and no call of either succeeded or returned a draft. Other
+    /// tools, a saved chart and a draft all leave the model's text alone.
+    #[test]
+    fn an_unbacked_chart_write_ignores_other_tools_and_both_kinds_of_effect() {
+        let refused = vec![
+            json!({ "tool": "list_boards", "ok": true, "result": {} }),
+            json!({ "tool": "update_chart", "ok": false, "result": { "error": "no" } }),
+        ];
+        assert!(chart_write_attempted_without_effect(&refused));
+        let drafted = vec![
+            json!({ "tool": "create_chart", "ok": true, "result": { "needs_confirmation": true } }),
+        ];
+        assert!(!chart_write_attempted_without_effect(&drafted));
+        let saved = vec![json!({ "tool": "update_chart", "ok": true, "result": { "ok": true } })];
+        assert!(!chart_write_attempted_without_effect(&saved));
+        let no_write =
+            vec![json!({ "tool": "list_boards", "ok": false, "result": { "error": "no" } })];
+        assert!(!chart_write_attempted_without_effect(&no_write));
     }
 
     // AI-34: a turn that runs long on a slow model answers from what it
