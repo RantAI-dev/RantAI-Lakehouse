@@ -3611,10 +3611,21 @@ html[data-tod="day"] footer .lk-wm [class*="text-[#E8F4FF]/[0.12]"] {
   html[data-scene] .lk-show-visual:not([data-on]) *::after {
     animation-play-state: paused !important;
   }
+  /* The dots sit with the words, between the promise and its picture, and the pictures hang from
+     the top of the stage, so what is left of the screen is under the picture, not between parts. */
   html[data-scene] .lk-show-dots {
+    order: 1;
     display: flex;
-    justify-content: center;
+    justify-content: flex-start;
     gap: 6px;
+    padding-left: 22px;
+  }
+  html[data-scene] .lk-show-stage {
+    order: 2;
+  }
+  /* The pin's own empty foot is the gap to Get started at the release. */
+  html[data-scene] #open {
+    padding-bottom: 8px;
   }
   html[data-scene] .lk-show-dots > li {
     --lk-near: 0;
