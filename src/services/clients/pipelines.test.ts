@@ -209,6 +209,34 @@ describe("dagsterPipelineService refusals on a write", () => {
   })
 })
 
+describe("dagsterPipelineService re-upload chain read", () => {
+  it("reads the newest chain step from the pipeline's own route", async () => {
+    const step = {
+      rootRunId: "root-1",
+      sourceTable: "bronze.orders",
+      outcome: "started",
+      reason: null,
+      runId: "run-42",
+      causePipelineId: null,
+      causePipelineName: null,
+      recordedAt: "2026-11-20T10:02:11Z",
+    }
+    const calls = stubFetch(() => json({ last: step }))
+
+    const signal = new AbortController().signal
+    const body = await dagsterPipelineService.getReuploadChain("pl gold", signal)
+
+    expect(body).toEqual({ last: step })
+    expect(calls[0].url).toContain("/api/pipelines/pl%20gold/reupload-chain")
+    expect(calls[0].init?.signal).toBe(signal)
+  })
+
+  it("reads a null last step before any re-upload", async () => {
+    stubFetch(() => json({ last: null }))
+    expect(await dagsterPipelineService.getReuploadChain("pl-1")).toEqual({ last: null })
+  })
+})
+
 // BLD-16 / J6: the SQL of one form step of an unsaved definition. The body
 // and the answer are the plan's contract; a 400 keeps the API's sentence so
 // the editor can select the step and the row it names (D7).

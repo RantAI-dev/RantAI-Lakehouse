@@ -570,7 +570,10 @@ async fn table_access(
     state: &AppState,
     principal: &Principal,
 ) -> Result<crate::table_access::TableAccess, &'static str> {
-    crate::table_access::for_roles(state.pg.as_deref(), &principal.role_names)
+    // SEC-68: `for_principal` distinguishes a genuine `*:*` admin from a
+    // role-less service identity; the latter must not silently read every
+    // table through `for_roles(&[])`.
+    crate::table_access::for_principal(state.pg.as_deref(), principal)
         .await
         .map_err(|_| "the table access rule could not be read right now")
 }

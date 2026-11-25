@@ -849,9 +849,26 @@ def build_authored_dependency_sensors(
     docstring for the F1.1 BLOCKER this avoids). `run_jobs` does the
     HTTP fetch itself, so this function takes a plain list and is
     unit-testable without monkeypatching `requests`."""
+    # BLD-14 D7: one chain per re-upload owns a pipeline's run when the
+    # graph gives it chain parents, so the `_after` sensor must not also
+    # launch it. Both sensors are built from the SAME payload list, so
+    # they derive the same D3 order rather than two copies of the rule.
+    payloads = [p for p, _ in pipeline_jobs]
+    chain_graph = reupload_chain_graph(payloads)
+    # BLD-14 review R2: the chain also owns a first pipeline's launch, so
+    # `_after` must step aside for its file load too. The graph has no entry
+    # for a first pipeline without parents; add the empty one from D4. A
+    # pipeline that is both first and downstream keeps its graph entry.
+    first_entries = reupload_first_pipeline_entries(payloads)
     sensors: list[Any] = []
     for pipeline, authored_job in pipeline_jobs:
-        sensor = build_authored_dependency_sensor(pipeline, authored_job)
+        pipeline_id = str(pipeline.get("id"))
+        chain = {**first_entries.get(pipeline_id, {}), **chain_graph.get(pipeline_id, {})}
+        sensor = build_authored_dependency_sensor(
+            pipeline,
+            authored_job,
+            chain=chain,
+        )
         if sensor is not None:
             sensors.append(sensor)
     return sensors
@@ -1093,7 +1110,7 @@ def _latest_record_for_ingest_table(instance: Any, table: str) -> Any | None:
 
 
 def build_authored_dependency_sensor(
-    pipeline: dict[str, Any], authored_job: Any
+    pipeline: dict[str, Any], authored_job: Any, chain: dict[str, ChainEntry] | None = None
 ) -> Any | None:
     """One `run_status_sensor` for `pipeline`, or `None` when it has no
     `dependsOn`. Reads `dependsOn` (camelCase), matching the wire
@@ -1137,6 +1154,14 @@ def build_authored_dependency_sensor(
     connector per run and reads it from the materialization that run logged
     (`_latest_record_for_ingest_table`). Everything else keeps the
     unfiltered rule above, byte for byte.
+
+    BLD-14 D5/D7: `chain` is this pipeline's D3 entry map (`table` ->
+    [`ChainEntry`]). When a file load of a table it belongs to is the fresh
+    upstream, the chain sensor owns that launch and this sensor skips; a
+    run of a chain parent tagged with the same re-upload root skips too.
+    Otherwise a file load's `RunRequest` carries the two re-upload tags so
+    the downstream chain can tell which load it came from. A manual or
+    scheduled upstream still triggers this sensor exactly as before.
     """
     # BLD-2 D3: A target lag (either kind) replaces the dependency (_after) sensor while it is set.
     # The dependsOn list stays stored, so clearing the target lag restores the chain sensor (AC8).
@@ -1183,6 +1208,14 @@ def build_authored_dependency_sensor(
         if source_zone and source_table
         else "a source that names no bronze table"
     )
+    chain = chain or {}
+
+    def _chain_skip(table: str | None) -> str | None:
+        entry = chain.get(table or "")
+        if entry is None:
+            return None
+        parents = ", ".join(entry.parents)
+        return f"BLD-14: the re-upload chain starts this pipeline after {parents}"
 
     @run_status_sensor(
         run_status=DagsterRunStatus.SUCCESS,
@@ -1197,6 +1230,10 @@ def build_authored_dependency_sensor(
         ),
     )
     def _dependency_sensor(context: Any) -> Any:
+        # D5: a fresh file load gives the RunRequest its two tags; a manual
+        # or scheduled upstream leaves them unset. Both are per-tick state.
+        reupload_root: str | None = None
+        reupload_table: str | None = None
         # `context.dagster_run` is the upstream run that triggered THIS
         # tick -- it is always SUCCESS here (`run_status=SUCCESS` on the
         # decorator).
@@ -1306,6 +1343,35 @@ def build_authored_dependency_sensor(
                     f"this upstream run ({upstream_run.run_id}) is not enough"
                 )
                 return
+            # BLD-14 D5/D7: a fresh file load of a table this pipeline is
+            # in the chain for belongs to the chain sensor, not to this
+            # one. Remember the root so an untagged chain (P10's floor)
+            # still passes the re-upload tags to its RunRequest.
+            if upstream_id == FILE_INGEST_JOB and latest is not None and latest.end_time is not None:
+                if (reason := _chain_skip(bronze_table)) is not None:
+                    yield SkipReason(reason)
+                    return
+                reupload_root = latest.dagster_run.run_id
+                reupload_table = bronze_table or ""
+            elif (
+                upstream_id.startswith("pl-")
+                and latest is not None
+                and latest.end_time is not None
+            ):
+                # An upstream pipeline's run tagged by the chain sensor is
+                # also owned by that chain: this sensor must not launch a
+                # second run for the same re-upload (D7).
+                upstream_tags = getattr(latest.dagster_run, "tags", None) or {}
+                tagged_table = upstream_tags.get(REUPLOAD_TABLE_TAG)
+                if (
+                    upstream_tags.get(REUPLOAD_ROOT_TAG)
+                    and tagged_table in chain
+                    and upstream_id in chain[tagged_table].parents
+                ):
+                    yield SkipReason(
+                        _chain_skip(tagged_table) or "BLD-14: the re-upload chain owns this run"
+                    )
+                    return
             if latest.end_time <= (downstream_start or 0.0):
                 if upstream_id in _PER_TABLE_UPSTREAMS and bronze_table:
                     # BLD-4 review R1 SHOULD-FIX 1: name the table in the stale anchor reason
@@ -1329,7 +1395,15 @@ def build_authored_dependency_sensor(
         # see the same set of upstreams ask for the same downstream
         # launch exactly once.
         joined = ",".join(sorted(latest_success_ids))
-        yield RunRequest(run_key=f"authored-deps:{joined}")
+        tags = (
+            {REUPLOAD_ROOT_TAG: reupload_root, REUPLOAD_TABLE_TAG: reupload_table}
+            if reupload_root is not None and reupload_table is not None
+            else None
+        )
+        # The run_key stays exactly as before: D5 adds tags, not a new
+        # dedup key. A manual or scheduled upstream has no root and keeps
+        # an untagged request.
+        yield RunRequest(run_key=f"authored-deps:{joined}", tags=tags)
 
     return _dependency_sensor
 
@@ -1496,6 +1570,198 @@ def _pipeline_tenant(p: dict[str, Any]) -> str | None:
 def _pipeline_depends_on(p: dict[str, Any]) -> list[str]:
     deps = p.get("dependsOn") or p.get("depends_on") or []
     return [str(d) for d in deps]
+
+
+# ── BLD-14: the re-upload chain graph ──────────────────────────────────────
+#
+# `DEC-22` says a re-upload runs the pipelines DOWNSTREAM of the ones that
+# read the loaded table, not just those. The order already exists as data:
+# `_pipeline_target(A)` in `_pipeline_sources(B)` (BLD-1 part 1 D11, the same
+# rule as the store's `input_tables_of`). This pure module derives nothing
+# new from the wire: it reuses those two helpers and applies D3's rule.
+REUPLOAD_ROOT_TAG = "lakehouse/reupload-root"
+REUPLOAD_TABLE_TAG = "lakehouse/reupload-table"
+# P5: waiting for a chain's parents ends at the authored run limit.
+CHAIN_WAIT_LIMIT_SECONDS = DEFAULT_RUN_LIMIT_SECONDS
+
+
+@dataclass(frozen=True)
+class ChainEntry:
+    """One pipeline's place in one bronze table's re-upload chain.
+
+    `parents` are the direct predecessors inside the chain; `ancestors` are
+    every node that can reach it, so a failure two steps up can be named as
+    the cause (D9). Both are sorted tuples so two callers that derive the
+    graph from different payload orders agree byte for byte.
+    """
+
+    parents: tuple[str, ...]
+    ancestors: tuple[str, ...]
+
+
+def _chain_cyclic_nodes(edges: dict[str, set[str]]) -> set[str]:
+    """Every node on a directed cycle (Tarjan's SCC), or nothing.
+
+    P2 leaves a cycle out rather than refusing to save such pipelines: a
+    node that waits on itself would never launch. An edge out of a cycle is
+    also gone once the cycle's nodes are dropped, so anything reachable
+    only through the loop is left out with it.
+    """
+    index = 0
+    indices: dict[str, int] = {}
+    low: dict[str, int] = {}
+    stack: list[str] = []
+    on_stack: set[str] = set()
+    cyclic: set[str] = set()
+
+    def visit(node: str) -> None:
+        nonlocal index
+        indices[node] = low[node] = index
+        index += 1
+        stack.append(node)
+        on_stack.add(node)
+        for nxt in edges[node]:
+            if nxt not in indices:
+                visit(nxt)
+                low[node] = min(low[node], low[nxt])
+            elif nxt in on_stack:
+                low[node] = min(low[node], indices[nxt])
+        if low[node] == indices[node]:
+            component: list[str] = []
+            while True:
+                member = stack.pop()
+                on_stack.discard(member)
+                component.append(member)
+                if member == node:
+                    break
+            if len(component) > 1:
+                cyclic.update(component)
+
+    for node in edges:
+        if node not in indices:
+            visit(node)
+    return cyclic
+
+
+def _reupload_chain_nodes_edges(
+    pipelines: list[dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, set[str]], dict[str, set[str]]]:
+    """P1 nodes and D3 edges, with P2's cycles removed. Shared by the
+    downstream graph and by the first-pipeline entry map (BLD-14 review R2)
+    so the two launchers derive the same order from one set of helpers."""
+    nodes: dict[str, dict[str, Any]] = {}
+    for pipeline in pipelines:
+        pipeline_id = pipeline.get("id")
+        if not isinstance(pipeline_id, str) or not pipeline_id:
+            continue
+        if (
+            pipeline.get("status") != "ready"
+            or pipeline.get("targetLag") is not None
+            or _pipeline_tenant(pipeline) is None
+        ):
+            continue
+        nodes[pipeline_id] = pipeline
+
+    successors: dict[str, set[str]] = {pid: set() for pid in nodes}
+    predecessors: dict[str, set[str]] = {pid: set() for pid in nodes}
+    for upstream_id, upstream in nodes.items():
+        target = _pipeline_target(upstream)
+        if not target:
+            continue
+        for downstream_id, downstream in nodes.items():
+            if upstream_id == downstream_id:
+                continue
+            if _pipeline_tenant(upstream) != _pipeline_tenant(downstream):
+                continue
+            if target in _pipeline_sources(downstream):
+                successors[upstream_id].add(downstream_id)
+                predecessors[downstream_id].add(upstream_id)
+
+    cyclic = _chain_cyclic_nodes(successors)
+    for node in cyclic:
+        nodes.pop(node, None)
+        successors.pop(node, None)
+        predecessors.pop(node, None)
+    for node in successors:
+        successors[node] -= cyclic
+        predecessors[node] -= cyclic
+    return nodes, successors, predecessors
+
+
+def reupload_first_pipeline_entries(
+    pipelines: list[dict[str, Any]],
+) -> dict[str, dict[str, ChainEntry]]:
+    """The first pipelines a re-upload reaches, each with an empty chain
+    entry (BLD-14 review R2 BLOCKER, option A). The chain sensor owns THEIR
+    launch too -- same `run_key` per re-upload and pipeline -- so a newer
+    load that ends while an older first run is queued still gets its own
+    tagged run; `_after` steps aside for the file load instead. Uses the
+    same P1/P2/D4 helpers as `reupload_chain_graph`, never a second order.
+    """
+    nodes, _successors, _predecessors = _reupload_chain_nodes_edges(pipelines)
+    entries: dict[str, dict[str, ChainEntry]] = {}
+    for pipeline_id, pipeline in nodes.items():
+        definition = pipeline.get("definition") or {}
+        if definition.get("sourceZone") != "bronze" or not definition.get("sourceTable"):
+            continue
+        if FILE_INGEST_JOB not in _pipeline_depends_on(pipeline):
+            continue
+        entries.setdefault(pipeline_id, {})[str(definition["sourceTable"])] = ChainEntry(
+            parents=(), ancestors=()
+        )
+    return entries
+
+
+def reupload_chain_graph(
+    pipelines: list[dict[str, Any]],
+) -> dict[str, dict[str, ChainEntry]]:
+    """Derive, per pipeline id and bronze table, its chain place (D3, P1-P2).
+
+    A node is a `ready` pipeline with no target lag and a tenant (P1). An
+    edge A -> B is D3's rule: same tenant, A != B and A's target is one of
+    B's inputs. Nodes on a cycle are dropped (P2). A chain starts at a
+    pipeline whose first input is `bronze.<T>` with `file_ingest_job` in
+    `dependsOn` (D4) and reaches everything downstream of it; a reached
+    pipeline with no parent in that reach has no entry (the switch being
+    off on the first pipeline leaves nothing below it in the chain).
+    """
+    nodes, successors, predecessors = _reupload_chain_nodes_edges(pipelines)
+
+    first_by_table: dict[str, set[str]] = {}
+    for pipeline_id, pipeline in nodes.items():
+        definition = pipeline.get("definition") or {}
+        if definition.get("sourceZone") != "bronze" or not definition.get("sourceTable"):
+            continue
+        if FILE_INGEST_JOB not in _pipeline_depends_on(pipeline):
+            continue
+        table = str(definition["sourceTable"])
+        first_by_table.setdefault(table, set()).add(pipeline_id)
+
+    graph: dict[str, dict[str, ChainEntry]] = {}
+    for table, first_pipelines in first_by_table.items():
+        reach: set[str] = set()
+        pending = list(first_pipelines)
+        while pending:
+            current = pending.pop()
+            if current in reach:
+                continue
+            reach.add(current)
+            pending.extend(successors.get(current, set()) - reach)
+        for pipeline_id in reach:
+            parents = tuple(sorted(predecessors[pipeline_id] & reach))
+            if not parents:
+                continue
+            ancestors: set[str] = set()
+            pending = list(parents)
+            while pending:
+                current = pending.pop()
+                if current in ancestors:
+                    continue
+                ancestors.add(current)
+                pending.extend(predecessors.get(current, set()) & reach)
+            entry = ChainEntry(parents=parents, ancestors=tuple(sorted(ancestors)))
+            graph.setdefault(pipeline_id, {})[table] = entry
+    return graph
 
 
 def build_authored_lag_sensors(

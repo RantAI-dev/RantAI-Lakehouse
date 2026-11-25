@@ -424,6 +424,29 @@ pub async fn runs(
     (StatusCode::OK, ApiJson(body)).into_response()
 }
 
+/// `GET /api/pipelines/{id}/reupload-chain` — the newest chain outcome the
+/// page shows as one sentence (BLD-14 D8). It is a page read like [`runs`],
+/// so it lives here rather than in the orchestrator-only authored router.
+///
+/// BLD-14 review R5: the per-tenant gate runs first, exactly as [`runs`]
+/// does; an id in another tenant and an unknown id are the same 404.
+///
+/// # Errors
+///
+/// 404 for an unknown id or one outside the caller's tenant; 503 with no
+/// database; 500 on a store failure.
+pub async fn reupload_chain(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id).await?;
+    let pool = pool(&state)?;
+    let last = lakehouse_store::pipeline_chain::latest_chain_step(pool, &id).await?;
+    Ok(ApiJson(json!({ "last": last })))
+}
+
 async fn runs_body(state: &AppState, id: &str) -> Value {
     // An authored pipeline's runs belong to its `authored__<id>` job; the
     // `pl-` id itself names no job, so asking for it always found none.
@@ -4038,14 +4061,15 @@ async fn authored_status(
 }
 
 /// Switch the stored Dagster state of every automation that can launch an
-/// authored pipeline: its cron schedule, its dependency `_after` sensor and
-/// — for `targetLag.kind == "lag"` — its freshness `_lag` sensor (BLD-18).
+/// authored pipeline: its cron schedule, its dependency `_after` sensor, the
+/// re-upload chain `_chain` sensor (BLD-14) and — for `targetLag.kind ==
+/// "lag"` — its freshness `_lag` sensor (BLD-18).
 ///
 /// Each flip is best effort: the status is the record, and a definition that
-/// was never built (no cron schedule, no `dependsOn`, no target lag) is not
-/// an error. [`lakehouse_dagster::DgClient::set_sensor_running`] already
-/// treats a missing sensor on `running=false` as already stopped; a missing
-/// schedule or a `startSensor` on an undefined sensor comes back as an
+/// was never built (no cron schedule, no `dependsOn`, no chain sensor, no
+/// target lag) is not an error. [`lakehouse_dagster::DgClient::set_sensor_running`]
+/// already treats a missing sensor on `running=false` as already stopped; a
+/// missing schedule or a `startSensor` on an undefined sensor comes back as an
 /// `Ok` outcome with `error` set, which is logged here and never surfaced.
 async fn toggle_authored_automation(
     state: &AppState,
@@ -4095,6 +4119,22 @@ async fn toggle_authored_automation(
         {
             tracing::info!(%err, pipeline_id = id, "authored lag sensor not switched");
         }
+    }
+    // BLD-14 D6/D7: the re-upload chain sensor is a fourth automation for
+    // the same pipeline. Its stored state also outlives a reload, so a
+    // paused pipeline would otherwise keep launching the downstream chain.
+    // A pipeline without a chain sensor is tolerated just like a missing
+    // `_after` sensor (SensorNotFoundError on stop, error outcome on start).
+    let chain_sensor = authored_pipelines::chain_sensor_name(id);
+    let chain_switched = state
+        .dagster
+        .set_sensor_running(&chain_sensor, running)
+        .await;
+    if let Ok(SensorOutcome {
+        error: Some(err), ..
+    }) = &chain_switched
+    {
+        tracing::info!(%err, pipeline_id = id, "authored chain sensor not switched");
     }
 }
 

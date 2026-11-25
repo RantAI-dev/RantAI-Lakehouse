@@ -295,6 +295,7 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("DELETE", "/api/pipelines/{id}", Coverage::Handler { action: "pipeline.delete", resource_kind: "pipeline" }),
     ("POST", "/api/pipelines/runnable/{id}/lag-check", Coverage::Excluded { reason: EX_LAG_CHECK }),
     ("POST", "/api/pipelines/runnable/{id}/compile", Coverage::Excluded { reason: EX_READ_LIKE }),
+    ("POST", "/api/pipelines/runnable/{id}/chain-step", Coverage::Excluded { reason: EX_MACHINE }),
     ("POST", "/api/pipelines/{id}/trigger", Coverage::Handler { action: "pipeline.trigger", resource_kind: "pipeline" }),
     ("POST", "/api/pipelines/{id}/status", Coverage::Central { action: "pipeline.status_set", resource_kind: "pipeline", id_param: IdParam::Path("id") }),
     ("POST", "/api/pipelines/{id}/pause", Coverage::Handler { action: "pipeline.pause", resource_kind: "pipeline" }),
@@ -455,7 +456,9 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     // WEB-4 retired workflow creation, employee creation and the
     // suspend/resume/revoke routes: their audit entries went with them.
     // The headless-run route is kept — Dagster's scheduled/manual trigger
-    // still calls it and its execution is audited.
+    // still calls it and its execution is audited. SEC-68's explicit role
+    // grant stays: it is served by a live route and audited centrally.
+    ("PUT", "/api/agents/employees/{id}/read-roles", Coverage::Central { action: "agent.read_roles.set", resource_kind: "digital_employee", id_param: IdParam::Path("id") }),
     ("POST", "/api/agents/employees/{id}/run", Coverage::Central { action: "digital_employee.run", resource_kind: "digital_employee", id_param: IdParam::Path("id") }),
     ("POST", "/api/agents/approvals/{id}/decide", Coverage::Handler { action: crate::routes::agents::APPROVAL_DECIDE_ACTION, resource_kind: "approval" }),
 ];
