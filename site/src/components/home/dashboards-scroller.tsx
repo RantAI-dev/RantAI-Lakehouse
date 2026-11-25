@@ -89,9 +89,9 @@ export function DashboardsScroller({
       style={{ height: "calc(100vh + 0px)" }}
     >
       {/* WEB-5 M2 (phone pass): below 1024 px the stage sits under the 64 px bar and its content
-          (heading, one tile, the dots) is one block centred in the screen that is left, so there
-          is no band of empty water above or below the rail. */}
-      <div className="lk-fallback-bg sticky top-0 flex h-[100svh] flex-col justify-center overflow-hidden bg-[var(--lk-n-bg)] max-lg:pt-16 motion-reduce:static motion-reduce:h-auto motion-reduce:py-28 max-lg:motion-reduce:py-20">
+          (heading, one tile, the dots) is one block centred in the screen that is left, a little
+          above the middle, so there is no band of empty water above or below the rail. */}
+      <div className="lk-fallback-bg sticky top-0 flex h-[100svh] flex-col justify-center overflow-hidden bg-[var(--lk-n-bg)] max-lg:pt-16 max-lg:pb-[8svh] motion-reduce:static motion-reduce:h-auto motion-reduce:py-28 max-lg:motion-reduce:py-20">
         {before}
 
         {/* The rail. Pinned: transformed by scroll. Reduced motion: a native horizontal scroller.

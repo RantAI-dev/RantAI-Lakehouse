@@ -39,7 +39,7 @@ export function AssistantSection({ copy }: { copy: AssistantCopy }) {
       id="assistant"
       className="lk-fallback-bg relative overflow-hidden bg-[var(--lk-n-bg)] motion-safe:[html[data-scene]_&]:-mt-[30vh]"
     >
-      <Container className="relative z-10 grid min-h-[100svh] items-center gap-10 py-24 md:grid-cols-[1fr_1.1fr] md:gap-14 md:py-28">
+      <Container className="relative z-10 grid min-h-[100svh] items-center gap-10 py-24 max-md:pb-12 md:grid-cols-[1fr_1.1fr] md:gap-14 md:py-28">
         <div>
           <DisplayHeading size="lg" className="max-md:text-[clamp(2.2rem,10vw,2.8rem)]">
             <SplitWords text={copy.headline} />

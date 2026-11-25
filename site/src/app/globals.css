@@ -3396,6 +3396,10 @@ html[data-tod="day"] footer .lk-wm [class*="text-[#E8F4FF]/[0.12]"] {
 [data-home] #faq { contain-intrinsic-block-size: auto 635px; }
 :lang(id) [data-home] #get-started { contain-intrinsic-block-size: auto 753.63px; }
 :lang(id) [data-home] #faq { contain-intrinsic-block-size: auto 688.88px; }
+/* Phones under 375 px: the English governance section is one line taller (measured at 360). */
+@media (max-width: 374.98px) {
+  [data-home] #governance { contain-intrinsic-block-size: auto 1312.16px; }
+}
 @media (min-width: 768px) {
   [data-home] #governance,
   :lang(id) [data-home] #governance { contain-intrinsic-block-size: auto 890.73px; }
