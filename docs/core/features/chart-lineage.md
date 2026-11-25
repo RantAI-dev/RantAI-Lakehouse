@@ -51,14 +51,18 @@ changed.
 
 ## Asking the assistant
 
-`AI-13`: a new read tool `get_chart_lineage { chart }` returns the same path
-the panel shows (steps, kinds, refresh times, columns per field, gaps), under
-the person's permissions; the dashboard page's context already names the
-charts, so "Where does this number come from?" on a chart resolves to it.
-`get_lineage` gains "used by" in its answer for a table. The prompt tells the
-assistant to name the source tables, the connector and the refresh times, and
-to say "not recorded" where the path stops. Fixture regenerated; the standard
-request set gains the `AI-13-AC1` request. The AI team reviews this part.
+`AI-13`: the chart's path comes from the existing `get_lineage` tool, which
+now takes an optional `chart` argument (`get_lineage { chart }`); there is no
+separate chart-lineage tool, because the owner's prompt size ceilings make one
+extended tool cheaper than two (planner decision 1, plan ai-143). It returns
+the same path the panel shows (steps, kinds, refresh times, columns per field,
+gaps), under the person's permissions; the dashboard page's context already
+names the charts, so "Where does this number come from?" on a chart resolves
+to it. With `slug` the answer also lists the charts that use the table. The
+prompt tells the assistant to name the source tables, the connector and the
+refresh times, and to say "not recorded" where the path stops. Fixture
+regenerated; the standard request set gains the `AI-13-AC1` request. The AI
+team reviews this part.
 
 ## Acceptance checklist
 
