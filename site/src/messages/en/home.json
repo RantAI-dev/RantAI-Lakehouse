@@ -8,6 +8,7 @@
       "Free & open source (AGPL-3.0)",
       "Runs on your servers"
     ],
+    "reassurancePhone": ["Free", "Open source", "Runs on your servers"],
     "scrollCue": "Scroll to dive",
     "tod": { "day": "Day", "night": "Night", "label": "Day mode" }
   },

@@ -56,7 +56,9 @@ export function HeroSection({
             {/* WEB-1 review round 1 SHOULD-FIX 4: on a phone the eyebrow sits on the moon's
                 reflection, so it is lighter and carries a dark halo there. */}
             {/* O50 (audit #7): who it is for, not the product name the top bar already shows. */}
-            <Eyebrow className="lk-ii text-balance max-md:text-[#a9d6ff] max-md:[text-shadow:0_0_10px_rgba(2,5,20,0.95),0_1px_2px_rgba(2,5,20,0.9)]">
+            {/* WEB-5 owner QA 2026-11-25 ("kek ada 4 text disini"): below 1024 px the eyebrow goes; the
+                reassurance's "Runs on your servers" already says who it is for. */}
+            <Eyebrow className="lk-ii text-balance max-lg:hidden max-md:text-[#a9d6ff] max-md:[text-shadow:0_0_10px_rgba(2,5,20,0.95),0_1px_2px_rgba(2,5,20,0.9)]">
               {copy.eyebrow}
             </Eyebrow>
             <DisplayHeading as="h1" size="xl" className="lk-ii mt-5 short:mt-3 short:text-[2.75rem]">
@@ -83,11 +85,21 @@ export function HeroSection({
                 <li
                   key={part}
                   className={cn(
-                    "whitespace-nowrap",
+                    "whitespace-nowrap max-lg:hidden",
                     i > 0 && "before:mx-2 before:text-[#44A6FA] before:content-['·']",
                     i === 0 && "max-sm:basis-full max-sm:text-center",
                     i === 1 && "max-sm:before:hidden",
                   )}
+                >
+                  {part}
+                </li>
+              ))}
+              {/* Owner QA 2026-11-25: below 1024 px one line of three short claims (the licence's
+                  name is in the open-source section). The same list, so the intro's beats are unchanged. */}
+              {copy.reassurancePhone.map((part, i) => (
+                <li
+                  key={`p-${part}`}
+                  className={cn("whitespace-nowrap lg:hidden", i > 0 && "before:mx-2 before:text-[#44A6FA] before:content-['·']")}
                 >
                   {part}
                 </li>

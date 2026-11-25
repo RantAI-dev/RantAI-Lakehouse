@@ -8,6 +8,7 @@
       "Gratis & open source (AGPL-3.0)",
       "Jalan di server Anda"
     ],
+    "reassurancePhone": ["Gratis", "Open source", "Jalan di server Anda"],
     "scrollCue": "Gulir untuk menyelam",
     "tod": { "day": "Siang", "night": "Malam", "label": "Mode siang" }
   },
