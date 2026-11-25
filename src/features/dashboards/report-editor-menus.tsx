@@ -20,7 +20,7 @@ import { BubbleMenu } from "@tiptap/react/menus"
 import { Bold, Check, GripVertical, Italic, Link2, Plus, Unlink } from "lucide-react"
 
 import { safeReportUrl } from "@/lib/report-blocks"
-import { CHART_NODE, SLASH_GROUPS } from "@/lib/report-doc"
+import { CHART_NODE, DRAFT_NODE, SLASH_GROUPS } from "@/lib/report-doc"
 import { cn } from "@/lib/utils"
 import { endBlockDrag, startBlockDrag, type SlashItem, type SlashStore } from "./report-editor-extensions"
 import { EASE, FOCUS, IconTip } from "./report-editor-ui"
@@ -129,7 +129,7 @@ export function SlashMenu({ store, icons }: { readonly store: SlashStore; readon
                 const idx = enabled.indexOf(item)
                 const on = idx === active
                 const Icon = icons[item.id]
-                return (
+                const row = (
                   <div
                     key={item.id}
                     role="option"
@@ -158,9 +158,20 @@ export function SlashMenu({ store, icons }: { readonly store: SlashStore; readon
                     >
                       {Icon ? <Icon className="size-4" /> : null}
                     </span>
-                    <span className="min-w-0 flex-1 truncate">{item.label}</span>
+                    <span className="min-w-0 flex-1 truncate">
+                      {item.label}
+                      {item.disabled && item.reason ? <span className="sr-only">, {item.reason}</span> : null}
+                    </span>
                     {item.hint ? <span className="shrink-0 pr-1 text-xs text-muted-foreground">{item.hint}</span> : null}
                   </div>
+                )
+                // A disabled row says why on hover (BI-62 D8: Ask AI while a draft is open or an answer is on its way).
+                return item.disabled && item.reason ? (
+                  <IconTip key={item.id} label={item.reason} side="right">
+                    {row}
+                  </IconTip>
+                ) : (
+                  row
                 )
               })}
             </div>
@@ -371,7 +382,8 @@ export function BlockHandles({
       let start = 0
       for (let i = 0; i < doc.childCount; i++) {
         const node = doc.child(i)
-        if (i > 0) {
+        // A draft is not a block of the report: it has no handles (BI-62 D8).
+        if (i > 0 && node.type.name !== DRAFT_NODE) {
           const dom = editor.view.nodeDOM(start) as HTMLElement | null
           if (dom instanceof HTMLElement) {
             // A chart's view wraps its card; a wide card reaches past the wrapper, so measure the card.
