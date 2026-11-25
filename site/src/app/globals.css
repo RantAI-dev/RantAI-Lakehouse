@@ -3408,3 +3408,17 @@ html[data-tod="day"] footer .lk-wm [class*="text-[#E8F4FF]/[0.12]"] {
   [data-home] #faq,
   :lang(id) [data-home] #faq { contain-intrinsic-block-size: auto 432px; }
 }
+
+/* ---- WEB-5 phone pass (plan §12, M1–M11): rules for below 1024 px only ----
+   Desktop (1024 px and up) does not change; every rule here is inside a max-width query or
+   styles an element that only renders below 1024 px. */
+
+/* M2: the dashboards rail's position dots. `--lk-f` is the rail's position in tiles (set by
+   dashboards-scroller.tsx); a dot grows from 6 to 20 px and lights as its tile comes in. */
+.lk-dash-dots > li {
+  --lk-near: max(0, 1 - max(var(--lk-f, 0) - var(--i), var(--i) - var(--lk-f, 0)));
+  height: 6px;
+  width: calc(6px + 14px * var(--lk-near));
+  border-radius: 9999px;
+  background: rgb(232 244 255 / calc(0.22 + 0.6 * var(--lk-near)));
+}

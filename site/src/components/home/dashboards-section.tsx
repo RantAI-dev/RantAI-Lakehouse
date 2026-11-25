@@ -65,10 +65,10 @@ export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
             key={id}
             label={`${tile.kind}: ${tile.title}`}
             // O18: a clear lift (6 px) with a deeper shadow on hover, focus or a tap; still under reduced motion.
-            className="w-[78vw] shrink-0 rounded-3xl transition-transform duration-200 ease-out outline-none hover:-translate-y-1.5 focus-visible:-translate-y-1.5 active:-translate-y-1 motion-reduce:transition-none motion-reduce:hover:translate-y-0 motion-reduce:focus-visible:translate-y-0 sm:w-[380px] md:w-[420px]"
+            className="shrink-0 rounded-3xl transition-transform duration-200 ease-out outline-none hover:-translate-y-1.5 focus-visible:-translate-y-1.5 active:-translate-y-1 motion-reduce:transition-none motion-reduce:hover:translate-y-0 motion-reduce:focus-visible:translate-y-0 max-lg:w-[var(--lk-tw)] max-lg:snap-center lg:w-[420px]"
           >
-            <TiltCard className="rounded-3xl bg-[var(--lk-n-surface)] p-5 shadow-[0_30px_80px_-40px_rgba(2,5,20,0.9)] transition-shadow duration-200 ease-out group-hover/tile:shadow-[0_40px_90px_-36px_rgba(2,5,20,0.95),0_0_44px_-6px_rgba(68,166,250,0.55)] group-focus-visible/tile:shadow-[0_40px_90px_-36px_rgba(2,5,20,0.95),0_0_44px_-6px_rgba(68,166,250,0.6)] md:p-6">
-              <p className="text-[11px] tracking-[0.2em] text-[#44A6FA] uppercase">{tile.kind}</p>
+            <TiltCard className="rounded-3xl bg-[var(--lk-n-surface)] p-5 max-md:p-4 shadow-[0_30px_80px_-40px_rgba(2,5,20,0.9)] transition-shadow duration-200 ease-out group-hover/tile:shadow-[0_40px_90px_-36px_rgba(2,5,20,0.95),0_0_44px_-6px_rgba(68,166,250,0.55)] group-focus-visible/tile:shadow-[0_40px_90px_-36px_rgba(2,5,20,0.95),0_0_44px_-6px_rgba(68,166,250,0.6)] md:p-6">
+              <p className="text-[11px] tracking-[0.2em] text-[#44A6FA] uppercase max-lg:text-[12px]">{tile.kind}</p>
               <p className="mt-1.5 text-[15px] text-[#E8F4FF]/85 transition-colors duration-200 ease-out group-hover/tile:text-white group-focus-visible/tile:text-white">
                 {tile.title}
               </p>
