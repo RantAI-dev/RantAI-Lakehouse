@@ -1779,7 +1779,11 @@ fn create_pipeline_schema() -> Value {
             "targetZone": { "type": "string", "enum": ["silver", "serving"] },
             "targetTable": { "type": "string" },
             "transforms": { "type": "array", "items": { "type": "string" } },
-            "incrementalColumn": { "type": "string", "description": "optional column for incremental loads" },
+            "kind": { "type": "string", "enum": ["batch", "incremental"], "description": "batch (default) rebuilds the whole target each run; incremental materializes only new or changed rows" },
+            "incrementalColumn": { "type": "string", "description": "required when kind is incremental: the cursor column; letters digits and underscores, not starting with a digit, at most 128 characters" },
+            "incrementalStrategy": { "type": "string", "enum": ["append", "partition_replace"], "description": "incremental only, default append: append adds rows newer than the watermark; partition_replace rewrites entire day or month partitions and tolerates late-arriving data" },
+            "partitionGranularity": { "type": "string", "enum": ["day", "month"], "description": "partition_replace only, default day" },
+            "lookbackHours": { "type": "integer", "minimum": 0, "maximum": 720, "description": "partition_replace only, default 0: hours before the watermark included in the replaced window" },
             "schedule": { "type": "string", "description": "\"manual\" or a cron expression" } },
             "required": ["name", "targetZone", "targetTable"] } } })
 }

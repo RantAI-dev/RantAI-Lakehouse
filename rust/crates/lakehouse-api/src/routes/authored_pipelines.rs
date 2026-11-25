@@ -98,8 +98,15 @@ const MAX_TICKS: u32 = 50;
 /// `str.isalnum` and `char::is_ascii_alphanumeric` agree on them).
 #[must_use]
 pub fn job_name(id: &str) -> String {
-    let safe: String = id
-        .chars()
+    format!("authored__{}", dagster_safe_name(id))
+}
+
+/// The sanitized id both the job name and the op name use. This is Rust's
+/// byte-for-byte equivalent of `authored_factory._dagster_safe_name`: every
+/// character outside `[A-Za-z0-9_]` becomes `_`.
+#[must_use]
+pub fn dagster_safe_name(id: &str) -> String {
+    id.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' {
                 c
@@ -107,8 +114,16 @@ pub fn job_name(id: &str) -> String {
                 '_'
             }
         })
-        .collect();
-    format!("authored__{safe}")
+        .collect()
+}
+
+/// The Dagster OP name `authored_factory._op_for_pipeline` gives pipeline
+/// `id`: `authored_` plus the sanitized id (ONE underscore, unlike the job
+/// name's `authored__`). BLD-12's `fullRefresh` run config addresses this
+/// op, so the two sides must share the exact naming rule.
+#[must_use]
+pub fn op_name(id: &str) -> String {
+    format!("authored_{}", dagster_safe_name(id))
 }
 
 /// The schedule name `authored_factory.py` gives pipeline `id`'s job.
@@ -538,6 +553,111 @@ pub fn validate_target_table(target_table: &str) -> Result<(), ApiRejection> {
         return Err(ApiError::BadRequest(TARGET_TABLE_REFUSED.to_owned()).into());
     }
     Ok(())
+}
+
+// ── BLD-12: materialization validation ──────────────────────────────────
+
+/// The two kinds a pipeline may be authored as today. `"document"` and
+/// `"vector"` survive in old rows (they are still readable) but no new row
+/// may be created or edited with one.
+pub const ACTIVE_PIPELINE_KINDS: [&str; 2] = ["batch", "incremental"];
+
+pub const KIND_REFUSED: &str = "kind must be batch or incremental";
+pub const INCREMENTAL_COLUMN_REQUIRED: &str =
+    "incrementalColumn is required when kind is incremental";
+pub const INCREMENTAL_COLUMN_REFUSED: &str = "incrementalColumn must be a safe ClickHouse column identifier: letters, digits and underscores, not starting with a digit, at most 128 characters";
+pub const INCREMENTAL_STRATEGY_REFUSED: &str =
+    "incrementalStrategy must be append or partition_replace";
+pub const PARTITION_GRANULARITY_REFUSED: &str = "partitionGranularity must be day or month";
+pub const LOOKBACK_HOURS_REFUSED: &str = "lookbackHours must be between 0 and 720";
+
+/// A validated materialization config, ready for the store. Kept as one
+/// type so create/update/restore cannot forget one of the four fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializationConfig {
+    /// Watermark cursor column; `None` for a batch pipeline.
+    pub incremental_column: Option<String>,
+    pub incremental_strategy: String,
+    pub partition_granularity: String,
+    pub lookback_hours: i32,
+}
+
+/// Whether `column` is a safe `ClickHouse` identifier for the cursor: the
+/// same shape `authored_factory._is_safe_ch_identifier` re-checks before it
+/// interpolates a column into SQL, with the BLD-12 128-character ceiling.
+#[must_use]
+pub fn is_safe_incremental_column(column: &str) -> bool {
+    !column.is_empty()
+        && column.len() <= 128
+        && !column.starts_with(|c: char| c.is_ascii_digit())
+        && column
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// BLD-12: validate the kind and the materialization fields at every write
+/// boundary (create, update, restore and the assistant tool that calls them).
+///
+/// Fail closed: an active kind outside [`ACTIVE_PIPELINE_KINDS`] is refused,
+/// an incremental pipeline without a safe cursor is refused, and an unknown
+/// strategy/granularity or an out-of-range lookback is refused — all with
+/// fixed messages that never echo the caller's value back (AGENTS.md rule 4).
+/// A `batch` save then RESETS the incremental fields, so switching a pipeline
+/// back to full rebuild cannot leave a stale strategy behind.
+///
+/// # Errors
+///
+/// [`ApiError::BadRequest`] with one of the fixed sentences above.
+pub fn validate_materialization(
+    kind: &str,
+    incremental_column: Option<String>,
+    incremental_strategy: Option<String>,
+    partition_granularity: Option<String>,
+    lookback_hours: Option<i32>,
+) -> Result<MaterializationConfig, ApiError> {
+    if !ACTIVE_PIPELINE_KINDS.contains(&kind) {
+        return Err(ApiError::BadRequest(KIND_REFUSED.to_owned()));
+    }
+    if kind == "batch" {
+        return Ok(MaterializationConfig {
+            incremental_column: None,
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
+        });
+    }
+    let Some(column) = incremental_column else {
+        return Err(ApiError::BadRequest(INCREMENTAL_COLUMN_REQUIRED.to_owned()));
+    };
+    let column = column.trim().to_owned();
+    if column.is_empty() {
+        return Err(ApiError::BadRequest(INCREMENTAL_COLUMN_REQUIRED.to_owned()));
+    }
+    if !is_safe_incremental_column(&column) {
+        return Err(ApiError::BadRequest(INCREMENTAL_COLUMN_REFUSED.to_owned()));
+    }
+    let strategy = incremental_strategy.unwrap_or_else(|| "append".to_owned());
+    if !matches!(strategy.as_str(), "append" | "partition_replace") {
+        return Err(ApiError::BadRequest(
+            INCREMENTAL_STRATEGY_REFUSED.to_owned(),
+        ));
+    }
+    let granularity = partition_granularity.unwrap_or_else(|| "day".to_owned());
+    if !matches!(granularity.as_str(), "day" | "month") {
+        return Err(ApiError::BadRequest(
+            PARTITION_GRANULARITY_REFUSED.to_owned(),
+        ));
+    }
+    let lookback = lookback_hours.unwrap_or(0);
+    if !(0..=720).contains(&lookback) {
+        return Err(ApiError::BadRequest(LOOKBACK_HOURS_REFUSED.to_owned()));
+    }
+    Ok(MaterializationConfig {
+        incremental_column: Some(column),
+        incremental_strategy: strategy,
+        partition_granularity: granularity,
+        lookback_hours: lookback,
+    })
 }
 
 /// DATA-19 / D2: the one refusal a `file_ingest_job` upstream gets when the
@@ -1210,15 +1330,25 @@ fn update_input_from_body(
     body: &UpdateBody,
     connector_change: ConnectorChange,
     run_as: lakehouse_store::pipelines::RunAsChange,
-) -> UpdatePipelineInput {
-    UpdatePipelineInput {
+) -> Result<UpdatePipelineInput, ApiError> {
+    // BLD-12: an edit may only name an active kind, and an incremental one
+    // must carry a safe cursor. A batch save resets the incremental fields;
+    // nothing is written until this passes (fail closed, fixed 400 messages).
+    let materialization = validate_materialization(
+        &body.kind,
+        body.incremental_column.clone(),
+        body.incremental_strategy.clone(),
+        body.partition_granularity.clone(),
+        body.lookback_hours,
+    )?;
+    Ok(UpdatePipelineInput {
         kind: body.kind.clone(),
         source_zone: first.zone.clone(),
         source_table: first.table.clone(),
-        incremental_column: body
-            .incremental_column
-            .clone()
-            .filter(|c| !c.trim().is_empty()),
+        incremental_column: materialization.incremental_column.clone(),
+        incremental_strategy: materialization.incremental_strategy.clone(),
+        partition_granularity: materialization.partition_granularity.clone(),
+        lookback_hours: materialization.lookback_hours,
         transforms: form.legacy_transforms.clone().unwrap_or_default(),
         inputs: form.inputs.clone(),
         steps: form.steps.clone(),
@@ -1232,7 +1362,7 @@ fn update_input_from_body(
         depends_on: body.depends_on.clone(),
         connector_id: connector_change,
         run_as,
-    }
+    })
 }
 
 /// R1-B3 / D3a: a body in today's form, applied to the definition it may
@@ -2229,6 +2359,13 @@ pub async fn compile_pipeline(
         // D8: whether any input is Bronze decides `allow_database_iceberg` on
         // the statements the orchestrator runs.
         "readsIceberg": definition.inputs.iter().any(|input| input.zone == "bronze"),
+        // BLD-12: the materialization config travels with the compiled SQL
+        // so the orchestrator needs only one call to know HOW to write.
+        "kind": pipeline.kind,
+        "incrementalColumn": definition.incremental_column,
+        "incrementalStrategy": definition.incremental_strategy,
+        "partitionGranularity": definition.partition_granularity,
+        "lookbackHours": definition.lookback_hours,
     })))
 }
 
@@ -2246,6 +2383,14 @@ pub struct UpdateBody {
     source_table: Option<String>,
     #[serde(default)]
     incremental_column: Option<String>,
+    /// BLD-12: the materialization fields, validated together with `kind`
+    /// by [`validate_materialization`] before any store write.
+    #[serde(default)]
+    incremental_strategy: Option<String>,
+    #[serde(default)]
+    partition_granularity: Option<String>,
+    #[serde(default)]
+    lookback_hours: Option<i32>,
     /// The legacy form's transforms (absent is the same as empty).
     #[serde(default)]
     transforms: Option<Vec<String>>,
@@ -2453,7 +2598,7 @@ pub async fn update(
         (&body.target_zone, &body.target_table),
     )
     .await?;
-    let input = update_input_from_body(&form, &first, &body, connector_change, new_run_as);
+    let input = update_input_from_body(&form, &first, &body, connector_change, new_run_as)?;
     let updated = pipelines::update_pipeline(pool, &id, &input, Some(principal.id.uuid()))
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
@@ -2747,6 +2892,14 @@ pub async fn restore_version(
     // `status` are deliberately excluded: a restore is a replay of the
     // editable fields, not a rename/re-promotion (Plan R4 2b).
     let input = UpdatePipelineInput {
+        // BLD-12: a restore replays the stored configuration verbatim. A
+        // snapshot taken before migration `0156` already carries the three
+        // defaults (serde `default` on `PipelineDefinitionSnapshot`), so a
+        // legacy row restores to full rebuild without a validation the
+        // caller never asked for.
+        incremental_strategy: snapshot.incremental_strategy.clone(),
+        partition_granularity: snapshot.partition_granularity.clone(),
+        lookback_hours: snapshot.lookback_hours,
         kind: snapshot.kind,
         source_zone: first.zone.clone(),
         source_table: first.table.clone(),
@@ -3660,6 +3813,9 @@ mod tests {
 
         fn create_input(name: &str, depends_on: Vec<String>) -> CreatePipelineInput {
             CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
@@ -4069,6 +4225,9 @@ mod tests {
 
         fn create_input(name: &str, depends_on: Vec<String>) -> CreatePipelineInput {
             CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
@@ -4273,6 +4432,146 @@ mod tests {
         assert_eq!(legacy.inputs[0].zone, "serving");
     }
 
+    /// BLD-12: the materialization gate refuses every incomplete or
+    /// unsupported shape with a FIXED message that never echoes the caller's
+    /// value, and resets all four fields on a batch save.
+    #[test]
+    fn materialization_validation_fails_closed_with_fixed_messages() {
+        use super::{
+            INCREMENTAL_COLUMN_REFUSED, INCREMENTAL_COLUMN_REQUIRED, INCREMENTAL_STRATEGY_REFUSED,
+            KIND_REFUSED, LOOKBACK_HOURS_REFUSED, PARTITION_GRANULARITY_REFUSED,
+        };
+
+        for (kind, column, strategy, granularity, lookback, expected) in [
+            ("document", None, None, None, None, KIND_REFUSED),
+            ("vector", None, None, None, None, KIND_REFUSED),
+            (
+                "incremental",
+                None,
+                None,
+                None,
+                None,
+                INCREMENTAL_COLUMN_REQUIRED,
+            ),
+            (
+                "incremental",
+                Some("  ".to_owned()),
+                None,
+                None,
+                None,
+                INCREMENTAL_COLUMN_REQUIRED,
+            ),
+            (
+                "incremental",
+                Some("bad; DROP TABLE x --".to_owned()),
+                None,
+                None,
+                None,
+                INCREMENTAL_COLUMN_REFUSED,
+            ),
+            (
+                "incremental",
+                Some("1bad".to_owned()),
+                None,
+                None,
+                None,
+                INCREMENTAL_COLUMN_REFUSED,
+            ),
+            (
+                "incremental",
+                Some("a".repeat(129)),
+                None,
+                None,
+                None,
+                INCREMENTAL_COLUMN_REFUSED,
+            ),
+            (
+                "incremental",
+                Some("event_time".to_owned()),
+                Some("merge".to_owned()),
+                None,
+                None,
+                INCREMENTAL_STRATEGY_REFUSED,
+            ),
+            (
+                "incremental",
+                Some("event_time".to_owned()),
+                None,
+                Some("week".to_owned()),
+                None,
+                PARTITION_GRANULARITY_REFUSED,
+            ),
+            (
+                "incremental",
+                Some("event_time".to_owned()),
+                None,
+                None,
+                Some(721),
+                LOOKBACK_HOURS_REFUSED,
+            ),
+            (
+                "incremental",
+                Some("event_time".to_owned()),
+                None,
+                None,
+                Some(-1),
+                LOOKBACK_HOURS_REFUSED,
+            ),
+        ] {
+            let err =
+                super::validate_materialization(kind, column, strategy, granularity, lookback)
+                    .expect_err("this shape must be refused");
+            assert_eq!(err.to_string(), expected);
+        }
+    }
+
+    /// BLD-12: a valid incremental config round-trips through the gate, and
+    /// a batch save clears the cursor and resets every other field even when
+    /// the caller sends stale incremental values.
+    #[test]
+    fn materialization_validation_accepts_incremental_and_resets_batch() {
+        let incremental = super::validate_materialization(
+            "incremental",
+            Some(" event_time ".to_owned()),
+            Some("partition_replace".to_owned()),
+            Some("month".to_owned()),
+            Some(24),
+        )
+        .expect("a valid incremental config");
+        assert_eq!(
+            incremental.incremental_column.as_deref(),
+            Some("event_time")
+        );
+        assert_eq!(incremental.incremental_strategy, "partition_replace");
+        assert_eq!(incremental.partition_granularity, "month");
+        assert_eq!(incremental.lookback_hours, 24);
+
+        let defaulted = super::validate_materialization(
+            "incremental",
+            Some("event_time".to_owned()),
+            None,
+            None,
+            None,
+        )
+        .expect("defaults are valid");
+        assert_eq!(defaulted.incremental_strategy, "append");
+        assert_eq!(defaulted.partition_granularity, "day");
+        assert_eq!(defaulted.lookback_hours, 0);
+
+        let batch = super::validate_materialization(
+            "batch",
+            Some("event_time".to_owned()),
+            Some("partition_replace".to_owned()),
+            Some("month".to_owned()),
+            Some(24),
+        )
+        .expect("a batch save is valid");
+        assert_eq!(batch.incremental_column, None);
+        assert_eq!(batch.incremental_strategy, "append");
+        assert_eq!(batch.partition_granularity, "day");
+        assert_eq!(batch.lookback_hours, 0);
+    }
+
     /// BLD-19: the legacy-form-over-stored path rebuilds the input from the
     /// raw body source zone, so it needs its own normalisation — otherwise an
     /// edit that spells Gold `gold` would store an orphan `gold` input even
@@ -4291,6 +4590,9 @@ mod tests {
             source_zone: "silver".to_owned(),
             source_table: "orders".to_owned(),
             incremental_column: None,
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             transforms: Vec::new(),
             fbic_enabled: false,
             target_zone: "serving".to_owned(),
@@ -4545,6 +4847,9 @@ mod tests {
         /// default (`NULL`) so the `*:*` principal passes `in_scope`.
         fn pipeline_input(name: &str, target_zone: &str) -> CreatePipelineInput {
             CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
@@ -4727,6 +5032,9 @@ mod tests {
             connector_id: Option<&str>,
         ) -> pipelines::Pipeline {
             let input = CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
@@ -5080,6 +5388,9 @@ mod tests {
         /// zone is the only field D2 reads, and `silver` is the refusal.
         fn pipeline_input(name: &str) -> CreatePipelineInput {
             CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
@@ -5196,6 +5507,9 @@ mod tests {
             // through the store because the create and update ROUTES now
             // refuse that body itself.
             let pre_refusal = UpdatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 run_as: pipelines::RunAsChange::Keep,
@@ -5255,6 +5569,9 @@ mod tests {
             .await
             .expect("seed the row the refused restore would rewrite");
             let pre_refusal = UpdatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 run_as: pipelines::RunAsChange::Keep,
@@ -5372,6 +5689,9 @@ mod tests {
 
         fn create_input(name: &str, tenant_id: uuid::Uuid) -> CreatePipelineInput {
             CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
@@ -5577,6 +5897,9 @@ mod tests {
 
         fn create_input(name: &str, depends_on: Vec<String>) -> CreatePipelineInput {
             CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
@@ -5724,6 +6047,9 @@ mod tests {
             tenant_id: Option<uuid::Uuid>,
         ) -> CreatePipelineInput {
             CreatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 name: name.to_owned(),
@@ -6170,6 +6496,9 @@ mod tests {
             let pl = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    incremental_strategy: "append".to_owned(),
+                    partition_granularity: "day".to_owned(),
+                    lookback_hours: 0,
                     inputs: Vec::new(),
                     steps: Vec::new(),
                     name: "pl-lag-test".to_owned(),
@@ -6268,6 +6597,9 @@ mod tests {
             let pl = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    incremental_strategy: "append".to_owned(),
+                    partition_granularity: "day".to_owned(),
+                    lookback_hours: 0,
                     inputs: Vec::new(),
                     steps: Vec::new(),
                     name: "pl-bounds".to_owned(),
@@ -6325,6 +6657,9 @@ mod tests {
             let pl = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    incremental_strategy: "append".to_owned(),
+                    partition_granularity: "day".to_owned(),
+                    lookback_hours: 0,
                     inputs: Vec::new(),
                     steps: Vec::new(),
                     name: "pl-tenant-b".to_owned(),
@@ -6386,6 +6721,9 @@ mod tests {
             let pl = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    incremental_strategy: "append".to_owned(),
+                    partition_granularity: "day".to_owned(),
+                    lookback_hours: 0,
                     inputs: Vec::new(),
                     steps: Vec::new(),
                     name: "pl-b-multi".to_owned(),
@@ -6448,6 +6786,9 @@ mod tests {
             let pl = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    incremental_strategy: "append".to_owned(),
+                    partition_granularity: "day".to_owned(),
+                    lookback_hours: 0,
                     inputs: Vec::new(),
                     steps: Vec::new(),
                     name: "pl-b-admin".to_owned(),
