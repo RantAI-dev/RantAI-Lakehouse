@@ -14,6 +14,14 @@ const COL_WIDTH: Record<(typeof GOVERNANCE_COLUMNS)[number]["key"], string> = {
   amount: "w-[16%]",
 };
 import { maskEmail, maskName, scrambleFrame } from "@/lib/scramble";
+
+/** Owner QA 2026-11-25: below 768 px the table has two columns, the person (name over e-mail) and the amount. */
+const PHONE_COL: Record<(typeof GOVERNANCE_COLUMNS)[number]["key"], string> = {
+  name: "max-md:w-auto",
+  email: "max-md:hidden",
+  city: "max-md:hidden",
+  amount: "max-md:w-[34%]",
+};
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 
 /**
@@ -78,17 +86,23 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
     >
       {/* O32: no visible "Illustration" label (the owner's decision; the data is plainly fictional and the
           caption for screen readers stays). The policy chip leads; the switch sits at the right. */}
-      <div className="flex flex-wrap items-center justify-between gap-3 px-6 pt-4 pb-1 md:px-8 md:pt-5">
-        <PolicyChip copy={copy} role={role} />
+      {/* Owner QA 2026-11-25 ("jadi 1 row aja"): below 768 px the header is the switch alone; the
+          locks and the PII tags already say what the policy does, and the live region still says it. */}
+      <div className="flex flex-wrap items-center justify-between gap-3 px-6 pt-4 pb-1 max-md:px-5 md:px-8 md:pt-5">
+        <span className="contents max-md:hidden">
+          <PolicyChip copy={copy} role={role} />
+        </span>
         <RoleToggle copy={copy} role={role} onChange={choose} />
       </div>
       <p aria-live="polite" className="sr-only">
         {copy.status[role]}
       </p>
-      {/* Phones: the table scrolls inside its frame; the right edge fades to say there is more. */}
-      <div className="overflow-x-auto max-md:[mask-image:linear-gradient(90deg,#000_82%,transparent)]">
+      {/* Owner QA 2026-11-25 ("gausah sampe segala bisa di scroll horizontal"): below 768 px the
+          table fits the card. City goes, the avatar goes, and the e-mail sits under the name, as a
+          contact list shows it; the two PII values still mask and decode. */}
+      <div className="overflow-x-auto">
         {/* Fixed column widths: the columns stay put when the role switches and the values change length. */}
-        <table className="w-full min-w-[640px] table-fixed text-left">
+        <table className="w-full min-w-[640px] table-fixed text-left max-md:min-w-0">
           <caption className="sr-only">{copy.tableCaption}</caption>
           <thead>
             <tr className="text-[13px] text-white/55">
@@ -96,7 +110,12 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
                 <th
                   key={c.key}
                   scope="col"
-                  className={cn("px-6 py-2 font-medium md:px-8", COL_WIDTH[c.key], c.key === "amount" && "text-right")}
+                  className={cn(
+                    "px-6 py-2 font-medium max-md:px-5 md:px-8",
+                    COL_WIDTH[c.key],
+                    c.key === "amount" && "text-right",
+                    PHONE_COL[c.key],
+                  )}
                 >
                   <span className="inline-flex items-center gap-2">
                     {copy.columns[c.key]}
@@ -112,22 +131,29 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
                 key={r.email}
                 className={cn("text-[14px] text-white/90 transition-colors duration-200 hover:bg-white/[0.04]", i > 0 && "border-t border-white/[0.04]")}
               >
-                <td className="px-6 py-[7px] whitespace-nowrap md:px-8">
+                <td className="px-6 py-[7px] whitespace-nowrap max-md:px-5 max-md:py-1.5 md:px-8">
                   <span className="inline-flex items-center gap-3">
-                    <Avatar name={r.name} masked={role === "analyst"} />
-                    <Cell value={r.name} masked={maskName(r.name)} role={role} row={i} animate={!reduced} tip={copy.maskedTip} />
+                    <span className="contents max-md:hidden">
+                      <Avatar name={r.name} masked={role === "analyst"} />
+                    </span>
+                    <span className="flex min-w-0 flex-col">
+                      <Cell value={r.name} masked={maskName(r.name)} role={role} row={i} animate={!reduced} tip={copy.maskedTip} />
+                      <span className="text-[13px] leading-5 text-white/60 md:hidden">
+                        <Cell value={r.email} masked={maskEmail(r.email)} role={role} row={i} animate={!reduced} tip={copy.maskedTip} />
+                      </span>
+                    </span>
                   </span>
                 </td>
-                <td className="px-6 py-[7px] whitespace-nowrap md:px-8">
+                <td className="px-6 py-[7px] whitespace-nowrap max-md:hidden md:px-8">
                   <Cell value={r.email} masked={maskEmail(r.email)} role={role} row={i} animate={!reduced} tip={copy.maskedTip} />
                 </td>
-                <td className="px-6 py-[7px] whitespace-nowrap md:px-8">
+                <td className="px-6 py-[7px] whitespace-nowrap max-md:hidden md:px-8">
                   <span className="inline-flex items-center gap-1.5">
                     <MapPin aria-hidden="true" className="size-3.5 text-[#44A6FA]/70" />
                     {r.city}
                   </span>
                 </td>
-                <td className="px-6 py-[7px] text-right whitespace-nowrap tabular-nums md:px-8">€{r.amount}</td>
+                <td className="px-6 py-[7px] text-right whitespace-nowrap tabular-nums max-md:px-5 max-md:align-top max-md:py-1.5 md:px-8">€{r.amount}</td>
               </tr>
             ))}
           </tbody>
@@ -272,7 +298,7 @@ function RoleToggle({ copy, role, onChange }: { copy: GovernanceCopy; role: Role
   };
   return (
     <div className="flex items-center gap-2.5">
-      <span id="lk-view-as" className="text-[13px] text-white/55">
+      <span id="lk-view-as" className="text-[13px] text-white/55 max-md:sr-only">
         {copy.viewAs}
       </span>
       <div
