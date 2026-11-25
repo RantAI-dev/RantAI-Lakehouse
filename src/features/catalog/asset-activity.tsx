@@ -42,9 +42,8 @@ import { assetService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import type { LakehouseSchemaVersion } from "@/services/contracts/lakehouse"
 import { FreshnessTargetDialog } from "@/features/governance/freshness-target-dialog"
-import { DropTableAction } from "./asset-drop"
 import { lineageKey } from "./asset-lineage"
-import { icebergTableOf, type IcebergTableState } from "./asset-storage"
+import { AssetStorage, ClickHouseStorage, icebergTableOf, type IcebergTableState } from "./asset-storage"
 import { ALL, CountToggle } from "./count-toggle"
 import { TableGrantNote } from "./table-grant-note"
 
@@ -370,21 +369,9 @@ export function AssetActivity({
     iceberg.status === "success" ? (iceberg.data?.schemaVersions ?? []) : [],
     a.schemaVersions
   )
-  const { hasPermission } = useAuth()
   const [snapshotLimit, setSnapshotLimit] = React.useState<number>(PAGE_SIZES[0])
   const [changeLimit, setChangeLimit] = React.useState<number>(PAGE_SIZES[0])
   const snapshotCount = iceberg.status === "success" ? (iceberg.data?.snapshots.length ?? 0) : 0
-  // `DATA-55` (QA `LH-DATA-15-06`, `TC-1731`): Drop table is offered only to
-  // `governance:write` — the permission that restores (D6, proposed) — and only
-  // for a Bronze table that exists and an upload made. The check hides the
-  // control AND the request: without the permission nothing is asked of
-  // `/drop`, which would answer 403 anyway.
-  const canDrop =
-    hasPermission("governance:write") &&
-    iceberg.status === "success" &&
-    iceberg.data !== null &&
-    isIcebergCandidate(a) &&
-    Boolean(a.tableName)
   // DATA-16 D2: how far back versions go is what the list shows, never a promise.
   const retention =
     iceberg.status === "success" && iceberg.data && iceberg.data.snapshots.length > 0
@@ -412,19 +399,16 @@ export function AssetActivity({
           retention ? ` ${retention}.` : ""
         }${snapshotCount > snapshotLimit ? ` Showing the newest ${snapshotLimit} of ${snapshotCount}.` : ""}`}
         action={
-          canDrop || snapshotCount > PAGE_SIZES[0] ? (
-            <div className="flex items-center gap-2">
-              {snapshotCount > PAGE_SIZES[0] ? (
-                <CountToggle
-                  label="Show"
-                  ariaLabel="Snapshots to show"
-                  options={sizesFor(snapshotCount)}
-                  value={snapshotLimit}
-                  onChange={setSnapshotLimit}
-                />
-              ) : null}
-              {canDrop ? <DropTableAction asset={a} onDropped={iceberg.reload} /> : null}
-            </div>
+          // UX-8: Drop table moved to the page's ⋯ menu (`useDropTable`); the
+          // restore stays here, beside the snapshots it brings back.
+          snapshotCount > PAGE_SIZES[0] ? (
+            <CountToggle
+              label="Show"
+              ariaLabel="Snapshots to show"
+              options={sizesFor(snapshotCount)}
+              value={snapshotLimit}
+              onChange={setSnapshotLimit}
+            />
           ) : undefined
         }
       >
@@ -607,6 +591,13 @@ export function AssetActivity({
           )}
         </SectionCard>
       </div>
+      {/* UX-8: how the table is stored is part of its history (loads, files,
+          the row count over snapshots), so it moved here from the Overview. */}
+      {isIcebergCandidate(a) && a.tableName ? (
+        <AssetStorage tableName={a.tableName} detail={iceberg} />
+      ) : (
+        <ClickHouseStorage asset={a} />
+      )}
     </div>
   )
 }

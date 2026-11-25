@@ -177,9 +177,23 @@ export function useDataTableFilters<TData>(
     [filters, setFiltersAndResetPage]
   );
 
+  // UX-8: the filters the property bar draws as chips — all of them, less
+  // the ones a control on the page already shows (`meta.isQuickFilter`),
+  // and those only while the rules are ANDed: with "or" a rule means
+  // something only beside the others, so every one is shown.
+  const isQuickFilter = table.options.meta?.isQuickFilter;
+  const shownFilters = React.useMemo(
+    () =>
+      isQuickFilter && joinOperator !== "or"
+        ? filters.filter((filter) => !isQuickFilter(filter))
+        : filters,
+    [filters, isQuickFilter, joinOperator]
+  );
+
   return {
     columns,
     filters,
+    shownFilters,
     joinOperator,
     onFilterAdd,
     onFilterUpdate,

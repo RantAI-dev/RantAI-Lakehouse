@@ -90,6 +90,15 @@ function renderPage() {
 }
 
 describe("the /copilot title bar (AI-24)", () => {
+  // Owner QA 2026-11-15: no visible thread title; the heading stays for screen readers.
+  it("keeps the thread title as the page's heading, visually hidden", async () => {
+    renderPage()
+    await waitFor(() => expect(copilot?.sessionId).toBe("old"))
+    const h1 = await screen.findByRole("heading", { level: 1, name: "Quarterly revenue" })
+    expect(h1.className).toContain("sr-only")
+    expect(h1.parentElement?.className).not.toContain("h-9")
+  })
+
   it("shows the opened conversation's title, though it is not among the newest 20", async () => {
     renderPage()
     await waitFor(() => expect(copilot?.sessionId).toBe("old"))

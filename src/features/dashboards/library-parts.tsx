@@ -113,10 +113,18 @@ export function ScrollRegion({ children, className }: { readonly children: React
  */
 export function SearchField({
   value, onChange, placeholder = "Search dashboards", className, expandedClassName = "w-72 shrink-0",
+  inputLabel = "Search dashboards, reports and templates", buttonLabel = "Search dashboards",
 }: {
   readonly value: string
   readonly onChange: (value: string) => void
   readonly placeholder?: string
+  /**
+   * The open input's accessible name, and the collapsed button's (its tooltip adds "(/)").
+   * `UX-8`: the Catalog draws the page frame's search with this same control, so the names
+   * are the caller's; the defaults are the Dashboards page's own.
+   */
+  readonly inputLabel?: string
+  readonly buttonLabel?: string
   /** Applied in both states. */
   readonly className?: string
   /** The width while open; collapsed is always the 32 px square. */
@@ -168,7 +176,7 @@ export function SearchField({
               }
             }}
             placeholder={placeholder}
-            aria-label="Search dashboards, reports and templates"
+            aria-label={inputLabel}
             className={cn(
               "h-8 w-full min-w-0 rounded-lg bg-muted/70 pr-8 pl-9 text-sm placeholder:text-muted-foreground hover:bg-muted focus:bg-background focus:ring-1 focus:ring-ring/60 dark:bg-input/30 dark:focus:bg-input/40 [&::-webkit-search-cancel-button]:hidden",
               EASE,
@@ -196,7 +204,7 @@ export function SearchField({
               <button
                 ref={buttonRef}
                 type="button"
-                aria-label="Search dashboards"
+                aria-label={buttonLabel}
                 onClick={() => setOpen(true)}
                 className={cn("grid size-8 place-items-center rounded-lg bg-muted/70 text-muted-foreground hover:bg-muted hover:text-foreground dark:bg-input/30", EASE, FOCUS)}
               />
@@ -204,7 +212,7 @@ export function SearchField({
           >
             <Search className="size-4" aria-hidden />
           </TooltipTrigger>
-          <TooltipContent>Search dashboards (/)</TooltipContent>
+          <TooltipContent>{`${buttonLabel} (/)`}</TooltipContent>
         </Tooltip>
       )}
     </div>
