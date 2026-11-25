@@ -59,6 +59,7 @@ mod dashboard_sources;
 pub(crate) mod dashboard_templates;
 pub(crate) mod drill;
 mod embed;
+mod frame_check;
 mod pdf_export;
 pub mod public_links;
 mod render;
@@ -91,6 +92,7 @@ pub(crate) mod params;
 // an early answer left behind, so the client is not left writing into a
 // closed connection. See the module's own doc comment.
 mod picture_drain;
+pub(crate) mod pipeline_chain;
 mod pipeline_preview;
 mod pipelines;
 mod quality;
@@ -479,7 +481,15 @@ fn pipeline_preview_router() -> Router<AppState> {
 /// [`crate::policy`], and keeping them together makes that pairing the
 /// thing a reader sees first.
 fn authored_pipelines_router() -> Router<AppState> {
-    pipeline_compile_router().route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+    pipeline_compile_router()
+        .route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+        .route(
+            "/api/pipelines/{id}/schedule-ticks",
+            get(authored_pipelines::schedule_ticks),
+        )
+        // BLD-14: the chain-step write is orchestrator-only here as well as
+        // in `POLICY_TABLE`, so it sits with `runnable` and `compile`.
+        .merge(pipeline_chain_routes())
 }
 
 /// The `/api/pipelines/*` sub-router (Task 2.5), split out of [`router`]
@@ -508,18 +518,13 @@ fn pipelines_router() -> Router<AppState> {
                 .delete(authored_pipelines::delete),
         )
         .route("/api/pipelines/{id}/source", get(pipelines::source))
-        .route(
-            "/api/pipelines/{id}/schedule-ticks",
-            get(authored_pipelines::schedule_ticks),
-        )
-        // BLD-2: the two target-lag routes live in `target_lag_routes`,
-        // merged in above.
+        // BLD-2: target-lag routes live in `target_lag_routes`.
         .merge(target_lag_routes())
         .route("/api/pipelines/{id}/runs", get(pipelines::runs))
-        // Plan R4 2b: definition version history. Static under
-        // `{id}/versions`, so it is registered BEFORE
-        // `{id}/versions/{version}/restore` (which would otherwise
-        // match `{version}/restore` as `{version}`).
+        // BLD-14 review R5: beside `runs`, not in the orchestrator-only router.
+        .merge(chain_read_routes())
+        // Plan R4 2b: static `{id}/versions` comes BEFORE
+        // `{id}/versions/{version}/restore` (which would match `{version}/restore`).
         .route(
             "/api/pipelines/{id}/versions",
             get(pipelines::list_versions),
@@ -658,6 +663,25 @@ fn target_lag_routes() -> Router<AppState> {
             "/api/pipelines/{id}/target-lag",
             put(authored_pipelines::set_target_lag),
         )
+}
+
+/// `BLD-14` D8: the chain sensor's one write per (re-upload, pipeline).
+/// Orchestrator-only like `lag-check`, hence under `/runnable/`.
+fn pipeline_chain_routes() -> Router<AppState> {
+    Router::new().route(
+        "/api/pipelines/runnable/{id}/chain-step",
+        post(pipeline_chain::record_chain_step),
+    )
+}
+
+/// BLD-14 review R5: the page's reason-read is merged into
+/// [`pipelines_router`] beside `runs`, not into the orchestrator-only
+/// [`authored_pipelines_router`] next to `compile`/`lag-check`.
+fn chain_read_routes() -> Router<AppState> {
+    Router::new().route(
+        "/api/pipelines/{id}/reupload-chain",
+        get(pipelines::reupload_chain),
+    )
 }
 
 /// The `/api/storage/*` sub-router (Task 2.6), split out for the same
@@ -1340,7 +1364,8 @@ fn agents_router() -> Router<AppState> {
         // are absent from `POLICY_TABLE` too, so they answer 404 — pinned
         // by `tests/route_auth.rs`'s `web4_retired_paths_are_not_registered`.
         //
-        // The three employee routes that remain are live consumers, not
+        // Four employee routes remain, all with live consumers (the fourth
+        // is SEC-68's `PUT /employees/{id}/read-roles`, noted below) — not
         // console leftovers: `GET /employees` is read at code-load by
         // Dagster's schedule factory
         // (`dagster/dispar_orchestrate/agent_runs.py`), `GET /employees/{id}`
@@ -1350,6 +1375,13 @@ fn agents_router() -> Router<AppState> {
         // creates a real `agent_run` and its page shows the trace.
         .route("/api/agents/employees", get(agents::list_employees))
         .route("/api/agents/employees/{id}", get(agents::get_employee))
+        // SEC-68: set an employee's explicit table-access role grant. A
+        // dedicated live route on the employee store/read path — no
+        // dependency on the retired workflows/suspend/resume/revoke routes.
+        .route(
+            "/api/agents/employees/{id}/read-roles",
+            axum::routing::put(agents::set_employee_read_roles),
+        )
         .route(
             "/api/agents/employees/{id}/run",
             axum::routing::post(agents::run_employee),
@@ -1675,6 +1707,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/dashboard/table-export", get(dashboard::table_export))
         .route("/api/dashboard/chart-export", get(dashboard::chart_export))
+        // BI-72 (D3): whether a web-page card's site allows being framed.
+        .route("/api/dashboard/frame-check", get(frame_check::frame_check))
         // BI-14 (D1): where a chart comes from. `lineage:read` (owner decision Q6).
         .route(
             "/api/dashboard/charts/{id}/lineage",

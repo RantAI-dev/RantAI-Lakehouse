@@ -374,3 +374,224 @@ slice 1 handoff used (and it is clean).
 4. `supportedInPlaceSources` is omitted in `full` mode on purpose: the
    existing deployment test asserts exactly three top-level keys, and a
    full stack does not read any source in place.
+
+---
+
+## Slice 3 Handoff
+
+Developer: implementation sub-agent, 2026-11-25. Branch
+`feat/bi-44-in-place-assistant-and-bi`, stacked on
+`origin/feat/bi-44-in-place-external-catalog` at `051810b82` (slice 2's
+handoff commit, itself rebased on `origin/main` at `051810b82`). Worktree
+`/tmp/wt-bi44-s3`. No PR opened or merged; the developer pushes the branch
+and hands off.
+
+### Commits (plan order)
+
+- `37a01fe26` T1 `BI-44 slice 3: run assistant tools on the active engine`
+- `e5340a6e8` T2 `BI-44 slice 3: guard dashboard SQL sources for the active engine`
+- `e7a482dc9` T3 `BI-44 slice 3: preview dashboard SQL sources on the active engine`
+- `26210d4f4` T4 `BI-44 slice 3: in-place assistant and preview integration tests`
+- this commit: the handoff.
+
+### What was built
+
+- **T1** `routes/ai/tools/data.rs`: in `bi-only+trino`, `run_sql` classifies
+  the statement with `TrinoDialect`, applies `is_trino_safe`, executes via
+  `query::run_statement(..., "trino")` (which applies the `Engine::Trino`
+  governance rewrite), and never runs the ClickHouse `EXPLAIN AST` dry run.
+  `list_datasets` and `describe_dataset` introspect the active engine via
+  `in_place::*` and return the assistant's slug/column shape with `zone:
+  "external"`, `engine`, and `null` warehouse statistics. `full` mode and
+  `bi-only+clickhouse` keep their exact old paths. `tools/queries.rs`:
+  `run_saved_query` uses `Config::default_query_engine_name()` in `bi-only`.
+  `routes/ai/prompt.rs` gains `bi_only_engine_rules(engine)`; `routes/ai/mod.rs`
+  assembles a `bi-only` prompt through a separate helper WITHOUT the DATA MAP
+  builder (which would dial the uninstalled ClickHouse). `full` mode's
+  prompt bytes are unchanged; `AI-32`'s pin tests pass untouched.
+- **T2** `sql_guard.rs`: new `check_sql_source_for_mode(sql, mode, engine)`.
+  `Full` delegates to the unchanged `check_sql_source`. `BiOnly` shares the
+  lexical core but reads with the active engine's rules, then admits exactly
+  one read-only `SELECT`/`WITH` whose parsed tables are 2- or 3-part external
+  names outside reserved metadata schemas; DDL/DML, table functions, bare or
+  constant sources, `SETTINGS`/`FORMAT`, placeholders, a second statement and
+  Trino session keywords are refused with fixed sentences. Five unit tests.
+- **T3** `routes/support.rs`: `describe_trino_preview_columns` (a zero-row
+  governed execution supplies Trino's own column metadata) and
+  `run_trino_preview` (reusing `query::trino_result_to_rows`), both dialing
+  only `state.trino` and classifying `TrinoError` through `upstream_error`.
+  `routes/dashboard_sources.rs`: `POST /api/dashboard/sources/preview` in
+  `bi-only+trino` validates with the new guard, gates and rewrites with
+  `Engine::Trino` and `PolicyEngineObligations::from_state`, probes and reads
+  rows on Trino with no ClickHouse `SETTINGS` text. `lakehouse_bi::store`
+  persistence routes (list/create/update/delete of SQL sources) answer a
+  fixed 503 in `bi-only+trino` before any dial; an inline `chart` preview is
+  refused with a fixed 422. `docs/core/features/bi-assistant-only-install.md`
+  records both honest limits.
+- **T4** New integration module `tests/bi_only_assistant_and_preview.rs`,
+  registered in `tests/it.rs` (`OPS-32`): four tests over wiremock `Trino`
+  with a deliberately dead ClickHouse upstream, covering `list_datasets`,
+  `describe_dataset`, `run_sql`, `run_saved_query` and the unsaved SQL-source
+  preview. They assert the mask `CASE`, the row filter, the full quoted
+  `"erp_pg"."public"."customers"` reference, the absence of `EXPLAIN AST` /
+  `SETTINGS`, and the honest 503/422 answers.
+
+### Verification (foreground, on the final code commit `26210d4f4`)
+
+Every command ran in `/tmp/wt-bi44-s3`; Rust used `CARGO_INCREMENTAL=0` and
+`CARGO_TARGET_DIR=/home/shiro/rantai/RantAI-Lakehouse/rust/target`.
+
+| Command | Result |
+| --- | --- |
+| `cd rust && cargo fmt --check -p lakehouse-api` | clean (`FMT_CHECK_CLEAN`) |
+| `cargo clippy --manifest-path rust/Cargo.toml -p lakehouse-api --all-targets -- -D warnings` | finished with no warnings |
+| `cargo test --manifest-path rust/Cargo.toml -p lakehouse-api --lib` | **3995 passed**, 0 failed, 19 ignored (includes `AI-32` pin and the `AI-15` tool-schema snapshot) |
+| `cargo test --manifest-path rust/Cargo.toml -p lakehouse-api --test it -- bi_only_assistant_and_preview bi_only_in_place_catalog bi_only_query_mode deployment_settings_route route_auth sec11_guard ai_dashboard_reach` | **135 passed**, 0 failed, 1756 filtered out |
+| `bash scripts/ci/check_test_modules.sh` | every test file under `rust/crates/*/tests/` compiled into a test binary |
+| `git diff --check` | clean |
+
+### Skipped / not verified
+
+- **Not run:** the full workspace verification block (`cargo clippy
+  --workspace`, `cargo test --workspace`, `bun run typecheck/lint/test`,
+  Dagster pytest, `docker compose --profile '*' config --quiet`). This slice
+  changes only `lakehouse-api` Rust and two documents; the reviewer runs the
+  full block before merge (`AGENTS.md`, "Keep build time down").
+- **No migrations added** (`0154`–`0157` stay reserved). `policy.rs`,
+  `audit_coverage.rs`, `routes/agents.rs`, `routes/gold.rs` and the root
+  `docker-compose.yml` were not touched. No PR opened or merged.
+- **Not verified:** a live `bi-only` install against a real source; the proof
+  here is wiremock, as in slice 2. The E2E gate belongs to slice 4.
+- **Not built:** an inline chart query on Trino or a Trino-backed store for
+  saved dashboard metadata. Both are refused with fixed sentences and written
+  down on the feature page; neither is silently approximated.
+
+### Design notes for the reviewer
+
+1. The `AI-15` tool schemas and `tests/fixtures/tool_schemas.json` are NOT
+   changed: regenerating them would move a byte-pinned corpus, and the engine
+   context belongs in the prompt, where it can be scoped to `bi-only`. The
+   snapshot test is in the passing `--lib` run.
+2. `run_statement` is the same choke point Query Studio uses, so the
+   assistant's Trino run inherits `engine_allowed`, `is_read_only`,
+   `is_trino_safe`, the tenant gate, the policy rewrite and classified
+   engine failures instead of growing a second copy of any of them.
+3. Saved queries have no engine column in `lakehouse-store` (adding one needs
+   a reserved migration), so `full` mode keeps its historical ClickHouse run;
+   only `bi-only` resolves the installed engine. `engine_allowed` still
+   refuses a stale name at the choke point.
+4. The integration harness cannot set a wiremock URL as `CH_URL` in
+   `bi-only+trino` (that config is refused by design). Instead ClickHouse is
+   a dead upstream: a successful governed answer, plus assertions that no
+   statement contains `EXPLAIN AST` or `SETTINGS`, proves no ClickHouse path
+   was taken. Introspection errors are rendered from `into_api_error()` so
+   `sec11_guard` sees no interpolated error text.
+5. The Trino column probe is a `LIMIT 0` execution of the governed statement,
+   not `DESCRIBE (SELECT …)`: Trino has no subquery form of `DESCRIBE`. It
+   still happens only after the guard, tenant gate and policy rewrite.
+
+---
+
+## Slice 4 Handoff
+
+Developer: implementation sub-agent, 2026-11-25. Branch
+`feat/bi-44-console-and-installer`, stacked on
+`origin/feat/bi-44-in-place-assistant-and-bi` at `3f7127448`. Worktree
+`/tmp/wt-bi44-s4`. No PR opened or merged; the developer pushes the branch
+and hands off. No SQL migration, no `lakehouse-api` change and no root
+`docker-compose.yml` change.
+
+### Commits (plan order)
+
+- `0d94c1292` T1 `BI-44 slice 4: show install mode and query engine on Deployment`
+- `ea68765eb` T2 `BI-44 slice 4: hide warehouse pages and narrow Query Studio engines`
+- `9908c627a` T3 `BI-44 slice 4: lakehousectl install --mode and --engine`
+- this commit: the documentation and handoff.
+
+### What was built
+
+- **T1** `settings.ts` gains additive optional `installMode`, `queryEngine`
+  and `supportedInPlaceSources`, so an older server's `{ features: [] }` and
+  every full-mode mock are unchanged. `deployment-settings.tsx` draws an
+  installation summary from those fields only when one is present: Full vs
+  BI & Assistant only, the named engine, and, for a `bi-only` answer with a
+  source list, badges plus "read in place, nothing copied into the
+  lakehouse". An unknown value is shown as sent, never guessed. Five new
+  tests alongside the four existing ones.
+- **T2** `nav-config.ts` gains the pure `isHiddenInBiOnly` and
+  `filterNavSectionsForInstallMode`: full, absent, empty and unknown modes
+  return the ORIGINAL array; only `"bi-only"` drops Pipelines and the
+  warehouse-only hrefs including their child routes. A shared
+  `useDeploymentSettings(canRead)` hook fetches
+  `GET /api/settings/deployment` only for a `settings:write` holder — that
+  route is admin-gated in `policy.rs:960`, so a viewer fires no extra 403
+  (`WEB-11` / `ADM-13`). The sidebar filters the sections it already had;
+  Query Studio's pure `availableQueryEngines` narrows the engine picker to
+  the installed one and moves a stale `?engine=` tab onto it. Both-engine
+  behaviour is unchanged without an affirmative `bi-only` answer.
+- **T3** `cli.rs` adds `InstallModeArg` (`full`/`bi-only`) and
+  `QueryEngineArg` (`clickhouse`/`trino`) to `install --mode` / `--engine`,
+  with `validated_install` refusing `full` + `trino` before any file is
+  written. `install.rs` passes the parsed pair to a new
+  `write_layout_with_mode`; the old full-only entry point stays for the
+  existing tests. `secrets.rs` writes the two mode variables and exactly
+  one engine URL into the same 0600 `.env`, commenting out `TRINO_URL` for
+  a ClickHouse install and both `CH_URL` / `CLICKHOUSE_URL` for a Trino
+  install. A full install's `.env` is unchanged byte for byte.
+- **T4** `docs/core/features/bi-assistant-only-install.md` and
+  `ops/bi-only/README.md` document the flags, the console behaviour and the
+  honest limits; `docs/plans/BI-44-RESULT.md` records the memory gate as
+  **not verified** rather than inventing a figure; this handoff.
+
+### Verification (foreground, on the final code commit `9908c627a`)
+
+Every command ran in `/tmp/wt-bi44-s4`. Rust used `CARGO_INCREMENTAL=0`
+and `CARGO_TARGET_DIR=/home/shiro/rantai/RantAI-Lakehouse/rust/target`.
+
+| Command | Result |
+| --- | --- |
+| `bun run typecheck` | clean |
+| `bun run lint` | 0 errors, 13 warnings — the same 13 pre-existing warnings; none in a file this branch touched |
+| `bun run test` | **5089 pass**, 1 skip, 0 fail, 16978 `expect()` calls, 5090 tests across 468 files |
+| `bun test src/features/admin/deployment-settings.test.tsx` | **9 pass**, 0 fail |
+| `bun test src/lib/query-engines.test.ts src/components/app-shell/nav-config.test.ts src/components/app-shell/app-sidebar.test.tsx src/features/queries/query-studio-page.test.tsx` | **62 pass**, 0 fail |
+| `cd rust && cargo fmt --check -p lakehousectl` | clean (`FMT_CHECK_CLEAN`) |
+| `cargo clippy --manifest-path rust/Cargo.toml -p lakehousectl --all-targets -- -D warnings` | finished with no warnings |
+| `cargo test --manifest-path rust/Cargo.toml -p lakehousectl` | **211 passed**, 0 failed, 0 ignored |
+| `git diff --check` | clean (`DIFF_CHECK_CLEAN`) |
+
+### Skipped / not verified
+
+- **Not verified:** a live `docker compose up` of either standalone file
+  from a clean project name, a read query against a real in-place source,
+  and the peak-RSS comparison with `full`. `AC1`–`AC7` were not exercised on
+  a running installation. `docs/plans/BI-44-RESULT.md` says so by name; no
+  number is claimed as measured. This needs the clean-host Docker E2E gate.
+- **Not run:** the full workspace block (`cargo clippy --workspace`,
+  `cargo test --workspace`, Dagster pytest, `docker compose --profile '*'
+  config --quiet`). This slice touches only `src/`,
+  `rust/crates/lakehousectl/`, `ops/bi-only/README.md` and docs; the reviewer
+  runs the full block before merge (`AGENTS.md`, "Keep build time down").
+- **No migrations added.** `rust/crates/lakehouse-api/`, the root
+  `docker-compose.yml` and `policy.rs` were read but not changed.
+
+### Design notes for the reviewer
+
+1. The deployment route is `settings:write`-gated, so the console cannot
+   honestly learn the mode for a non-admin without a 403 on every page.
+   The pure helpers are still fully tested and wired for the principal who
+   may read the route; everyone else keeps the old menu and both engines,
+   and the API's own guard remains the second line of defence. This is a
+   limit, not a claim that every role sees the narrowed UI.
+2. `filterNavSectionsForInstallMode` returns the SAME array reference for
+   every mode other than `"bi-only"`. No extra render, no flash of a
+   shorter sidebar while loading, and no guess from a health probe.
+3. Full-mode `.env` bytes are protected by delegation: both
+   `write_env_with_mode(Full, ClickHouse)` and the production install path
+   run the original writer, and `with_install_mode` is the identity there.
+   The two full-only wrappers are `#[cfg(test)]` so the existing tests stay
+   untouched while clippy `-D warnings` sees no dead code in the binary.
+4. The installer writes the mode and engine variables; it does not swap the
+   release's root Compose file or start the standalone file. The seven-service
+   deployment still comes from `ops/bi-only/`; the docs say so instead of
+   implying that the flag alone removes warehouse containers.

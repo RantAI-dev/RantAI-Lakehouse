@@ -8,8 +8,10 @@ import { useTheme } from "next-themes";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useService } from "@/hooks/use-service";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
+import { cn } from "@/lib/utils";
 import type { LayoutMap } from "@/services";
 import { apiFetch } from "@/services/http";
+import { TileBodyPlaceholder } from "./dashboard-skeleton";
 import { TileBody } from "./tile-body";
 import type { TileFailure } from "@/services/contracts/dashboards";
 
@@ -21,9 +23,9 @@ type Payload = {
 };
 
 /**
- * The first few tiles of one dashboard, read-only, for Home's "continue
- * working": the board you last had open, shown with its own data rather
- * than as a link.
+ * The first few tiles of one dashboard, read-only, inside Home's focal
+ * widget (`WEB-17`): the board drawn with its own data rather than as a
+ * link. The widget owns the card and the title row; this is the tiles.
  *
  * It asks the same `/api/dashboard?board=` the canvas does (through
  * `apiFetch`, like `dashboard-page.tsx`: there is no service method for a
@@ -34,18 +36,25 @@ type Payload = {
  * Tiles are taken in canvas order (top to bottom, left to right), charts
  * first: text notes are never shown (a note without its neighbours says
  * little), and tables only when the board has no chart to show, since a
- * table of a row or two is mostly empty space at this size. Legends are
- * hidden: one with many entries fills the tile and cannot be read here.
- * No drill or edit: the title links to the canvas for that.
+ * table of a row or two is mostly empty space at this size. Legends and the
+ * "Data from" line are hidden: at this size they crowd out the chart. No
+ * drill or edit: each title links to the canvas for that.
+ *
+ * Layout: two tiles a row once the widget is 480 px wide, one below that,
+ * where only the first two are drawn so a phone is not a long scroll of
+ * charts. Rows share the height the widget has (at least 150 px each), and
+ * no tile has a box of its own: the widget is the one surface (DESIGN.md §3,
+ * no box inside a box). While loading, the same grid holds grey bars in the
+ * tiles' exact places, so the page does not change shape when data lands.
  */
 export function DashboardPreview({
   boardId,
-  name,
-  limit = 2,
+  limit = 4,
+  className,
 }: {
   readonly boardId: string;
-  readonly name: string;
   readonly limit?: number;
+  readonly className?: string;
 }) {
   const { resolvedTheme } = useTheme();
   const state = useService(async (signal) => {
@@ -71,43 +80,54 @@ export function DashboardPreview({
     return (visual.length > 0 ? visual : candidates).slice(0, limit);
   }, [state.data, limit]);
 
-  if (state.status === "success" && tiles.length === 0) return null;
+  if (state.status === "error") {
+    return <p className={cn("py-1 text-xs leading-5 text-muted-foreground", className)}>Couldn&apos;t load this dashboard&apos;s charts.</p>;
+  }
+  if (state.status === "success" && tiles.length === 0) {
+    return <p className={cn("py-1 text-xs leading-5 text-muted-foreground", className)}>This dashboard has no chart to preview yet.</p>;
+  }
+
+  const grid = cn(
+    "grid min-h-0 auto-rows-[minmax(150px,1fr)] grid-cols-1 gap-x-6 gap-y-4 @[480px]/focal:grid-cols-2",
+    className,
+  );
+  /** The third tile on is for the two-column width only. */
+  const extra = (i: number) => (i >= 2 ? "hidden @[480px]/focal:flex" : "flex");
+
+  if (state.status === "loading") {
+    return (
+      <div className={grid} role="status" aria-label="Loading charts">
+        {Array.from({ length: limit }, (_, i) => (
+          <div key={i} aria-hidden className={cn(extra(i), "min-w-0 flex-col gap-2")}>
+            <div className="flex h-5 items-center">
+              <Skeleton className="h-3" style={{ width: TITLE_WIDTHS[i % TITLE_WIDTHS.length] }} />
+            </div>
+            <TileBodyPlaceholder className="min-h-0 flex-1" />
+          </div>
+        ))}
+      </div>
+    );
+  }
 
   return (
-    <section className="flex flex-col gap-3">
-      <div className="flex items-baseline justify-between gap-3 px-1">
-        <h2 className="min-w-0 truncate text-xs font-semibold tracking-[0.08em] text-muted-foreground uppercase">
-          From {name}
-        </h2>
-        <Link href={href} className="shrink-0 text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline">
-          Open dashboard
-        </Link>
-      </div>
-      {state.status === "error" ? (
-        <p className="rounded-xl border border-border bg-card px-4 py-3 text-xs text-muted-foreground">
-          Couldn&apos;t load this dashboard&apos;s charts.
-        </p>
-      ) : (
-        <div className="grid gap-3 sm:grid-cols-2">
-          {state.status === "loading"
-            ? Array.from({ length: limit }).map((_, i) => (
-                <div key={i} className="flex h-72 flex-col gap-3 rounded-xl border border-border bg-card p-4">
-                  <Skeleton className="h-4 w-40" />
-                  <Skeleton className="flex-1" />
-                </div>
-              ))
-            : tiles.map((spec) => (
-                <div key={spec.id} className="flex h-72 min-w-0 flex-col gap-2 rounded-xl border border-border bg-card p-4">
-                  <Link href={href} className="truncate text-sm font-semibold underline-offset-4 hover:underline">
-                    {spec.title}
-                  </Link>
-                  <div className="min-h-0 flex-1">
-                    <TileBody spec={spec} cell={state.data?.results[spec.id]} dark={resolvedTheme === "dark"} loading={false} hideLegend />
-                  </div>
-                </div>
-              ))}
+    <div className={grid}>
+      {tiles.map((spec, i) => (
+        <div key={spec.id} data-slot="preview-tile" className={cn(extra(i), "min-w-0 flex-col gap-2")}>
+          <Link
+            href={href}
+            className="h-5 truncate text-xs leading-5 font-medium text-muted-foreground underline-offset-4 transition-colors duration-150 ease-ui hover:text-foreground hover:underline"
+          >
+            {spec.title}
+          </Link>
+          {/* Micro-interaction audit 2026-11-14 (WEB-17): the chart fades in where its placeholder was, rather than in one frame. */}
+          <div className="min-h-0 flex-1 transition-opacity duration-200 ease-ui starting:opacity-0">
+            <TileBody spec={spec} cell={state.data?.results[spec.id]} dark={resolvedTheme === "dark"} loading={false} hideLegend hideDataFrom />
+          </div>
         </div>
-      )}
-    </section>
+      ))}
+    </div>
   );
 }
+
+/** Title widths that vary like real titles do. */
+const TITLE_WIDTHS = ["9rem", "11rem", "7.5rem", "10rem"];

@@ -672,6 +672,67 @@ assert_groups "outside_reads selects pipelines and governance" ",pipelines,gover
 assert_groups "catalog_drop selects pipelines, ingest, upload, and governance" ",pipelines,ingest,upload,governance," "rust/crates/lakehouse-api/src/routes/catalog_drop.rs"
 assert_groups "sql_lineage selects pipelines, cdc, ingest, alerts, and governance" ",pipelines,cdc,ingest,alerts,governance," "rust/crates/lakehouse-api/src/sql_lineage.rs"
 
+# ── OPS-CI-FAST: `ops/bi-only/*` selects no gate group ─────────────────────
+# PR #724 (run 45531278457) touched `ops/bi-only/README.md` and ran all 25
+# acceptance gates, because the directory had no `path` line and fell through
+# to `path ops/* all`. No gate mounts or starts these standalone templates.
+assert_groups "a bi-only deployment template selects no gate group" "none" "ops/bi-only/docker-compose.bi-only-trino.yml"
+assert_groups "the bi-only ClickHouse template selects no gate group" "none" "ops/bi-only/docker-compose.bi-only-clickhouse.yml"
+assert_groups "the bi-only README selects no gate group" "none" "ops/bi-only/README.md"
+assert_groups "the bi-only static test selects no gate group" "none" "ops/bi-only/test_bi_only_compose.py"
+assert_groups "the landing site selects no gate group" "none" "ops/landing-pages/app/page.tsx"
+
+# ── OPS-CI-FAST: `images_needed`, the answer `images`/`image-smoke` read ───
+# `false` only for a change that cannot alter either shared image. Anything
+# else -- including a selected gate group, `all`, an unreadable map and the
+# label -- is `true` (fail closed).
+assert_images() {
+  local label="$1" expected="$2"
+  shift 2
+  local output got
+  output="$(run_case "$@")"
+  got="$(grep "^images_needed=" <<< "$output" | cut -d= -f2)"
+  if [ "$got" = "$expected" ]; then
+    log_pass "$label"
+  else
+    log_fail "$label (got images_needed=${got}, want ${expected})"
+  fi
+}
+
+# The exact PR #724 file set: the console page, a lakehousectl module and the
+# bi-only README. It selected every gate group and built both images before
+# this change; it must now select no group and need neither image.
+PR724_FILES=(
+  "rust/crates/lakehousectl/src/cli.rs"
+  "src/features/admin/deployment-settings.tsx"
+  "ops/bi-only/README.md"
+  "docs/core/specs/bi-44.md"
+)
+assert_groups "the PR #724 file set selects no gate group" "none" "${PR724_FILES[@]}"
+assert_images "the PR #724 file set needs no image build" "false" "${PR724_FILES[@]}"
+
+# Paths that cannot change either image.
+assert_images "a lakehousectl change needs no image build" "false" "rust/crates/lakehousectl/src/cli.rs"
+assert_images "a test-support change needs no image build" "false" "rust/crates/lakehouse-test-support/src/lib.rs"
+assert_images "an API integration test needs no image build" "false" "rust/crates/lakehouse-api/tests/route_auth.rs"
+assert_images "a bench needs no image build" "false" "rust/crates/lakehouse-bi/benches/formula.rs"
+assert_images "the parity corpus needs no image build" "false" "rust/tests/parity/corpus.json"
+assert_images "a bi-only template needs no image build" "false" "ops/bi-only/docker-compose.bi-only-trino.yml"
+assert_images "a documents-only change needs no image build" "false" "docs/test.md"
+
+# Paths that can, or that a gate depends on.
+assert_images "an API source change needs the image build" "true" "rust/crates/lakehouse-api/src/main.rs"
+assert_images "G1's own test needs the image build (its gate starts it)" "true" "rust/crates/lakehouse-iceberg/tests/g1_lakekeeper.rs"
+assert_images "a gate directory needs the image build" "true" "ops/g2/g2_tenant_test.py"
+assert_images "a compose change needs the image build" "true" "docker-compose.yml"
+assert_images "an init image change needs the image build" "true" "ops/init/Dockerfile"
+assert_images "a Dagster change needs the image build" "true" "dagster/pipeline.py"
+assert_images "a workflow change needs the image build" "true" ".github/workflows/ci.yml"
+assert_images "an unclassified path needs the image build" "true" "some_random_file.xyz"
+CASE_ALL_GATES_LABEL=true assert_images "the ci:all-gates label needs the image build" "true" "ops/bi-only/README.md"
+CASE_GATE_PATHS_FILE=/nonexistent assert_images "a missing gate map needs the image build" "true" "ops/bi-only/README.md"
+CASE_EVENT=schedule assert_images "a scheduled run needs the image build" "true" "ops/bi-only/README.md"
+
 echo "=== Results: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then
   exit 1

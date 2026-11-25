@@ -39,7 +39,7 @@ expect() {
   (
     # Clean subshell environment
     unset EVENT_NAME SCOPE_RUST SCOPE_FRONTEND SCOPE_DAGSTER SCOPE_STACK SCOPE_SITE SCOPE_DOCS_ONLY SCOPE_ALL \
-          PUSH_PROVEN PR_DRAFT SELECTED_GATE_GROUPS GATE_PATHS_FILE \
+          PUSH_PROVEN PR_DRAFT SELECTED_GATE_GROUPS SCOPE_IMAGES GATE_PATHS_FILE \
           CHANGES_RESULT REPO_LINTS_RESULT FRONTEND_RESULT SITE_RESULT RUST_FMT_RESULT RUST_CLIPPY_RESULT \
           RUST_BUILD_RESULT RUST_TEST_RESULT RUST_MSRV_RESULT DAGSTER_TESTS_RESULT DAGSTER_LOADER_TESTS_RESULT \
           G1_RUSTFS_RESULT G2_SEAWEEDFS_RESULT G3A_DAGSTER_RESULT G3_MAINTENANCE_RESULT \
@@ -273,6 +273,38 @@ expect 1 "Skipped consumers alone block rust PR even when images reports success
   G9_UPLOAD_RESULT=skipped G6_ALERTS_RESULT=skipped G6_OPS_RESULT=skipped G6_CREDENTIALS_RESULT=skipped G6_SECRET_MANAGERS_RESULT=skipped G6_OAUTH_RESULT=skipped G6_DISCOVERY_SCALE_RESULT=skipped G6_SAAS_A_RESULT=skipped G6_SAAS_B_RESULT=skipped GOLD_EXPORT_RESULT=skipped \
   G8_GOVERNANCE_RESULT=skipped G8_TIME_TRAVEL_RESULT=skipped
 expect 0 "Images and smoke skipped is fine for a docs-only PR" "${base_docs_green[@]}"
+
+# OPS-CI-FAST: `changes` answers `images_needed` (`SCOPE_IMAGES`), and only the
+# exact string `false` excuses a skipped `images` and `image-smoke`. The scope
+# script only answers `false` for a change that cannot alter either image, so a
+# PR that selects a gate group, `all`, an unreadable map or the `ci:all-gates`
+# label always arrives with `true`.
+base_images_not_needed=(
+  EVENT_NAME=pull_request SCOPE_STACK=true SCOPE_IMAGES=false SELECTED_GATE_GROUPS=none
+  CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=skipped
+  IMAGES_RESULT=skipped IMAGE_SMOKE_RESULT=skipped
+)
+
+base_lakehousectl_green=(
+  EVENT_NAME=pull_request SCOPE_RUST=true SCOPE_IMAGES=false SELECTED_GATE_GROUPS=none
+  CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=skipped
+  RUST_FMT_RESULT=success RUST_CLIPPY_RESULT=success RUST_BUILD_RESULT=success
+  RUST_TEST_RESULT=success RUST_MSRV_RESULT=success
+  DAGSTER_TESTS_RESULT=skipped DAGSTER_LOADER_TESTS_RESULT=skipped
+  IMAGES_RESULT=skipped IMAGE_SMOKE_RESULT=skipped
+)
+
+expect 0 "an ops/bi-only PR with images not needed passes with both skipped" "${base_images_not_needed[@]}"
+expect 0 "a lakehousectl-only PR passes with every Rust job green and the images skipped" "${base_lakehousectl_green[@]}"
+expect 0 "images not needed still accepts them when they ran green" "${base_images_not_needed[@]}" IMAGES_RESULT=success IMAGE_SMOKE_RESULT=success
+expect 1 "a failed images job still blocks the gate when images were not needed" "${base_images_not_needed[@]}" IMAGES_RESULT=failure
+expect 1 "a cancelled image smoke test still blocks the gate when images were not needed" "${base_images_not_needed[@]}" IMAGE_SMOKE_RESULT=cancelled
+expect 1 "a skipped build still blocks a lakehousectl-only PR" "${base_lakehousectl_green[@]}" RUST_BUILD_RESULT=skipped
+# Fail closed: only exact `false` excuses the images.
+expect 1 "SCOPE_IMAGES=true keeps the skipped images required" "${base_images_not_needed[@]}" SCOPE_IMAGES=true
+expect 1 "SCOPE_IMAGES=TRUE (wrong case) keeps the skipped images required" "${base_images_not_needed[@]}" SCOPE_IMAGES=TRUE
+expect 1 "an empty SCOPE_IMAGES keeps the skipped images required" "${base_images_not_needed[@]}" SCOPE_IMAGES=
+expect 1 "an unknown SCOPE_IMAGES keeps the skipped images required" "${base_images_not_needed[@]}" SCOPE_IMAGES=no
 
 # OPS-25 D7: a gate job is required only when its group was selected, and a
 # selection that cannot be read means every gate is required. The cases above

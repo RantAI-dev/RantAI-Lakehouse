@@ -6,7 +6,11 @@
  * `lakehouse_store::dashboard_reports`.
  *
  * Text is plain text: no block carries HTML, and the console renders every
- * string as text. A chart block is a reference to a chart on a dashboard; the
+ * string as text. `BI-62` (decision D3): the text of a heading, paragraph,
+ * list item and quote may carry a Markdown subset (`**bold**`, `*italic*`,
+ * `[words](address)`, `\` escaping `\ * [ ] ( )`), parsed by
+ * `src/lib/report-inline.ts` into React nodes and checked again by the
+ * server (`lakehouse_bi::reports`, `BadInlineLink`). A chart block is a reference to a chart on a dashboard; the
  * server reads it as the person reading the report (their masks and row
  * filters), and a chart they may not see comes back as `unavailable` with a
  * fixed sentence and nothing else.
@@ -15,14 +19,27 @@ import type { ChartRenderSpec } from "@/lib/dashboard-specs"
 import type { ReportingContext } from "@/lib/time-grain"
 import type { AccessLevel, TileFailure } from "./dashboards"
 
+/**
+ * How wide a chart block is drawn (`lakehouse_bi::reports::ChartWidth`,
+ * `BI-62`): the text column, or wider. Absent means `"text"`; the server does
+ * not write the default.
+ */
+export type ReportChartWidth = "text" | "wide"
+
 /** One block of a report (`lakehouse_bi::reports::Block`). */
 export type ReportBlock =
+  /** The editor writes levels 1 and 2 (`BI-62`); 3 still reads. */
   | { type: "heading"; text: string; level: 1 | 2 | 3 }
   | { type: "paragraph"; text: string }
   | { type: "list"; items: string[]; ordered?: boolean }
+  /** `BI-62`. */
+  | { type: "quote"; text: string }
+  /** `BI-62`: a line between two parts of the page. */
+  | { type: "divider" }
+  /** A report made before `BI-62`; the editor now saves a link inside a paragraph. */
   | { type: "link"; text: string; url: string }
   /** `board` is filled by the server from the chart's own row. */
-  | { type: "chart"; chart: string; board?: string }
+  | { type: "chart"; chart: string; board?: string; width?: ReportChartWidth }
 
 export type ReportBlockType = ReportBlock["type"]
 

@@ -1,10 +1,12 @@
 "use client"
 
 import Link from "next/link"
+import { FileCode2 } from "lucide-react"
 
 import { formatRelativeTime } from "@/lib/format"
 import { savedQueryHref, savedQueryRows, type CardRead } from "@/lib/home-cards"
-import { CardNote, CardSection, CardSkeleton, ReadNote } from "./home-ui"
+import { cn } from "@/lib/utils"
+import { CardNote, CardSection, CardSkeleton, ReadNote, ROW } from "./home-ui"
 
 type SavedQuery = { id: string; title: string; updatedAt: string }
 
@@ -24,6 +26,7 @@ export function SavedQueriesCard({
   return (
     <CardSection
       title="Saved queries"
+      icon={FileCode2}
       link={{ href: "/query-studio/saved", label: "All saved queries" }}
     >
       {read === "loading" ? (
@@ -38,7 +41,7 @@ export function SavedQueriesCard({
             <li key={q.id}>
               <Link
                 href={savedQueryHref(q.id)}
-                className="flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-sm transition-colors hover:bg-muted/60"
+                className={cn(ROW, "h-9 text-[13px] leading-5")}
               >
                 <span className="min-w-0 flex-1 truncate">{q.title}</span>
                 <span className="shrink-0 text-xs text-muted-foreground tabular-nums">

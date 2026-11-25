@@ -70,8 +70,6 @@ const RESULT = {
 
 /** Mounts the hook with `sql` in the editor and no network answers for the lists. */
 function mountWith(sql: string) {
-  spyOn(queryService, "listSaved").mockResolvedValue([])
-  spyOn(queryService, "listHistory").mockResolvedValue([])
   spyOn(assetService, "listAssets").mockResolvedValue([])
   const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
   act(() => hook.result.current.setSql(sql))
@@ -83,8 +81,6 @@ function mountWith(sql: string) {
 describe("useQueryStudio starter text", () => {
   it("starts the first tab and every new tab with an empty document", () => {
     window.localStorage.clear()
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(assetService, "listAssets").mockResolvedValue([])
     visit("/query-studio")
 
@@ -117,8 +113,6 @@ describe("useQueryStudio run link", () => {
   } as unknown as QueryHistoryItem
 
   function stubLists() {
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
     spyOn(assetService, "listAssets").mockResolvedValue([])
   }
@@ -168,8 +162,6 @@ describe("useQueryStudio run link", () => {
 describe("useQueryStudio saved-query link", () => {
   it("opens the saved query the link names, with its id and the caller's level", async () => {
     window.localStorage.clear()
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
     spyOn(assetService, "listAssets").mockResolvedValue([])
     const getSaved = spyOn(queryService, "getSaved").mockResolvedValue(SAVED)
@@ -188,8 +180,6 @@ describe("useQueryStudio saved-query link", () => {
 
   it("says the query is not available and opens no tab when the caller may not see it", async () => {
     window.localStorage.clear()
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
     spyOn(assetService, "listAssets").mockResolvedValue([])
     spyOn(queryService, "getSaved").mockRejectedValue(
@@ -208,8 +198,6 @@ describe("useQueryStudio saved-query link", () => {
 
   it("does not ask for a saved query when the link names none", async () => {
     window.localStorage.clear()
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
     spyOn(assetService, "listAssets").mockResolvedValue([])
     const getSaved = spyOn(queryService, "getSaved").mockResolvedValue(SAVED)
@@ -222,8 +210,6 @@ describe("useQueryStudio saved-query link", () => {
 
   it("opens the saved query once when the page runs in StrictMode", async () => {
     window.localStorage.clear()
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
     spyOn(assetService, "listAssets").mockResolvedValue([])
     const getSaved = spyOn(queryService, "getSaved").mockResolvedValue(SAVED)
@@ -343,8 +329,6 @@ describe("useQueryStudio explain", () => {
 
 describe("useQueryStudio columns", () => {
   it("takes the columns of a table once, however often the statement names it", async () => {
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(assetService, "listAssets").mockResolvedValue([
       { id: "silver.orders", name: "Orders", namespace: "silver" },
     ] as never)
@@ -402,8 +386,6 @@ describe("useQueryStudio Bronze tables", () => {
   function mountWithBronze(
     options: { tableMissing?: boolean; tableError?: ServiceError } = {}
   ) {
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
     spyOn(assetService, "listAssets").mockResolvedValue([
       { id: "demo_orders", name: "Demo Orders", namespace: "bronze", layer: "raw" },
@@ -586,8 +568,6 @@ describe("useQueryStudio Bronze proof on list load", () => {
   })
 
   function mountList(assets: unknown[], options: { tableError?: ServiceError } = {}) {
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
     spyOn(assetService, "listAssets").mockResolvedValue(assets as never)
     const getAsset = spyOn(assetService, "getAsset").mockImplementation(
@@ -802,6 +782,113 @@ describe("useQueryStudio statements", () => {
     // QA LH-QS-4-10: Stop says "stopped", not a failure.
     expect(runs.map((entry) => (entry.status === "not-run" ? entry.reason : null))).toEqual(["stopped", "stopped", "stopped"])
     expect(result.current.running).toBe(false)
+  })
+
+  it("asks the server to cancel a Trino run too, and aborts the request only after the answer (BI-63)", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    let signal: AbortSignal | undefined
+    const run = spyOn(queryService, "run").mockImplementation(((
+      _sql: string,
+      _options: unknown,
+      sig?: AbortSignal
+    ) => {
+      signal = sig
+      return new Promise(() => {})
+    }) as never)
+    let answer: () => void = () => {}
+    const cancel = spyOn(queryService, "cancel").mockImplementation(
+      () => new Promise((resolve) => { answer = () => resolve({ stopped: 0 }) })
+    )
+    const { result } = mountWith("SELECT 1")
+    expect(result.current.engine).toBe("trino")
+
+    await act(async () => {
+      void result.current.runQuery()
+    })
+    await waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+    const runId = (run.mock.calls[0]?.[1] as { runId: string }).runId
+
+    await act(async () => {
+      result.current.stopRun()
+    })
+
+    // Cancel went first and the request is still open; "Stopped" is already on screen.
+    expect(cancel).toHaveBeenCalledTimes(1)
+    expect(cancel.mock.calls[0]?.[0]).toBe(runId)
+    expect(signal?.aborted).toBe(false)
+    expect(result.current.running).toBe(false)
+
+    await act(async () => {
+      answer()
+    })
+    await waitFor(() => expect(signal?.aborted).toBe(true))
+  })
+
+  // PR #649 review 1: Stop aborts only after the cancel's answer (up to 2 s),
+  // so a stopped batch's cleanup can resume after the person pressed Run
+  // again and a newer batch owns the tab. The old batch must leave the new
+  // one's rows, its "running" state (the Stop button) and its reload alone.
+  it("a stopped batch's late cleanup leaves alone the newer batch that replaced it", async () => {
+    // The real fetch rejects when its request is aborted, so the stopped
+    // batch's loop resumes in its catch; the promise settles otherwise only
+    // when the test says so, which ends the newer batch.
+    const inFlight: { signal?: AbortSignal; resolve: (value: unknown) => void }[] = []
+    const run = spyOn(queryService, "run").mockImplementation(((
+      _sql: string,
+      _options: unknown,
+      sig?: AbortSignal
+    ) => {
+      return new Promise((resolve, reject) => {
+        inFlight.push({ signal: sig, resolve })
+        sig?.addEventListener("abort", () => reject(new Error("aborted")))
+      })
+    }) as never)
+    let answer: () => void = () => {}
+    const cancel = spyOn(queryService, "cancel").mockImplementation(
+      () => new Promise((resolve) => { answer = () => resolve({ stopped: 0 }) })
+    )
+    const { result } = mountWith("SELECT 1")
+
+    // The first batch is in flight when Stop is pressed.
+    await act(async () => {
+      void result.current.runSelectionOrAll()
+    })
+    await waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+    await act(async () => {
+      result.current.stopRun()
+    })
+    expect(result.current.running).toBe(false)
+
+    // Run pressed again before the cancel answered: a newer batch owns the
+    // tab, and its statement is in flight.
+    await act(async () => {
+      void result.current.runSelectionOrAll()
+    })
+    await waitFor(() => expect(run).toHaveBeenCalledTimes(2))
+    expect(result.current.running).toBe(true)
+
+    // The cancel answers; the old request aborts and the stopped batch's
+    // cleanup resumes — after the newer batch has replaced it.
+    await act(async () => {
+      answer()
+    })
+    await waitFor(() => expect(inFlight[0]?.signal?.aborted).toBe(true))
+
+    // The newer batch still owns the page: its row was not overwritten with
+    // "not run", and running is still true, so the Stop button is still
+    // there to stop it.
+    expect(result.current.running).toBe(true)
+    const rows = result.current.runs[result.current.activeTabId] ?? []
+    expect(rows.map((entry) => entry.status)).toEqual(["running"])
+
+    // And it ends on its own terms, not on the old batch's cleanup.
+    await act(async () => {
+      inFlight[1]?.resolve(RESULT)
+    })
+    await waitFor(() => expect(result.current.running).toBe(false))
+    const done = result.current.runs[result.current.activeTabId] ?? []
+    expect(done.map((entry) => entry.status)).toEqual(["done"])
+    expect(cancel).toHaveBeenCalledTimes(1)
   })
 
   it("runs only the selection when there is one", async () => {
@@ -1228,8 +1315,6 @@ describe("useQueryStudio parameter requests", () => {
 
   it("opens a saved query with its definitions and no values, so each field starts at its default", async () => {
     window.localStorage.clear()
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
     spyOn(assetService, "listAssets").mockResolvedValue([])
     const definitions = [
@@ -1294,8 +1379,6 @@ describe("useQueryStudio draft owner", () => {
 
   /** Stubs the lists the hook asks for, so nothing reaches the network. */
   function stubLists() {
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
     spyOn(assetService, "listAssets").mockResolvedValue([])
   }

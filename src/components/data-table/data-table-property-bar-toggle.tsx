@@ -61,13 +61,15 @@ export function DataTablePropertyBarToggle<TData>({
   const [pickerOpen, setPickerOpen] = React.useState(false);
   const openedBarForPickerRef = React.useRef(false);
 
-  const { columns, filters, addColumnFilter } = useDataTableFilters(table, {
+  const { columns, filters, shownFilters, addColumnFilter } = useDataTableFilters(table, {
     shallow,
     debounceMs,
     throttleMs,
   });
 
-  const hasActiveFilters = filters.length > 0;
+  // UX-8: a filter the page's own control shows (`meta.isQuickFilter`) is
+  // not counted here, so the button says "2" only for what the bar shows.
+  const hasActiveFilters = shownFilters.length > 0;
 
   const availableColumns = React.useMemo(
     () =>
@@ -141,7 +143,7 @@ export function DataTablePropertyBarToggle<TData>({
       <ListFilter className="text-muted-foreground" />
       {hasActiveFilters ? (
         <Badge variant="secondary" className="rounded-sm px-1 font-normal">
-          {filters.length}
+          {shownFilters.length}
         </Badge>
       ) : null}
     </Button>
@@ -258,6 +260,30 @@ function readStoredDismissed(storageKey: string): string | null {
   }
 }
 
+/**
+ * The `filters` param less the filters a control on the page already shows
+ * (UX-8, `meta.isQuickFilter`), so those alone do not open the bar: it
+ * would open on nothing but "+ Filter". Unreadable JSON is passed through,
+ * and the bar decides on it as before.
+ */
+function shownFiltersParam(
+  raw: string | null,
+  isQuickFilter?: (filter: { id: string; value: unknown; operator: string }) => boolean
+): string | null {
+  if (!raw || !isQuickFilter) return raw;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return raw;
+    const shown = parsed.filter(
+      (filter) =>
+        !(typeof filter === "object" && filter !== null && isQuickFilter(filter as { id: string; value: unknown; operator: string }))
+    );
+    return shown.length > 0 ? JSON.stringify(shown) : null;
+  } catch {
+    return raw;
+  }
+}
+
 export function usePropertyBarOpenState<TData>(
   table: Table<TData>,
   /** Extra URL keys that should open the bar on load (e.g. page-specific filters). */
@@ -269,14 +295,18 @@ export function usePropertyBarOpenState<TData>(
   const persistKey = table.options.meta?.persistKey ?? pathname;
   const storageKey = getPropertyBarStorageKey(persistKey);
 
+  const isQuickFilter = table.options.meta?.isQuickFilter;
   const ruleSignature = React.useMemo(
     () =>
       [
         searchParams.get(keys.sort),
-        searchParams.get(keys.filters),
+        shownFiltersParam(
+          searchParams.get(keys.filters),
+          searchParams.get(keys.joinOperator) === "or" ? undefined : isQuickFilter
+        ),
         ...openWhenKeys.map((key) => searchParams.get(key)),
       ].join("\0"),
-    [keys.filters, keys.sort, openWhenKeys, searchParams]
+    [isQuickFilter, keys.filters, keys.joinOperator, keys.sort, openWhenKeys, searchParams]
   );
 
   const hasActiveRules = ruleSignature.replace(/\0/g, "").length > 0;

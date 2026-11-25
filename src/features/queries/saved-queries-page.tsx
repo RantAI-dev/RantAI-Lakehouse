@@ -187,6 +187,8 @@ export function SavedQueriesPage() {
         description="Reusable SQL in a personal and a shared space, with owners and tags."
         actions={
           <>
+            {/* UX-9: the sections are the header's own control now. */}
+            <QueryStudioTabs />
             <Button
               variant="outline"
               size="sm"
@@ -201,7 +203,6 @@ export function SavedQueriesPage() {
           </>
         }
       />
-      <QueryStudioTabs />
       {scheduling.status === "success" && scheduling.data.supported === false ? (
         <p className="text-sm text-muted-foreground">
           Scheduled queries: not supported yet — {scheduling.data.reason}.

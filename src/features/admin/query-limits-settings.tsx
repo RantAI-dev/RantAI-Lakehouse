@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { HelpHint } from "@/components/patterns/help-hint"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -143,7 +144,7 @@ export function QueryLimitsForm({ canWrite }: { canWrite: boolean }) {
           <div className="flex flex-col gap-2" role="group" aria-labelledby="limits-roles">
             <Label id="limits-roles">Time limit by role</Label>
             <p className="text-xs text-muted-foreground">
-              A role listed here uses its own time limit instead of the install’s. A person with several roles gets the longest.
+              Roles with their own time limit. The longest wins.
             </p>
             {rows.map((row, i) => {
               const problem = limitProblem("timeoutSeconds", row.timeoutSeconds)
@@ -200,8 +201,9 @@ export function QueryLimitsForm({ canWrite }: { canWrite: boolean }) {
               </div>
             ) : null}
           </div>
+          {/* PR UX-7 review SHOULD-FIX 1: the one help popover, `HelpHint`, ends the one-line help. */}
           <p className="text-xs text-muted-foreground">
-            A long time limit keeps a request open as long: with 30 minutes, a dashboard may take 30 minutes to answer. Exports keep their own limits.
+            A dashboard may wait this long to answer. <HelpHint>With 30 minutes, a dashboard may take 30 minutes to answer. Exports keep their own limits.</HelpHint>
           </p>
           {canWrite ? (
             <div className="flex items-center gap-3">

@@ -90,8 +90,14 @@ type ChatResult = {
   nextStep?: string;
 };
 
+/** What an answer with no text and no tool steps is shown as. */
+export const NO_ANSWER_TEXT = "AI Copilot didn't return an answer.";
+
 /** How many recent sessions the header history menus list. */
-const RECENT_SESSIONS = 20;
+export const RECENT_SESSIONS = 20;
+
+/** Whether the recent sessions were read: Home tells "no chats yet" from "could not load" (`WEB-17` T5). */
+export type SessionsRead = "loading" | "ok" | "error";
 
 /**
  * The line a stopped answer is sent to the model as (`BI-41` D3). An answer
@@ -309,6 +315,7 @@ function useCopilotState() {
    */
   const [sessionTitle, setSessionTitle] = React.useState<string | null>(null);
   const [sessions, setSessions] = React.useState<SessionMeta[]>([]);
+  const [sessionsRead, setSessionsRead] = React.useState<SessionsRead>("loading");
   const [confirmingKey, setConfirmingKey] = React.useState<string | null>(null);
   const [enabledCaps, setEnabledCaps] = React.useState<Set<string>>(() => new Set(ALL_CAP_KEYS));
   const pathname = usePathname();
@@ -373,7 +380,11 @@ function useCopilotState() {
     try {
       const page = await chatSessionService.list({ limit: RECENT_SESSIONS });
       if (Array.isArray(page.sessions)) setSessions(page.sessions);
-    } catch { /* the menu keeps what it had */ }
+      setSessionsRead("ok");
+    } catch {
+      // The menu keeps what it had; a list that was never read says so.
+      setSessionsRead((r) => (r === "ok" ? r : "error"));
+    }
   }, []);
 
   React.useEffect(() => { void refreshSessions(); }, [refreshSessions]);
@@ -412,8 +423,12 @@ function useCopilotState() {
   /**
    * Sends `text` after `history` (default: the current conversation) and
    * streams Copilot's progress until the answer arrives.
+   *
+   * `options.mode` asks in that mode for this one message and leaves the
+   * conversation's own mode as it is (`BI-62` D8: the report editor's
+   * drafts are always Ask, whatever the panel is set to).
    */
-  const send = React.useCallback(async (text: string, history?: Msg[], options?: { continuation?: boolean }) => {
+  const send = React.useCallback(async (text: string, history?: Msg[], options?: { continuation?: boolean; mode?: Mode }) => {
     const q = text.trim();
     if (!q || busy) return;
     // A typed message starts a new chain; a continuation belongs to the
@@ -439,9 +454,9 @@ function useCopilotState() {
         method: "POST", headers: { "Content-Type": "application/json" },
         signal: controller.signal,
         body: JSON.stringify({
-          mode,
+          mode: options?.mode ?? mode,
           stream: true,
-          tools: toolsFromCaps(enabledCaps, mode),
+          tools: toolsFromCaps(enabledCaps, options?.mode ?? mode),
           context: pageContextRef.current?.system,
           view: pageContextRef.current?.view,
           messages: chatHistory(next),
@@ -499,7 +514,7 @@ function useCopilotState() {
         {
           id: assistantId,
           role: "assistant",
-          content: result.answer || (tools.length ? "" : "AI Copilot didn't return an answer."),
+          content: result.answer || (tools.length ? "" : NO_ANSWER_TEXT),
           tools,
           buildRunId: result.buildRunId,
           chartCreated,
@@ -775,7 +790,7 @@ function useCopilotState() {
   const main = React.useMemo(
     () => ({
       sessionTitle,
-      mode, setMode, messages, busy, error, askNotice, sessionId, sessions,
+      mode, setMode, messages, busy, error, askNotice, sessionId, sessions, sessionsRead,
       enabledCaps, toggleCap, pageContext, setPageContext,
       send, newChat, loadSession, removeSession, renameSession, refreshSessions,
       stop, retry, editAndResend, deleteMessage, clearError, answerAskOption,
@@ -784,7 +799,7 @@ function useCopilotState() {
       sidebarWidth, setSidebarWidth,
     }),
     [
-      sessionTitle, mode, messages, busy, error, askNotice, sessionId, sessions,
+      sessionTitle, mode, messages, busy, error, askNotice, sessionId, sessions, sessionsRead,
       enabledCaps, toggleCap, pageContext, setPageContext,
       send, newChat, loadSession, removeSession, renameSession, refreshSessions,
       stop, retry, editAndResend, deleteMessage, clearError, answerAskOption,
@@ -848,6 +863,7 @@ const NOOP_COPILOT: CopilotValue = {
   askNotice: null,
   sessionId: null,
   sessions: [],
+  sessionsRead: "ok",
   enabledCaps: new Set<string>(),
   toggleCap: () => {},
   pageContext: derivePageContext("/"),

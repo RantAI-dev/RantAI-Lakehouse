@@ -2,12 +2,13 @@
 // editor that the console actually runs, and that the dialog lists a row
 // for each shortcut when the button is pressed. The services are stubbed;
 // nothing here reaches the network.
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, render, screen, waitFor } from "@testing-library/react"
 import type { EditorState } from "@codemirror/state"
 import { EditorView, keymap, type KeyBinding } from "@codemirror/view"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
-import { assetService, queryService } from "@/services"
+import { assetService } from "@/services"
 import { EDITOR_SHORTCUTS } from "@/lib/editor-shortcuts"
+import { KeyboardShortcutsDialog } from "./keyboard-shortcuts-dialog"
 import { SqlPanel } from "./sql-panel"
 import { queryDraftKey } from "@/lib/query-draft"
 import { useQueryStudio } from "./use-query-studio"
@@ -19,8 +20,6 @@ afterEach(() => {
 })
 
 function stubServices() {
-  spyOn(queryService, "listSaved").mockResolvedValue([])
-  spyOn(queryService, "listHistory").mockResolvedValue([])
   spyOn(assetService, "listAssets").mockResolvedValue([])
   spyOn(assetService, "getAsset").mockResolvedValue({ schema: [] } as never)
 }
@@ -28,7 +27,7 @@ function stubServices() {
 /** Wraps the studio hook with the SQL panel, the same way the page does. */
 function Harness() {
   const studio = useQueryStudio(queryDraftKey("u1", null))
-  return <SqlPanel studio={studio} onSave={() => {}} />
+  return <SqlPanel studio={studio} />
 }
 
 /** Finds the editor view from the DOM, the way the editor's own API exposes it. */
@@ -74,18 +73,15 @@ describe("keyboard shortcut bindings", () => {
 })
 
 describe("KeyboardShortcutsDialog", () => {
-  it("opens the dialog from the button in the toolbar and lists a row for every shortcut", async () => {
-    stubServices()
-    render(<Harness />)
+  // UX-9: the dialog opens from the ⋯ menu and the command menu, so the
+  // page holds whether it is open; the menu path is in the page tests.
+  it("lists a row for every shortcut the editor binds, and the command menu's key", async () => {
+    render(<KeyboardShortcutsDialog open onOpenChange={() => {}} />)
 
-    const trigger = await screen.findByRole("button", { name: /keyboard shortcuts/i })
-    act(() => {
-      fireEvent.click(trigger)
-    })
-
-    // Every action should be visible in the dialog
     for (const shortcut of EDITOR_SHORTCUTS) {
       expect(await screen.findByText(shortcut.action)).toBeTruthy()
     }
+    expect(screen.getByText("Open the command menu")).toBeTruthy()
+    expect(screen.getByText("F1")).toBeTruthy()
   })
 })

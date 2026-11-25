@@ -1,0 +1,356 @@
+# BI-62: the report editor as a document (mockup D), plan
+
+| | |
+| --- | --- |
+| Backlog | `BI-62` |
+| Spec | `docs/core/specs/bi-62.md` |
+| Feature page | `docs/core/features/report-editor.md` |
+| Base | `feat/bi-61-dashboard-page` at `96491b8d5` (PR #541: the shared side panel with tabs, which contains #528 reports and #530/#531). This PR follows #541 |
+| Branch | `feat/bi-62-report-editor`, worktree `/home/hv/mtharreq/lakehouse-bi62` |
+| Planner and reviewer | Claude Opus (hub session) |
+| Developer | an Opus developer agent (console design work, AGENTS.md exception) |
+
+## 1. Decisions already made
+
+- **Owner QA 2026-11-16: no Preview button** — the editor already shows the reader's view.
+
+- **D1, layout = mockup D (owner, 2026-11-15, "aku suka yang D ini, gaskan kita implementasikan").**
+  The reference is the local branch `design/chart-builder-mockups` (worktree
+  `/home/hv/mtharreq/lakehouse-mockups`), route `/mockups/report-editor/d`, code in
+  `src/features/mockups/report-editor/` (`editor.tsx`, `extensions.ts`, `menus.tsx`, `chart.tsx`,
+  `draft.tsx`, `frame.tsx`, `thread.ts`, `ui.tsx`, `report-editor.css`, `mockups.tsx`). Read it
+  with `git -C /home/hv/mtharreq/lakehouse-mockups show <commit>:<path>` at the commit the planner
+  names in the "Reference commit" line below (the D mockup is being finished; until that line is
+  filled, read the worktree as it is and say so in the handoff). The mockup code is ours (same
+  repository, AGPL): port it, do not copy third-party component code. Copy the look and the
+  behaviour, not the fixtures.
+  - Reference commit: `8826424ae` on `design/chart-builder-mockups` (local branch, worktree
+    `/home/hv/mtharreq/lakehouse-mockups`), committed 2026-11-19. PR B reads `draft.tsx`,
+    `thread.ts`, `menus.tsx` and `editor.tsx` there.
+- **D2, editor library: Tiptap 3, MIT packages only, exact versions.** The mockup uses
+  `@tiptap/react`, `@tiptap/pm`, `@tiptap/core`, `@tiptap/starter-kit`, `@tiptap/extensions`,
+  `@tiptap/extension-typography`, `@tiptap/suggestion`, `@tiptap/extension-bubble-menu`, all
+  `3.34.0`, MIT. Add exactly those the editor needs, pinned (no `^`), and check each new transitive
+  dependency's licence (the repo is AGPL-3.0: MIT, Apache-2.0, BSD and ISC are fine; ask before anything else). No Tiptap Pro, no
+  `@tiptap/extension-drag-handle` (it pulls collaboration packages): the drag handle is ours, as
+  in the mockup. The owner has used Tiptap before.
+- **D3, storage stays a list of blocks; the editor is a view of it.** No new storage format and
+  no migration: `lakehouse_bi::reports::Block` (`rust/crates/lakehouse-bi/src/reports.rs:66`)
+  grows, everything old still parses.
+  - New block kinds: `quote { text }` and `divider {}`.
+  - `chart` gains `width: "text" | "wide"` (absent = `"text"`).
+  - Heading levels written by the editor are 1 and 2; 3 still reads.
+  - **Inline marks are a Markdown subset inside the text fields** of heading, paragraph, list
+    items and quote: `**bold**`, `*italic*`, `[words](address)`, with `\` escaping `\ * [ ] ( )`.
+    Why: one string per field keeps the schema and every reader (console, PDF render view,
+    assistant tools, exports) simple, plain text reads the same, and the assistant already writes
+    Markdown. The editor escapes what a person types, so a literal `*` stays a `*`.
+  - The server checks every inline link address with the same rule as the `link` block (today's
+    `safe_url` in `reports.rs`; `https://`, `http://`, `mailto:`, a console path), and refuses a
+    report holding another one with a fixed sentence (a new `ReportRule` variant). Limits are
+    unchanged (30 charts, 300 blocks, 10,000 characters per text, 100 list items).
+  - **Old `link` blocks** still parse, read and print as today. The editor shows one as a
+    paragraph holding an inline link and saves it that way (the only lossless rewrite).
+- **D4, autosave replaces Save.** Save about 1 s after typing stops, and immediately on blur,
+  on leaving the page (route change) and on `pagehide`/`beforeunload` (best effort). The header
+  shows Saving… · Saved · Couldn't save · Retry (DESIGN.md: one short status line). A new report
+  is created on its first non-empty change (title or any block), then the URL becomes its edit
+  URL without a navigation flash. Last write wins when two people edit (as today, a limit on the
+  feature page). A server refusal (e.g. the 31st chart, an unsafe link) shows its sentence next to
+  the status and keeps the local text.
+- **D5, charts.** A chart block is a node drawing the live chart through the existing
+  `ReportingProvider` / `TileBody` path, in a soft card without border (DESIGN.md), with the
+  chart title and "from <dashboard>" small above it, and a hover toolbar: Swap · Text width/Wide ·
+  Remove. Pickers show **live previews grouped by dashboard** with search (DESIGN.md: choices are
+  previews). Thumbnails render lazily when visible.
+- **D6, the Charts shelf is a tab of the one side panel** (`useSidePanelTabs`,
+  `src/components/app-shell/side-panel.tsx`, BI-61 T6): tabs **AI Copilot · Charts**. Drag a
+  thumbnail into the document or click to insert at the cursor. On a wide screen the panel opens
+  on Charts for an empty report; otherwise it keeps its last state. On a phone it is a sheet.
+  DESIGN.md: one side panel at a time, one header, close by divider click / dock / Esc.
+- **D7, the reader page, the editor and the PDF use one renderer** (`report-blocks.tsx`): marks,
+  quote, divider and chart width render the same everywhere; marks are built as React nodes
+  (never `dangerouslySetInnerHTML`), links only through `safeReportUrl`.
+- **D8, the assistant in the page (PR B).** "Ask AI to write…" (first item of `/`) and
+  "Describe" (a chart's hover toolbar) send a request to the existing assistant in Ask mode with
+  the report as page context (title, blocks as Markdown, the chosen chart's id, title, dashboard
+  and the rows the reader can see, capped), stream the answer into an inline **draft** node, and
+  Accept (Enter) turns it into blocks with the D3 parser; Discard (Esc) removes it. The exchange
+  is one assistant conversation, so it also appears in the AI Copilot tab. No sparkles; the
+  `Bot` mark. Drafts never save until accepted.
+- **D9, assistant parity (AGENTS.md).** The assistant's report tools `create_report` /
+  `update_report` (`rust/crates/lakehouse-api/src/routes/ai/registry.rs:2015-2035, 2893-2905`,
+  prompt hints `prompt.rs:877, 1205`) accept the new block kinds, the chart width and the inline
+  Markdown subset; regenerate (hand-edit, see Verification) `tests/fixtures/tool_schemas.json`;
+  the standard request set (`AI-15`, `ops/ai_eval/dashboard_cases.json`) gains "write a report
+  with a bold sentence, a quote and a wide chart". This is in PR A so the assistant never writes
+  a report the editor cannot show.
+- **Phone, motion, focus.** No drag handles on touch (the mockup does the same); `/`, Alt+↑/↓ and
+  tapping a chart (its toolbar) work. Reduced motion: no animated widths or slides. Focus rings on
+  everything. Mono font only for code.
+
+## 2. Tasks
+
+PR A (editor, storage, reader, PDF, Charts tab, assistant tools):
+
+1. **T1 (Rust) Blocks grow.** `reports.rs`: `Quote`, `Divider`, `Chart.width`, the inline-link
+   check with its `ReportRule` and sentence, unit tests (parse old and new JSON; a `javascript:`
+   inline link refused; escaped brackets are not a link; limits unchanged). Assistant tool
+   schema and prompt hints (D9) and the fixture. *Check:* `cargo fmt --check`,
+   `scripts/ci/check_test_modules.sh`; compile, clippy and tests in CI (no Rust compile on the
+   VM, owner rule 2026-11-14).
+2. **T2 (TS) Contract and the inline Markdown subset.** `src/services/contracts/dashboard-reports.ts`
+   types; `src/lib/report-inline.ts`: parse to tokens, serialise from Tiptap marks with escaping,
+   `safeReportUrl` on links; round-trip tests incl. hostile input (`[x](javascript:…)`,
+   unbalanced `**`, nested marks, backslashes). *Check:* scoped `bun test`, typecheck.
+3. **T3 One renderer.** `report-blocks.tsx` renders marks, quote, divider, chart width; reader
+   page, the editor and `report-render-view.tsx` (PDF) use it. *Check:* render tests for each kind.
+4. **T4 The editor.** Replace `report-editor-page.tsx`'s form with the D editor: title line,
+   `/` menu (grouped, height-capped with edge fade, keyboard), Markdown shortcuts, bubble menu
+   (bold, italic, link with `safeReportUrl`), ⋮⋮ and + handles, Alt+↑/↓, chart node (D5), picker,
+   Download PDF, N-of-30 near the limit, old link blocks mapped (D3). The editor converts
+   blocks → document on load and document → blocks on save (pure functions, unit-tested
+   round trip on every block kind). *Check:* tests for slash filtering, shortcut mapping,
+   conversion round trip.
+5. **T5 Autosave (D4).** A small state machine (idle → dirty → saving → saved | error) with
+   debounce, flush on blur/leave, create-on-first-change, refusal sentences kept beside the
+   status. *Check:* unit tests with fake timers and a fake service (debounce, flush, retry,
+   create then update, refusal).
+6. **T6 Charts tab (D6).** Register the tab on the report editor page; thumbnails grouped by
+   dashboard, search, drag and click insert, lazy render, sheet on phone. *Check:* tests for tab
+   registration, click insert, search.
+7. **T7 Finish.** Light/dark, 1190×800, 1366×900, 390×844 screenshots (headless Chrome against a
+   production build is not possible on the VM without the QA stack; take them from the QA stack
+   after the planner deploys, or from a component harness), reduced motion, focus. Handoff.
+
+PR B (the assistant in the page, D8), on top of PR A:
+
+8. **T8** inline drafts: `/` "Ask AI to write…" (one-line prompt with three suggestions as in
+   the mockup), chart "Describe", streaming into a draft node, Accept/Discard, the same
+   conversation in the AI Copilot tab, page context as in D8. *Check:* tests with a fake stream:
+   draft appears, Accept inserts parsed blocks, Discard leaves the document unchanged, nothing is
+   saved before Accept.
+9. **T9** AI-15 cases for the editor ("describe this chart", "write a short summary of this
+   report"); handoff.
+
+### PR B anchors and rules (planner, 2026-11-19, verified at `7d6f960ea`)
+
+Branch `feat/bi-62-report-editor-b` off `feat/bi-62-report-editor` (`7d6f960ea`, PR #545), worktree
+`/home/hv/mtharreq/lakehouse-bi62b`. The PR's base is `main`; its body says "merge after #545".
+
+- **One conversation.** The page has one assistant: `useCopilot()`
+  (`src/features/copilot/use-copilot.ts`): `send(text)`, `messages`, `busy`, `stop`, `mode` /
+  `setMode`. A draft is a `send` on that conversation, so it shows in the AI Copilot tab by
+  construction; the draft reads the streaming text of the assistant message that `send` adds.
+  Do not open a second chat stream or call the chat route directly. Drafts are Ask mode: if
+  `send` cannot take a mode for one call, switch to Ask for the draft and back afterwards, and
+  say in the handoff which one you did.
+- **Busy.** While the conversation is busy (an answer streaming in the tab, or another draft), the
+  `/` item and Describe stay visible but disabled with a one-line reason in their tooltip; one
+  draft at a time.
+- **Page context.** The editor page sets `setPageContext` like `report-reader-page.tsx:54-73`,
+  but richer: title, the blocks as Markdown (headings, lists, quotes, charts as
+  `[chart: <title> · <dashboard>]`), and for Describe the chosen chart's id, title, dashboard
+  and its rows as the reader sees them (`summarizeRows` in `src/lib/page-context-summary.ts`),
+  the whole capped at `PAGE_CONTEXT_MAX_CHARS`. Cleared on unmount. Rows come from data the page
+  already loaded for that chart (the `ReportingProvider` / `TileBody` path); never a second
+  query just for the context. If the rows are not loaded yet, send the context without rows and
+  say so in it ("rows not loaded").
+- **Draft node.** Port `DraftNode` and the prompt line from the mockup (`draft.tsx`, three
+  suggestions). States: prompt → writing (streamed text, a Stop control) → done (Accept ·
+  Discard; Enter / Esc). The draft is never part of the saved document: the document → blocks
+  conversion skips it and the autosave state machine does not go dirty on it.
+- **Accept** turns the answer into blocks with a pure `markdownToBlocks` (paragraphs, `#`/`##`,
+  `-` and `1.` lists, `>` quotes, `---`, inline marks through `report-inline.ts`; anything else
+  → paragraph text; a link that fails `safeReportUrl` becomes its plain words). Unit-tested on
+  every kind and on hostile input. Accept is one undo step. **Discard** while writing calls
+  `stop` first; the document is then byte-identical to before.
+- **An error or a refusal** in the answer shows as one line in the draft with Retry; nothing is
+  inserted.
+- **Look.** `Bot` mark, no sparkles (DESIGN.md §3). Status text is one short line. Reduced motion:
+  no typing animation, the text appears as it arrives. Phone: `/` → Ask AI works; Describe from
+  the chart's tap toolbar.
+- **T9.** Add the two cases to `ops/ai_eval/dashboard_cases.json` in the existing shape; no tool
+  or schema change is expected in PR B. If one turns out to be needed, stop and report (D9 is the
+  AI team's part).
+- **Tests** (scoped, VM rules in section 3): fake stream through a stubbed `useCopilot`: draft
+  appears and streams, Accept inserts parsed blocks, Discard (also mid-stream) leaves the document
+  unchanged, nothing reaches the save service before Accept, busy disables the entries, error →
+  Retry. Restore every global and `mock.module` (CI runs all files in one process).
+
+## 3. Verification (VM rules, 2026-11-14 and 2026-11-15)
+
+- **No Rust compilation on the VM** (`cargo build/check/clippy/test` OOM the shared VM). Rust is
+  written carefully and verified by GitHub CI on the draft PR; locally only `cargo fmt --check`
+  and `scripts/ci/check_test_modules.sh`. The fixture `tests/fixtures/tool_schemas.json` is
+  edited by hand to match the new schema; CI's comparison test confirms it.
+- TS: `bun install` once (after adding the pinned Tiptap packages), then only scoped tests and
+  typecheck, each under `flock /tmp/claude-1000/lh-bun.lock systemd-run --user --scope -p
+  MemoryMax=3G -p MemorySwapMax=0 nice -n 15 …`; `npx eslint` on changed files. Never the full
+  `bun run test` or `bun run lint` (CI runs them). No dev server, no prettier.
+- Watch for test pollution (CI runs all files in one process): restore every global and
+  `mock.module` you change, and set up every global your test relies on.
+- QA: the planner deploys the console to the QA stack from the preview branch; the API image with
+  T1 comes from the PR's CI image artifact (as for #528), never from a VM build.
+
+## 4. Out of scope
+
+Co-editing, comments and version history on reports, images/tables in reports, report delivery
+by schedule, templates for reports.
+
+## Handoff
+
+(The developer appends one entry per PR: commits, commands run with counts, packages added with
+licences, and everything *not verified*.)
+
+### Handoff, PR A (T1 to T7), developer (Opus, console design), 2026-11-15
+
+**Commits** (branch `feat/bi-62-report-editor`, on `db69c34c4`), one task each:
+
+| Task | Commit | What |
+| --- | --- | --- |
+| T1 | `fa351711e` | `reports.rs`: `Quote`, `Divider {}`, `Chart.width` (`ChartWidth`, default `text`, not serialised when `text` so old rows write back unchanged), `ReportRule::BadInlineLink` + sentence, inline-link check (linear; checks the console's link rule at *every* unescaped `[`, so it is a superset of what the console can draw); the route keeps `width` when it fills `board`; integration test for the new kinds over HTTP and the updated unknown-kind sentence; tool schema (`report_blocks_schema`), prompt hint, fixture hand-edited; AI-15 case `report_with_marks_a_quote_and_a_wide_chart`; CHANGELOG |
+| T2 | `0d231af05` | contract (`ReportChartWidth`, quote, divider, width); `src/lib/report-inline.ts` (parse, serialise, escape, Tiptap nodes both ways, links only through `safeReportUrl`); `blocksForSave` keeps a wide width |
+| T3 | `6c665dc57` | `report-blocks.tsx` one renderer (marks as React nodes, quote, divider, chart width box, D look of the card); `report-document.css` shared by editor and reader; reader page as the document; print view test reads charts through the width box |
+| T4 | `9bfc5fdb2` | the editor (Tiptap 3): `report-editor-page.tsx`, `-extensions.ts`, `-chart.tsx`, `-menus.tsx`, `-ui.tsx`, `report-charts.tsx` (catalogue + lazy board payloads), `report-chart-picker.tsx` (D picker), `src/lib/report-doc.ts` (blocks ↔ document); `listCharts` service call; old block-edit helpers in `report-blocks.ts` removed with their tests; packages added |
+| T5 | `b0216e963` | `src/lib/report-autosave.ts` state machine and its wiring (debounce 1 s, flush on blur, unmount, pagehide, hidden tab; beforeunload confirm when unsaved; create on first non-empty change, `history.replaceState` to the edit URL; refusal sentence beside the status) |
+| T6 | `0febc8c15` | Charts tab: `report-chart-shelf.tsx` (`useSidePanelTabs`, portal into the panel, opens on Charts for an empty report on ≥1024 px, else remembered per browser), header toggle |
+| T7 | this commit | CHANGELOG extended; this handoff |
+
+**Mockup state ported.** The "Reference commit" line was still empty when T4 started, and the
+mockups worktree had D uncommitted on top of `5b1cca202`. Ported from the worktree as read at
+2026-11-15T06:29Z; sha256 prefixes: `editor.tsx c4fdef1c1aba`, `extensions.ts 048fe6fd5b69`,
+`menus.tsx 87f0b0bd0ef8`, `chart.tsx 899751cd16f1`, `frame.tsx 6c0764b3d25d`,
+`mockups.tsx e982c1fd3cea`, `report-editor.css cafc4e1d768f`, `context.ts be9c51423b01`. If the
+final D commit differs, the diff against these is what is left to port.
+
+**Packages** (`bun add --exact`, under the 3 GB scope): `@tiptap/core`, `@tiptap/pm`,
+`@tiptap/react`, `@tiptap/starter-kit`, `@tiptap/extensions`, `@tiptap/extension-typography`,
+`@tiptap/suggestion`, `@tiptap/extension-bubble-menu`, all `3.34.0`, MIT. The lockfile gained 48
+packages (the eight above, the StarterKit's `@tiptap/extension-*`, `prosemirror-*` 1.x,
+`orderedmap`, `rope-sequence`, `linkifyjs`, `fast-equals`, `@types/use-sync-external-store`);
+each `package.json` was read: **48 of 48 MIT**. No Tiptap Pro, no drag-handle extension. The
+lockfile was written by bun 1.4.0 (VM); `packageManager` says 1.3.12; only additions, no
+existing line changed.
+
+**Commands run, on the final commit, with counts:**
+
+- `cd rust && cargo fmt --check` — clean. `bash scripts/ci/check_test_modules.sh` — "every test
+  file under rust/crates/*/tests/ is compiled into a test binary".
+- `flock … systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15 bun test
+  src/lib/report-blocks.test.ts src/lib/report-inline.test.ts src/lib/report-doc.test.ts
+  src/lib/report-autosave.test.ts src/features/dashboards/report-editor-extensions.test.ts
+  src/features/dashboards/report-blocks.test.tsx src/features/dashboards/report-pages.test.tsx
+  src/features/dashboards/report-chart-shelf.test.tsx
+  src/features/dashboards/report-render-view.test.tsx src/components/app-shell/side-panel.test.tsx
+  src/services/clients/dashboards.test.ts src/features/copilot/capabilities.test.ts` — **142 pass,
+  0 fail, 12 files** (one process, so the files' `mock.module`/global restores were exercised
+  together).
+- `… bun run typecheck` — clean.
+- `npx eslint` on the 27 TS/TSX files changed since `db69c34c4` — clean.
+- `(cd ops/ai_eval && python3 -m unittest -q test_ai_eval)` — 206 tests OK (pytest is not
+  installed on the VM).
+- The tool schema fixture: checked that Python's `json.dumps(indent=2, ensure_ascii=False)`
+  reproduces the committed file byte for byte before editing it the same way, and that every
+  description string of `report_blocks_schema` appears in the fixture.
+
+**Not verified** (rule 7):
+
+- **No Rust was compiled** (owner rule 2026-11-14): `cargo build/check/clippy/test` were not run,
+  so the new Rust unit tests in `reports.rs` (7), the prompt test
+  (`the_report_hint_names_the_editors_blocks_and_marks`), the API integration test
+  (`the_editors_blocks_save_as_written_and_an_unsafe_inline_link_is_refused`), the updated
+  unknown-kind sentence assertion, clippy pedantic on `ChartWidth::is_text` (an `allow` with a
+  reason for `trivially_copy_pass_by_ref`) and the byte-identical fixture comparison
+  (`tool_schemas_snapshot_is_byte_identical`) run first in CI on the draft PR.
+- The full `bun run test`, `bun run lint`, `next build` and a dev server were not run (VM rules).
+- **T7 screenshots** (light/dark at 1190×800, 1366×900, 390×844), the real look of reduced
+  motion and focus rings, drag and drop with a real mouse (block handles, a chart from the
+  Charts tab), the bubble menu's placement, the `/` menu's placement near the screen edges, the
+  phone sheet and IME/Android typing: none seen in a browser; they need the QA stack. Reduced
+  motion and focus were checked in code only (CSS animations sit under
+  `prefers-reduced-motion: no-preference`; spinners and hover lifts carry `motion-reduce`).
+- The AI-15 case was not run against a model.
+- Saving on a closing tab is best effort (the request may be cut); unsaved text then makes the
+  browser ask to confirm. Not tried in a browser.
+
+**Known limits and choices to review:**
+
+- A chart inserted in this sitting is drawn from its dashboard's payload (`/api/dashboard?board=`,
+  with the board's saved filters), the reader then reads it through the report route; the two
+  can differ if the dashboard has saved filters. The editor does not re-read the report after a
+  save.
+- A new report with no title is saved as "Untitled report" (the placeholder the page shows),
+  because the server requires a title and D4 creates on the first non-empty change.
+- The editor drops empty paragraphs (blank lines) on save, and flattens an indented list item into
+  the same list (a report's list has one level), as `report-doc.ts` says.
+- Download PDF in the editor shows only for a report that existed when the page opened (the
+  flags come from its read); a report made in this sitting gets it on the next visit.
+- The bold/italic rule is a whitespace-flanking star rule of our own (documented in
+  `report-inline.ts`); CommonMark edge cases such as `**a**b**` read differently from a
+  Markdown renderer. The server never needs it (it checks links only).
+
+### Handoff, PR B (T8, T9), developer (Opus), 2026-11-19
+
+**Commits** (branch `feat/bi-62-report-editor-b`, on the plan commit `102363d19`), in plan order:
+
+| Task | Commit | What |
+| --- | --- | --- |
+| T8 | `536fccdf4` | `src/lib/report-markdown.ts`: `markdownToBlocks` (the PR B anchors' list; an unsafe link keeps its words) and `blocksToMarkdown` (charts as `[chart: <title> · <dashboard>]`), with tests on every kind and on hostile input |
+| T8 | `6f01fac54` | the draft node's schema (`DRAFT_NODE_SPEC`, attrs `draft`, `chart`, `replaced`; never parsed from HTML) and `insertDraft` / `removeDraft` / `acceptDraft` in `report-editor-extensions.ts`; tests: Discard byte-identical (empty line and under a chart), the draft is not an undo step, Accept is one undo step |
+| T8 | `52fcf9f9c` | wiring: `report-editor-draft.tsx` (draft store, `useReportDrafts` controller, `DraftNode` view ported from mockup D's `draft.tsx`), `/` → Ask AI to write… (`AI_SLASH_ITEM`, first, "Write with AI"), Describe in the chart toolbar, disabled reasons, page context (`src/lib/report-editor-context.ts`), `send`'s per-call `mode`, CSS (rise, caret), no handles beside a draft |
+| T8 | `974a52a65` | `report-editor-draft.test.tsx`: the real editor page with `useCopilot` / `useCopilotStream` stubbed by a fake stream |
+| T9 | `69bfe166f` | AI-15 cases `report_editor_describe_chart` and `report_editor_write_summary` (`ops/ai_eval/dashboard_cases.json`, hand-formatted like the file); a test rebuilds their contexts with `buildReportEditorContext`; CHANGELOG entry |
+| T8 | `ea1e0bd41` | focus: a finished draft takes the focus only from someone who did not edit meanwhile (see decisions) |
+
+**Commands run, on the final commit, with counts** (each under `flock /tmp/claude-1000/lh-bun.lock systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15`):
+
+- `bun run typecheck` — clean.
+- `bun test src/features/dashboards/report-editor-draft.test.tsx src/lib/report-markdown.test.ts src/lib/report-editor-context.test.ts src/lib/report-blocks.test.ts src/lib/report-inline.test.ts src/lib/report-doc.test.ts src/lib/report-autosave.test.ts src/features/dashboards/report-editor-extensions.test.ts src/features/dashboards/report-blocks.test.tsx src/features/dashboards/report-pages.test.tsx src/features/dashboards/report-chart-shelf.test.tsx src/features/dashboards/report-render-view.test.tsx src/components/app-shell/side-panel.test.tsx src/services/clients/dashboards.test.ts src/features/copilot/capabilities.test.ts src/features/copilot/use-copilot.test.tsx src/features/copilot/copilot-dock.test.tsx src/features/copilot/chat-messages.test.tsx src/features/copilot/use-copilot-select.test.tsx src/features/dashboards/chart-builder-page.test.tsx src/lib/page-context-summary.test.ts` — **270 pass, 0 fail, 21 files**, one process (the new file first, so its `mock.module` restores were exercised against the files after it). Also run once with the new file after `report-pages`, `use-copilot` and `chart-builder-page` (72 pass, 0 fail, 5 files).
+- `bun x eslint` on the 14 TS/TSX files changed since `102363d19` — 0 errors, 1 warning (`changedABoard` unused in `use-copilot.ts`, already on the base).
+- `(cd ops/ai_eval && python3 -m unittest -q test_ai_eval)` — 206 tests OK.
+- A mutation check: with `{ mode: "ask" }` removed from the draft's `send`, the page tests fail (2 of 8 then); put back.
+- The 14 "not wrapped in act" warnings of `report-pages.test.tsx` are on the base too (same count with this branch's changes set aside).
+
+**Decisions the plan left open:**
+
+- **Ask mode: `send` takes a mode for one call.** `send(text, history, { mode: "ask" })` (a new optional `mode` in its options, `use-copilot.ts`) sends that message, and picks its tools, in Ask mode; the conversation's `mode` and the session it is saved under are not changed. Switching the panel to Ask and back was not used: `send` reads `mode` from its closure, so the switch would need an extra render before sending and would flicker the panel's mode toggle. Tested in `use-copilot.test.tsx`. `NO_ANSWER_TEXT` is now exported from there so a draft can tell an empty answer from text.
+- **Sending after the context is set.** A request first calls `setPageContext` (with the chart for Describe), then sends from an effect after that render, when the provider's `pageContextRef` holds it; the context is also refreshed a second after typing stops (not on every keystroke, so `useCopilot` consumers do not re-render per key) and cleared on unmount. The last described chart stays in the context, so a follow-up in the panel still has its rows.
+- **What is sent.** "Ask AI to write…" sends `Write for this report: <prompt>`; Describe sends `Describe the chart “<title>” for this report`. The context says such a message's answer becomes a draft and asks for the text only, in the Markdown a report holds, using only numbers from the given rows or tools, and tells the assistant not to change the report with `update_report` while the editor holds it (the editor would overwrite it on its next save). Rows: up to 50 through `summarizeRows`, the chart part capped at 2,500 characters, the report's Markdown cut at its end to fit `PAGE_CONTEXT_MAX_CHARS`.
+- **Stop is not offered for Accept.** The streamed text before `done` is not the server-checked answer (the verifier may replace it), so Stop ends with "Stopped" and Retry · Discard. Mockup D's Stop showed the whole fixed text instead.
+- **Retry** replaces the failed attempt in the conversation when it is still its end (as the panel's Retry does); otherwise it asks again after what is there.
+- **The draft shows its text through `ReportBlocks`** (the one renderer, D7) parsed with `markdownToBlocks` as it streams, so the draft looks as Accept will insert it; mockup D showed plain text.
+- **`###` and deeper read as level 3** (the level the editor still reads and saves, D3), not as paragraph text with hashes. The plan's list names `#`/`##`; this is the one addition.
+- **An X (Discard · Esc) on the prompt line**, so an empty prompt can be closed on a phone, which has no Esc. An empty prompt does not block the next draft: the next one replaces it.
+- **Focus.** Mockup D focuses Accept when a draft is done (Enter accepts). Here it does so unless the person edited the document while the answer was on its way, so a long answer never turns their next Enter into an Accept.
+- **Entries for the assistant only.** Ask AI and Describe show for `assistant:use` or `assistant:ask`, the app frame's test; without it the menu and the toolbar are as in PR A.
+- **The AI Copilot tab** shows the exchange as ordinary messages of the one conversation. Mockup D's extra lines in the panel ("In the report", "Kept in the report", "Show") were not ported: the plan's anchors ask for the same conversation, not for a new panel view.
+
+**Not verified** (rule 7):
+
+- Nothing was seen in a browser: the draft's look in light and dark, the rise and caret, reduced motion, focus rings, the disabled tooltips, the phone (`/` → Ask AI and Describe from a tapped chart), and the real streaming through `CopilotProvider` and `/api/ai/chat`. The tests use a fake conversation; the provider's own `send` was tested only for the per-call mode.
+- The two AI-15 cases were not run against a model (eval stack); only their JSON shape (`test_ai_eval`) and their contexts (rebuilt by `report-editor-context.test.ts`).
+- The full `bun run test`, `bun run lint`, `next build` and a dev server were not run (VM rules). No Rust was touched, so no cargo command was needed.
+
+## Review, PR B (planner, 2026-11-19, at `5e3fbe997`)
+
+No `BLOCKER`.
+
+- **SHOULD-FIX 1 (fixed in `2245a3c83`).** `src/features/copilot/use-copilot.test.tsx` mocked
+  `next/navigation` with `usePathname` only and never put it back; run in one process before the
+  report tests (`use-copilot`, `report-pages`, `report-chart-shelf`, `report-editor-draft`), three
+  files failed with "Export named 'useRouter' not found". The mock predates PR B (it is on
+  `main` since #392; CI stays green only because of the order files happen to run in), but PR B
+  adds another file it would break. The mock now keeps the real exports and is restored in
+  `afterAll`.
+- Checked and fine: the per-call `mode` on `send` leaves the panel's mode and the saved session
+  alone, and a continuation (`confirmTool` → `send(…, { continuation: true })`) cannot follow an
+  Ask draft, because Ask offers no tool that needs confirming; `markdownToBlocks` drops a
+  `javascript:` or `data:` address and keeps its words, and renders nothing as HTML; the draft is
+  outside the saved document and the autosave; the context sends rows the page already drew,
+  capped.
+- Re-run by the reviewer on `2245a3c83`: `bun run typecheck` clean; `bun test` on every
+  `src/features/copilot/*.test.ts*`, `src/features/dashboards/report-*.test.ts*` and
+  `src/lib/report-*.test.ts` file in one process, sorted: 272 pass, 0 fail (28 files);
+  `bun x eslint` on the changed TS files: 0 errors, 1 old warning.
+- *Not verified* yet: the browser (QA stack next), the AI-15 cases against a model.

@@ -212,7 +212,10 @@ export function CertificationBadge({
 
 const CLASSIFICATION_TONE: Record<Classification, Tone> = {
   public: "neutral",
-  internal: "info",
+  // UX-8 browser review: `info` is the primary blue at 10 %, which is dark
+  // on dark and hard to read there; `sky` is the soft fill the other badges
+  // (Warm, Hot) use, legible in both themes.
+  internal: "sky",
   confidential: "warning",
   restricted: "destructive",
 }

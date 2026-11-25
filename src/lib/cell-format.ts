@@ -1,4 +1,5 @@
 import type { ColumnSetting } from "./table-types"
+import { isYearColumn, isYearValue } from "./value-format"
 
 /**
  * How a table cell reads (`BI-16` part A). The server returns raw values;
@@ -68,13 +69,15 @@ export function formatDate(value: unknown): string {
  * `locale` is the deployment's number locale (BI-17); without it numbers are
  * `en-US` as before. A currency column with no code of its own stays the
  * Indonesian `Rp` it always was, whatever the locale, so no table changes
- * until somebody sets a code.
+ * until somebody sets a code. `column` is the column's name: an integer from
+ * 1000 to 9999 in a year column prints without a separator (`BI-64`).
  */
-export function cellContent(value: unknown, setting?: ColumnSetting, locale?: string): CellContent {
+export function cellContent(value: unknown, setting?: ColumnSetting, locale?: string, column?: string): CellContent {
   if (value === null || value === undefined) return { kind: "text", text: "" }
   const format = setting?.format ?? "auto"
   const decimals = setting?.decimals
   const n = asNumber(value)
+  const year = n !== null && isYearColumn(column) && isYearValue(n)
   switch (format) {
     case "link": {
       const href = safeHttpUrl(value)
@@ -92,10 +95,11 @@ export function cellContent(value: unknown, setting?: ColumnSetting, locale?: st
     case "currency":
       return { kind: "text", text: n === null ? String(value) : new Intl.NumberFormat(setting?.currency ? (locale ?? "en-US") : "id-ID", { style: "currency", currency: setting?.currency ?? "IDR", ...fractionOptions(decimals ?? 0, 0) }).format(n) }
     case "number":
+      if (year) return { kind: "text", text: String(n) }
       return { kind: "text", text: n === null ? String(value) : n.toLocaleString(locale ?? "en-US", fractionOptions(decimals, 3)) }
     default:
       // `auto`: a JSON number reads as a number; a quoted one is left as text.
-      if (typeof value === "number") return { kind: "text", text: value.toLocaleString(locale ?? "en-US", fractionOptions(decimals, 3)) }
+      if (typeof value === "number") return { kind: "text", text: year ? String(value) : value.toLocaleString(locale ?? "en-US", fractionOptions(decimals, 3)) }
       return { kind: "text", text: String(value) }
   }
 }

@@ -1,10 +1,20 @@
 // The Catalog's list of dropped tables (`DATA-55`, QA `LH-DATA-15-06`,
 // `TC-1731`): each row says who dropped it, how many rows it held and how long
 // it has left, and links to the page that restores it.
+//
+// UX-8: the list moved from a card above the table into a dialog opened from
+// the page's ⋯; the facts of a row are one line, joined by " · ". The page's
+// own tests cover the ⋯ item that opens it.
 
 import { cleanup, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
-import { DroppedTablesNote } from "./dropped-tables"
+import { DroppedTablesList, useDroppedTables } from "./dropped-tables"
+
+/** The list as the page feeds it: the page's one read, rendered. */
+function DroppedTablesHarness({ now }: { now: number }) {
+  const state = useDroppedTables()
+  return <DroppedTablesList state={state} now={now} />
+}
 
 const NOW = Date.parse("2026-11-14T00:00:00Z")
 
@@ -35,55 +45,53 @@ const ENTRY = {
   expiresAt: "2026-11-20T00:00:00Z",
 }
 
-describe("DroppedTablesNote", () => {
+describe("DroppedTablesList", () => {
   it("lists each dropped table with who dropped it, its rows and the days it has left, and links to its page", async () => {
     const calls = stubFetch(() => json({ tables: [ENTRY] }))
-    render(<DroppedTablesNote now={NOW} />)
+    render(<DroppedTablesHarness now={NOW} />)
 
-    expect(await screen.findByText("Dropped tables")).toBeTruthy()
-    const link = await screen.findByRole("link", { name: "bronze.orders" })
+    const link = await screen.findByRole("link", { name: /bronze\.orders/ })
     expect(link.getAttribute("href")).toBe("/data/assets/orders")
-    expect(screen.getByText("dropped by Ada Lovelace")).toBeTruthy()
-    expect(screen.getByText("1,234 rows")).toBeTruthy()
-    expect(screen.getByText("6 days left")).toBeTruthy()
+    expect(screen.getByText("dropped by Ada Lovelace · 1,234 rows · 6 days left")).toBeTruthy()
     expect(calls).toEqual(["/api/catalog/dropped/tables"])
   })
 
   it("says the rows were not counted rather than 0", async () => {
     stubFetch(() => json({ tables: [{ ...ENTRY, rowCount: null }] }))
-    render(<DroppedTablesNote now={NOW} />)
+    render(<DroppedTablesHarness now={NOW} />)
 
-    expect(await screen.findByText("rows not counted")).toBeTruthy()
-    expect(screen.queryByText("0 rows")).toBeNull()
+    expect(await screen.findByText(/· rows not counted ·/)).toBeTruthy()
+    expect(screen.queryByText(/0 rows/)).toBeNull()
   })
 
   it("says one row in the singular, as the dialog does", async () => {
     stubFetch(() => json({ tables: [{ ...ENTRY, rowCount: 1 }] }))
-    render(<DroppedTablesNote now={NOW} />)
+    render(<DroppedTablesHarness now={NOW} />)
 
-    expect(await screen.findByText("1 row")).toBeTruthy()
-    expect(screen.queryByText("1 rows")).toBeNull()
+    expect(await screen.findByText(/· 1 row ·/)).toBeTruthy()
+    expect(screen.queryByText(/1 rows/)).toBeNull()
   })
 
   it("says less than a day is left for a row at its end", async () => {
     stubFetch(() => json({ tables: [{ ...ENTRY, expiresAt: "2026-11-14T00:00:00Z" }] }))
-    render(<DroppedTablesNote now={NOW} />)
+    render(<DroppedTablesHarness now={NOW} />)
 
-    expect(await screen.findByText("less than a day left")).toBeTruthy()
+    expect(await screen.findByText(/· less than a day left$/)).toBeTruthy()
   })
 
-  it("shows nothing when no table is dropped", async () => {
+  it("says no table is dropped when the list is empty", async () => {
     const calls = stubFetch(() => json({ tables: [] }))
-    const { container } = render(<DroppedTablesNote now={NOW} />)
+    render(<DroppedTablesHarness now={NOW} />)
 
     await waitFor(() => expect(calls.length).toBeGreaterThan(0))
-    expect(container.textContent).toBe("")
+    expect(await screen.findByText("No dropped tables.")).toBeTruthy()
   })
 
   it("says so when the list could not be read", async () => {
     stubFetch(() => json({ error: "database error" }, 503))
-    render(<DroppedTablesNote now={NOW} />)
+    render(<DroppedTablesHarness now={NOW} />)
 
     expect(await screen.findByText("The list of dropped tables could not be read.")).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy()
   })
 })

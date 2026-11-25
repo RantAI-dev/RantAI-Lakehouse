@@ -32,17 +32,24 @@ Two gaps that every customer security review finds, both listed in
 6. Expired and signed-out sessions, and revoked service tokens, are deleted
    automatically after a retention period. Nothing the Sessions page shows
    today disappears: it lists live sessions only.
+7. When an operator has declared a trusted edge proxy in `TRUSTED_PROXIES`,
+   a caller who fails to sign in 50 times in 15 minutes from one address is
+   refused until the window ends. With the default empty list there is no
+   per-source 429. In both cases the audit log shows one row for the first
+   failure and one summary row with the count for the rest.
 
 ## Not included
 
-- Limiting by network address. The API sits behind the console's own
-  server, so it cannot see the real client address reliably.
 - A button for an admin to unlock an account early. The lock expires on its
   own; an operator can clear it in the database (documented).
 - Expiry or forced rotation of **active** service tokens. Only revoked ones
   are cleaned up.
 - Throttling the "change password" form.
 - CAPTCHA, two-factor sign-in.
+- Limiting by network address through the console with the default config:
+  the console's `/api` proxy forwards a client-supplied `X-Forwarded-For`
+  verbatim and does not append the browser's address, so the browser's
+  address cannot be trusted today (`SEC-82`).
 
 ## Asking the assistant
 
@@ -56,6 +63,10 @@ No. Sign-in protection is not something a user asks for; it is always on.
 | 2 | How long the lock lasts | 5 minutes | |
 | 3 | How long dead sessions and revoked tokens are kept before deletion | 30 days | |
 | 4 | Whether an operator can switch the protection off | No. The numbers can be changed; it cannot be disabled | |
+| 5 | How many failed sign-ins one source may make, and within what time (plan `adm-130` decision 2). 50, not 5, because one office behind one NAT shares one address | 50 in 15 minutes. Above that every sign-in from that source is refused with a 429 and a `Retry-After` until the window ends, and the check runs before the password is checked. The per-account lock (5 in 15 minutes) is unchanged and still guards each account. A successful sign-in does not reset the count. The 429 runs only behind a declared edge proxy that OVERWRITES `X-Forwarded-For`; with the default empty list the 429 is off, but the count and audit compaction still run | Owner, 2026-11-20; revised by the owner 2026-11-24 (decision B) |
+| 6 | What the audit trail writes for a source's failed sign-ins (plan `adm-130` decision 3) | The first failed sign-in of a source and window writes the `auth.login` refused row; the later ones only count, and one summary row with the count is written when the window closes. The per-account `auth.login_locked` row is unchanged: one per lock | Owner, 2026-11-20 |
+| 7 | How the gate's refusals are recorded (plan `adm-130` decision 4) | Per principal, route pattern and window: the first 403 writes the row, the later ones count, and one summary row names the route and the count. A 401 writes nothing. There is no 429 for a gate refusal | Owner, 2026-11-20 |
+| 8 | What the rows carry about the source (plan `adm-130` decision 5) | The source address, in `args.source`. Never the identifier, never the password, never a hash of either | Owner, 2026-11-20 |
 
 The numbers in 1–3 are starting points, not measurements. They are settings
 an operator can change.
@@ -68,7 +79,15 @@ an operator can change.
 - The first administrator account can be locked like any other.
 - The protection applies to password sign-in only.
 - Active service tokens never expire on their own.
-- A session's network address is not recorded: the API sits behind the console's own server and has no trusted source for it, so the Sessions page says "Not recorded". The browser is recorded as the browser named itself.
+- A session's network address is not recorded (`SEC-82`); the Sessions page
+  says "Not recorded" for it.
+- Through the console with the default empty `TRUSTED_PROXIES` every caller
+  shares one source, so there is no per-source 429, while the audit
+  compaction still applies.
+- Without a trusted edge, `args.source` is the console proxy's address. It
+  does not identify the caller, and the counts cover the whole deployment.
+  Per-caller attribution exists only behind an edge that overwrites
+  `X-Forwarded-For` and is declared in `TRUSTED_PROXIES`.
 
 ## Acceptance checklist
 
@@ -88,7 +107,7 @@ for the two marked steps.
 | 8 | If single sign-on is configured: sign in through it while the account is locked | Works | |
 | 9 | (operator) Check the database for sessions that expired more than the retention period ago | None remain after the cleanup has run | |
 | 10 | (operator) Check the API log after start-up | A cleanup line with counts, and no error | |
-| 11 | As Platform Admin, open Administration → Sessions | Live sessions are listed, each with the time it expires and the browser it was created from ("Not recorded" for a session older than this change) | |
+| 11 | As Platform Admin, open Administration → Sessions | Live sessions are listed, each with the time it expires and the browser it was created from ("Not recorded" for a session older than this change); the network address reads "Not recorded" | |
 
 **Accepted** when 1–7 and 11 pass, and 8–10 pass or have an agreed
 exception.

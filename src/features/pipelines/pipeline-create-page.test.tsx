@@ -410,13 +410,16 @@ describe("table suggestions in the pipeline editor", () => {
     const input = await screen.findByPlaceholderText("orders_events")
     // The suggestions come from `/api/lakehouse/tables` for the input's
     // zone, once the zone is one the lakehouse client lists.
-    await waitFor(() => expect(input.getAttribute("list")).toBe("input-table-options-input-1"))
-    const options = Array.from(document.querySelectorAll("#input-table-options-input-1 option")).map((o) =>
-      o.getAttribute("value")
-    )
-    expect(options).toEqual(["orders_raw", "stock_raw"])
+    // The console's own list (`UX-7`), not the browser's `datalist`: it opens
+    // under the field once the names have loaded.
+    await waitFor(() => {
+      fireEvent.keyDown(input, { key: "ArrowDown" })
+      expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["orders_raw", "stock_raw"])
+    })
+    expect(document.querySelector("datalist")).toBeNull()
+    fireEvent.keyDown(input, { key: "Escape" })
 
-    // Typing is still allowed: a datalist filters, it never narrows.
+    // Typing is still allowed: the list filters, it never narrows.
     fireEvent.change(input, { target: { value: "typed_by_hand" } })
     expect((input as HTMLInputElement).value).toBe("typed_by_hand")
   })
@@ -472,13 +475,14 @@ describe("the zone and column pickers in the pipeline editor", () => {
     renderEditor()
     chooseLastOption(screen.getByRole("combobox", { name: "Zone" }), "Silver")
     const input = screen.getByPlaceholderText("orders_events") as HTMLInputElement
-    // Only the chosen namespace's tables are suggested, from `/api/catalog`.
-    await waitFor(() => expect(input.getAttribute("list")).toBe("input-table-options-input-1"))
-    await waitFor(() =>
-      expect(
-        Array.from(document.querySelectorAll("#input-table-options-input-1 option")).map((o) => o.getAttribute("value"))
-      ).toEqual(["orders_clean"])
-    )
+    // Only the chosen namespace's tables are suggested, from `/api/catalog`:
+    // the console's own list (`UX-7`), not the browser's `datalist`.
+    await waitFor(() => {
+      fireEvent.keyDown(input, { key: "ArrowDown" })
+      expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["orders_clean"])
+    })
+    expect(document.querySelector("datalist")).toBeNull()
+    fireEvent.keyDown(input, { key: "Escape" })
     expect(sent.some((c) => c.path === "/api/catalog")).toBe(true)
     fireEvent.change(input, { target: { value: "orders_clean" } })
     const list = await screen.findByRole("list", { name: "Columns of this table" })
@@ -1570,5 +1574,80 @@ describe("a form step as SQL (BLD-16, J6)", () => {
       await screen.findByText("steps[0].transforms[0]: this transform is not in the supported grammar")
     ).toBeTruthy()
     expect(document.querySelector(".cm-content")).toBeNull()
+  })
+})
+
+describe("BLD-12 materialization in the pipeline editor", () => {
+  it("offers Full rebuild and Incremental, and reveals the strategy and cursor only for incremental", async () => {
+    renderEditor()
+    await openTab("Schedule and settings")
+    const mode = screen.getByRole("combobox", { name: "Mode" })
+    expect(mode.textContent).toContain("Full rebuild")
+    expect(screen.queryByRole("combobox", { name: "Strategy" })).toBeNull()
+
+    chooseOption(mode, "Incremental")
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Strategy" })).toBeTruthy())
+    expect(screen.getByLabelText("Cursor column")).toBeTruthy()
+    expect(screen.queryByRole("combobox", { name: "Partition by" })).toBeNull()
+
+    chooseOption(screen.getByRole("combobox", { name: "Strategy" }), "Replace time partitions")
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Partition by" })).toBeTruthy())
+    expect(screen.getByRole("spinbutton", { name: "Lookback window (hours)" })).toBeTruthy()
+  })
+
+  it("blocks an incremental save without a cursor, then sends every field once one is given", async () => {
+    renderEditor()
+    await fillNewPipeline()
+    await openTab("Schedule and settings")
+    chooseOption(screen.getByRole("combobox", { name: "Mode" }), "Incremental")
+
+    const button = saveButton(/create pipeline/i)
+    await waitFor(() => expect(button.disabled).toBe(true))
+    expect(await screen.findByText(/cursor column is required/i)).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText("Cursor column"), {
+      target: { value: "event_time" },
+    })
+    chooseOption(screen.getByRole("combobox", { name: "Strategy" }), "Replace time partitions")
+    chooseOption(screen.getByRole("combobox", { name: "Partition by" }), "Month")
+    fireEvent.change(screen.getByRole("spinbutton", { name: "Lookback window (hours)" }), {
+      target: { value: "24" },
+    })
+    await waitFor(() => expect(button.disabled).toBe(false))
+
+    const body = await saveAndRead("POST")
+    expect(body.kind).toBe("incremental")
+    expect(body.incrementalColumn).toBe("event_time")
+    expect(body.incrementalStrategy).toBe("partition_replace")
+    expect(body.partitionGranularity).toBe("month")
+    expect(body.lookbackHours).toBe(24)
+  })
+
+  it("sends the stored materialization fields on an edit and resets them for a full rebuild", async () => {
+    renderEditor(
+      existing({
+        kind: "incremental",
+        definition: {
+          ...existing().definition!,
+          incrementalColumn: "event_time",
+          incrementalStrategy: "partition_replace",
+          partitionGranularity: "month",
+          lookbackHours: 12,
+        },
+      })
+    )
+    await openTab("Schedule and settings")
+    expect((screen.getByLabelText("Cursor column") as HTMLInputElement).value).toBe("event_time")
+    expect(screen.getByRole("combobox", { name: "Mode" }).textContent).toContain("Incremental")
+    let body = await saveAndRead("PUT")
+    expect(body.incrementalStrategy).toBe("partition_replace")
+    expect(body.lookbackHours).toBe(12)
+
+    chooseOption(screen.getByRole("combobox", { name: "Mode" }), "Full rebuild")
+    await waitFor(() => expect(screen.queryByLabelText("Cursor column")).toBeNull())
+    await saveAndRead("PUT")
+    body = sent.filter((c) => c.method === "PUT").at(-1)?.body ?? {}
+    expect(body.kind).toBe("batch")
+    expect(body.incrementalColumn).toBeUndefined()
   })
 })

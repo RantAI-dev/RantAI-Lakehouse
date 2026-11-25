@@ -18,7 +18,7 @@ import { TabBar } from "./tab-bar";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import { EMBED_UNAVAILABLE, embedRefusalMessage } from "./embed-refusal";
 import { PasswordGate, TICKET_HEADER, openPublic, readTicket } from "./public-link-access";
-import { DEFAULT_EMBED_LOOK, themeFor, type EmbedLook } from "@/lib/embed-look";
+import { DEFAULT_EMBED_LOOK, EMBED_TRANSPARENT_CLASS, themeFor, type EmbedLook } from "@/lib/embed-look";
 import { EmbedFilterBar, type EmbedFilter, type ViewerFilter } from "./embed-filter-bar";
 import { fetchFrameOrigins, useEmbedHeight } from "./use-embed-height";
 import { useBranding } from "@/hooks/use-branding";
@@ -178,11 +178,31 @@ export function EmbedView({
   // a single chart (whether the token is a chart token is known only from the payload).
   useEmbedHeight(measured, frameOrigins, state === "ok" && data !== null && !(chartId ?? data.onlyChart));
 
+  // BI-64 (`BI-26-AC2`): what paints behind the tiles is the root layout's
+  // `body { @apply bg-background }` (design-system `globals.css`), outside this
+  // component, so clearing the wrapper's own background was not enough: the
+  // frame stayed opaque. `globals.css` clears `html` and `body` for this class.
+  // PR #648 review 1: the proxy marks the request and the root layout puts the
+  // class on `<html>` in the server render, so nothing opaque shows before
+  // hydration; this effect keeps it right in a client-only render (the tests).
+  React.useEffect(() => {
+    if (!look.transparent) return;
+    const root = document.documentElement;
+    root.classList.add(EMBED_TRANSPARENT_CLASS);
+    return () => root.classList.remove(EMBED_TRANSPARENT_CLASS);
+  }, [look.transparent]);
+
   if (state === "password") {
     return <PasswordGate token={token ?? ""} onOpen={() => { setState("loading"); setAttempt((n) => n + 1); }} />;
   }
   if (state === "notfound" || state === "error") {
-    return <div className="grid h-screen place-content-center px-4 text-center text-sm text-muted-foreground">{refusal}</div>;
+    // PR #648 review 2: with `embed-transparent` the page behind is the host's,
+    // so the refusal keeps a surface of its own instead of floating on it.
+    return (
+      <div className="grid h-screen place-content-center px-4">
+        <div className="max-w-sm rounded-xl border border-border bg-card px-6 py-5 text-center text-sm text-card-foreground">{refusal}</div>
+      </div>
+    );
   }
 
   const charts = data?.charts ?? [];
@@ -229,8 +249,10 @@ export function EmbedView({
   return (
     <ReportingProvider reporting={data?.reporting}>
     <SurfaceThemeProvider themeClass={boardLook.surfaceThemeClass}>
-    <div className={cn("min-h-screen p-2", boardLook.className, look.transparent ? "!bg-transparent" : "bg-background")} style={boardLook.style}>
-      <div ref={measured}>
+    <div className={cn("min-h-screen", boardLook.className, look.transparent ? "!bg-transparent" : "bg-background")} style={boardLook.style}>
+      {/* BI-64: the padding is inside the measured root, so the posted height is the
+          content's whole height and the frame does not scroll by the padding. */}
+      <div ref={measured} className="p-2">
       {jwt && data?.embedFilters?.length ? (
         <EmbedFilterBar jwt={jwt} filters={data.embedFilters} onChange={setViewerFilters} />
       ) : null}

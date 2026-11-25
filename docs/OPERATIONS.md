@@ -1401,7 +1401,7 @@ Migration `0133_pages_per_role.sql` introduces four new read permissions (`assis
 1. **The added role: Assistant only**
    - **ID:** `22222222-2222-4222-8222-000000000008`
    - **Permissions:** `assistant:ask,dashboard:read`
-   - **Access:** Home (`/`), History (`/copilot/history`), Dashboards (`/dashboards`), and the Copilot dock.
+   - **Access:** Home (`/`), a conversation (`/copilot`, whose sidebar lists their chats), Dashboards (`/dashboards`), and the Copilot dock.
    - **Restrictions:** Operates in ask-only mode (`assistant:ask`). Can ask conversational questions and run read-only tools. Cannot perform write or mutate actions (`is_build = false`), cannot create charts or dashboards via tools, and cannot edit assets.
 
 2. **Existing roles upgrade (`role` table):**
@@ -1434,7 +1434,7 @@ role and uncheck both:
 
 **Effect on users with that role:**
 - The Copilot dock and composer toggle disappear entirely.
-- The Home (`/`) and History (`/copilot/history`) items are hidden in the sidebar.
+- The Home (`/`) item is hidden in the sidebar, and a conversation (`/copilot`) shows "You don't have access".
 - Visiting `/` automatically redirects to the first available page (e.g. `/dashboards`).
 - Any direct API requests to `/api/ai/*` return `403 Forbidden`.
 
@@ -1972,6 +1972,45 @@ nothing promises a session is gone within any particular bound. The job
 only deletes — it does not rotate anything, and an ACTIVE (non-revoked)
 service token never expires or gets cleaned up no matter how old it is;
 rotation is a manual, operator-driven act.
+
+## Trusted proxies: whose `X-Forwarded-For` the API reads (`SEC-75`)
+
+`TRUSTED_PROXIES` names the proxies whose `X-Forwarded-For` the API may
+read. A request from a peer that is not on the list IS the source, whatever
+its header says; a request from a peer that is on the list takes the
+right-most `X-Forwarded-For` entry that is not itself trusted. An empty list
+trusts no header at all, so every request's source is the address of the
+peer that sent it.
+
+What to list:
+
+- An edge proxy or load balancer that OVERWRITES `X-Forwarded-For` with the
+  address it saw, and only such a proxy.
+- That proxy's address or network. The API then takes the right-most
+  `X-Forwarded-For` entry that is not itself trusted, which is the address
+  that proxy saw.
+- That proxy's compose service name. The name is resolved again every five
+  minutes, because a compose network's addresses are not fixed and a
+  recreated container comes back with another one.
+
+An entry that is neither a network, nor an address, nor a service name stops
+the API at start: a dropped entry would quietly stop trusting a proxy the
+operator named, and every caller would then look like one source.
+
+**The limit of the current deployment.** With the default empty
+`TRUSTED_PROXIES`, the header is never read and every request through the
+console has the console's address as its source. The per-source 429 is
+therefore OFF: with one shared source, a limit would 429 everyone behind the
+console. The client source counting and the audit compaction still run.
+
+**Behind a listed edge proxy**, every path to the API must go through that
+edge; a peer not on the list remains its own source. The edge must OVERWRITE
+`X-Forwarded-For` with the address it saw, not append to it. The console's
+`/api` rewrite keeps a client-supplied header unchanged (Next.js sets it
+with `??=`), so a caller behind it could otherwise name its own source and
+evade the limit. The console-side fix — the console setting the header from
+its own peer, or a dedicated edge container — is `SEC-82`, not part of this
+change. The API ignores a header whose peer is not trusted.
 
 ## Proposal: `GET /api/auth/providers` (not built)
 

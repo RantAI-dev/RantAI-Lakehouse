@@ -45,13 +45,13 @@ async function pick(placeholder: string, option: RegExp) {
 describe("IcebergTimeTravelControls", () => {
   it("on ClickHouse lists a version by its time and operation and pins it through pinSnapshot", async () => {
     stubLakehouse()
-    const onApply = mock<(next: string) => void>(() => {})
+    const onApply = mock<(next: string, pinned: unknown) => void>(() => {})
     render(<IcebergTimeTravelControls sql={SQL} engine="clickhouse" onApply={onApply} />)
 
     expect(screen.getByText(/One version applies to every raw table in the query\./)).toBeTruthy()
-    await pick("Namespace", /^bronze$/)
-    await pick("Table", /^orders$/)
-    await pick("Version", /2026.* · append/)
+    await pick("Choose a namespace", /^bronze$/)
+    await pick("Choose a table", /^orders$/)
+    await pick("Choose a version", /2026.* · append/)
     fireEvent.click(screen.getByText("Query this version"))
 
     await waitFor(() => expect(onApply).toHaveBeenCalledTimes(1))
@@ -60,13 +60,13 @@ describe("IcebergTimeTravelControls", () => {
 
   it("on Trino pins the version on the table the user picked", async () => {
     stubLakehouse()
-    const onApply = mock<(next: string) => void>(() => {})
+    const onApply = mock<(next: string, pinned: unknown) => void>(() => {})
     render(<IcebergTimeTravelControls sql={TRINO_SQL} engine="trino" onApply={onApply} />)
 
     expect(screen.getByText(/The version applies to the table you picked\./)).toBeTruthy()
-    await pick("Namespace", /^bronze$/)
-    await pick("Table", /^orders$/)
-    await pick("Version", /2026.* · append/)
+    await pick("Choose a namespace", /^bronze$/)
+    await pick("Choose a table", /^orders$/)
+    await pick("Choose a version", /2026.* · append/)
     fireEvent.click(screen.getByText("Query this version"))
 
     await waitFor(() => expect(onApply).toHaveBeenCalledTimes(1))
@@ -77,12 +77,49 @@ describe("IcebergTimeTravelControls", () => {
 
   it("says so when the engine has no past versions", () => {
     stubLakehouse()
-    const onApply = mock<(next: string) => void>(() => {})
+    const onApply = mock<(next: string, pinned: unknown) => void>(() => {})
     render(<IcebergTimeTravelControls sql={SQL} engine="duckdb" onApply={onApply} />)
 
     expect(screen.getByText("Past versions can be queried on ClickHouse and Trino.")).toBeTruthy()
     expect((screen.getByText("Query this version") as HTMLButtonElement).disabled).toBe(true)
-    expect((screen.getByText("Namespace").closest("button") as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByText("Choose a namespace").closest("button") as HTMLButtonElement).disabled).toBe(true)
+    expect(onApply).not.toHaveBeenCalled()
+  })
+})
+
+// UX-9: the pin reports what it pinned, for the chip by the editor, and a
+// Trino statement that does not read the picked table says so.
+describe("IcebergTimeTravelControls in the Time travel dialog", () => {
+  it("hands the chip the table and the version's time with the pinned SQL", async () => {
+    stubLakehouse()
+    const onApply = mock<(next: string, pinned: unknown) => void>(() => {})
+    render(<IcebergTimeTravelControls sql={SQL} engine="clickhouse" onApply={onApply} />)
+
+    await pick("Choose a namespace", /^bronze$/)
+    await pick("Choose a table", /^orders$/)
+    await pick("Choose a version", /2026.* · append/)
+    fireEvent.click(screen.getByText("Query this version"))
+
+    await waitFor(() => expect(onApply).toHaveBeenCalledTimes(1))
+    expect(onApply.mock.calls[0][1]).toEqual({
+      snapshotId: "7539123456789012345",
+      table: "bronze.orders",
+      at: "2026-09-23T03:37:39.000Z",
+    })
+  })
+
+  it("says the Trino query does not read the picked table instead of doing nothing", async () => {
+    stubLakehouse()
+    const onApply = mock<(next: string, pinned: unknown) => void>(() => {})
+    render(<IcebergTimeTravelControls sql="SELECT 1" engine="trino" onApply={onApply} />)
+
+    await pick("Choose a namespace", /^bronze$/)
+    await pick("Choose a table", /^orders$/)
+    await pick("Choose a version", /2026.* · append/)
+    fireEvent.click(screen.getByText("Query this version"))
+
+    expect(await screen.findByRole("alert")).toBeTruthy()
+    expect(screen.getByRole("alert").textContent).toContain("does not read bronze.orders")
     expect(onApply).not.toHaveBeenCalled()
   })
 })

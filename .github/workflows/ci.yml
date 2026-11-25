@@ -109,6 +109,12 @@ jobs:
       gates_upload: ${{ steps.scope.outputs.gates_upload }}
       gates_governance: ${{ steps.scope.outputs.gates_governance }}
       gate_groups: ${{ steps.scope.outputs.gate_groups }}
+      # OPS-CI-FAST: whether the two shared images (`images`, `image-smoke`)
+      # are needed. `true` unless every changed file is on the scope script's
+      # closed neutral list (tooling, test-only and bench-only paths); `all`,
+      # a selected gate group and the `ci:all-gates` label each force it to
+      # `true`, and so does an unreadable map (fail closed).
+      images_needed: ${{ steps.scope.outputs.images_needed }}
       # OPS-24 D4/D8: `proven` is true only for a push whose own `ci-required`
       # run repeated a passed pull request, and only while the kill switch is
       # unset. The proof script returns `false` on every other event, and R4
@@ -684,24 +690,35 @@ jobs:
 
   # ── Rust: tests (Docker/testcontainers required — Postgres) ───────────
   test:
-    name: Rust · test ${{ matrix.partition }}/3 (stable)
+    name: Rust · test ${{ matrix.partition }}/6 (stable)
     needs: changes
     if: needs.changes.outputs.heavy == 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     strategy:
-      # REL-20 (D4): three partitions. `count:` balances by test count rather
-      # than test name, so the three runners finish at roughly the same time
-      # despite `lakehouse-api`'s unit tests outnumbering every other crate.
-      # `fail-fast: false` keeps all three partitions running to completion
-      # even when one fails, so the `ci-required` sum check always sees three
-      # counts. `needs: test` in `ci-required` fans in on all three, and
-      # `needs.test.result` is the worst of the three (D5).
+      # REL-20 (D4), OPS-CI-FAST: six partitions. `count:` balances by test
+      # count rather than test name, so the six runners finish at roughly the
+      # same time despite `lakehouse-api`'s unit tests outnumbering every other
+      # crate. Six, not three, because this job was the longest wall-clock
+      # bottleneck on every Rust pull request: on PR #724 (run 45531278457)
+      # `test 1/3` took 1,704s, `test 3/3` 1,674s and `test 2/3` 1,382s, each
+      # after minutes of queueing, and the gates behind them waited 10-21
+      # minutes for a runner slot. The tests are the same, split six ways; the
+      # cost is three more legs that each restore the cache and compile the
+      # workspace before their own tests (about 9 minutes of runner time each,
+      # the `OPS-24` measurement), bought in exchange for a per-leg wall clock
+      # of roughly half what it was. That is the trade this change makes on
+      # purpose: the pull request's critical path was this job, not the total
+      # runner minutes.
+      # `fail-fast: false` keeps all six partitions running to completion
+      # even when one fails, so the `ci-required` sum check always sees six
+      # counts. `needs: test` in `ci-required` fans in on all six, and
+      # `needs.test.result` is the worst of the six (D5).
       fail-fast: false
       matrix:
         # OPS-24 D5: a proven push keeps ONE leg of the matrix, so that the
         # dependency cache pull requests restore is still refreshed (and
-        # nothing else is); any value but `true` gives the three legs.
-        partition: ${{ fromJSON(needs.changes.outputs.proven == 'true' && '[1]' || '[1, 2, 3]') }}
+        # nothing else is); any value but `true` gives the six legs.
+        partition: ${{ fromJSON(needs.changes.outputs.proven == 'true' && '[1]' || '[1, 2, 3, 4, 5, 6]') }}
     # 60, not 40: the three last green runs of this job on `main` took 39m18s,
     # 30m07s and 36m12s (runs 40627697997, 40628462938, 40667618267), the
     # longest took 39m27s (40387475151), and the job was cancelled at the
@@ -836,15 +853,15 @@ jobs:
       # ubuntu-latest ships Docker; lakehouse-test-support's integration
       # tests spin up real Postgres via testcontainers.
       #
-      # REL-20 (D4): one of three partitions. `--color never` keeps the
+      # REL-20 (D4): one of six partitions. `--color never` keeps the
       # summary line parseable (no ANSI); `tee` captures it for the count
       # step below while `PIPESTATUS` preserves nextest's own exit status.
       # OPS-24 D5: a proven push does not run the tests at all.
-      - name: cargo nextest run (partition ${{ matrix.partition }}/3)
+      - name: cargo nextest run (partition ${{ matrix.partition }}/6)
         if: needs.changes.outputs.proven != 'true'
         run: |
           cargo nextest run --workspace --locked --profile ci --color never \
-            --partition "count:${{ matrix.partition }}/3" 2>&1 | tee nextest.log
+            --partition "count:${{ matrix.partition }}/6" 2>&1 | tee nextest.log
           exit "${PIPESTATUS[0]}"
         working-directory: rust
 
@@ -874,7 +891,7 @@ jobs:
       # still does. This workspace's doc comments use only non-Rust fences
       # (text/bash/json/sh/ignore), so it compiles and runs zero doctests
       # today, but the guarantee is kept. Run once, on partition 1, so the
-      # doctest compile/run is not triplicated across the three partitions.
+      # doctest compile/run is not repeated across the six partitions.
       # OPS-24 D5: a proven push ran the doctests in the pull request's run.
       - name: cargo test --workspace --locked --doc (doctests)
         if: matrix.partition == 1 && needs.changes.outputs.proven != 'true'
@@ -892,12 +909,12 @@ jobs:
           if [ -z "$count" ]; then count=0; fi
           echo "partition ${{ matrix.partition }}: $count tests run"
           echo "$count" > "$RUNNER_TEMP/partition-${{ matrix.partition }}.txt"
-          echo "## Nextest partition ${{ matrix.partition }}/3: $count tests" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Nextest partition ${{ matrix.partition }}/6: $count tests" >> "$GITHUB_STEP_SUMMARY"
         working-directory: rust
 
       # REL-20 (D4): one artifact per partition (`test-counts-N`):
       # `upload-artifact` v4 and later refuse a second upload under a name
-      # that already exists in the run, so the three cannot share one name.
+      # that already exists in the run, so the six cannot share one name.
       # `ci-required` downloads them by pattern, merges them and sums.
       - name: Upload nextest partition count (REL-20)
         if: always() && needs.changes.outputs.proven != 'true'
@@ -1100,10 +1117,20 @@ jobs:
   # cache (`type=gha`, scopes `api-image` and `dagster-image`), which the
   # pull requests read; skipping it would stop `main` from refreshing that
   # cache. So its `if:` is the acceptance one and not the gates' one.
+  #
+  # OPS-CI-FAST: `images_needed` is the second half of that `if:`. The scope
+  # script answers `false` only for a change that is proved unable to alter
+  # either image (a lakehousectl-only or test-only change, the console,
+  # `ops/bi-only/*`, `ops/landing-pages/*`); it answers `true` for everything
+  # else, for a selected gate group and for `all`, because every gate job
+  # `needs: images`. A lakehousectl-only pull request used to pay ~8-10 Docker
+  # minutes for two images it cannot change, and the runner slot it held
+  # starved the gates on other PRs. `ci-required` accepts the skip only when
+  # that answer is exactly `false`; anything else keeps the job required.
   images:
     name: Images · build lakehouse-api + dagster once
     needs: changes
-    if: needs.changes.outputs.heavy == 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.heavy == 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.images_needed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -4129,7 +4156,9 @@ jobs:
   image-smoke:
     name: Image smoke test · lakehouse-api /health
     needs: [changes, images]
-    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    # OPS-CI-FAST: same scope as `images`, which builds the artifact this job
+    # loads; when the images are not needed there is nothing to smoke.
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.images_needed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -4398,6 +4427,11 @@ jobs:
           SCOPE_ALL: ${{ needs.changes.outputs.all }}
           PUSH_PROVEN: ${{ needs.changes.outputs.proven }}
           PR_DRAFT: ${{ needs.changes.outputs.draft }}
+          # OPS-CI-FAST: the scope script's answer on whether the two shared
+          # images were needed. Exactly `false` excuses a skipped `images` and
+          # `image-smoke`; unset, empty, `TRUE` or any other value keeps both
+          # required (fail closed, see required_gate.sh).
+          SCOPE_IMAGES: ${{ needs.changes.outputs.images_needed }}
           # OPS-25 D7: which gate groups this run selected. A gate whose group
           # was selected is required; a skip is accepted only for a gate whose
           # group was not selected. An empty or malformed value requires every
@@ -4443,15 +4477,17 @@ jobs:
           IMAGE_SMOKE_RESULT: ${{ needs.image-smoke.result }}
         run: ./scripts/ci/required_gate.sh
 
-      # REL-20 (D4): the three nextest partitions each upload their test
-      # count as their own artifact (`test-counts-{1,2,3}`, one file
+      # REL-20 (D4), OPS-CI-FAST: the six nextest partitions each upload their
+      # test count as their own artifact (`test-counts-{1..6}`, one file
       # `partition-N.txt` each). Merge them and sum, failing the job if the
       # total dropped below the floor. The floor is measured, not guessed:
       # 9,935 tests ran on PR #397 (run 42197087127) while the API's unit
       # tests still ran twice; REL-20 slice A removed the binary's copy
       # (3,161 tests run there), keeping the 52 that existed only in it, so
-      # 9,935 - 3,161 + 52 = 6,826 (review R2). A dropped partition removes
-      # about a third of that, well below the floor. Raise it as tests are
+      # 9,935 - 3,161 + 52 = 6,826 (review R2). The floor does not move when
+      # the partition count does -- six partitions run the same tests, only
+      # split more ways -- and a dropped partition still removes about a sixth
+      # of that, well below the floor. Raise it as tests are
       # added; lower it only with a measured reason like this one.
       # Same scope as the `test` job: only when it actually ran.
       - name: Download nextest partition counts (REL-20)
@@ -4467,7 +4503,7 @@ jobs:
         run: |
           set -euo pipefail
           total=0
-          for p in 1 2 3; do
+          for p in 1 2 3 4 5 6; do
             f="$RUNNER_TEMP/counts/partition-$p.txt"
             if [ ! -f "$f" ]; then
               echo "::error::missing nextest count for partition $p"

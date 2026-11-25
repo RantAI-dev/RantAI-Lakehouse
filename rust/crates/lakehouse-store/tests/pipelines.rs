@@ -40,6 +40,9 @@ static TARGET_SEQ: AtomicU64 = AtomicU64::new(0);
 fn input() -> CreatePipelineInput {
     let seq = TARGET_SEQ.fetch_add(1, Ordering::Relaxed);
     CreatePipelineInput {
+        incremental_strategy: "append".to_owned(),
+        partition_granularity: "day".to_owned(),
+        lookback_hours: 0,
         inputs: Vec::new(),
         steps: Vec::new(),
         name: "orders_hourly_rollup".to_owned(),
@@ -137,6 +140,139 @@ async fn get_definition_reports_absent_optional_fields_honestly(pool: PgPool) ->
     Ok(())
 }
 
+/// BLD-12: the three materialization columns survive create, the detail read,
+/// the list read and the orchestrator's runnable read — including a
+/// non-default strategy, granularity and lookback. A row that loses one of
+/// these between the store and the factory would run with the wrong materialization
+/// semantics, so the round-trip is pinned at every read the factory uses.
+#[sqlx::test(migrations = "../../migrations")]
+async fn incremental_materialization_fields_round_trip_through_every_read(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let mut configured = input();
+    configured.name = "bld12-roundtrip".to_owned();
+    configured.incremental_strategy = "partition_replace".to_owned();
+    configured.partition_granularity = "month".to_owned();
+    configured.lookback_hours = 24;
+    let created = pipelines::create_pipeline(&pool, &configured, None)
+        .await
+        .expect("create should succeed");
+    assert_eq!(created.incremental_strategy, "partition_replace");
+    assert_eq!(created.partition_granularity, "month");
+    assert_eq!(created.lookback_hours, 24);
+    assert_eq!(created.incremental_column.as_deref(), Some("updated_at"));
+
+    let detail = pipelines::get_pipeline(&pool, &created.id)
+        .await
+        .expect("get_pipeline should succeed")
+        .expect("pipeline should exist");
+    assert_eq!(detail.incremental_strategy, "partition_replace");
+    assert_eq!(detail.partition_granularity, "month");
+    assert_eq!(detail.lookback_hours, 24);
+
+    let definition = pipelines::get_definition(&pool, &created.id)
+        .await
+        .expect("get_definition should succeed")
+        .expect("definition should exist");
+    assert_eq!(definition.incremental_strategy, "partition_replace");
+    assert_eq!(definition.partition_granularity, "month");
+    assert_eq!(definition.lookback_hours, 24);
+
+    let list = pipelines::list_pipelines(
+        &pool,
+        &pipelines::PipelineFilter {
+            all_tenants: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list_pipelines should succeed");
+    let listed = list.iter().find(|p| p.id == created.id).expect("listed");
+    assert_eq!(listed.incremental_strategy, "partition_replace");
+    assert_eq!(listed.partition_granularity, "month");
+    assert_eq!(listed.lookback_hours, 24);
+
+    pipelines::set_status(&pool, &created.id, "ready")
+        .await
+        .expect("set_status should succeed");
+    let runnable = pipelines::list_runnable_pipelines(&pool)
+        .await
+        .expect("list_runnable should succeed");
+    let one = runnable
+        .iter()
+        .find(|p| p.id == created.id)
+        .expect("runnable");
+    assert_eq!(one.kind, "incremental");
+    assert_eq!(one.incremental_strategy, "partition_replace");
+    assert_eq!(one.partition_granularity, "month");
+    assert_eq!(one.lookback_hours, 24);
+    assert_eq!(one.definition.incremental_strategy, "partition_replace");
+    Ok(())
+}
+
+/// BLD-12: an `update_pipeline` that changes the materialization config
+/// persists it and the version snapshot replays it. A batch save that clears
+/// the cursor column resets the other three fields to their defaults.
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_pipeline_persists_materialization_fields_in_the_row_and_snapshot(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input(), None)
+        .await
+        .expect("create should succeed");
+    let mut change = input();
+    change.incremental_strategy = "partition_replace".to_owned();
+    change.partition_granularity = "month".to_owned();
+    change.lookback_hours = 48;
+    pipelines::update_pipeline(
+        &pool,
+        &created.id,
+        &pipelines::UpdatePipelineInput {
+            incremental_strategy: change.incremental_strategy.clone(),
+            partition_granularity: change.partition_granularity.clone(),
+            lookback_hours: change.lookback_hours,
+            inputs: Vec::new(),
+            steps: Vec::new(),
+            run_as: pipelines::RunAsChange::Keep,
+            kind: change.kind.clone(),
+            source_zone: change.source_zone.clone(),
+            source_table: change.source_table.clone(),
+            incremental_column: change.incremental_column.clone(),
+            transforms: change.transforms.clone(),
+            fbic_enabled: change.fbic_enabled,
+            target_zone: change.target_zone.clone(),
+            target_table: change.target_table.clone(),
+            schedule: change.schedule.clone(),
+            owner: None,
+            description: None,
+            max_retries: None,
+            depends_on: None,
+            connector_id: pipelines::ConnectorChange::Keep,
+        },
+        None,
+    )
+    .await
+    .expect("update should succeed")
+    .expect("pipeline should exist");
+
+    let definition = pipelines::get_definition(&pool, &created.id)
+        .await
+        .expect("get_definition should succeed")
+        .expect("definition should exist");
+    assert_eq!(definition.incremental_strategy, "partition_replace");
+    assert_eq!(definition.partition_granularity, "month");
+    assert_eq!(definition.lookback_hours, 48);
+
+    let snapshot = pipelines::get_definition_version(&pool, &created.id, 2)
+        .await
+        .expect("version read should succeed")
+        .expect("updated version should exist");
+    assert_eq!(snapshot.incremental_strategy, "partition_replace");
+    assert_eq!(snapshot.partition_granularity, "month");
+    assert_eq!(snapshot.lookback_hours, 48);
+    Ok(())
+}
+
 // ── R3 plan 2a: depends_on (migration 0052) ───────────────────────────────
 
 /// A pipeline created with a non-empty `depends_on` reads back the same
@@ -189,12 +325,18 @@ async fn update_replaces_depends_on_wholesale(pool: PgPool) -> sqlx::Result<()> 
         &pool,
         &created.id,
         &pipelines::UpdatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             run_as: pipelines::RunAsChange::Keep,
             depends_on: Some(vec!["pl-new-1".to_owned(), "pl-new-2".to_owned()]),
             connector_id: pipelines::ConnectorChange::Keep,
             ..pipelines::UpdatePipelineInput {
+                incremental_strategy: "append".to_owned(),
+                partition_granularity: "day".to_owned(),
+                lookback_hours: 0,
                 inputs: Vec::new(),
                 steps: Vec::new(),
                 run_as: pipelines::RunAsChange::Keep,
@@ -230,6 +372,9 @@ async fn update_replaces_depends_on_wholesale(pool: PgPool) -> sqlx::Result<()> 
 #[sqlx::test(migrations = "../../migrations")]
 async fn depends_on_defaults_to_empty_when_unset(pool: PgPool) -> sqlx::Result<()> {
     let empty_deps = CreatePipelineInput {
+        incremental_strategy: "append".to_owned(),
+        partition_granularity: "day".to_owned(),
+        lookback_hours: 0,
         inputs: Vec::new(),
         steps: Vec::new(),
         depends_on: vec![],
@@ -315,6 +460,9 @@ fn tenant_input(slug: &str) -> CreateTenantInput {
 /// without a name collision.
 fn named_input(name: &str) -> CreatePipelineInput {
     CreatePipelineInput {
+        incremental_strategy: "append".to_owned(),
+        partition_granularity: "day".to_owned(),
+        lookback_hours: 0,
         inputs: Vec::new(),
         steps: Vec::new(),
         name: name.to_owned(),
@@ -405,6 +553,9 @@ async fn create_pipeline_with_a_tenant_is_listed_for_it(pool: PgPool) -> sqlx::R
     let created = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             tenant_id: Some(tenant_id),
@@ -498,6 +649,9 @@ async fn a_pipeline_created_with_a_tenant_is_on_that_tenants_list(
     let created = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             tenant_id: Some(tenant_id),
@@ -532,6 +686,9 @@ async fn update_replaces_the_definition_and_keeps_the_status(pool: PgPool) -> sq
         &pool,
         &created.id,
         &pipelines::UpdatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             run_as: pipelines::RunAsChange::Keep,
@@ -572,6 +729,9 @@ async fn update_replaces_the_definition_and_keeps_the_status(pool: PgPool) -> sq
         &pool,
         "pl-missing",
         &pipelines::UpdatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             run_as: pipelines::RunAsChange::Keep,
@@ -654,6 +814,9 @@ async fn create_pipeline_persists_max_retries_zero_and_five(pool: PgPool) -> sql
     let zero = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             max_retries: Some(0),
@@ -667,6 +830,9 @@ async fn create_pipeline_persists_max_retries_zero_and_five(pool: PgPool) -> sql
     let five = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             max_retries: Some(5),
@@ -697,6 +863,9 @@ async fn create_pipeline_rejects_max_retries_outside_zero_to_five(
     let result = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             max_retries: Some(6),
@@ -722,6 +891,9 @@ async fn update_pipeline_keeps_max_retries_when_absent_and_overwrites_when_prese
     let created = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             max_retries: Some(4),
@@ -735,6 +907,9 @@ async fn update_pipeline_keeps_max_retries_when_absent_and_overwrites_when_prese
 
     // An update that doesn't touch max_retries keeps the stored value.
     let mut update = pipelines::UpdatePipelineInput {
+        incremental_strategy: "append".to_owned(),
+        partition_granularity: "day".to_owned(),
+        lookback_hours: 0,
         inputs: Vec::new(),
         steps: Vec::new(),
         run_as: pipelines::RunAsChange::Keep,
@@ -768,6 +943,9 @@ async fn runnable_pipelines_carry_their_max_retries(pool: PgPool) -> sqlx::Resul
     let ready = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             max_retries: Some(3),
@@ -797,6 +975,9 @@ fn update_input_for(p: &pipelines::Pipeline) -> pipelines::UpdatePipelineInput {
     // single-field change).
     let _ = p; // helper shape only
     pipelines::UpdatePipelineInput {
+        incremental_strategy: "append".to_owned(),
+        partition_granularity: "day".to_owned(),
+        lookback_hours: 0,
         inputs: Vec::new(),
         steps: Vec::new(),
         run_as: pipelines::RunAsChange::Keep,
@@ -916,6 +1097,9 @@ async fn list_pipelines_for_all_tenants_includes_unassigned_and_tenanted_rows(
     let tenanted = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             tenant_id: Some(tenant_id),
@@ -1045,6 +1229,9 @@ async fn create_pipeline_writes_one_created_version_in_the_same_transaction(
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             run_as: pipelines::RunAsChange::Keep,
@@ -1077,6 +1264,9 @@ async fn create_pipeline_writes_one_created_version_in_the_same_transaction(
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             run_as: pipelines::RunAsChange::Keep,
@@ -1155,6 +1345,9 @@ async fn restore_pipeline_writes_exactly_one_restored_version(pool: PgPool) -> s
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             run_as: pipelines::RunAsChange::Keep,
@@ -1195,6 +1388,9 @@ async fn restore_pipeline_writes_exactly_one_restored_version(pool: PgPool) -> s
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             run_as: pipelines::RunAsChange::Keep,
@@ -1264,6 +1460,9 @@ async fn update_pipeline_writes_one_updated_version_with_post_write_state(
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             run_as: pipelines::RunAsChange::Keep,
@@ -1365,6 +1564,9 @@ async fn failed_update_writes_no_version_row(pool: PgPool) -> sqlx::Result<()> {
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             run_as: pipelines::RunAsChange::Keep,
@@ -1417,6 +1619,9 @@ async fn list_definition_versions_is_newest_first_without_snapshots(
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             run_as: pipelines::RunAsChange::Keep,
@@ -1443,6 +1648,9 @@ async fn list_definition_versions_is_newest_first_without_snapshots(
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             run_as: pipelines::RunAsChange::Keep,
@@ -1570,6 +1778,9 @@ async fn snapshot_round_trips_through_create_update_and_restore(pool: PgPool) ->
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             run_as: pipelines::RunAsChange::Keep,
@@ -1603,6 +1814,9 @@ async fn snapshot_round_trips_through_create_update_and_restore(pool: PgPool) ->
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             run_as: pipelines::RunAsChange::Keep,
@@ -1785,6 +1999,9 @@ async fn baseline_backfill_synthesises_version_one_for_a_legacy_row(
     let created = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             tenant_id: Some(tenant_id),
@@ -2633,6 +2850,9 @@ async fn create_lag_reader_fixture(
     let (source_zone, source_table) = source.split_once('.').expect("source is zone.table");
     let (target_zone, target_table) = target.split_once('.').expect("target is zone.table");
     let fixture = CreatePipelineInput {
+        incremental_strategy: "append".to_owned(),
+        partition_granularity: "day".to_owned(),
+        lookback_hours: 0,
         inputs: Vec::new(),
         steps: Vec::new(),
         name: name.to_owned(),
@@ -3085,6 +3305,9 @@ async fn update_pipeline_refuses_target_lag_cycle(pool: PgPool) -> sqlx::Result<
     // the stored `Pipeline`, which carries the flattened `source`/`target`
     // strings rather than the zone/table parts `UpdatePipelineInput` takes.
     let update_input = pipelines::UpdatePipelineInput {
+        incremental_strategy: "append".to_owned(),
+        partition_granularity: "day".to_owned(),
+        lookback_hours: 0,
         inputs: Vec::new(),
         steps: Vec::new(),
         run_as: pipelines::RunAsChange::Keep,
@@ -3153,6 +3376,9 @@ async fn update_leaves_the_author_alone(pool: PgPool) -> sqlx::Result<()> {
     let created = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             run_as: Some(author),
@@ -3675,6 +3901,9 @@ async fn an_update_carrying_inputs_and_steps_rewrites_every_legacy_column(
         .await
         .expect("create should succeed");
     let mut update = pipelines::UpdatePipelineInput {
+        incremental_strategy: "append".to_owned(),
+        partition_granularity: "day".to_owned(),
+        lookback_hours: 0,
         inputs: Vec::new(),
         steps: Vec::new(),
         run_as: pipelines::RunAsChange::Keep,
@@ -4174,6 +4403,9 @@ async fn update_can_clear_the_author(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(created.run_as, Some(author));
 
     let mut update = pipelines::UpdatePipelineInput {
+        incremental_strategy: "append".to_owned(),
+        partition_granularity: "day".to_owned(),
+        lookback_hours: 0,
         inputs: Vec::new(),
         steps: Vec::new(),
         run_as: pipelines::RunAsChange::Clear,

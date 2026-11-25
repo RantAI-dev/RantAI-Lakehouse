@@ -74,6 +74,12 @@ fn parse_chart_input(args: &Map<String, Value>) -> Result<ChartInput, String> {
 /// The longest digest, in characters.
 const DIGEST_MAX: usize = 300;
 
+/// The builder's default row cap for a chart that sets no `limit`. The number
+/// is `lakehouse-bi/src/builder.rs`'s `limit_value().unwrap_or(20)`, used at
+/// its three query-build sites; `the_reported_default_cap_matches_every_builder_default`
+/// reads that source at compile time and fails if the two drift apart.
+const DEFAULT_CHART_LIMIT: u32 = 20;
+
 /// The `limit: …` part of [`definition_digest`] (`BI-46`, plan D15), or `None`
 /// when the chart has no limit and nothing to say about one.
 ///
@@ -160,8 +166,29 @@ fn limit_digest(def: &ChartInput, breakdown: Option<&str>, caps_built: bool) -> 
             part.push_str("; the breakdown is not limited");
         }
         return Some(part);
-    } else if def.shape.sort.is_some() || breakdown.is_some() {
-        return Some("limit: none (default applies)".to_owned());
+    }
+    // F5: the builder caps rows at `DEFAULT_CHART_LIMIT` when the call sets
+    // no `limit`. Say so when the capped dimension is a bin, and only when
+    // no other cap was built — `caps_built` is the BI-46 breakdown cap, and
+    // naming the default beside it would describe a cut the chart does not
+    // make. A `limit` shows more than the default.
+    let default_cap = def.shape.bin.is_some() && !caps_built;
+    let mut part = String::new();
+    if def.shape.sort.is_some() || breakdown.is_some() {
+        part.push_str("limit: none (default applies)");
+    }
+    if default_cap {
+        use std::fmt::Write;
+        if !part.is_empty() {
+            part.push_str("; ");
+        }
+        let _ = write!(
+            part,
+            "shows at most {DEFAULT_CHART_LIMIT} values by default; set a `limit` to show more"
+        );
+    }
+    if !part.is_empty() {
+        return Some(part);
     }
     None
 }
@@ -3535,6 +3562,58 @@ mod tests {
             false,
         );
         assert!(counted.contains("bin: 10 bins"), "{counted}");
+    }
+
+    /// F5: a chart whose number dimension is binned and that sets no `limit`
+    /// shows only the builder's default rows, so the digest must say the cap
+    /// and that a `limit` shows more. Without that the model cannot warn the
+    /// person that the bins are cut.
+    #[test]
+    fn a_definition_digest_says_the_default_cap_for_a_bin_without_a_limit() {
+        let digest = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "visitors",
+                "measures": ["spend"],
+                "bin": { "mode": "count", "count": 10 },
+            })),
+            false,
+        );
+        assert!(digest.contains("at most 20 values"), "{digest}");
+        assert!(digest.contains("default"), "{digest}");
+        assert!(digest.contains("`limit`"), "{digest}");
+    }
+
+    /// F5: the cap the tool reports must track the builder's own default. The
+    /// builder has no public constant, so read its source at compile time and
+    /// fail here if any of its three `limit_value().unwrap_or(N)` sites drifts
+    /// from `DEFAULT_CHART_LIMIT`.
+    #[test]
+    fn the_reported_default_cap_matches_every_builder_default() {
+        let source = include_str!("../../../../../lakehouse-bi/src/builder.rs");
+        let marker = "limit_value().unwrap_or(";
+        let mut found = Vec::new();
+        for line in source.lines() {
+            if let Some(at) = line.find(marker) {
+                let rest = &line[at + marker.len()..];
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                found.push(
+                    digits
+                        .parse::<u32>()
+                        .expect("a decimal number at every builder default"),
+                );
+            }
+        }
+        assert_eq!(
+            found.len(),
+            3,
+            "the builder has three default-cap sites: {found:?}"
+        );
+        for n in found {
+            assert_eq!(
+                n, DEFAULT_CHART_LIMIT,
+                "the reported cap must match the builder"
+            );
+        }
     }
 
     /// A breakdown with no limit keeps every value of the dimension: the

@@ -3360,7 +3360,11 @@ pub(crate) async fn table_access_for(
     state: &AppState,
     principal: &Principal,
 ) -> Result<crate::table_access::TableAccess, ApiError> {
-    Ok(crate::table_access::for_roles(state.pg.as_deref(), &principal.role_names).await?)
+    // SEC-68: a role-less service identity is NOT a wildcard admin — only a
+    // real `*:*` grant reads every table. `for_principal` also leaves a
+    // platform admin (whose wildcard is a permission, not a role name) and
+    // Postgres-optional reads with non-empty roles unchanged.
+    Ok(crate::table_access::for_principal(state.pg.as_deref(), principal).await?)
 }
 
 /// The canonical `schema.table` key a catalog row or detail body names, or

@@ -92,6 +92,19 @@ path ops/bench/* none
 path ops/geo/* none
 path ops/demo/* none
 path ops/forecast/* none
+# OPS-CI-FAST (OPS-38 D2 standard): the two standalone `BI-44` deployment
+# templates and their static test. Grepping `ops/`, `dagster/`,
+# `.github/workflows/ci.yml` and `rust/` for `bi-only` (and for the file names
+# `docker-compose.bi-only-clickhouse.yml` / `docker-compose.bi-only-trino.yml`)
+# finds no reference outside `ops/bi-only/` itself: no gate mounts or starts
+# them, `docker-compose.yml` is a different file, and no `include_str!` in
+# `rust/` reads them. They were missing here, so `ops/* all` ran all 25 gates
+# on PR #724, which touched `ops/bi-only/README.md` among other things.
+path ops/bi-only/* none
+# OPS-CI-FAST (OPS-38 D2 standard): the static landing site. Only
+# `.github/workflows/deploy-landing.yml` builds or deploys it (`eslint.config.mjs`
+# ignores its build output), no compose file and no gate references it.
+path ops/landing-pages/* none
 
 # ── The console (OPS-25 D4) ───────────────────────────────────────────────
 # No gate builds or starts the console image (`images` builds the API and
@@ -325,6 +338,23 @@ path ops/g6/* cdc,ingest,saas,secrets,alerts
 #     lakehouse-store/src/ except the modules listed above, lakehouse-auth,
 #     lakehouse-iceberg/src/, lakehouse-clickhouse, lakehouse-dagster;
 #   - any other ops/* or rust/* path.
+#
+# OPS-CI-FAST: `ops/init/*` is the `init` image `lakekeeper-warehouse-init` and
+# the other one-shot initialisers build (`docker-compose.yml`, `build: context:
+# ./ops/init`), so every gate that starts the stack needs it. Named explicitly
+# rather than left to the `ops/*` catch-all, so a later narrowing there cannot
+# skip the gates that mount it.
+path ops/init/* all
+# OPS-CI-FAST, audit of the `BI-44` modules that arrived with PR #724 and stay
+# shared on purpose (OPS-38 D2 asks for a proof before a narrower line):
+#   - `rust/crates/lakehouse-api/src/in_place.rs` is called from
+#     `routes/catalog.rs` (`pipelines,governance`) and `routes/connectors.rs`
+#     (shared), so a change can move those gates;
+#   - `rust/crates/lakehouse-api/src/routes/settings.rs` serves
+#     `/api/settings/*` and exports `add_formatting`, which every dashboard
+#     payload (`governance,alerts`) calls.
+# Grepping `ops/`, `dagster/` and `.github/workflows/ci.yml` finds no direct
+# user of either, but the routes above are the user, so neither is narrowed.
 path docker-compose.yml all
 path .env.example all
 path .github/* all
