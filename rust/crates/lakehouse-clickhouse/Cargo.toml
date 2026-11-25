@@ -11,7 +11,10 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+# `sync`: [`ChTableEnsured`] keeps its per-URL answer behind a
+# `tokio::sync::RwLock`. The workspace's own `tokio` features cover only the
+# runtime, so this crate asks for the one feature it uses.
+tokio = { workspace = true, features = ["sync"] }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
