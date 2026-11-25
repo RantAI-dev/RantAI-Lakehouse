@@ -5589,7 +5589,17 @@ mod tests {
         let http = WebhookSender::new(std::sync::Arc::new(RefuseAll));
         let email = no_smtp_email_sender();
         let rule = metric_rule("orphaned", AlertOp::Gt, 0.0);
-        let result = run_one(&ch, &http, &email, None, (None, None), &RewriteGate, &rule).await;
+        // PR #645 CI: #654 (BI-73) made the locale an argument.
+        let result = run_one(
+            &ch,
+            &http,
+            &email,
+            None,
+            (None, None),
+            &RewriteGate,
+            (&rule, "en-US"),
+        )
+        .await;
         assert!(!result.fired);
         assert_eq!(
             result.failed.as_deref(),
