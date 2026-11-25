@@ -1205,8 +1205,11 @@ def run_case(cfg: Config, session: requests.Session, case: dict[str, Any]) -> di
         # Cleanup runs on every exit. A run that scored keeps its problems on the
         # result; a run that raised becomes a failed result with the same problems,
         # so a failed cleanup is never only on stderr.
-        cleanup_problems = _cleanup(cfg, session, setup_created, bodies, confirms)
-        cleanup_problems.extend(run_teardown(cfg, session, case.get("cleanup", []), names))
+        # A case's teardown undoes what its setup changed, so it runs while
+        # those objects still exist: deleting a board first puts it in the
+        # trash and makes a comment on it unreachable (404).
+        cleanup_problems = run_teardown(cfg, session, case.get("cleanup", []), names)
+        cleanup_problems.extend(_cleanup(cfg, session, setup_created, bodies, confirms))
         if scored is None:
             scored = _failed_run(case, _raised_run, cleanup_problems)
         else:

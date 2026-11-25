@@ -719,7 +719,7 @@ class CleanupPlanTests(unittest.TestCase):
 
 class TeardownTests(unittest.TestCase):
     """The calls a case names in `cleanup` undo what its setup changed and the
-    deletes cannot: a certification mark it put on an asset. They run after
+    deletes cannot: a certification mark it put on an asset. They run before
     the deletes, on every exit of the run."""
 
     MARK = {"method": "PUT", "path": "/api/catalog/serving.mart_x/certification", "body": {"status": None}}
@@ -760,7 +760,7 @@ class TeardownTests(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("HTTP 403", problems[0])
 
-    def test_the_teardown_runs_after_the_deletes_even_when_the_run_raises(self) -> None:
+    def test_the_teardown_runs_even_when_the_run_raises(self) -> None:
         # The turn raises (the stack is gone mid-run). The mark the setup put
         # is still cleared, so the next run does not read a mart that is
         # deprecated for good.
@@ -789,6 +789,64 @@ class TeardownTests(unittest.TestCase):
         self.assertEqual(len(puts), 2)
         self.assertEqual(puts[0][2]["status"], "deprecated")
         self.assertIsNone(puts[-1][2]["status"])
+
+    def test_the_comment_teardown_deletes_before_the_board_and_reports_no_problem(self) -> None:
+        # A board DELETE moves the board to the trash, so a comment still in
+        # that board becomes unreachable (404). The case's own teardown must
+        # delete the comment while the board is still there, before the
+        # harness deletes the objects the run created.
+        cfg = make_cfg()
+        case = {
+            "id": "comment_deleted_before_board",
+            "mode": "ask",
+            "turns": ["Read the comments on the board."],
+            "setup": [
+                {"name": "board", "method": "POST", "path": "/api/dashboard/boards",
+                 "body": {"name": "T"}, "id_at": "board.id"},
+                {"name": "comment", "method": "POST", "path": "/api/dashboard/comments",
+                 "body": {"board": "{board}", "body": "Check March", "mentions": []}, "id_at": "id"},
+            ],
+            "cleanup": [{"method": "DELETE", "path": "/api/dashboard/comments/{comment}"}],
+        }
+
+        class BoardAwareSession(FakeSession):
+            def __init__(self) -> None:
+                super().__init__({
+                    ("POST", "/api/dashboard/boards"): {"board": {"id": "b-1"}},
+                    ("POST", "/api/dashboard/comments"): {"id": "cm-1"},
+                })
+                self.board_deleted = False
+
+            def _answer(self, method: str, url: str, body: Any) -> FakeResponse:
+                path = url.split("http://api.test", 1)[-1].split("?", 1)[0]
+                if method == "DELETE" and path == "/api/dashboard/boards":
+                    self.board_deleted = True
+                if (
+                    method == "DELETE"
+                    and path == "/api/dashboard/comments/cm-1"
+                    and self.board_deleted
+                ):
+                    # `target_of_comment` cannot resolve a comment on a board
+                    # that has been moved to the trash.
+                    self.replies[(method, path)] = FakeResponse(404, {"error": "board not found"})
+                return super()._answer(method, url, body)
+
+        session = BoardAwareSession()
+        reply = {"answer": "The comment asks about March visitors.", "_status": 200, "toolTrace": []}
+        with mock.patch.object(m, "ask", return_value=reply):
+            result = m.run_case(cfg, session, case)
+
+        self.assertEqual(result["problems"], [])
+        self.assertTrue(session.board_deleted)
+        self.assertEqual(
+            [(method, url) for method, url, _ in session.calls],
+            [
+                ("POST", "http://api.test/api/dashboard/boards"),
+                ("POST", "http://api.test/api/dashboard/comments"),
+                ("DELETE", "http://api.test/api/dashboard/comments/cm-1"),
+                ("DELETE", "http://api.test/api/dashboard/boards?id=b-1"),
+            ],
+        )
 
 
 # ── setup and {name} substitution ─────────────────────────────────────────
