@@ -1,5 +1,6 @@
 "use client"
 
+import { SuggestInput } from "@/components/patterns/suggest-input"
 import * as React from "react"
 import { observeElementRect, useVirtualizer } from "@tanstack/react-virtual"
 import { LoaderIcon, SearchIcon } from "lucide-react"
@@ -392,19 +393,13 @@ export function TableFinder({
             <Label htmlFor="discover-schema" className="text-xs">
               Schema
             </Label>
-            <Input
+            <SuggestInput
               id="discover-schema"
-              list="discover-schemas"
               value={schema}
-              onChange={(e) => setSchema(e.target.value)}
+              onValueChange={setSchema}
+              suggestions={schemas.map((s) => ({ value: s.name }))}
               className="h-8"
-              autoComplete="off"
             />
-            <datalist id="discover-schemas">
-              {schemas.map((s) => (
-                <option key={s.name} value={s.name} />
-              ))}
-            </datalist>
           </div>
         ) : kind === "files" || kind === "sftp" ? (
           <div className={inputClass}>

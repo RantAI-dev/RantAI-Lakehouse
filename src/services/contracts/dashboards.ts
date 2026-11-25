@@ -280,6 +280,13 @@ export type DashboardService = {
    * caller can see and does not manage, 404 for one they cannot see).
    */
   getAccess(kind: AccessKind, id: string, signal?: AbortSignal): Promise<ItemAccess>
+  /**
+   * `BI-72`: whether a web-page card's site allows being shown inside a
+   * dashboard. `false` when the site's own headers refuse the console, `true`
+   * when they do not, `null` when the server could not tell (the site did not
+   * answer, or the caller is not signed in, as on a public link): no claim.
+   */
+  frameCheck(url: string, signal?: AbortSignal): Promise<boolean | null>
   /** Replace the item's rules and its "only the people listed" mark. */
   saveAccess(input: ItemAccessInput, signal?: AbortSignal): Promise<ItemAccess>
   /** People and roles for the picker; at most 20 people. */

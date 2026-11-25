@@ -153,7 +153,7 @@ export function buildOption(
     type: "value" as const,
     name, nameTextStyle: { color: axis, fontSize: 10 }, nameGap: 8,
     position: (right ? "right" : "left") as "right" | "left",
-    axisLabel: { color: axis, fontSize: 11, formatter: (v: number) => fmtCompact(v) },
+    axisLabel: { color: axis, fontSize: 11, hideOverlap: true, formatter: (v: number) => fmtCompact(v) },
     splitLine: { show: !right, lineStyle: { color: split } },
     axisLine: { show: false }, axisTick: { show: false },
   });
@@ -400,7 +400,7 @@ export function buildOption(
   const horizontal = spec.kind === "hbar";
   const valueAxis = {
     type: "value" as const,
-    axisLabel: { color: axis, fontSize: 11, formatter: (v: number) => fmtCompact(v) },
+    axisLabel: { color: axis, fontSize: 11, hideOverlap: true, formatter: (v: number) => fmtCompact(v) },
     splitLine: { lineStyle: { color: split } },
     axisLine: { show: false },
     axisTick: { show: false },
@@ -698,6 +698,35 @@ export function forecastNote(lines: readonly ReferenceLine[] | undefined, ctx: L
   return forecastOf(lines, ctx, horizontal)?.plan.note;
 }
 
+/** One number as the person wrote it: digits with grouping separators ("1,000", "1 000", "1'000") and a decimal point. */
+const NUMBER = /\d[\d' \u00a0\u202f,.]*/g;
+
+/** A number as digits and its decimal point, grouping separators dropped; trailing periods are a sentence's, not the number's. */
+const plainNumber = (t: string) => t.replace(/[' \u00a0\u202f,]/g, "").replace(/\.+$/, "");
+
+/**
+ * Whether a person's own label already holds the line's number as a whole
+ * number, compared against both the formatted value (the chart's locale and
+ * format) and the plain number, grouping separators ignored. "Goal 1,000" for
+ * a 1,000 line carries it; "Goal 21000" does not (its 1,000 sits inside
+ * another number), so the second still shows the line's number once
+ * (`BI-72`; whole-number tokens, `PR #651 review 2`).
+ */
+function carriesNumber(label: string, formatted: string, value: number): boolean {
+  const wanted = [plainNumber(formatted), plainNumber(String(value))].filter((w) => w !== "");
+  const numbers = label.match(NUMBER) ?? [];
+  return numbers.some((n) => wanted.includes(plainNumber(n)));
+}
+
+/** The next 1, 2, 2.5 or 5 x 10^n step above `top`, with steps sized for about five intervals from `min` (BI-72). */
+function niceCeil(top: number, min: number): number {
+  const raw = (top - Math.min(min, 0)) / 5;
+  if (!(raw > 0)) return top;
+  const p = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * p).find((c) => c >= raw) ?? raw;
+  return Math.ceil(top / step) * step;
+}
+
 function withMarkLines(
   option: EChartsOption,
   lines: readonly ReferenceLine[] | undefined,
@@ -773,7 +802,9 @@ function withMarkLines(
       formatter: (p: { name?: string; value?: unknown }) => {
         // A trend line has two ends and no single value to write.
         const v = typeof p.value === "number" ? write(g.measure, p.value) : "";
-        return `${p.name ? `${p.name} ` : ""}${v}`.trim();
+        // BI-72: a label that already holds the number is not given it again ("Goal 1,000 1,000").
+        const written = typeof p.value === "number" && p.name && carriesNumber(p.name, v, p.value) ? "" : v;
+        return `${p.name ? `${p.name} ` : ""}${written}`.trim();
       },
     },
     data: g.lineData,
@@ -791,7 +822,8 @@ function withMarkLines(
   const widen = (axis: unknown, top: number) => {
     if (!axis || typeof axis !== "object" || (axis as { type?: string }).type !== "value") return axis;
     if (!Number.isFinite(top)) return axis;
-    return { ...(axis as object), max: (range: { max: number }) => Math.max(range.max, top) };
+    // BI-72: end on a round tick above the line, not on its raw value, so no second max label sits beside the last tick.
+    return { ...(axis as object), max: (range: { max: number; min?: number }) => (top <= range.max ? range.max : niceCeil(top, range.min ?? 0)) };
   };
   const valueAxes = horizontal ? option.xAxis : option.yAxis;
   const widened = Array.isArray(valueAxes)
