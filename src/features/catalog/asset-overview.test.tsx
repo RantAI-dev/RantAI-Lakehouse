@@ -1,6 +1,7 @@
-// QS-10 (D5): the "Sensitive columns" card must not claim that a
-// classification on its own masks a column. Rendering the overview directly
-// keeps the assertion on the card, where a reader of the asset page looks.
+// QS-10 (D5): the Overview must not claim that a classification on its own
+// masks a column. UX-8: the "Sensitive columns" card became one line under
+// the column list, which says for each column whether it is masked or only
+// classified; rendering the overview directly keeps the assertion there.
 import type { ReactNode } from "react"
 
 // A faithful stand-in: forward every prop, not just href and children. A
@@ -57,7 +58,11 @@ const ASSET = {
   lastUpdated: "2026-10-01T00:00:00Z",
   health: "healthy",
   residency: "id-jakarta",
-  schema: [{ name: "id", dataType: "Int64" }],
+  schema: [
+    { name: "id", dataType: "Int64" },
+    { name: "email", dataType: "String", classification: "confidential" },
+    { name: "phone", dataType: "String", masked: true },
+  ],
   sample: [],
   qualityChecks: [],
   policySummary: [],
@@ -104,8 +109,6 @@ it("says a classification alone does not mask a column", () => {
   )
 
   expect(
-    screen.getByText(
-      "Columns a policy masks, and columns classified confidential or above. A classification alone does not mask a column."
-    )
+    screen.getByText("2 sensitive columns: email (confidential) · phone (masked)")
   ).toBeTruthy()
 })

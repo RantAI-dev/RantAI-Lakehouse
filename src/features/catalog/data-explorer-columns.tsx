@@ -16,8 +16,10 @@ import {
 
 import { Copyable } from "@/components/copyable"
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header"
-import { AssetRowActions } from "./data-explorer-actions"
+import { AssetRowActions, assetAddress } from "./data-explorer-actions"
+import { layerDot } from "./catalog-layers"
 import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
+import { HelpHint } from "@/components/patterns/help-hint"
 import { CertificationBadge, Pill, TierBadge } from "@/components/patterns/status-badge"
 import { formatBytes } from "@/lib/format"
 import { governedPairLabels } from "./governed-tags"
@@ -69,6 +71,13 @@ const typeOptions = Object.entries(ASSET_TYPE_LABEL).map(([value, label]) => ({
   value,
 }))
 
+/**
+ * What a dash in the Freshness column means, said once on its header
+ * (`UX-8`, plan decision 5) instead of "Not measured" on every row.
+ */
+export const FRESHNESS_NOT_MEASURED =
+  "A dash means nothing measures this asset's freshness yet: no load has reported when it last wrote. Give its pipeline a schedule or a freshness target and the age appears here."
+
 /** The reason line under a name; nothing when the server sent none. */
 export function MatchedOnLine({ matchedOn }: { matchedOn: Asset["matchedOn"] }) {
   const reason = matchedOnLabel(matchedOn)
@@ -92,12 +101,13 @@ export function getDataExplorerColumns({
       id: "name",
       accessorKey: "name",
       header: ({ column }) => <DataTableColumnHeader column={column} label="Name" />,
-      // Just the name. The namespace used to repeat here as a subtitle, but
-      // it already has its own sortable, filterable, copyable column — the
-      // second copy only widened the row and gave the same value two places
-      // to be copied from.
+      // UX-8 (mockup A): the name, and the table's address under it — the
+      // name a person types in SQL, which also says the namespace, so the
+      // Namespace column is hidden by default (it stays defined: its filter,
+      // sort and grouping live on it). The address is code, so it is the one
+      // monospace line in the row (plan decision 3).
       cell: ({ row }) => (
-        <div className="flex flex-col">
+        <div className="flex min-w-0 flex-col py-0.5">
           {/* Capped and truncated: asset names run long ("Kunjungan Daya
               Tarik Wisata"), and left to itself this column took ~270px —
               enough to push the last columns off a narrow screen on its own.
@@ -116,6 +126,12 @@ export function getDataExplorerColumns({
                 mark rides the name instead of a column of its own. */}
             <CertificationBadge certification={row.original.certification} />
           </div>
+          <span
+            className="max-w-[12rem] truncate font-mono text-xs text-muted-foreground xl:max-w-[22rem]"
+            title={assetAddress(row.original)}
+          >
+            {assetAddress(row.original)}
+          </span>
           {/* Why a search returned this row (DATA-11); only a search with a
               term sends it, and a match on the name needs no reason. */}
           <MatchedOnLine matchedOn={row.original.matchedOn} />
@@ -135,6 +151,9 @@ export function getDataExplorerColumns({
       header: ({ column }) => (
         <DataTableColumnHeader column={column} label="Namespace" />
       ),
+      // Hidden by default (UX-8: the address under the name says it); the
+      // column stays for its filter, sort and grouping, and the Columns menu
+      // brings it back.
       cell: ({ row }) => (
         <Copyable value={row.original.namespace}>
           <span className="font-mono text-xs">{row.original.namespace}</span>
@@ -235,11 +254,15 @@ export function getDataExplorerColumns({
       id: "layer",
       accessorKey: "layer",
       header: ({ column }) => <DataTableColumnHeader column={column} label="Layer" />,
-      cell: ({ row }) => (
-        <span className="text-sm">
-          {DATA_LAYER_LABEL[row.original.layer as DataLayer] ?? row.original.layer}
-        </span>
-      ),
+      cell: ({ row }) => {
+        const dot = layerDot(row.original.layer)
+        return (
+          <span className="inline-flex items-center gap-1.5 whitespace-nowrap text-sm">
+            {dot ? <span aria-hidden className={`size-2 shrink-0 rounded-full ${dot}`} /> : null}
+            {DATA_LAYER_LABEL[row.original.layer as DataLayer] ?? row.original.layer}
+          </span>
+        )
+      },
       enableColumnFilter: true,
       meta: {
         label: "Layer",
@@ -267,15 +290,34 @@ export function getDataExplorerColumns({
       id: "freshnessLagSeconds",
       accessorKey: "freshnessLagSeconds",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} label="Freshness" />
+        <span className="inline-flex items-center gap-0.5">
+          <DataTableColumnHeader column={column} label="Freshness" />
+          {/* Outside the header's own button, and kept from reaching it:
+              the header opens its menu on pointer down and starts a column
+              drag, neither of which a look at the hint should do. */}
+          <span
+            className="inline-flex"
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={(event) => event.stopPropagation()}
+            onKeyDown={(event) => event.stopPropagation()}
+          >
+            <HelpHint>{FRESHNESS_NOT_MEASURED}</HelpHint>
+          </span>
+        </span>
       ),
-      cell: ({ row }) => (
-        <FreshnessIndicator
-          lagSeconds={row.original.freshnessLagSeconds}
-          targetSeconds={row.original.freshnessTargetSeconds ?? null}
-          targetSource={row.original.freshnessTargetSource}
-        />
-      ),
+      cell: ({ row }) =>
+        row.original.freshnessLagSeconds === null ? (
+          // UX-8: a quiet dash, explained once on the header.
+          <span className="text-muted-foreground/70">
+            —<span className="sr-only">Not measured</span>
+          </span>
+        ) : (
+          <FreshnessIndicator
+            lagSeconds={row.original.freshnessLagSeconds}
+            targetSeconds={row.original.freshnessTargetSeconds ?? null}
+            targetSource={row.original.freshnessTargetSource}
+          />
+        ),
       enableColumnFilter: true,
       meta: {
         label: "Freshness",

@@ -53,6 +53,7 @@ import {
 import { typeFamily, type TypeFamily } from "@/lib/column-type"
 import { formatCompactNumber, formatDate, formatNumber } from "@/lib/format"
 import { cn } from "@/lib/utils"
+import { HelpHint } from "@/components/patterns/help-hint"
 import type { AssetColumn, AssetProfile, ColumnProfile } from "@/services/contracts/assets"
 import { ALL, CountToggle } from "./count-toggle"
 import { draftCount, type MeaningState } from "./asset-meaning"
@@ -213,7 +214,16 @@ export function ProfileNote({ state }: { state: ProfileState }) {
   if (state.kind === "restricted") {
     return <span>Column statistics are read from the data, so they need the query:read permission.</span>
   }
-  if (state.kind === "unsupported") return <span>No column statistics: {state.reason}</span>
+  // UX-8 browser review (DESIGN.md §2, status text is one short line): the
+  // server's reason is engine detail, so it goes in the ⓘ.
+  if (state.kind === "unsupported") {
+    return (
+      <span className="inline-flex items-center gap-1">
+        No column statistics yet
+        <HelpHint>{state.reason}</HelpHint>
+      </span>
+    )
+  }
   if (state.kind === "error") {
     return (
       <span className="flex items-center gap-2">
@@ -643,17 +653,22 @@ function ColumnRow({
           </span>
         </div>
         <div role="cell" className="min-w-0 self-end @lg:self-center">
-          <div className="flex h-5 min-w-0 items-center gap-1.5 overflow-hidden">
+          {/* UX-8 browser review: a mark never squeezes the name. The line
+              wraps and is one line tall, so a mark that does not fit beside
+              the name drops whole onto the hidden second line (the opened
+              column lists every mark), and the name truncates only when the
+              column itself is narrower than it, with the full name as title. */}
+          <div className="flex h-5 min-w-0 flex-wrap items-center gap-x-1.5 overflow-hidden">
             <button
               type="button"
               aria-expanded={open}
               aria-controls={panelId}
               title={c.name}
-              className="min-w-0 truncate rounded-sm text-left font-mono text-xs font-medium outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
+              className="h-5 max-w-full truncate rounded-sm text-left font-mono text-xs font-medium outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
             >
               {c.name}
             </button>
-            <Marks row={row} sortKey={sortKey} className="hidden @lg:flex" />
+            <Marks row={row} sortKey={sortKey} className="hidden @lg:contents" />
           </div>
         </div>
         {/* Below `@lg` this is the second line of the name's track: the type, which truncates, then
@@ -931,5 +946,66 @@ export function ColumnsCard({
         )}
       </div>
     </SectionCard>
+  )
+}
+
+/**
+ * The Overview's columns (`UX-8`, mockup A: the Overview reads like a
+ * readme): the first `count` columns in table order, each with its value
+ * profile, drawn with the very rows of the Columns tab — so a column opens
+ * the same way here — but without the tab's filter, page size and views.
+ * The tab has them, and the rest of the columns.
+ */
+export function ColumnsPreview({
+  rows,
+  profile,
+  sortingKey,
+  count,
+}: {
+  rows: SchemaRow[]
+  profile: ProfileState
+  sortingKey?: string | null
+  count: number
+}) {
+  const showStats = profile.kind === "ready" || profile.kind === "loading"
+  const [open, setOpen] = React.useState<ReadonlySet<string>>(() => new Set())
+  const toggle = (name: string) =>
+    setOpen((prev) => {
+      const next = new Set(prev)
+      if (next.has(name)) next.delete(name)
+      else next.add(name)
+      return next
+    })
+  const sortKeys = sortKeyColumns(
+    sortingKey,
+    rows.map((r) => r.column.name)
+  )
+  if (rows.length === 0) return <p className="text-sm text-muted-foreground">No columns registered.</p>
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="@container overflow-hidden rounded-lg border border-border">
+        <div role="table" aria-label="Columns">
+          <div role="rowgroup">
+            <ColumnHeader showStats={showStats} />
+          </div>
+          <div role="rowgroup">
+            {rows.slice(0, count).map((row) => (
+              <ColumnRow
+                key={row.column.name}
+                row={row}
+                state={profile}
+                showStats={showStats}
+                sortKey={sortKeys.has(row.column.name)}
+                open={open.has(row.column.name)}
+                onToggle={() => toggle(row.column.name)}
+              />
+            ))}
+          </div>
+        </div>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        <ProfileNote state={profile} />
+      </p>
+    </div>
   )
 }
