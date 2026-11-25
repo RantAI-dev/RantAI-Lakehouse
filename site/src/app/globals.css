@@ -3004,6 +3004,11 @@ html[data-tod="day"] .lk-waterline path {
 }
 html[data-tod="day"] #hero [data-intro-copy] h1 {
   color: var(--lk-ink);
+  /* WEB-5 day-mode LCP: Chrome counts a text's shadow in its painted area. The reassurance line below carries a
+     26px halo (see `ul` below), which makes its area larger than the headline's; when the intro reveals it at
+     about 2.2 s it took over as the largest paint (LCP 4.7 s simulated instead of 1.7 s). A fully transparent
+     shadow of the same kind on the headline makes the headline's area the larger one again. Nothing is drawn. */
+  text-shadow: 0 0 64px transparent;
 }
 html[data-tod="day"] #hero [data-intro-copy] > :first-child {
   color: #083f82;
