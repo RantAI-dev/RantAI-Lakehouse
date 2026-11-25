@@ -47,7 +47,7 @@ export async function HomePage({ locale }: Readonly<{ locale: Locale }>) {
 
   return (
     <LandingModeProvider>
-      <div className="lk-root relative min-h-screen overflow-x-clip">
+      <div data-home="" className="lk-root relative min-h-screen overflow-x-clip">
         {/* WEB-5 O47: first, so its class is on <html> before anything paints. */}
         <HeroIntro />
         <TodBoot />
