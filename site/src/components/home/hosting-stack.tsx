@@ -32,18 +32,18 @@ export function HostingStack({ copy, contactHref }: { copy: HomeCopy["open"]["ho
       <fieldset className="lk-open-seg relative inline-grid w-full grid-cols-2 rounded-xl p-1 text-[13px] leading-5 font-medium">
         <legend className="sr-only">{copy.label}</legend>
         <span aria-hidden="true" className="lk-hs-thumb absolute inset-y-1 left-1 w-[calc(50%-4px)] rounded-lg" />
-        <label className="lk-open-seg-opt relative z-10 cursor-pointer rounded-lg px-3 py-1.5 text-center">
+        <label className="lk-open-seg-opt relative z-10 cursor-pointer rounded-lg px-3 py-1.5 text-center max-lg:py-2.5">
           <input type="radio" name="lk-host" value="yours" defaultChecked className="sr-only" />
           {copy.yours}
         </label>
-        <label className="lk-open-seg-opt relative z-10 cursor-pointer rounded-lg px-3 py-1.5 text-center">
+        <label className="lk-open-seg-opt relative z-10 cursor-pointer rounded-lg px-3 py-1.5 text-center max-lg:py-2.5">
           <input type="radio" name="lk-host" value="ours" className="sr-only" />
           {copy.ours}
         </label>
       </fieldset>
 
       {/* Run for you: your sources connect in from outside the boundary (reserved in both views, so the grid never moves). */}
-      <div aria-hidden="true" className="lk-hs-sources flex h-6 items-center gap-2 text-[11.5px] leading-4 text-[#E8F4FF]/60">
+      <div aria-hidden="true" className="lk-hs-sources flex h-6 items-center gap-2 text-[11.5px] leading-4 text-[#E8F4FF]/60 max-lg:text-[12px]">
         <span>{copy.sourcesLabel}</span>
         {(["postgresql", "mysql", "hubspot"] as const).map((id) => (
           <span key={id} className="grid size-6 place-items-center rounded-full bg-white/[0.07] text-[#E8F4FF]/80">
@@ -54,7 +54,7 @@ export function HostingStack({ copy, contactHref }: { copy: HomeCopy["open"]["ho
       </div>
 
       <div className="lk-hs-box relative flex flex-1 flex-col rounded-2xl p-2.5 sm:p-3">
-        <div className="lk-hs-head flex items-center gap-1.5 text-[11.5px] leading-4 font-medium">
+        <div className="lk-hs-head flex items-center gap-1.5 text-[11.5px] leading-4 font-medium max-lg:text-[12px]">
           <Lock aria-hidden="true" className="size-3 shrink-0" strokeWidth={2.25} />
           <span className="lk-hs-name relative grid">
             <span className="lk-hs-name-yours col-start-1 row-start-1">{copy.yourNetwork}</span>
@@ -70,12 +70,13 @@ export function HostingStack({ copy, contactHref }: { copy: HomeCopy["open"]["ho
             const Icon = s.icon;
             return (
               <li key={s.id} className="lk-hs-card" data-id={s.id} data-rel={s.rel} style={{ "--i": i } as React.CSSProperties}>
-                <span className="flex items-center gap-1.5 text-[12px] leading-4 font-medium text-[#E8F4FF]/90">
+                <span className="flex items-center gap-1.5 text-[12px] leading-4 font-medium text-[#E8F4FF]/90 max-lg:text-[13px]">
                   <Icon aria-hidden="true" className="size-3.5 shrink-0 text-[#8fcbff]" strokeWidth={2} />
                   {s.name}
                 </span>
-                <span className="mt-0.5 block text-[10.5px] leading-4 text-[#E8F4FF]/55">{copy.roles[s.id]}</span>
-                <span className="lk-hs-st mt-1.5 grid text-[10.5px] leading-4 font-medium">
+                {/* WEB-5 M5 (phone pass): below 1024 px a card is its name and its state; the role line goes. */}
+                <span className="mt-0.5 block text-[10.5px] leading-4 text-[#E8F4FF]/55 max-lg:hidden">{copy.roles[s.id]}</span>
+                <span className="lk-hs-st mt-1.5 grid text-[10.5px] leading-4 font-medium max-lg:text-[12px]">
                   <span className="lk-hs-st-a col-start-1 row-start-1 text-[#E8F4FF]/45">{copy.starting}…</span>
                   <span className="lk-hs-st-b col-start-1 row-start-1 inline-flex items-center gap-1 text-[#7be0b0]">
                     <Check aria-hidden="true" className="size-3" strokeWidth={2.75} />
@@ -90,10 +91,10 @@ export function HostingStack({ copy, contactHref }: { copy: HomeCopy["open"]["ho
 
       <div className="lk-hs-foot grid min-h-9 items-center">
         <div aria-hidden="true" className="lk-hs-term col-start-1 row-start-1 rounded-xl bg-[var(--lk-n-bg)] px-3 py-1.5">
-          <code className="block truncate !text-[11.5px] !leading-[18px] text-[#E8F4FF]/85">
+          <code className="block truncate !text-[11.5px] !leading-[18px] text-[#E8F4FF]/85 max-lg:!text-[12px]">
             <span className="text-[#8fcbff]/60">$</span> scripts/compose.sh up --build
           </code>
-          <code className="lk-hs-done block !text-[11.5px] !leading-[18px] text-[#7be0b0]">✓ {copy.allStarted}</code>
+          <code className="lk-hs-done block !text-[11.5px] !leading-[18px] text-[#7be0b0] max-lg:!text-[12px]">✓ {copy.allStarted}</code>
         </div>
         <a
           href={contactHref}
