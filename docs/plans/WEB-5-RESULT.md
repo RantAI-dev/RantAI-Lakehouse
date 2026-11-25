@@ -428,3 +428,84 @@ The column-lineage and "one table, many readers" pictures are split into a state
 - `c6f2fff84` `WEB-5 chore(deps): site Next.js 16.4.3 to 16.4.6 (dependency review)`
 - `ce10be3d6` `WEB-5 perf(site): run the WebGL probe after the first paint, not before it`
 - `809796fae` `WEB-5 perf(site): load the lineage and open-tables pictures after the first paint`
+
+## 2026-11-25 SEO, accessibility and policy pass (T4)
+
+Built with `NEXT_PUBLIC_SITE_URL=https://lakehouse.rantai.dev`. The `next` bump of T4 was already done in `c6f2fff84`.
+
+### Audit of the exported HTML
+
+Checked on `/`, `/id/`, `/contact/`, `/id/contact/` and `404.html`.
+
+| Item | State |
+| --- | --- |
+| `<html lang>` `en` / `id` per locale; the 404 is `en` | present |
+| canonical on each page, absolute on `lakehouse.rantai.dev` | present |
+| hreflang `en`, `id`, `x-default` on the four real pages (the 404 has none, by design) | present |
+| `sitemap.xml`: both pages, each with `xhtml:link` alternates `en`, `id`, `x-default` | present |
+| `robots.txt`: allow all, `Sitemap:` and `Host:` | present |
+| title and description per page and language (titles 25 to 39, descriptions 125 to 153 characters) | present; length bounds now tested in `seo.test.ts` |
+| Open Graph: title, description, url, site name, `og:locale` plus the alternate, `og:image` absolute with type, 1200 x 630 and alt | present |
+| Twitter `summary_large_image` with title, description and image | present |
+| `referrer` meta `strict-origin-when-cross-origin` | present |
+| JSON-LD `SoftwareApplication`: name, category, `operatingSystem`, AGPL-3.0 license, free | present |
+| JSON-LD `SoftwareApplication.offers` (price 0; the page says "Free and open source") | **fixed**: added |
+| JSON-LD `Organization` (RantAI, `https://rantai.dev`) with `logo` | **fixed**: logo `https://rantai.dev/rant-ai.png`, the one rantai.dev names itself |
+| No rating or review anywhere; `FAQPage` only on `/contact/` and `/id/contact/` | present |
+| `404.html`: `noindex`, no canonical, no hreflang, no JSON-LD | present |
+
+### Contrast (`color-contrast`, accessibility 97 to 100)
+
+Failing nodes read from the T3 Lighthouse JSONs. Only the text colour was changed, hue kept; all ratios are against the measured background.
+
+| Selector | Old | New | Ratio |
+| --- | --- | --- | --- |
+| `.lk-ast-placeholder` (composer placeholder), `[data-ghost]` (the console's ghost prompt) | `#E8F4FF` at 45% (`#728092`) | at 50% (`#7C8B9C`) | 3.98 to 4.60 |
+| `.lk-ast-mode` (Ask / Build, both states) | white at 45% (`#7C8592`) | at 47% (`#818A96`) | 4.29 to 4.59 |
+| `.lk-otr-type` (column types in the open-tables card) | `#E8F4FF` at 45% (`#728192`) | at 50% (`#7C8B9C`) | 4.02 to 4.60 |
+| `.lk-otr-a-caption` ("Together" caption) | `#E8F4FF` at 40% (`#637181`) | at 50% (`#778594`) | 3.50 to 4.64 |
+| `.lk-open-pre` line numbers (`span.w-11`), 9 nodes | `#E8F4FF` at 30% (`#4D5B6C`, `#51657B` on the hot band) | text replaced by `::before { content: attr(data-n) }`, colour unchanged | 2.52 / 2.48, no text node left to measure |
+
+The line numbers are the one case that could not be nudged: passing at 4.5:1 needs about 52% alpha, and a gutter at half brightness against 80% code would change the block's look. They sit in an `aria-hidden` block and are `select-none`, so generated content keeps the exact look. The effect is that they are no longer in the DOM: nobody can copy or select them (they could not before either) and the audit has nothing to measure. This is a judgement call worth a second look at review.
+
+### Content Security Policy (meta, first in `<head>`)
+
+```
+default-src 'self'; script-src 'self' 'sha256-<one per inline script of that page>'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; media-src 'self'; worker-src 'self' blob:; manifest-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'none'
+```
+
+- **Changed:** `script-src` no longer has `'unsafe-inline'`. `scripts/csp-meta.ts` hashes each executable inline script of each exported page at build time and writes the hashes into that page's own meta (the home page has 9, the 404 has 3; 37 in all). `application/ld+json` is data and needs no hash.
+- **Limit:** `style-src` keeps `'unsafe-inline'` because of React `style` attributes (about 400 on the home page) and motion transforms. Inline styles cannot run script.
+- **Check:** the export served on :3401, loaded in headless Chrome 152 (`/usr/bin/google-chrome`, CDP, 1280 x 800), scrolled to the bottom in 500 px steps so the deferred chunks, Lenis and the lazy pictures loaded: **0 `securitypolicyviolation` events and 0 console messages on `/`, `/id/`, `/contact/` and `/id/contact/`**, and the page hydrated (`motion-ready` set). A control run that appended an inline script from the page was blocked and logged one violation, so the listener works.
+- **Not covered:** headless Chrome here has no GPU, so the WebGL scene chunk (155.9 KB, loaded when WebGL works) did not run. Its code is from `'self'`, so the policy holds, but this was not observed.
+
+### Limits of the host (D22)
+
+GitHub Pages cannot set response headers. A meta tag cannot carry the rest, so these are limits of the host, not passes:
+- no HSTS (`Strict-Transport-Security`; Pages enforces HTTPS on the custom domain, but sends no header the site controls);
+- no `frame-ancestors` (ignored in a meta tag, and it logs an error there), so framing is not refused;
+- no `X-Content-Type-Options: nosniff`.
+
+### Lighthouse (mobile, simulated throttling, `lighthouse@13.6.0`, :3401, three runs alternating `/` and `/id/`)
+
+| Run | `/` perf | `/` a11y | `/` BP | `/` SEO | `/id/` perf | `/id/` a11y | `/id/` BP | `/id/` SEO |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 86 | 100 | 100 | 100 | 89 | 100 | 100 | 100 |
+| 2 | 84 | 100 | 100 | 100 | 86 | 100 | 100 | 100 |
+| 3 | 85 | 100 | 100 | 100 | 92 | 100 | 100 | 100 |
+| median | **85** | **100** | **100** | **100** | **89** | **100** | **100** | **100** |
+
+- SEO, best practices and accessibility reach 100 on both pages; no accessibility audit remains failing.
+- The canonical points at `lakehouse.rantai.dev` while Lighthouse loads `localhost`; Lighthouse did not flag it.
+- Performance is unchanged work from T3 (TBT 330 to 560 ms, LCP 1.66 s); this pass did not touch it, so the T3 miss on `/` stands.
+- JSONs are in `/tmp/claude-1000/web5-t4-lh/`.
+
+### Checks
+
+`bun run typecheck`, `bun run lint`, tests (the claims test reads `docs/`, so it was run in the repo), build and `bun run size` (home 193.7 KB, contact 165.8 KB, budget 200 KB): all pass.
+
+### Commits
+
+- `2b52c39c8` `WEB-5 seo(site)`: the free offer and the Organization logo, plus the length test.
+- `518da111e` `WEB-5 sec(site)`: script hashes in the CSP instead of `'unsafe-inline'`.
+- `903ae2fa9` `WEB-5 a11y(site)`: the contrast changes above, alone so it can be reverted.
