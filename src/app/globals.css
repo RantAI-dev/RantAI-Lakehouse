@@ -54,6 +54,36 @@
 }
 
 /*
+ * BI-64 (`BI-26-AC2`): an embed with `background=transparent` lets the host
+ * page show through. The only opaque paint behind the tiles is `body`'s
+ * `bg-background` from the design system's base layer; `EmbedView` sets this
+ * class on `<html>` while the option is on.
+ *
+ * PR BI-64 review SHOULD-FIX 1: a transparent `body` is not enough. When the
+ * embedded document's used `color-scheme` differs from the host page's, the
+ * browser paints an opaque canvas behind the iframe (CSS Color Adjust, the
+ * iframe backdrop rule), and the console's dark theme sets `color-scheme:
+ * dark` on `<html>`. `normal` leaves the host page's scheme to decide.
+ *
+ * Second pass (BI-64 review SHOULD-FIX 1, second pass): the `ThemeProvider`
+ * (next-themes, from the Rantai Design System, mounted in `src/app/layout.tsx`)
+ * writes `color-scheme` as an inline `style` on `<html>`. An inline style beats
+ * a class rule, so only an `!important` declaration outranks it. The canvas
+ * backdrop follows the root's scheme only, so `body` keeps the theme's scheme
+ * and native scrollbars and form controls stay dark in a dark embed.
+ */
+html.embed-transparent {
+  color-scheme: normal !important;
+}
+html.dark.embed-transparent body {
+  color-scheme: dark;
+}
+html.embed-transparent,
+html.embed-transparent body {
+  background: transparent;
+}
+
+/*
  * DESIGN.md §3: when the system asks for less motion, every movement stops.
  * One rule here instead of a `motion-reduce:` on each element, so a component
  * added later cannot forget it. A near-zero duration (not `none`) keeps
@@ -228,13 +258,53 @@
   }
 }
 
+/* BI-61 review round 1, SHOULD-FIX 1 (DESIGN.md §3: an area that scrolls fades
+   at the edge where it is cut). `useScrollFade` sets `data-fade-top` while
+   something is scrolled out above and `data-fade-bottom` while something is
+   still below; the mask fades only those edges. The two lengths are registered
+   so the fade can ease in and out; under reduced motion it changes at once. */
+@property --fade-top { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --fade-bottom { syntax: "<length>"; inherits: false; initial-value: 0px; }
+.scroll-fade {
+  --fade-top: 0px;
+  --fade-bottom: 0px;
+  mask-image: linear-gradient(to bottom, transparent 0, #000 var(--fade-top), #000 calc(100% - var(--fade-bottom)), transparent 100%);
+  transition: --fade-top 150ms cubic-bezier(0.2, 0, 0, 1), --fade-bottom 150ms cubic-bezier(0.2, 0, 0, 1);
+}
+.scroll-fade[data-fade-top] { --fade-top: 20px; }
+.scroll-fade[data-fade-bottom] { --fade-bottom: 20px; }
+@media (prefers-reduced-motion: reduce) {
+  .scroll-fade { transition: none; }
+}
+@media print {
+  .scroll-fade { mask-image: none; }
+}
+
+/* Micro-interaction audit 2026-11-14 (BI-61, "tiles filling in place"): when a
+   tile's data lands, its chart, table or number fades in over the tile's own
+   box instead of replacing the grey placeholder in one frame. The placeholder
+   itself is left out, so the loading skeleton handing over to the grid (the
+   same placeholder in the same box) does not blink. A tab switch mounts new
+   bodies and fades them the same way; a refresh updates a body in place and
+   does not. */
+.tile-body-fill > :not([data-slot="tile-body-placeholder"]) {
+  transition: opacity 220ms var(--ease-ui);
+  @starting-style { opacity: 0; }
+}
+
 /* ── Print / Export PDF ──────────────────────────────────────────────────────
    Sembunyikan chrome konsol; ubah kanvas dashboard (tile absolut) jadi tumpukan
    vertikal yang rapi agar "Save as PDF" dari dialog print menghasilkan snapshot
    bersih. Dipicu tombol Export → PDF (window.print()). */
 @media print {
   [data-print-hide] { display: none !important; }
-  body { background: #fff !important; }
+  /* RPT-3 (PR #641 review SHOULD-FIX 1): the @page margin is not painted with
+     the root's background but with the canvas colour of the colour scheme. The
+     console's <html> carries the `dark` class (color-scheme: dark), whose
+     canvas is #121212, so a PDF had a dark band around the white page. The root
+     is light and white in the print medium only. */
+  html { color-scheme: light !important; }
+  html, body { background: #fff !important; }
   @page { margin: 10mm; }
 
   .dash-canvas {

@@ -243,6 +243,15 @@ describe("lakehouseCompactionStatusUrl", () => {
   })
 })
 
+// OPS-21 / owner decision 2026-11-24: 20 is the G3-measured bar
+// (`docs/plans/G3-RESULT.md`, ADR 0009), not a guessed tolerance; changing it
+// is an owner decision and must update both this and the Rust constant.
+describe("NEEDS_COMPACTION_FILE_COUNT", () => {
+  it("is pinned at the measured 20", () => {
+    expect(NEEDS_COMPACTION_FILE_COUNT).toBe(20)
+  })
+})
+
 // OPS-21: the warning is driven only by a MEASURED count and a confirmed-off
 // Trino. These pure helpers are the same ones both UI surfaces call.
 describe("tableNeedsCompactionWarning", () => {
@@ -268,6 +277,19 @@ describe("tableNeedsCompactionWarning", () => {
         compactionAvailable: false,
       })
     ).toBe(false)
+  })
+
+  // Literal boundaries: a change to the constant must not move the warning.
+  it("is silent at a literal 19 measured files when Trino is off", () => {
+    expect(tableNeedsCompactionWarning({ smallFileCount: 19, compactionAvailable: false })).toBe(
+      false
+    )
+  })
+
+  it("warns at a literal 20 measured files when Trino is off", () => {
+    expect(tableNeedsCompactionWarning({ smallFileCount: 20, compactionAvailable: false })).toBe(
+      true
+    )
   })
 
   it("is silent when Trino can compact", () => {
@@ -315,6 +337,22 @@ describe("tablesNeedingCompaction", () => {
 
   it("lists only measured tables at or above the need count, sorted", () => {
     expect(tablesNeedingCompaction(status).map((t) => t.name)).toEqual(["events", "orders"])
+  })
+
+  // The System-status body carries its own need count; the console must honour
+  // that server value rather than re-apply its table-page constant. Here 22 is
+  // above the console's 20 but below the server's 25, so a constant-based
+  // filter would wrongly list it.
+  it("uses the server's need count when it differs from the console constant", () => {
+    const serverStatus = {
+      compactionAvailable: false,
+      needsCompactionFileCount: 25,
+      tables: [
+        { namespace: "bronze", name: "twenty_two", smallFileCount: 22 },
+        { namespace: "bronze", name: "twenty_six", smallFileCount: 26 },
+      ],
+    }
+    expect(tablesNeedingCompaction(serverStatus).map((t) => t.name)).toEqual(["twenty_six"])
   })
 
   it("is empty when Trino is available, however high the counts", () => {

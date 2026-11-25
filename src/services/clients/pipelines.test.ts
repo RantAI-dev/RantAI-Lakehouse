@@ -294,3 +294,15 @@ describe("dagsterPipelineService.stepSql", () => {
     )
   })
 })
+
+describe("dagsterPipelineService.triggerPipeline (BLD-12)", () => {
+  it("sends { fullRefresh: true } in the trigger body, and an empty body for a normal run", async () => {
+    const calls = stubFetch(() => json({ id: "run-1", status: "started" }))
+    await dagsterPipelineService.triggerPipeline("pl-1", { fullRefresh: true })
+    expect(calls[0]?.url).toBe("/api/pipelines/pl-1/trigger")
+    expect(JSON.parse(String(calls[0]?.init.body))).toEqual({ fullRefresh: true })
+
+    await dagsterPipelineService.triggerPipeline("pl-1")
+    expect(calls[1]?.init.body).toBeUndefined()
+  })
+})

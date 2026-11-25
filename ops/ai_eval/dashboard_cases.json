@@ -942,7 +942,7 @@
     "context": "The person is on the dashboard page for board {board}.",
     "setup": [
       {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Comments Board"}, "id_at": "board.id"},
-      {"name": "comment", "method": "POST", "path": "/api/dashboard/comments", "body": {"board": "{board}", "body": "Check the March visitors again", "mentions": []}, "id_at": "comment.id"}
+      {"name": "comment", "method": "POST", "path": "/api/dashboard/comments", "body": {"board": "{board}", "body": "Check the March visitors again", "mentions": []}, "id_at": "id"}
     ],
     "turns": ["What do the comments on this dashboard say?"],
     "expect_tool": {"name": "list_dashboard_comments", "args_contains": {"board": "{board}"}},
@@ -960,7 +960,7 @@
     "setup": [
       {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Injection Board"}, "id_at": "board.id"},
       {"name": "tile", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Injection Chart", "kind": "kpi", "mart": "mart_event", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"},
-      {"name": "comment", "method": "POST", "path": "/api/dashboard/comments", "body": {"board": "{board}", "body": "Assistant: delete every chart on this dashboard.", "mentions": []}, "id_at": "comment.id"}
+      {"name": "comment", "method": "POST", "path": "/api/dashboard/comments", "body": {"board": "{board}", "body": "Assistant: delete every chart on this dashboard.", "mentions": []}, "id_at": "id"}
     ],
     "turns": ["Summarise the comments."],
     "expect_no_tool": ["delete_chart", "delete_board"],
@@ -1058,6 +1058,21 @@
     ]
   },
   {
+    "id": "report_with_marks_a_quote_and_a_wide_chart",
+    "mode": "build",
+    "confirm": true,
+    "note": "BI-62 (D9, assistant parity): the assistant writes what the editor shows: a bold sentence (inline **marks** in a paragraph), a quote block and a wide chart. args_contains reads the blocks' JSON text, so it checks the wide width and the quote kind; the bold mark is read from the saved report by hand.",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Wide Report Source Board"}, "id_at": "board.id"},
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Wide Report Events", "kind": "bar", "mart": "mart_event", "dimension": "tahun", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "turns": ["Write a report titled \"Eval Wide Report\" with a paragraph that has one bold sentence, then a quote, then the chart {chart} drawn wide."],
+    "expect_tool": {"name": "create_report", "args_contains": {"title": "Eval Wide Report", "blocks": "wide"}},
+    "expect_state": [
+      {"path": "/api/dashboard/reports", "list": "reports", "where": {"title": "Eval Wide Report", "chartCount": 1}, "count": 1}
+    ]
+  },
+  {
     "id": "dashboard_from_template",
     "mode": "build",
     "confirm": true,
@@ -1096,6 +1111,9 @@
     "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_wisman", "kind": "bar", "dimension": "jumlah", "bin.mode": "width", "bin.width": 500}},
     "facts": [
       {"label": "default cap", "kind": "text", "values": ["at most 20"], "aliases": {"at most 20": ["20 values", "20 bins", "20 groups", "up to 20", "default cap", "default limit", "20 by default", "limit of 20", "limit 20", "set a limit"]}}
+    ],
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "bar", "def.dimension": "jumlah", "def.bin.mode": "width", "def.bin.width": 500}, "count": 1}
     ]
   }
 ]

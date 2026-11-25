@@ -58,14 +58,19 @@ nothing recorded that it had.
 8. Approve a waiting action on Approvals. The action runs once, and only if
    the approver holds the permission the action itself needs — and only if
    the approver is somebody other than the person who asked for it.
-9. Find an old conversation. History lists the signed-in user's
-   conversations, newest first and grouped by recency, with a search over
-   titles and messages and a filter for Ask or Build.
+9. Find an old conversation (`WEB-18`): on a conversation page
+   (`/copilot?id=…`) the app sidebar itself is the list of the signed-in
+   user's conversations, newest first and grouped by day (Today, Yesterday,
+   Previous 7 days, Previous 30 days, Earlier), with a search over titles
+   and messages. "Back to menu" slides the main menu back for that visit,
+   and the "AI chats" part of Home's row opens the list on any page without
+   navigating. The old `/copilot/history` address redirects to the newest
+   conversation, or to Home when there is none.
 10. Reopen an old conversation, with its messages, its tool steps and its
     mode, and continue it: type in the composer and the answer joins that
     conversation.
 11. Rename a conversation and delete one. Both are on the "…" menu of a row
-    on the History page.
+    in the sidebar's chat list.
 12. Stop an answer that is on its way, ask it again, edit a message and send
     it again, or delete a message from the conversation.
 13. Be told honestly when the model endpoint is not configured: the question
@@ -146,7 +151,8 @@ and a change it may not make is refused with the permission it lacks.
   that is cut off says so and can be asked again.
 - A conversation is saved after every message, under the person's own
   account, and is kept until it is deleted. The header menus list the last
-  eight conversations; the History page lists them all, thirty at a time.
+  eight conversations; the sidebar's chat list lists them all, thirty at a
+  time.
 - A conversation's title is taken from its first message (up to 80
   characters) until it is renamed; a renamed title sticks.
 - The assistant cannot ask a question in the middle of a turn that has
@@ -191,13 +197,13 @@ so a refusal here means the rest of the list cannot be run.
 | `AI-18-AC13` | (operator) Send `POST /api/agents/approvals/{id}/decide` twice for the same approval | The first answers 200 and runs the action; the second answers 409 ("Approval ... has already been decided"). The action ran once | |
 | `AI-18-AC14` | As Analyst, open Approvals | The list is refused: the permission to approve is missing | |
 | `AI-18-AC15` | As Analyst, ask the assistant to create a chart | No chart is created. The answer says it may not create charts; if the model tried the call anyway, the step shows "refused: this user lacks the 'dashboard:write' permission this tool needs" | |
-| `AI-18-AC16` | Open History | The conversations of this user are listed, newest first, grouped by recency | |
-| `AI-18-AC17` | Type a word of one of your conversations in the search box | Only the conversations that hold it are listed | |
-| `AI-18-AC18` | Click a conversation's title | It opens at `/copilot?id=…`, with its messages and its tool steps, and the mode it was had | |
-| `AI-18-AC19` | Type a message in that conversation | The answer joins that conversation, and the conversation's time in History changes | |
-| `AI-18-AC20` | On History, open the "…" menu of a conversation and choose "Rename", then save a new title | The row shows the new title, and the conversation's title bar shows it too | |
-| `AI-18-AC21` | On History, open the "…" menu of a conversation and choose "Delete", then confirm | The conversation leaves the list; opening its address says not found | |
-| `AI-18-AC22` | Sign in as the Analyst and open the address of a conversation of the Platform Admin | The conversation does not open; the page reports that it could not be loaded, and the conversation is not in the Analyst's History | |
+| `AI-18-AC16` | Open a conversation (`/copilot?id=…`) | The app sidebar lists this user's conversations instead of the main menu, newest first, grouped by day (Today, Yesterday, Previous 7 days, Previous 30 days, Earlier); "Back to menu" slides the main menu back without leaving the conversation (`WEB-18`) | |
+| `AI-18-AC17` | Type a word of one of your conversations in the sidebar's search box | Only the conversations that hold it are listed (titles and message text, on the server) | |
+| `AI-18-AC18` | Click a conversation's row in the sidebar's chat list | It opens at `/copilot?id=…`, with its messages and its tool steps, and the mode it was had | |
+| `AI-18-AC19` | Type a message in that conversation | The answer joins that conversation, and its row moves to the top of the sidebar's chat list | |
+| `AI-18-AC20` | In the sidebar's chat list, open the "…" menu of a conversation and choose "Rename", then save a new title | The row shows the new title. The conversation's visible title bar no longer exists (replaced by `WEB-18`); the title stays only as the page's hidden heading | |
+| `AI-18-AC21` | In the sidebar's chat list, open the "…" menu of a conversation and choose "Delete", then confirm | The conversation leaves the list; opening its address says not found | |
+| `AI-18-AC22` | Sign in as the Analyst and open the address of a conversation of the Platform Admin | The conversation does not open; the page reports that it could not be loaded, and the conversation is not in the Analyst's chat list | |
 | `AI-18-AC23` | Ask a question, then press "Stop" while the answer is on its way | The answer stops and the conversation shows that it was stopped; it can be asked again | |
 | `AI-18-AC24` | Make a question fail (for example, stop the model endpoint), then look at the page | The failure is shown in a red panel with a "Retry" button and a reference id; no empty answer is shown as a success | |
 | `AI-18-AC25` | (operator) Unset `LLM_KEY` and restart the API service; ask a question | The question is refused with "AI Copilot is unavailable." and the reference id; the page does not show a made-up answer | |
@@ -217,10 +223,13 @@ The code does not settle these, so they are not decided here.
    question is sent?** Today the only sign is the refusal after the question
    was sent (`AI-18-AC25`). A line on Home, or in the status area, would be
    a change to the console and a decision about what it shows.
-2. **Where should a conversation live in the navigation?** Today the
-   conversation is at `/copilot` and the navigation entry is "History"
-   (`/copilot/history`), and Home is where a conversation starts. Whether
-   `/copilot` deserves its own entry is a navigation question.
+2. **Where should a conversation live in the navigation?** Settled by
+   `WEB-18` (owner, 2026-11-14): the conversation is at `/copilot` and has
+   no navigation entry of its own — on a conversation the app sidebar lists
+   the chats, elsewhere they are reached from Home (its "AI chats" part
+   opens the list) and the navbar's AI Copilot panel, and Home is where a
+   conversation starts. The old `/copilot/history` address redirects to
+   the newest conversation.
 3. **Should a chat that was had with a colleague be shareable?** Today a
    conversation belongs to one person and cannot be seen by another. The
    product says the assistant is the way the team works; sharing a

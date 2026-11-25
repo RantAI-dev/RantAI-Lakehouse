@@ -56,6 +56,7 @@ export function DataTablePropertyBar<TData>({
   const {
     columns,
     filters,
+    shownFilters,
     addColumnFilter,
     onFilterUpdate,
     onFilterRemove,
@@ -107,11 +108,13 @@ export function DataTablePropertyBar<TData>({
     >
       <DataTableSortChips disabled={disabled} />
       {children}
-      {filters.length > 0 ? (
+      {(advancedFilterMode ? filters : shownFilters).length > 0 ? (
         <DataTableColumnFilterChips
           table={table}
           columns={columns}
-          filters={filters}
+          // UX-8: less the filters the page's own controls show, except in
+          // the advanced rule list, which is every rule or none.
+          filters={advancedFilterMode ? filters : shownFilters}
           onFilterUpdate={onFilterUpdate}
           onFilterRemove={onFilterRemove}
           disabled={disabled}

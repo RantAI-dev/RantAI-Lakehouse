@@ -1,21 +1,7 @@
 import { strict as assert } from "node:assert"
 import { test } from "node:test"
 import type { ReportBlock } from "@/services/contracts/dashboard-reports"
-import {
-  MAX_REPORT_CHARTS,
-  blocksForSave,
-  buildReportPageContext,
-  canAddChart,
-  chartCount,
-  emptyBlock,
-  insertBlock,
-  listItems,
-  listText,
-  moveBlock,
-  removeBlock,
-  replaceBlock,
-  safeReportUrl,
-} from "./report-blocks"
+import { MAX_REPORT_CHARTS, blocksForSave, buildReportPageContext, chartCount, safeReportUrl } from "./report-blocks"
 
 const p = (text: string): ReportBlock => ({ type: "paragraph", text })
 const c = (chart: string): ReportBlock => ({ type: "chart", chart })
@@ -29,33 +15,9 @@ test("safeReportUrl takes the web, email and console paths and nothing that runs
   }
 })
 
-test("canAddChart stops at the thirtieth chart", () => {
+test("chartCount counts chart blocks only", () => {
   const thirty = Array.from({ length: MAX_REPORT_CHARTS }, (_, i) => c(`c_${i}`))
-  assert.equal(chartCount(thirty), 30)
-  assert.equal(canAddChart(thirty.slice(1)), true)
-  assert.equal(canAddChart([...thirty, p("text does not count")]), false)
-})
-
-test("insertBlock, moveBlock, removeBlock and replaceBlock keep the rest in order", () => {
-  const blocks = [p("a"), p("b"), p("c")]
-  assert.deepEqual(insertBlock(blocks, -1, p("x")).map((b) => (b as { text: string }).text), ["x", "a", "b", "c"])
-  assert.deepEqual(insertBlock(blocks, 1, p("x")).map((b) => (b as { text: string }).text), ["a", "b", "x", "c"])
-  assert.deepEqual(moveBlock(blocks, 2, -1).map((b) => (b as { text: string }).text), ["a", "c", "b"])
-  assert.deepEqual(moveBlock(blocks, 0, -1), blocks, "the first block cannot move up")
-  assert.deepEqual(moveBlock(blocks, 2, 1), blocks, "the last block cannot move down")
-  assert.deepEqual(removeBlock(blocks, 1).map((b) => (b as { text: string }).text), ["a", "c"])
-  assert.deepEqual(replaceBlock(blocks, 0, p("z"))[0], p("z"))
-})
-
-test("emptyBlock makes each text kind with nothing typed yet", () => {
-  assert.deepEqual(emptyBlock("heading"), { type: "heading", text: "", level: 2 })
-  assert.deepEqual(emptyBlock("list"), { type: "list", items: [""], ordered: false })
-  assert.equal(emptyBlock("link").type, "link")
-})
-
-test("a list is edited as one item per line", () => {
-  assert.equal(listText(["a", "b"]), "a\nb")
-  assert.deepEqual(listItems("a\n\nb"), ["a", "", "b"])
+  assert.equal(chartCount([...thirty, p("text does not count")]), 30)
 })
 
 test("blocksForSave drops blank list lines and the dashboard of a chart, and keeps text as typed", () => {

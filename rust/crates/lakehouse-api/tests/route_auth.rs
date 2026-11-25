@@ -2791,6 +2791,47 @@ async fn a_seeded_data_engineer_may_read_the_catalog() {
     );
 }
 
+/// `OPS-21` (owner decision 2026-11-24): the System-status compaction route
+/// carries the same `catalog:read` floor as the table listing. Assert the exact
+/// `POLICY_TABLE` entry and both sides of the gate: no session is 401, a
+/// principal without the permission is 403 naming it, and a holder of
+/// `catalog:read` is past the gate. Downstream handlers may answer 5xx here —
+/// see this file's module doc comment on what "not 401/403" proves.
+#[tokio::test]
+async fn the_compaction_status_route_needs_catalog_read_and_a_reader_without_it_is_refused() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/lakehouse/compaction-status";
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == uri)
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("catalog:read")),
+    );
+
+    let none = request_with_cookie(&router, "GET", uri, "").await;
+    assert_eq!(none.status(), StatusCode::UNAUTHORIZED);
+
+    let query_reader = create_principal_with_permissions(&pool, "query:read").await;
+    let query_reader_cookie = session_cookie_for_user(&pool, query_reader).await;
+    let refused = request_with_cookie(&router, "GET", uri, &query_reader_cookie).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let bytes = to_bytes(refused.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    assert!(
+        body.contains("catalog:read"),
+        "the refusal names the permission: {body}"
+    );
+
+    let reader = create_principal_with_permissions(&pool, "catalog:read").await;
+    let cookie = session_cookie_for_user(&pool, reader).await;
+    let allowed = request_with_cookie(&router, "GET", uri, &cookie).await;
+    let status = allowed.status();
+    assert_ne!(status, StatusCode::UNAUTHORIZED, "actual status: {status}");
+    assert_ne!(status, StatusCode::FORBIDDEN, "actual status: {status}");
+}
+
 /// `GOV-10` (`DEC-17`; QA `LH-DATA-14-04`, `TC-1728`): running an authored
 /// rule by hand needs `governance:write`. A principal holding `query:read`
 /// and `governance:read` is refused (403); one holding `governance:write`
@@ -3358,6 +3399,45 @@ async fn report_routes_need_dashboard_read_to_read_and_dashboard_write_to_write(
             "{method} {uri} (neither)"
         );
     }
+}
+
+/// `BI-72` (D3): `GET /api/dashboard/frame-check` needs `dashboard:read`, both
+/// ways. A reader gets past the gate (the handler's own 400 for an address
+/// off the content sites is not a refusal by the gate); a writer without
+/// `dashboard:read` and a principal with neither are refused with 403.
+#[tokio::test]
+async fn frame_check_needs_dashboard_read_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let reader = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let reader = common::session_cookie_for_user(&pool, reader).await;
+    let writer = common::create_principal_with_permissions(&pool, "dashboard:write").await;
+    let writer = common::session_cookie_for_user(&pool, writer).await;
+    let neither = common::create_principal_with_permissions(&pool, "query:read").await;
+    let neither = common::session_cookie_for_user(&pool, neither).await;
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == "/api/dashboard/frame-check")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("dashboard:read"))
+    );
+    let uri = "/api/dashboard/frame-check?url=https://status.example/";
+    let resp = request_with_cookie(&router, "GET", uri, &reader).await;
+    assert!(
+        resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+        "a reader must get past the gate, got {}",
+        resp.status()
+    );
+    for (who, cookie) in [("writer", &writer), ("neither", &neither)] {
+        let resp = request_with_cookie(&router, "GET", uri, cookie).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{who}");
+    }
+    let anonymous = router
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 }
 
 /// `BI-18` part D (T3, feature T4 and `BI-18D-AC8`): every template route

@@ -56,6 +56,13 @@
 //! make the gate write a row it chose. A `401` writes nothing: nobody is
 //! signed in, and a `404` or `405` never reaches a route.
 //!
+//! `SEC-75` decision 4: the trail grows without limit when a caller is
+//! refused over and over, so the FIRST refusal of a principal, a route and
+//! a window writes the row and the later ones only count; the sweep
+//! ([`crate::audit_compaction`]) writes one summary row for the window
+//! when it has closed. The row names the kind of object the route changes
+//! (decision 6), for a `Handler` route as well as for a `Central` one.
+//!
 //! # A failed write
 //!
 //! [`record_best_effort`] is the one writer that does not undo or fail what
@@ -121,6 +128,15 @@ pub enum Coverage {
     Handler {
         /// The audit action, `module.verb` style where the module has one.
         action: &'static str,
+        /// The kind of object the route changes (`SEC-75` decision 6).
+        ///
+        /// The refusal row the gate writes names it, so a refused change
+        /// says what it would have changed. It is the kind the route's own
+        /// row carries where the handler writes one (`settings` for the
+        /// settings routes), and the kind of the object the route names
+        /// where the handler writes the change on something else (a
+        /// quality rule is a `quality_rule`, not the table it is about).
+        resource_kind: &'static str,
     },
     /// [`audit_gate`] writes the row after the handler answers.
     Central {
@@ -204,45 +220,45 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("POST", "/api/render/data", Coverage::Excluded { reason: EX_PUBLIC }),
     ("POST", "/api/embed/frame", Coverage::Excluded { reason: EX_PUBLIC }),
     ("POST", "/api/embed/values", Coverage::Excluded { reason: EX_PUBLIC }),
-    ("POST", "/api/public/dashboard/{token}/unlock", Coverage::Handler { action: "dashboard.public_link_unlocked" }),
+    ("POST", "/api/public/dashboard/{token}/unlock", Coverage::Handler { action: "dashboard.public_link_unlocked", resource_kind: "dashboard" }),
     ("POST", "/api/embed/maps/{id}/geojson", Coverage::Excluded { reason: EX_PUBLIC }),
     ("POST", "/api/render/maps/{id}/geojson", Coverage::Excluded { reason: EX_PUBLIC }),
-    ("POST", "/api/auth/login", Coverage::Handler { action: "auth.login" }),
-    ("POST", "/api/auth/logout", Coverage::Handler { action: "auth.logout" }),
-    ("POST", "/api/auth/change-password", Coverage::Handler { action: "auth.password_change" }),
-    ("DELETE", "/api/auth/sessions/{id}", Coverage::Handler { action: "auth.session.revoke" }),
-    ("PUT", "/api/catalog/{id}/annotation", Coverage::Handler { action: "catalog.annotate" }),
-    ("PUT", "/api/catalog/{id}/certification", Coverage::Handler { action: "catalog.certify" }),
-    ("PUT", "/api/semantic/{asset}", Coverage::Handler { action: "semantic.confirm" }),
-    ("POST", "/api/catalog/{id}/access-request", Coverage::Handler { action: "catalog.access_request" }),
-    ("POST", "/api/catalog/access-requests/{id}/decide", Coverage::Handler { action: crate::routes::catalog::ACCESS_DECIDE_ACTION }),
-    ("POST", "/api/catalog/{id}/grants", Coverage::Handler { action: "catalog.grant" }),
-    ("DELETE", "/api/catalog/{id}/grants/{grant_id}", Coverage::Handler { action: "catalog.revoke" }),
-    ("POST", "/api/catalog/{id}/restore", Coverage::Handler { action: "catalog.restore" }),
-    ("POST", "/api/catalog/{id}/drop", Coverage::Handler { action: "catalog.drop" }),
+    ("POST", "/api/auth/login", Coverage::Handler { action: "auth.login", resource_kind: "user" }),
+    ("POST", "/api/auth/logout", Coverage::Handler { action: "auth.logout", resource_kind: "session" }),
+    ("POST", "/api/auth/change-password", Coverage::Handler { action: "auth.password_change", resource_kind: "user" }),
+    ("DELETE", "/api/auth/sessions/{id}", Coverage::Handler { action: "auth.session.revoke", resource_kind: "session" }),
+    ("PUT", "/api/catalog/{id}/annotation", Coverage::Handler { action: "catalog.annotate", resource_kind: "catalog" }),
+    ("PUT", "/api/catalog/{id}/certification", Coverage::Handler { action: "catalog.certify", resource_kind: "catalog" }),
+    ("PUT", "/api/semantic/{asset}", Coverage::Handler { action: "semantic.confirm", resource_kind: "semantic" }),
+    ("POST", "/api/catalog/{id}/access-request", Coverage::Handler { action: "catalog.access_request", resource_kind: "catalog" }),
+    ("POST", "/api/catalog/access-requests/{id}/decide", Coverage::Handler { action: crate::routes::catalog::ACCESS_DECIDE_ACTION, resource_kind: "approval" }),
+    ("POST", "/api/catalog/{id}/grants", Coverage::Handler { action: "catalog.grant", resource_kind: "catalog" }),
+    ("DELETE", "/api/catalog/{id}/grants/{grant_id}", Coverage::Handler { action: "catalog.revoke", resource_kind: "catalog" }),
+    ("POST", "/api/catalog/{id}/restore", Coverage::Handler { action: "catalog.restore", resource_kind: "catalog" }),
+    ("POST", "/api/catalog/{id}/drop", Coverage::Handler { action: "catalog.drop", resource_kind: "catalog" }),
     ("POST", "/api/lakehouse/tables/{ns}/{table}/maintenance", Coverage::Central { action: "table.maintenance_set", resource_kind: "iceberg_table", id_param: IdParam::Path("table") }),
     ("POST", "/api/overview", Coverage::Excluded { reason: EX_OVERVIEW }),
     ("POST", "/api/overview/alerts/{id}/acknowledge", Coverage::Central { action: "overview_alert.acknowledge", resource_kind: "overview_alert", id_param: IdParam::Path("id") }),
     ("POST", "/api/overview/alerts/{id}/resolve", Coverage::Central { action: "overview_alert.resolve", resource_kind: "overview_alert", id_param: IdParam::Path("id") }),
     ("POST", "/api/overview/alerts/{id}/silence", Coverage::Central { action: "overview_alert.silence", resource_kind: "overview_alert", id_param: IdParam::Path("id") }),
     ("POST", "/api/ops/workloads/{id}/cancel", Coverage::Central { action: "workload.cancel", resource_kind: "workload", id_param: IdParam::Path("id") }),
-    ("POST", "/api/governance/policies", Coverage::Handler { action: "policy.create" }),
+    ("POST", "/api/governance/policies", Coverage::Handler { action: "policy.create", resource_kind: "policy" }),
     ("POST", "/api/governance/policies/preview", Coverage::Excluded { reason: EX_READ_LIKE }),
-    ("PUT", "/api/governance/policies/{id}/status", Coverage::Handler { action: "policy.enforce" }),
-    ("DELETE", "/api/governance/policies/{id}", Coverage::Handler { action: "policy.delete" }),
-    ("PUT", "/api/governance/sla", Coverage::Handler { action: "catalog.sla_set" }),
-    ("DELETE", "/api/governance/sla/{table}", Coverage::Handler { action: "catalog.sla_remove" }),
-    ("DELETE", "/api/governance/classification/{id}", Coverage::Handler { action: "catalog.declassify" }),
-    ("POST", "/api/governance/tag-keys", Coverage::Handler { action: "governance.tag_key_create" }),
-    ("PUT", "/api/governance/tag-keys/{key}", Coverage::Handler { action: "governance.tag_key_update" }),
-    ("DELETE", "/api/governance/tag-keys/{key}", Coverage::Handler { action: "governance.tag_key_delete" }),
-    ("POST", "/api/governance/quality/incidents/{id}/resolve", Coverage::Handler { action: "quality.incident_resolve" }),
-    ("PUT", "/api/governance/quality/schedules/{asset}", Coverage::Handler { action: "quality.schedule_update" }),
-    ("DELETE", "/api/governance/quality/schedules/{asset}", Coverage::Handler { action: "quality.schedule_reset" }),
+    ("PUT", "/api/governance/policies/{id}/status", Coverage::Handler { action: "policy.enforce", resource_kind: "policy" }),
+    ("DELETE", "/api/governance/policies/{id}", Coverage::Handler { action: "policy.delete", resource_kind: "policy" }),
+    ("PUT", "/api/governance/sla", Coverage::Handler { action: "catalog.sla_set", resource_kind: "catalog" }),
+    ("DELETE", "/api/governance/sla/{table}", Coverage::Handler { action: "catalog.sla_remove", resource_kind: "catalog" }),
+    ("DELETE", "/api/governance/classification/{id}", Coverage::Handler { action: "catalog.declassify", resource_kind: "catalog" }),
+    ("POST", "/api/governance/tag-keys", Coverage::Handler { action: "governance.tag_key_create", resource_kind: "tag_key" }),
+    ("PUT", "/api/governance/tag-keys/{key}", Coverage::Handler { action: "governance.tag_key_update", resource_kind: "tag_key" }),
+    ("DELETE", "/api/governance/tag-keys/{key}", Coverage::Handler { action: "governance.tag_key_delete", resource_kind: "tag_key" }),
+    ("POST", "/api/governance/quality/incidents/{id}/resolve", Coverage::Handler { action: "quality.incident_resolve", resource_kind: "quality_incident" }),
+    ("PUT", "/api/governance/quality/schedules/{asset}", Coverage::Handler { action: "quality.schedule_update", resource_kind: "quality_schedule" }),
+    ("DELETE", "/api/governance/quality/schedules/{asset}", Coverage::Handler { action: "quality.schedule_reset", resource_kind: "quality_schedule" }),
     ("POST", "/api/governance/quality/{id}/run", Coverage::Central { action: "quality.rule_run", resource_kind: "quality_rule", id_param: IdParam::Path("id") }),
-    ("PUT", "/api/governance/quality/{id}", Coverage::Handler { action: "quality.rule_update" }),
-    ("DELETE", "/api/governance/quality/{id}", Coverage::Handler { action: "quality.rule_delete" }),
-    ("POST", "/api/governance/{kind}", Coverage::Handler { action: "quality.rule_create" }),
+    ("PUT", "/api/governance/quality/{id}", Coverage::Handler { action: "quality.rule_update", resource_kind: "quality_rule" }),
+    ("DELETE", "/api/governance/quality/{id}", Coverage::Handler { action: "quality.rule_delete", resource_kind: "quality_rule" }),
+    ("POST", "/api/governance/{kind}", Coverage::Handler { action: "quality.rule_create", resource_kind: "quality_rule" }),
     ("POST", "/api/storage/policies", Coverage::Central { action: "storage.policy_create", resource_kind: "storage_policy", id_param: IdParam::None }),
     ("POST", "/api/storage/restore", Coverage::Central { action: "storage.restore", resource_kind: "storage", id_param: IdParam::None }),
     ("POST", "/api/alerts", Coverage::Central { action: "alert.create", resource_kind: "alert", id_param: IdParam::None }),
@@ -255,8 +271,8 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("POST", "/api/alerts/test", Coverage::Excluded { reason: EX_TEST_BUTTON }),
     ("POST", "/api/alerts/run", Coverage::Excluded { reason: EX_ALERT_SCHEDULER }),
     ("POST", "/api/gold/export/{mart}", Coverage::Central { action: "gold.export", resource_kind: "gold_mart", id_param: IdParam::Path("mart") }),
-    ("PUT", "/api/gold/export/{mart}/publication", Coverage::Handler { action: "gold.publication_set" }),
-    ("POST", "/api/query/run", Coverage::Handler { action: "query.run" }),
+    ("PUT", "/api/gold/export/{mart}/publication", Coverage::Handler { action: "gold.publication_set", resource_kind: "gold_mart" }),
+    ("POST", "/api/query/run", Coverage::Handler { action: "query.run", resource_kind: "query_history" }),
     ("POST", "/api/query/estimate", Coverage::Excluded { reason: EX_READ_LIKE }),
     ("POST", "/api/query/saved", Coverage::Central { action: "saved_query.create", resource_kind: "saved_query", id_param: IdParam::None }),
     ("PATCH", "/api/query/saved/{id}", Coverage::Central { action: "saved_query.update", resource_kind: "saved_query", id_param: IdParam::Path("id") }),
@@ -269,29 +285,29 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("DELETE", "/api/query/folders/{id}", Coverage::Central { action: "query_folder.delete", resource_kind: "query_folder", id_param: IdParam::Path("id") }),
     ("PUT", "/api/query/saved/{id}/access", Coverage::Central { action: "saved_query.access_update", resource_kind: "saved_query", id_param: IdParam::Path("id") }),
     ("PUT", "/api/query/folders/{id}/access", Coverage::Central { action: "query_folder.access_update", resource_kind: "query_folder", id_param: IdParam::Path("id") }),
-    ("POST", "/api/pipelines", Coverage::Handler { action: "pipeline.create" }),
-    ("POST", "/api/pipelines/generate", Coverage::Handler { action: "pipeline.generate" }),
+    ("POST", "/api/pipelines", Coverage::Handler { action: "pipeline.create", resource_kind: "pipeline" }),
+    ("POST", "/api/pipelines/generate", Coverage::Handler { action: "pipeline.generate", resource_kind: "pipeline" }),
     ("POST", "/api/pipelines/preview", Coverage::Excluded { reason: EX_READ_LIKE }),
     // BLD-16 / J6: reads no row, writes no row — the preview's own reason.
     ("POST", "/api/pipelines/step-sql", Coverage::Excluded { reason: EX_READ_LIKE }),
-    ("PUT", "/api/pipelines/{id}", Coverage::Handler { action: "pipeline.update" }),
-    ("PUT", "/api/pipelines/{id}/target-lag", Coverage::Handler { action: "pipeline.target_lag.set" }),
-    ("DELETE", "/api/pipelines/{id}", Coverage::Handler { action: "pipeline.delete" }),
+    ("PUT", "/api/pipelines/{id}", Coverage::Handler { action: "pipeline.update", resource_kind: "pipeline" }),
+    ("PUT", "/api/pipelines/{id}/target-lag", Coverage::Handler { action: "pipeline.target_lag.set", resource_kind: "pipeline" }),
+    ("DELETE", "/api/pipelines/{id}", Coverage::Handler { action: "pipeline.delete", resource_kind: "pipeline" }),
     ("POST", "/api/pipelines/runnable/{id}/lag-check", Coverage::Excluded { reason: EX_LAG_CHECK }),
     ("POST", "/api/pipelines/runnable/{id}/compile", Coverage::Excluded { reason: EX_READ_LIKE }),
     ("POST", "/api/pipelines/runnable/{id}/chain-step", Coverage::Excluded { reason: EX_MACHINE }),
-    ("POST", "/api/pipelines/{id}/trigger", Coverage::Handler { action: "pipeline.trigger" }),
+    ("POST", "/api/pipelines/{id}/trigger", Coverage::Handler { action: "pipeline.trigger", resource_kind: "pipeline" }),
     ("POST", "/api/pipelines/{id}/status", Coverage::Central { action: "pipeline.status_set", resource_kind: "pipeline", id_param: IdParam::Path("id") }),
-    ("POST", "/api/pipelines/{id}/pause", Coverage::Handler { action: "pipeline.pause" }),
-    ("POST", "/api/pipelines/{id}/resume", Coverage::Handler { action: "pipeline.resume" }),
+    ("POST", "/api/pipelines/{id}/pause", Coverage::Handler { action: "pipeline.pause", resource_kind: "pipeline" }),
+    ("POST", "/api/pipelines/{id}/resume", Coverage::Handler { action: "pipeline.resume", resource_kind: "pipeline" }),
     ("POST", "/api/pipelines/runs/{runId}/cancel", Coverage::Central { action: "pipeline.run_cancel", resource_kind: "pipeline_run", id_param: IdParam::Path("runId") }),
     ("POST", "/api/pipelines/runs/{runId}/retry", Coverage::Central { action: "pipeline.run_retry", resource_kind: "pipeline_run", id_param: IdParam::Path("runId") }),
     ("PUT", "/api/pipelines/{id}/tenant", Coverage::Central { action: "pipeline.tenant_assign", resource_kind: "pipeline", id_param: IdParam::Path("id") }),
-    ("PUT", "/api/pipelines/{id}/run-as", Coverage::Handler { action: "pipeline.run_as.assign" }),
+    ("PUT", "/api/pipelines/{id}/run-as", Coverage::Handler { action: "pipeline.run_as.assign", resource_kind: "pipeline" }),
     ("POST", "/api/pipelines/events/run-failed", Coverage::Excluded { reason: EX_MACHINE }),
     ("POST", "/api/pipelines/events/run-finished", Coverage::Excluded { reason: EX_MACHINE }),
-    ("PUT", "/api/pipelines/{id}/sla", Coverage::Handler { action: "pipeline.sla_set" }),
-    ("POST", "/api/pipelines/{id}/versions/{version}/restore", Coverage::Handler { action: "pipeline.restore.version" }),
+    ("PUT", "/api/pipelines/{id}/sla", Coverage::Handler { action: "pipeline.sla_set", resource_kind: "pipeline" }),
+    ("POST", "/api/pipelines/{id}/versions/{version}/restore", Coverage::Handler { action: "pipeline.restore.version", resource_kind: "pipeline" }),
     ("POST", "/api/dashboard/specs/preview", Coverage::Excluded { reason: EX_READ_LIKE }),
     ("POST", "/api/dashboard/specs", Coverage::Central { action: "dashboard_tile.create", resource_kind: "dashboard_tile", id_param: IdParam::None }),
     ("PUT", "/api/dashboard/specs", Coverage::Central { action: "dashboard_tile.update", resource_kind: "dashboard_tile", id_param: IdParam::None }),
@@ -341,10 +357,10 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("DELETE", "/api/reports/subscriptions/{id}", Coverage::Central { action: "report_subscription.delete", resource_kind: "report_subscription", id_param: IdParam::Path("id") }),
     ("POST", "/api/reports/subscriptions/{id}/send", Coverage::Central { action: "report_subscription.send", resource_kind: "report_subscription", id_param: IdParam::Path("id") }),
     ("POST", "/api/dashboard/embed-revoke", Coverage::Central { action: "dashboard.embed_revoke", resource_kind: "dashboard", id_param: IdParam::None }),
-    ("PUT", "/api/dashboard/embed-settings", Coverage::Handler { action: "dashboard.embed_settings" }),
-    ("PUT", "/api/dashboard/access", Coverage::Handler { action: "dashboard.access_change" }),
-    ("PUT", "/api/dashboard/public-link", Coverage::Handler { action: "dashboard.public_link_create" }),
-    ("DELETE", "/api/dashboard/public-link", Coverage::Handler { action: "dashboard.public_link_delete" }),
+    ("PUT", "/api/dashboard/embed-settings", Coverage::Handler { action: "dashboard.embed_settings", resource_kind: "dashboard" }),
+    ("PUT", "/api/dashboard/access", Coverage::Handler { action: "dashboard.access_change", resource_kind: "dashboard" }),
+    ("PUT", "/api/dashboard/public-link", Coverage::Handler { action: "dashboard.public_link_create", resource_kind: "dashboard" }),
+    ("DELETE", "/api/dashboard/public-link", Coverage::Handler { action: "dashboard.public_link_delete", resource_kind: "dashboard" }),
     ("POST", "/api/dashboard/comments", Coverage::Central { action: "dashboard_comment.create", resource_kind: "dashboard_comment", id_param: IdParam::None }),
     ("POST", "/api/dashboard/comments/mentions/read", Coverage::Excluded { reason: EX_UI_STATE }),
     ("PUT", "/api/dashboard/comments/{id}", Coverage::Central { action: "dashboard_comment.update", resource_kind: "dashboard_comment", id_param: IdParam::Path("id") }),
@@ -355,24 +371,24 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     // `save_reporting`, `routes::query_limits` `save_limits`). The handler
     // also writes the row of a save it refuses with `400`/`422`; the gate
     // keeps writing the `403` refusal.
-    ("PUT", "/api/settings/reporting", Coverage::Handler { action: "settings.reporting.update" }),
+    ("PUT", "/api/settings/reporting", Coverage::Handler { action: "settings.reporting.update", resource_kind: "settings" }),
     ("POST", "/api/usage/rates", Coverage::Central { action: "usage.rate_create", resource_kind: "settings", id_param: IdParam::None }),
-    ("PUT", "/api/settings/email", Coverage::Handler { action: "settings.email.update" }),
+    ("PUT", "/api/settings/email", Coverage::Handler { action: "settings.email.update", resource_kind: "settings" }),
     ("POST", "/api/settings/email/test", Coverage::Excluded { reason: EX_TEST_BUTTON }),
-    ("PUT", "/api/settings/sign-in", Coverage::Handler { action: "settings.sign_in.update" }),
-    ("PUT", "/api/settings/general", Coverage::Handler { action: "settings.general.update" }),
-    ("DELETE", "/api/settings/general", Coverage::Handler { action: "settings.general.reset" }),
-    ("PUT", "/api/settings/general/images/{kind}", Coverage::Handler { action: "settings.general.image_upload" }),
-    ("DELETE", "/api/settings/general/images/{kind}", Coverage::Handler { action: "settings.general.image_remove" }),
-    ("PUT", "/api/settings/assistant", Coverage::Handler { action: "settings.assistant.update" }),
+    ("PUT", "/api/settings/sign-in", Coverage::Handler { action: "settings.sign_in.update", resource_kind: "settings" }),
+    ("PUT", "/api/settings/general", Coverage::Handler { action: "settings.general.update", resource_kind: "settings" }),
+    ("DELETE", "/api/settings/general", Coverage::Handler { action: "settings.general.reset", resource_kind: "settings" }),
+    ("PUT", "/api/settings/general/images/{kind}", Coverage::Handler { action: "settings.general.image_upload", resource_kind: "settings" }),
+    ("DELETE", "/api/settings/general/images/{kind}", Coverage::Handler { action: "settings.general.image_remove", resource_kind: "settings" }),
+    ("PUT", "/api/settings/assistant", Coverage::Handler { action: "settings.assistant.update", resource_kind: "settings" }),
     ("POST", "/api/settings/assistant/test", Coverage::Excluded { reason: EX_TEST_BUTTON }),
-    ("PUT", "/api/settings/sso", Coverage::Handler { action: "settings.sso.update" }),
+    ("PUT", "/api/settings/sso", Coverage::Handler { action: "settings.sso.update", resource_kind: "settings" }),
     ("POST", "/api/settings/sso/test", Coverage::Excluded { reason: EX_TEST_BUTTON }),
     ("POST", "/api/query/cancel", Coverage::Central { action: "query.cancel", resource_kind: "query_run", id_param: IdParam::None }),
     // Plan D3: Handler — see the settings rows above.
-    ("PUT", "/api/settings/limits", Coverage::Handler { action: "settings.limits.update" }),
-    ("POST", "/api/ai/chat", Coverage::Handler { action: crate::routes::ASSISTANT_CHAT_ACTION }),
-    ("POST", "/api/ai/tool", Coverage::Handler { action: crate::routes::ASSISTANT_TOOL_ACTION }),
+    ("PUT", "/api/settings/limits", Coverage::Handler { action: "settings.limits.update", resource_kind: "settings" }),
+    ("POST", "/api/ai/chat", Coverage::Handler { action: crate::routes::ASSISTANT_CHAT_ACTION, resource_kind: "assistant" }),
+    ("POST", "/api/ai/tool", Coverage::Handler { action: crate::routes::ASSISTANT_TOOL_ACTION, resource_kind: "assistant" }),
     ("POST", "/api/ai/sessions", Coverage::Excluded { reason: EX_UI_STATE }),
     ("PATCH", "/api/ai/sessions", Coverage::Excluded { reason: EX_UI_STATE }),
     ("DELETE", "/api/ai/sessions", Coverage::Excluded { reason: EX_UI_STATE }),
@@ -380,61 +396,61 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("DELETE", "/api/ai/terms", Coverage::Central { action: "ai_term.delete", resource_kind: "ai_term", id_param: IdParam::Query("term") }),
     ("PUT", "/api/home/layout", Coverage::Excluded { reason: EX_UI_STATE }),
     ("DELETE", "/api/home/layout", Coverage::Excluded { reason: EX_UI_STATE }),
-    ("POST", "/api/identity/users", Coverage::Handler { action: "identity.user.invite" }),
-    ("PATCH", "/api/identity/users/{id}", Coverage::Handler { action: "identity.user.update" }),
-    ("PUT", "/api/identity/users/{id}/tenants/{tenant_id}", Coverage::Handler { action: "identity.user.tenant.add" }),
-    ("DELETE", "/api/identity/users/{id}/tenants/{tenant_id}", Coverage::Handler { action: "identity.user.tenant.remove" }),
-    ("PUT", "/api/identity/users/{id}/roles", Coverage::Handler { action: "identity.user.roles.set" }),
-    ("POST", "/api/identity/users/{id}/deactivate", Coverage::Handler { action: "identity.user.deactivate" }),
-    ("POST", "/api/identity/users/{id}/reactivate", Coverage::Handler { action: "identity.user.reactivate" }),
-    ("POST", "/api/identity/users/{id}/reset-password", Coverage::Handler { action: "identity.user.password_reset" }),
+    ("POST", "/api/identity/users", Coverage::Handler { action: "identity.user.invite", resource_kind: "user" }),
+    ("PATCH", "/api/identity/users/{id}", Coverage::Handler { action: "identity.user.update", resource_kind: "user" }),
+    ("PUT", "/api/identity/users/{id}/tenants/{tenant_id}", Coverage::Handler { action: "identity.user.tenant.add", resource_kind: "user" }),
+    ("DELETE", "/api/identity/users/{id}/tenants/{tenant_id}", Coverage::Handler { action: "identity.user.tenant.remove", resource_kind: "user" }),
+    ("PUT", "/api/identity/users/{id}/roles", Coverage::Handler { action: "identity.user.roles.set", resource_kind: "user" }),
+    ("POST", "/api/identity/users/{id}/deactivate", Coverage::Handler { action: "identity.user.deactivate", resource_kind: "user" }),
+    ("POST", "/api/identity/users/{id}/reactivate", Coverage::Handler { action: "identity.user.reactivate", resource_kind: "user" }),
+    ("POST", "/api/identity/users/{id}/reset-password", Coverage::Handler { action: "identity.user.password_reset", resource_kind: "user" }),
     ("POST", "/api/identity/roles", Coverage::Central { action: "identity.role.create", resource_kind: "role", id_param: IdParam::None }),
-    ("PUT", "/api/identity/roles/{id}", Coverage::Handler { action: "identity.role.update" }),
-    ("DELETE", "/api/identity/roles/{id}", Coverage::Handler { action: "identity.role.delete" }),
-    ("PUT", "/api/identity/roles/{id}/table-access", Coverage::Handler { action: "identity.role.table_access.update" }),
-    ("POST", "/api/identity/tenants", Coverage::Handler { action: "identity.tenant.create" }),
+    ("PUT", "/api/identity/roles/{id}", Coverage::Handler { action: "identity.role.update", resource_kind: "role" }),
+    ("DELETE", "/api/identity/roles/{id}", Coverage::Handler { action: "identity.role.delete", resource_kind: "role" }),
+    ("PUT", "/api/identity/roles/{id}/table-access", Coverage::Handler { action: "identity.role.table_access.update", resource_kind: "role" }),
+    ("POST", "/api/identity/tenants", Coverage::Handler { action: "identity.tenant.create", resource_kind: "tenant" }),
     ("POST", "/api/identity/service-identities", Coverage::Central { action: "identity.service_identity.create", resource_kind: "service_identity", id_param: IdParam::None }),
-    ("POST", "/api/identity/service-identities/{id}/rotate", Coverage::Handler { action: "identity.service_identity.rotate" }),
-    ("POST", "/api/connectors", Coverage::Handler { action: "connector.create" }),
-    ("DELETE", "/api/connectors/{id}", Coverage::Handler { action: "connector.delete" }),
-    ("PATCH", "/api/connectors/{id}", Coverage::Handler { action: "connector.update" }),
-    ("POST", "/api/connectors/{id}/test", Coverage::Handler { action: "connector.test" }),
-    ("PUT", "/api/connectors/{id}/secret", Coverage::Handler { action: "connector.secret_rotate" }),
-    ("PUT", "/api/connectors/{id}/credential", Coverage::Handler { action: "connector.credential_set" }),
+    ("POST", "/api/identity/service-identities/{id}/rotate", Coverage::Handler { action: "identity.service_identity.rotate", resource_kind: "service_identity" }),
+    ("POST", "/api/connectors", Coverage::Handler { action: "connector.create", resource_kind: "connector" }),
+    ("DELETE", "/api/connectors/{id}", Coverage::Handler { action: "connector.delete", resource_kind: "connector" }),
+    ("PATCH", "/api/connectors/{id}", Coverage::Handler { action: "connector.update", resource_kind: "connector" }),
+    ("POST", "/api/connectors/{id}/test", Coverage::Handler { action: "connector.test", resource_kind: "connector" }),
+    ("PUT", "/api/connectors/{id}/secret", Coverage::Handler { action: "connector.secret_rotate", resource_kind: "connector" }),
+    ("PUT", "/api/connectors/{id}/credential", Coverage::Handler { action: "connector.credential_set", resource_kind: "connector" }),
     ("POST", "/api/connectors/{id}/discovery/{kind}", Coverage::Central { action: "connector.discover", resource_kind: "connector", id_param: IdParam::Path("id") }),
-    ("PUT", "/api/connectors/{id}/ingest-spec", Coverage::Handler { action: "connector.update" }),
-    ("POST", "/api/connectors/{id}/ingest/run", Coverage::Handler { action: "connector.ingest.run" }),
+    ("PUT", "/api/connectors/{id}/ingest-spec", Coverage::Handler { action: "connector.update", resource_kind: "connector" }),
+    ("POST", "/api/connectors/{id}/ingest/run", Coverage::Handler { action: "connector.ingest.run", resource_kind: "connector" }),
     ("POST", "/api/connectors/{id}/schema-observations", Coverage::Excluded { reason: EX_MACHINE }),
     ("POST", "/api/connectors/{id}/schema-observations/tables", Coverage::Excluded { reason: EX_MACHINE }),
-    ("POST", "/api/connectors/{id}/resume", Coverage::Handler { action: "connector.resume" }),
-    ("POST", "/api/connectors/{id}/pause", Coverage::Handler { action: "connector.pause" }),
-    ("PUT", "/api/connectors/{id}/lag-limit", Coverage::Handler { action: "connector.lag_limit" }),
+    ("POST", "/api/connectors/{id}/resume", Coverage::Handler { action: "connector.resume", resource_kind: "connector" }),
+    ("POST", "/api/connectors/{id}/pause", Coverage::Handler { action: "connector.pause", resource_kind: "connector" }),
+    ("PUT", "/api/connectors/{id}/lag-limit", Coverage::Handler { action: "connector.lag_limit", resource_kind: "connector" }),
     ("POST", "/api/connectors/{id}/capture/observations", Coverage::Excluded { reason: EX_MACHINE }),
     ("POST", "/api/connectors/{id}/run-reports", Coverage::Excluded { reason: EX_MACHINE }),
     ("POST", "/api/connectors/{id}/run-reports/{runId}/attempts", Coverage::Excluded { reason: EX_MACHINE }),
     ("POST", "/api/connectors/{id}/run-reports/{runId}/log", Coverage::Excluded { reason: EX_MACHINE }),
     ("POST", "/api/connectors/{id}/run-reports/{runId}/end", Coverage::Excluded { reason: EX_MACHINE }),
-    ("POST", "/api/connectors/{id}/discovery-results", Coverage::Handler { action: "connector.test" }),
-    ("POST", "/api/connectors/{id}/oauth/start", Coverage::Handler { action: "connector.oauth_start" }),
-    ("POST", "/api/connectors/{id}/oauth/sign-out", Coverage::Handler { action: "connector.oauth_signed_out" }),
-    ("POST", "/api/connectors/{id}/oauth/refresh-token", Coverage::Handler { action: "connector.oauth_refresh_token_rotated" }),
-    ("POST", "/api/connectors/{id}/schema-changes/approve", Coverage::Handler { action: "connector.schema_change.approve" }),
+    ("POST", "/api/connectors/{id}/discovery-results", Coverage::Handler { action: "connector.test", resource_kind: "connector" }),
+    ("POST", "/api/connectors/{id}/oauth/start", Coverage::Handler { action: "connector.oauth_start", resource_kind: "connector" }),
+    ("POST", "/api/connectors/{id}/oauth/sign-out", Coverage::Handler { action: "connector.oauth_signed_out", resource_kind: "connector" }),
+    ("POST", "/api/connectors/{id}/oauth/refresh-token", Coverage::Handler { action: "connector.oauth_refresh_token_rotated", resource_kind: "connector" }),
+    ("POST", "/api/connectors/{id}/schema-changes/approve", Coverage::Handler { action: "connector.schema_change.approve", resource_kind: "connector" }),
     ("PUT", "/api/connectors/{id}/tenant", Coverage::Central { action: "connector.tenant_assign", resource_kind: "connector", id_param: IdParam::Path("id") }),
-    ("POST", "/api/uploads", Coverage::Handler { action: "upload.create" }),
-    ("DELETE", "/api/uploads/{id}", Coverage::Handler { action: "upload.delete" }),
-    ("POST", "/api/uploads/{id}/ingest", Coverage::Handler { action: "upload.ingest" }),
+    ("POST", "/api/uploads", Coverage::Handler { action: "upload.create", resource_kind: "upload" }),
+    ("DELETE", "/api/uploads/{id}", Coverage::Handler { action: "upload.delete", resource_kind: "upload" }),
+    ("POST", "/api/uploads/{id}/ingest", Coverage::Handler { action: "upload.ingest", resource_kind: "upload" }),
     ("POST", "/api/uploads/{id}/check", Coverage::Excluded { reason: EX_READ_LIKE }),
     ("POST", "/api/uploads/{id}/compare", Coverage::Excluded { reason: EX_READ_LIKE }),
     ("POST", "/api/uploads/sessions", Coverage::Central { action: "upload.session_start", resource_kind: "upload", id_param: IdParam::None }),
     ("PUT", "/api/uploads/{id}/parts/{n}", Coverage::Excluded { reason: EX_PART }),
-    ("POST", "/api/uploads/{id}/complete", Coverage::Handler { action: "upload.create" }),
-    ("POST", "/api/uploads/folders", Coverage::Handler { action: "upload.folder.create" }),
-    ("PATCH", "/api/uploads/folders/{id}", Coverage::Handler { action: "upload.folder.rename" }),
-    ("DELETE", "/api/uploads/folders/{id}", Coverage::Handler { action: "upload.folder.delete" }),
-    ("POST", "/api/uploads/move", Coverage::Handler { action: "upload.move" }),
-    ("POST", "/api/maps", Coverage::Handler { action: "map_upload" }),
-    ("PATCH", "/api/maps/{id}", Coverage::Handler { action: "map_rename" }),
-    ("DELETE", "/api/maps/{id}", Coverage::Handler { action: "map_delete" }),
+    ("POST", "/api/uploads/{id}/complete", Coverage::Handler { action: "upload.create", resource_kind: "upload" }),
+    ("POST", "/api/uploads/folders", Coverage::Handler { action: "upload.folder.create", resource_kind: "upload_folder" }),
+    ("PATCH", "/api/uploads/folders/{id}", Coverage::Handler { action: "upload.folder.rename", resource_kind: "upload_folder" }),
+    ("DELETE", "/api/uploads/folders/{id}", Coverage::Handler { action: "upload.folder.delete", resource_kind: "upload_folder" }),
+    ("POST", "/api/uploads/move", Coverage::Handler { action: "upload.move", resource_kind: "upload" }),
+    ("POST", "/api/maps", Coverage::Handler { action: "map_upload", resource_kind: "map" }),
+    ("PATCH", "/api/maps/{id}", Coverage::Handler { action: "map_rename", resource_kind: "map" }),
+    ("DELETE", "/api/maps/{id}", Coverage::Handler { action: "map_delete", resource_kind: "map" }),
     ("POST", "/api/knowledge/sources", Coverage::Central { action: "knowledge_source.create", resource_kind: "knowledge_source", id_param: IdParam::None }),
     ("POST", "/api/knowledge/vector-jobs", Coverage::Central { action: "knowledge_vector_job.create", resource_kind: "knowledge_vector_job", id_param: IdParam::None }),
     // WEB-4 retired workflow creation, employee creation and the
@@ -444,7 +460,7 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     // grant stays: it is served by a live route and audited centrally.
     ("PUT", "/api/agents/employees/{id}/read-roles", Coverage::Central { action: "agent.read_roles.set", resource_kind: "digital_employee", id_param: IdParam::Path("id") }),
     ("POST", "/api/agents/employees/{id}/run", Coverage::Central { action: "digital_employee.run", resource_kind: "digital_employee", id_param: IdParam::Path("id") }),
-    ("POST", "/api/agents/approvals/{id}/decide", Coverage::Handler { action: crate::routes::agents::APPROVAL_DECIDE_ACTION }),
+    ("POST", "/api/agents/approvals/{id}/decide", Coverage::Handler { action: crate::routes::agents::APPROVAL_DECIDE_ACTION, resource_kind: "approval" }),
 ];
 
 /// The coverage of `(method, pattern)`, `None` for a route not in
@@ -477,10 +493,23 @@ pub(crate) fn store_error_class(err: &StoreError) -> &'static str {
 /// A deployment with no Postgres pool counts as a failed write too: the
 /// change happened and its row did not.
 pub async fn record_best_effort(state: &AppState, event: NewAuditEvent) {
+    let _ = record_best_effort_checked(state, event).await;
+}
+
+/// Writes one audit row and says whether it landed.
+///
+/// The same write as [`record_best_effort`], and the same failure
+/// handling; the difference is the answer. The audit compaction
+/// (`SEC-75`, decision 3) needs it: the row it writes is the FIRST row
+/// of a window, and the counter that says so may only be set once the
+/// row is really there — a window whose first row never landed holds no
+/// row, and its summary has to count every failure instead of the ones
+/// that came after the row.
+pub async fn record_best_effort_checked(state: &AppState, event: NewAuditEvent) -> bool {
     let action = event.action.clone();
     let class = match state.pg.as_deref() {
         Some(pool) => match lakehouse_store::audit::insert(pool, event).await {
-            Ok(_) => return,
+            Ok(_) => return true,
             Err(err) => store_error_class(&err),
         },
         None => "unavailable",
@@ -491,6 +520,7 @@ pub async fn record_best_effort(state: &AppState, event: NewAuditEvent) {
         error_class = class,
         "an audit row could not be written; the change it records stands"
     );
+    false
 }
 
 /// The path parameters of a request as `(name, value)` pairs, empty when the
@@ -563,6 +593,12 @@ pub(crate) fn actor(principal: Option<&Principal>) -> (Option<String>, Option<St
 /// `params` are the request's path parameters and `query` its raw query
 /// string; the id of a `Central` route is read from them. `detail` is the missing permission or the fixed
 /// password-rotation sentence, text the gate wrote itself.
+///
+/// `SEC-75` decision 4: the FIRST refusal of a principal, a route and a
+/// window writes the row; the later ones only count, and the sweep
+/// writes one summary row for the window. The row still names the kind
+/// of object the route changes (decision 6), for a `Handler` route as
+/// well as for a `Central` one.
 pub async fn record_gate_refusal(
     state: &AppState,
     principal: &Principal,
@@ -573,7 +609,10 @@ pub async fn record_gate_refusal(
     detail: &str,
 ) {
     let (action, resource_kind, resource_id) = match coverage_for(method, pattern) {
-        Some(Coverage::Handler { action }) => (action, None, None),
+        Some(Coverage::Handler {
+            action,
+            resource_kind,
+        }) => (action, Some(resource_kind.to_owned()), None),
         Some(Coverage::Central {
             action,
             resource_kind,
@@ -585,8 +624,27 @@ pub async fn record_gate_refusal(
         ),
         Some(Coverage::Excluded { .. }) | None => return,
     };
+    // `SEC-75` decision 4: the FIRST refusal of a principal, a route and
+    // a window writes the row; the later ones only count, and the sweep
+    // writes one summary row for the window. A counter that cannot be
+    // written writes the row every time: the trail then holds what it
+    // held before, and never less.
+    let count = crate::audit_compaction::count_refusal(
+        state,
+        principal,
+        method,
+        pattern,
+        action,
+        resource_kind.as_deref(),
+    )
+    .await;
+    if let Some(count) = count
+        && !count.first
+    {
+        return;
+    }
     let (principal_id, principal_kind, actor_label) = actor(Some(principal));
-    record_best_effort(
+    let written = record_best_effort_checked(
         state,
         NewAuditEvent {
             principal_id,
@@ -602,6 +660,16 @@ pub async fn record_gate_refusal(
         },
     )
     .await;
+    if written && let Some(count) = count {
+        crate::audit_compaction::mark_first_row_written(
+            state,
+            principal,
+            method,
+            pattern,
+            count.window_started_at,
+        )
+        .await;
+    }
 }
 
 /// The audit outcome of a response status.

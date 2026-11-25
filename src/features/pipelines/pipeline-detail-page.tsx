@@ -11,6 +11,7 @@ import {
   PencilIcon,
   PlayIcon,
   RadarIcon,
+  RefreshCwIcon,
   RotateCcwIcon,
   Trash2Icon,
 } from "lucide-react"
@@ -147,6 +148,30 @@ function SettingsTab({ p, scheduleText }: { p: PipelineDetail; scheduleText: str
             // so one job-level boolean would not be honest (routes::pipelines).
             { label: "SLA", value: p.slaOk === null ? "Not defined per pipeline" : p.slaOk ? "OK" : "Breached" },
             { label: "Freshness", value: <FreshnessIndicator lagSeconds={p.freshnessLagSeconds} /> },
+            // BLD-12: the materialization config is a fact about the stored
+            // definition, so it belongs beside the other pipeline settings.
+            {
+              label: "Materialization",
+              value: p.kind === "incremental" ? "Incremental" : "Full rebuild",
+            },
+            ...(p.kind === "incremental"
+              ? [
+                  {
+                    label: "Strategy",
+                    value: p.incrementalStrategy === "partition_replace" ? "Replace time partitions" : "Append new rows",
+                  },
+                  { label: "Cursor column", value: p.incrementalColumn ?? "—" },
+                  ...(p.incrementalStrategy === "partition_replace"
+                    ? [
+                        {
+                          label: "Partition granularity",
+                          value: p.partitionGranularity === "month" ? "Month" : "Day",
+                        },
+                        { label: "Lookback hours", value: String(p.lookbackHours ?? 0) },
+                      ]
+                    : []),
+                ]
+              : []),
           ]}
         />
       </section>
@@ -292,6 +317,14 @@ export function PipelineDetailPage() {
   const runNow = useServiceAction(
     withNotify({ success: "Run launched", error: "The run could not be launched" }, (signal, id: string) =>
       pipelineService.triggerRun(id, signal)
+    )
+  )
+  // BLD-12: an authored incremental pipeline can be rebuilt in full without
+  // editing its definition. The toast confirms what the launch actually does.
+  const fullRefresh = useServiceAction(
+    withNotify(
+      { success: "Full refresh launched — the whole target is being rebuilt", error: "The full refresh could not be launched" },
+      (_signal, id: string) => pipelineService.triggerPipeline(id, { fullRefresh: true })
     )
   )
   const pause = useServiceAction(
@@ -472,6 +505,20 @@ export function PipelineDetailPage() {
         <PlayIcon data-icon="inline-start" />
         {runNow.status === "pending" ? "Launching…" : "Run now"}
       </Button>
+      {p.engine === "authored" && p.kind === "incremental" ? (
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={fullRefresh.status === "pending"}
+          onClick={async () => {
+            if (await fullRefresh.run(pipelineId)) afterLaunch(true)
+          }}
+          title="Rebuild the whole target atomically instead of applying the incremental strategy"
+        >
+          <RefreshCwIcon data-icon="inline-start" />
+          {fullRefresh.status === "pending" ? "Rebuilding…" : "Full refresh"}
+        </Button>
+      ) : null}
     </>
   )
 

@@ -87,7 +87,7 @@ The modules are the groups in the console's navigation
 | --- | --- | --- |
 | **Home** | Starts work: ask, instruct, see what needs attention | Built |
 | **History (Ask AI)** | Returns to past conversations with the assistant, which answers questions and performs actions; a conversation starts on Home (PR #68) | Built; needs a model endpoint |
-| **Dashboards** | Builds and views dashboards; filters, drills, shares, embeds | Built; behind Metabase on filters, calculations, formatting and delivery (BI matrix: 39 have, 39 partial, 68 missing) |
+| **Dashboards** | Builds and views dashboards; filters, drills, shares, embeds | Built; the base (create, browse, every chart kind, threshold alerts, viewer access, phone width) accepted by the product owner 2026-11-21 (`BI-56`, `features/dashboards-basics.md`); behind Metabase on filters, calculations, formatting and delivery (BI matrix: 39 have, 39 partial, 68 missing) |
 | **Data** | Browses the catalog and assets; registers sources; uploads a file; switches a Gold table's open-format publishing on or off from its page | Built; publishing (PR #64) and file upload (PR #71) are merged but not yet accepted |
 | **Query Studio** | Writes SQL or asks in plain language; saves queries; downloads results; explains a query in plain words and, for a failed ClickHouse query, proposes a fix as a diff to accept or reject | Built; in the Data menu today. A main module of its own, shared by BI and the lakehouse (product owner, 2026-10-07). Matrix: 4 have, 11 partial, 11 missing |
 | **Build** | Creates, schedules and operates pipelines | Built |
@@ -174,7 +174,7 @@ hands-on testing.
 | Chart formatting | **Partial.** The saved number format is ignored; one palette | Yes | `BI-17` |
 | Share by link and embed in other sites | **Partial.** Public links never expire; embed tokens can lack an expiry | Yes; often a paid extra | `BI-19`, `BI-26`, `SEC-12` |
 | Alerts on a threshold | **Partial.** Email and webhook; one aggregate per table, re-fires every check | Yes | `BI-19` |
-| Scheduled reports with PDF or spreadsheet attached | **Built, in acceptance** (#204, 2026-10-26). Email on a schedule with the dashboard as PDF and charts as Excel or CSV; needs SMTP and the PDF settings below. The assistant can set one up (`AI-10`) | Yes, all three BI tools | `RPT-1`, `BI-35` |
+| Scheduled reports with PDF or spreadsheet attached | **Released** (#204, 2026-10-26; released by the product owner 2026-11-21 on the planner's run, since the owner does not check e-mail in the dev setup). Email on a schedule with the dashboard as PDF and charts as Excel or CSV; needs SMTP and the PDF settings below. The assistant can set one up (`AI-10`) | Yes, all three BI tools | `RPT-1`, `BI-35` |
 | Export to PDF or spreadsheet | **Released** (#204, 2026-10-26; accepted by the product owner 2026-11-16). A server-made PDF of every tab (Gotenberg), chart data as Excel or CSV up to 1,000,000 rows, a chart as PNG (`BI-37`); the assistant gives the same links (`AI-10`). Off until `CONSOLE_INTERNAL_URL` is set (`docs/OPERATIONS.md`, `REL-18`); image cards print from the content sites; web cards do not (`BI-42`) | Yes | `BI-1`, `BI-36`, `BI-42`, `REL-18` |
 | Shared business definitions (a governed metrics layer) | **Partial.** Built-in dashboard cards are defined once in code; users cannot define and reuse their own metrics | Yes, all three BI tools | User-defined metrics |
 | Mobile app | **Missing** | Tableau and Power BI | Decide if wanted |
@@ -268,7 +268,7 @@ in `docs/KNOWN-LIMITATIONS.md` (moved from the README, 2026-11-05).
   whichever comes first, and the banner says which limit cut the result. The
   administrator's row limit ranges from 100 to 100,000. A chart built on a
   saved query is limited to 2,000 rows and 30 seconds.
-- PDF export is released and scheduled reports are built but in acceptance; both are off on a
+- PDF export and scheduled reports are released; both are off on a
   fresh install until `CONSOLE_INTERNAL_URL` is set (`REL-18`). A PDF has no
   web cards (`BI-42`).
 

@@ -42,6 +42,76 @@ use crate::bronze::{day_partition_key_for, sanitize_table_name};
 /// already a Lakekeeper *warehouse* boundary (ADR 0003).
 pub const GOLD_NAMESPACE: &str = "gold";
 
+/// DATA-65: Silver (`silver.*`) `ClickHouse` `MergeTree` tables are published
+/// to a separate, single-level Iceberg namespace. Mirrors
+/// [`GOLD_NAMESPACE`]: derived data, never mixed into `bronze` or `gold`.
+pub const SILVER_NAMESPACE: &str = "silver";
+
+/// DATA-65: which publication zone a table is written to/read from.
+///
+/// Both zones use the exact same naming, schema, partition and atomic
+/// commit mechanics (ADR 0010); only the Iceberg namespace and the
+/// `ClickHouse` source schema differ. `serving` is accepted as an alias of
+/// `Gold` (BLD-19: the source schema's name), so a caller that echoes the
+/// source schema still names the Gold publication zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishZone {
+    /// Publish `silver.<mart>` to the `silver` Iceberg namespace.
+    Silver,
+    /// Publish `{gold_source_schema}.<mart>` to the `gold` namespace.
+    Gold,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "the DATA-65 API pins these as &self methods; callers hold a Copy zone in a \
+              borrow and changing every call site to pass by value would only churn the API"
+)]
+impl PublishZone {
+    /// The Iceberg namespace this zone publishes into.
+    #[must_use]
+    pub fn namespace_name(&self) -> &'static str {
+        match self {
+            Self::Silver => SILVER_NAMESPACE,
+            Self::Gold => GOLD_NAMESPACE,
+        }
+    }
+
+    /// The single-level [`NamespaceIdent`] for this zone.
+    ///
+    /// # Errors
+    ///
+    /// Never actually fails (the name is a compile-time constant) — see
+    /// `bronze::bronze_namespace`'s doc comment for why this still returns
+    /// [`Result`].
+    pub fn namespace(&self) -> Result<NamespaceIdent> {
+        NamespaceIdent::from_strs([self.namespace_name()])
+    }
+
+    /// The `ClickHouse` source schema the export reads from. Silver always
+    /// reads `silver`; Gold keeps using the deployment's configured source
+    /// schema (`serving` by default).
+    #[must_use]
+    pub fn source_ch_schema<'a>(&self, gold_source_schema: &'a str) -> &'a str {
+        match self {
+            Self::Silver => SILVER_NAMESPACE,
+            Self::Gold => gold_source_schema,
+        }
+    }
+
+    /// Parses a caller-supplied zone name. `None` for anything else, so a
+    /// caller can answer `400` with its own fixed message (AGENTS.md rule
+    /// 4: never echo an unrecognised value into a response).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "silver" => Some(Self::Silver),
+            "gold" | "serving" => Some(Self::Gold),
+            _ => None,
+        }
+    }
+}
+
 /// System column every exported Gold table carries: when this crate wrote
 /// the row (i.e. when the export run happened), not any business-date
 /// column the mart itself may also carry.
@@ -198,6 +268,67 @@ mod tests {
         let ns = gold_namespace().unwrap();
         assert_eq!(ns.to_url_string(), GOLD_NAMESPACE);
         assert_ne!(GOLD_NAMESPACE, crate::bronze::BRONZE_NAMESPACE);
+    }
+
+    // DATA-65: the two published namespaces are distinct flat, single-level
+    // names, and neither is the Bronze ingestion namespace.
+    #[test]
+    fn publish_zone_namespaces_are_flat_distinct_and_not_bronze() {
+        for zone in [PublishZone::Silver, PublishZone::Gold] {
+            let ns = zone.namespace().unwrap();
+            assert_eq!(ns.to_url_string(), zone.namespace_name());
+            assert!(!ns.to_url_string().contains('/'), "the namespace is flat");
+            assert_ne!(zone.namespace_name(), crate::bronze::BRONZE_NAMESPACE);
+        }
+        assert_eq!(PublishZone::Silver.namespace_name(), "silver");
+        assert_eq!(PublishZone::Gold.namespace_name(), "gold");
+        assert_ne!(
+            PublishZone::Silver.namespace().unwrap(),
+            PublishZone::Gold.namespace().unwrap()
+        );
+    }
+
+    #[test]
+    fn publish_zone_parses_silver_gold_and_the_serving_alias() {
+        assert_eq!(PublishZone::parse("silver"), Some(PublishZone::Silver));
+        assert_eq!(PublishZone::parse("gold"), Some(PublishZone::Gold));
+        // BLD-19: `serving` is the Gold source schema's name, accepted as
+        // an alias so callers that echo it still name the Gold zone.
+        assert_eq!(PublishZone::parse("serving"), Some(PublishZone::Gold));
+        for invalid in ["bronze", "SILVER", "gold.", "", " silver"] {
+            assert_eq!(PublishZone::parse(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn publish_zone_chooses_the_clickhouse_source_schema() {
+        assert_eq!(PublishZone::Silver.source_ch_schema("serving"), "silver");
+        assert_eq!(PublishZone::Gold.source_ch_schema("serving"), "serving");
+        assert_eq!(
+            PublishZone::parse("serving")
+                .unwrap()
+                .source_ch_schema("serving"),
+            "serving"
+        );
+    }
+
+    #[test]
+    fn published_schema_and_partition_helpers_are_zone_independent() {
+        // The same `gold_schema`/`export_day_partition_spec` helpers back
+        // both zones: one schema shape, one `day(_exported_at)` spec.
+        let schema = gold_schema(vec![NestedField::required(
+            FIRST_DOMAIN_FIELD_ID,
+            "region",
+            Type::Primitive(PrimitiveType::String),
+        )])
+        .unwrap();
+        let spec = export_day_partition_spec(&schema).unwrap();
+        for zone in [PublishZone::Silver, PublishZone::Gold] {
+            let _ = zone;
+            assert!(schema.field_by_name(EXPORTED_AT_COLUMN).is_some());
+            assert_eq!(spec.fields().len(), 1);
+            assert_eq!(spec.fields()[0].source_id, EXPORTED_AT_FIELD_ID);
+        }
     }
 
     #[test]

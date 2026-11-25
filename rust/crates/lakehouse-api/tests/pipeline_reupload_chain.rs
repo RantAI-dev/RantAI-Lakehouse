@@ -45,6 +45,13 @@ async fn seed_pipeline(pool: &sqlx::PgPool, prefix: &str, tenant_id: Option<uuid
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
+            // BLD-12 (migration `0156`) / PR #715 merge: these three fields
+            // joined `CreatePipelineInput` after this file was written. A
+            // `batch` fixture keeps the migration's defaults — full rebuild,
+            // no lookback — so the seeded rows have no incremental config.
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             name: format!("{prefix}-{}", uuid::Uuid::new_v4().simple()),

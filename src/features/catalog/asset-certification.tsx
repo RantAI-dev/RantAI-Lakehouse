@@ -95,7 +95,13 @@ export function DeprecationNotice({
   )
 }
 
-function CertificationDialog({
+/**
+ * The Certification dialog. `UX-8`: the page opens it from its ⋯ menu
+ * ("Certification…"); `CertificationAction` below is the same dialog behind
+ * its own button. Mount it only while open, so each opening starts from the
+ * saved mark.
+ */
+export function CertificationDialog({
   asset: a,
   onClose,
   onSaved,

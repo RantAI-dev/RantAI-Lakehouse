@@ -10,14 +10,12 @@ import { Button } from "@/components/ui/button";
 import { clearTableMemory } from "@/hooks/use-table-memory";
 
 /**
- * Clears the narrowing the user applied — search, sort, filters, and any
- * page-specific keys registered as `memoryKeys` / `resetExtraKeys`. View and
- * page size survive (how they prefer to read the table).
- *
- * Absent until there is something to clear: a permanently visible Reset reads
- * as if the table were filtered when it is not.
+ * Whether the table is narrowed, and the one way to clear it — what the
+ * Reset button below does. Split out (`UX-8`) so a page's designed "no
+ * match" state can offer the same reset, not a second one that forgets the
+ * remembered state. Must sit under the toolbar's `DataTableQueryKeysProvider`.
  */
-export function DataTableResetFilters() {
+export function useDataTableReset(): { canReset: boolean; reset: () => void } {
   const pathname = usePathname();
   const searchParams = useSearchParams();
   // The toolbar names these after its own table, so a page with two tables
@@ -56,19 +54,35 @@ export function DataTableResetFilters() {
     history: "replace",
   });
 
-  if (!counted.some((key) => searchParams.get(key))) return null;
+  return {
+    canReset: counted.some((key) => searchParams.get(key)),
+    reset: () => {
+      // Empty URL alone is not enough to forget prefs (leave-page races look
+      // the same). Reset must clear localStorage explicitly.
+      clearTableMemory(pathname);
+      void clear(Object.fromEntries(cleared.map((key) => [key, null])));
+    },
+  };
+}
+
+/**
+ * Clears the narrowing the user applied — search, sort, filters, and any
+ * page-specific keys registered as `memoryKeys` / `resetExtraKeys`. View and
+ * page size survive (how they prefer to read the table).
+ *
+ * Absent until there is something to clear: a permanently visible Reset reads
+ * as if the table were filtered when it is not.
+ */
+export function DataTableResetFilters() {
+  const { canReset, reset } = useDataTableReset();
+  if (!canReset) return null;
 
   return (
     <Button
       variant="ghost"
       size="sm"
       className="text-muted-foreground h-7 px-2 font-normal hover:text-foreground"
-      onClick={() => {
-        // Empty URL alone is not enough to forget prefs (leave-page races look
-        // the same). Reset must clear localStorage explicitly.
-        clearTableMemory(pathname);
-        void clear(Object.fromEntries(cleared.map((key) => [key, null])));
-      }}
+      onClick={reset}
     >
       <X className="size-3.5" />
       Reset

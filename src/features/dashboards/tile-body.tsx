@@ -16,6 +16,9 @@ import { GeoChart } from "./geo-chart";
 import type { MapLoader } from "./echarts-maps";
 import { useReporting } from "./reporting-context";
 import { KpiCard } from "./kpi-card";
+import { KpiValue, OverflowText } from "./fit-text";
+import { compactKpiText } from "@/lib/kpi-fit";
+import { TileBodyPlaceholder } from "./dashboard-skeleton";
 import { PivotTable } from "./pivot-table";
 import { RawTable } from "./raw-table";
 import { cellClass, CellValue, columnStyle, conditionalCss } from "./table-cell";
@@ -91,6 +94,11 @@ type TileBodyProps = {
    * sent to the login page (`PR #246 review BLOCKER 1`).
    */
   loadMap?: MapLoader;
+  /**
+   * Leave out the "Data from" footer: the dashboard page shows it in the
+   * tile's hover line and its ⋯ instead (`BI-61` T4). Absent: shown.
+   */
+  hideDataFrom?: boolean;
 };
 
 /**
@@ -103,7 +111,7 @@ export function TileBody(props: TileBodyProps) {
   const reporting = useReporting();
   const cut = hasRows(props.cell) && props.cell.limitHit?.kind === "rows" ? limitSentence(props.cell.limitHit) : null;
   // BI-4 part B (feature decision 5): "Data from 10:42", and "remembered" when it came from memory.
-  const from = hasRows(props.cell) ? dataFromLabel(props.cell.computedAt, reporting.timeZone, props.cell.remembered) : null;
+  const from = hasRows(props.cell) && !props.hideDataFrom ? dataFromLabel(props.cell.computedAt, reporting.timeZone, props.cell.remembered) : null;
   if (!cut && !from) return <TileBodyOf {...props} />;
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -142,7 +150,8 @@ function TileBodyOf({
       </p>
     );
   }
-  if (loading && !cell) return <div className="h-full animate-pulse rounded bg-muted/40" />;
+  // The same body placeholder as a tile drawn before the layout is known (`DashboardTilesSkeleton`).
+  if (loading && !cell) return <TileBodyPlaceholder />;
 
   if (spec.kind === "kpi" && hasRows(cell) && def?.compare) {
     return <KpiCard def={def} cell={cell} caption={spec.caption} />;
@@ -153,9 +162,15 @@ function TileBodyOf({
     // BI-17: the KPI's number format, and the colour a rule gives its value ("green above the goal").
     const paint = v === null ? undefined : conditionalCss(def?.conditional, null, v);
     return (
-      <div className="grid h-full place-content-center px-2 text-center">
-        <p className="text-4xl font-semibold tabular-nums text-foreground" style={paint && { color: paint.color, backgroundColor: paint.backgroundColor }}>{v === null ? "—" : kpiFormat ? formatValue(v, kpiFormat, reporting.numberLocale, decimalsFor([v])) : fmtInt(v)}</p>
-        {spec.caption ? <p className="mt-1 text-xs text-muted-foreground">{spec.caption}</p> : null}
+      // Owner QA 2026-11-15: the number always fits the tile and the caption stops at two lines (`KpiCard`).
+      <div className="grid h-full grid-cols-[minmax(0,1fr)] content-center px-2 text-center">
+        <KpiValue
+          className="text-4xl font-semibold tabular-nums text-foreground" style={paint && { color: paint.color, backgroundColor: paint.backgroundColor }}
+          full={v === null ? "—" : kpiFormat ? formatValue(v, kpiFormat, reporting.numberLocale, decimalsFor([v])) : fmtInt(v)}
+          // Unformatted, the full value is `fmtInt`'s whole en-US number, so its compact form is too.
+          compact={v === null ? null : kpiFormat ? compactKpiText(v, kpiFormat, reporting.numberLocale, decimalsFor([v])) : compactKpiText(Math.round(v), undefined, "en-US", 0)}
+        />
+        {spec.caption ? <OverflowText as="p" lines={2} text={spec.caption} className="mt-1 text-xs text-muted-foreground" /> : null}
       </div>
     );
   }
@@ -500,7 +515,7 @@ function TableView({ columns, rows, settings = {}, labels = {}, style }: { colum
         <tbody>
           {rows.map((r, i) => (
             <tr key={i} className="border-b border-border/40 last:border-0">
-              {shown.map((c) => <td key={c} style={{ ...columnStyle(settings[c]), ...conditionalCss(style?.conditional, c, r[c], domains) }} className={cellClass(settings[c])}><CellValue value={r[c]} setting={settings[c]} format={style?.valueFormats?.[c] ?? style?.format} /></td>)}
+              {shown.map((c) => <td key={c} style={{ ...columnStyle(settings[c]), ...conditionalCss(style?.conditional, c, r[c], domains) }} className={cellClass(settings[c])}><CellValue value={r[c]} setting={settings[c]} format={style?.valueFormats?.[c] ?? style?.format} column={c} /></td>)}
             </tr>
           ))}
         </tbody>

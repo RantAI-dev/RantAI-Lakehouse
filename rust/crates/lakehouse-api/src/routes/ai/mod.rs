@@ -41,7 +41,7 @@ use axum::extract::{Extension, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
-use lakehouse_clickhouse::{ChClient, QueryOptions};
+use lakehouse_clickhouse::{ChClient, ChTableEnsured, QueryOptions};
 use lakehouse_core::ApiError;
 use lakehouse_llm::{
     ChatOptions, HiddenSpans, LlmMessage, LlmMessageRole, StreamPiece, ToolCall, ToolCallFunction,
@@ -2527,14 +2527,14 @@ const CHAT_SESSION_MIGRATIONS: [&str; 2] = [
 /// Longest title derived from a conversation's first message.
 const TITLE_MAX_CHARS: usize = 80;
 
-static CHAT_SESSION_TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+static CHAT_SESSION_TABLE_ENSURED: ChTableEnsured = ChTableEnsured::new();
 
 /// Create the `console` database and `chat_session` table if they don't
-/// already exist, and add later columns (idempotent, once per process —
-/// mirroring [`lakehouse_bi::store::ensure_bi_table`]'s pattern).
+/// already exist, and add later columns (idempotent, once per `ClickHouse`
+/// URL — same shared guard as the other `console.*` tables).
 async fn ensure_chat_session_table(ch: &ChClient) -> Result<(), lakehouse_clickhouse::ChError> {
     CHAT_SESSION_TABLE_ENSURED
-        .get_or_try_init(|| async {
+        .ensure(ch, || async {
             ch.exec("CREATE DATABASE IF NOT EXISTS console", None)
                 .await?;
             ch.exec(CREATE_CHAT_SESSION_TABLE, None).await?;
@@ -2544,7 +2544,6 @@ async fn ensure_chat_session_table(ch: &ChClient) -> Result<(), lakehouse_clickh
             Ok(())
         })
         .await
-        .map(drop)
 }
 
 /// A SQL fragment together with the values it binds.

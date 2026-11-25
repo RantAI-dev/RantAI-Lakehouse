@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { headers } from "next/headers";
 import { geist, geistMono } from "@rantai/design-system/fonts/fonts";
-import { ThemeProvider } from "@rantai/design-system/components/theme-provider";
+import { ConsoleThemeProvider } from "@/components/app-shell/console-theme-provider";
 import { Toaster } from "@rantai/design-system/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AppFrame } from "@/components/app-shell/app-frame";
@@ -9,6 +9,8 @@ import { TableProviders } from "@/components/app-shell/table-providers";
 import { AuthProvider } from "@/features/auth/auth-provider";
 import { ReactGrabDev } from "@/components/app-shell/react-grab-dev";
 import { NONCE_HEADER } from "@/lib/csp";
+import { HOME_BACKGROUND_SCRIPT } from "@/lib/home-background";
+import { EMBED_TRANSPARENT_CLASS, EMBED_TRANSPARENT_HEADER } from "@/lib/embed-look";
 import {
   readWorkspaceBranding,
   workspaceIconLinks,
@@ -49,7 +51,7 @@ export async function generateMetadata(): Promise<Metadata> {
  * App-wide root layout.
  *
  * Wires up the global providers in this exact order (outer → inner):
- * `ThemeProvider` (light/dark via next-themes, from the Rantai Design System) →
+ * `ConsoleThemeProvider` (light/dark via next-themes, from the Rantai Design System) →
  * `TooltipProvider` (shadcn tooltips) → `AuthProvider` (session + route
  * guard) → `TableProviders` (nuqs URL state + React Query cache for the
  * Advanced Data Table) → `SidebarProvider` (collapsible sidebar
@@ -73,12 +75,16 @@ export default async function RootLayout({
   // first paint) and only a nonce passed here lets the browser run it. Without
   // it the page paints light and only switches after hydration.
   const nonce = (await headers()).get(NONCE_HEADER) ?? undefined;
+  // `PR #648 review 1`: the proxy marks a transparent embed on the request, so
+  // `html` (and `body`, in `globals.css`) is cleared in this server render
+  // rather than after hydration, and the frame is transparent from first paint.
+  const embedTransparent = (await headers()).get(EMBED_TRANSPARENT_HEADER) === "1";
   const iconLinks = workspaceIconLinks(await readWorkspaceBranding());
   return (
     <html
       lang="en"
       suppressHydrationWarning
-      className={`${geist.variable} ${geistMono.variable} ${dashboardFontVariables} font-sans antialiased`}
+      className={`${geist.variable} ${geistMono.variable} ${dashboardFontVariables} font-sans antialiased${embedTransparent ? ` ${EMBED_TRANSPARENT_CLASS}` : ""}`}
     >
       <head>
         <meta name="theme-color" content="#050A30" />
@@ -93,13 +99,17 @@ export default async function RootLayout({
             media={link.media}
           />
         ))}
+        {/* WEB-17 T5: Home's Background choice is known before the first
+            paint, so its loading look shows the band's colour only when
+            there will be art (`HOME_BACKGROUND_SCRIPT`, a constant). */}
+        <script nonce={nonce} dangerouslySetInnerHTML={{ __html: HOME_BACKGROUND_SCRIPT }} />
       </head>
       {/* Browser extensions (Grammarly, ColorZilla, password managers) put
           their own attributes on <body> before React hydrates; in dev that
           showed as a permanent "1 Issue". This only covers <body>'s own
           attributes, never a mismatch inside it. */}
       <body suppressHydrationWarning>
-        <ThemeProvider nonce={nonce}>
+        <ConsoleThemeProvider nonce={nonce}>
           {/* Micro-interaction audit 2026-11-14 (emil): the first tooltip waits a beat so a
               pointer passing over a toolbar does not flash labels; once one is open, the
               next opens at once (Base UI's `timeout`, 400 ms) with no animation. */}
@@ -117,7 +127,7 @@ export default async function RootLayout({
                 for a coding agent. Compiles away in production builds. */}
             <ReactGrabDev />
           </TooltipProvider>
-        </ThemeProvider>
+        </ConsoleThemeProvider>
       </body>
     </html>
   );

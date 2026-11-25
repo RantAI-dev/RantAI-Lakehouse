@@ -25,6 +25,16 @@ declare module "@tanstack/react-table" {
      * filters keep working.
      */
     hiddenColumns?: string[];
+    /**
+     * Filters a control on the page itself already shows and edits (`UX-8`:
+     * the Catalog's layer switch and namespace picker). The property bar
+     * draws no chip for them, the Filter button does not count them, and
+     * they alone do not open the bar, so a picked layer is shown once. They
+     * are still in the `filters` param, the server query and Reset; with
+     * "or" or in the advanced rule list every rule is shown, since there the
+     * rules only mean something together.
+     */
+    isQuickFilter?: (filter: { id: string; value: unknown; operator: string }) => boolean;
   }
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars

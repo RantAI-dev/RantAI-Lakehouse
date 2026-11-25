@@ -4956,13 +4956,21 @@
     "type": "function",
     "function": {
       "name": "export_gold_mart",
-      "description": "Export one Gold mart (serving.<mart>) to its Iceberg Gold table through Lakekeeper. Append-only: running it again adds the rows again with a new _exported_at; it does not replace them.",
+      "description": "Export one Silver (silver.<mart>) or Gold (serving.<mart>) mart to its Iceberg table through Lakekeeper. Append-only: running it again adds the rows again with a new _exported_at; it does not replace them.",
       "parameters": {
         "type": "object",
         "properties": {
           "mart": {
             "type": "string",
-            "description": "Gold mart name, e.g. mart_sales"
+            "description": "Mart name, e.g. mart_sales"
+          },
+          "zone": {
+            "type": "string",
+            "enum": [
+              "silver",
+              "gold"
+            ],
+            "description": "Publication zone (default gold): silver reads silver.<mart> and writes silver.<mart>."
           }
         },
         "required": [
@@ -4975,13 +4983,21 @@
     "type": "function",
     "function": {
       "name": "get_gold_export",
-      "description": "Read a Gold Iceberg table back (by mart) through Lakekeeper: its row count and format version, independent of ClickHouse.",
+      "description": "Read a Silver or Gold Iceberg table back (by mart and zone) through Lakekeeper: its row count and format version, independent of ClickHouse.",
       "parameters": {
         "type": "object",
         "properties": {
           "mart": {
             "type": "string",
-            "description": "Gold mart name, e.g. mart_sales"
+            "description": "Mart name, e.g. mart_sales"
+          },
+          "zone": {
+            "type": "string",
+            "enum": [
+              "silver",
+              "gold"
+            ],
+            "description": "Publication zone (default gold)."
           }
         },
         "required": [
@@ -5680,9 +5696,39 @@
               "type": "string"
             }
           },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "batch",
+              "incremental"
+            ],
+            "description": "batch (default) rebuilds the whole target each run; incremental materializes only new or changed rows"
+          },
           "incrementalColumn": {
             "type": "string",
-            "description": "optional column for incremental loads"
+            "description": "required when kind is incremental: the cursor column; letters digits and underscores, not starting with a digit, at most 128 characters"
+          },
+          "incrementalStrategy": {
+            "type": "string",
+            "enum": [
+              "append",
+              "partition_replace"
+            ],
+            "description": "incremental only, default append: append adds rows newer than the watermark; partition_replace rewrites entire day or month partitions and tolerates late-arriving data"
+          },
+          "partitionGranularity": {
+            "type": "string",
+            "enum": [
+              "day",
+              "month"
+            ],
+            "description": "partition_replace only, default day"
+          },
+          "lookbackHours": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 720,
+            "description": "partition_replace only, default 0: hours before the watermark included in the replaced window"
           },
           "schedule": {
             "type": "string",
@@ -6579,13 +6625,15 @@
                     "heading",
                     "paragraph",
                     "list",
+                    "quote",
+                    "divider",
                     "link",
                     "chart"
                   ]
                 },
                 "text": {
                   "type": "string",
-                  "description": "heading, paragraph or link words; plain text, never HTML or Markdown"
+                  "description": "words; except in a link, **bold**, *italic* and [words](address). Never HTML"
                 },
                 "level": {
                   "type": "integer",
@@ -6614,6 +6662,14 @@
                 "chart": {
                   "type": "string",
                   "description": "a chart block's chart id, from list_charts"
+                },
+                "width": {
+                  "type": "string",
+                  "enum": [
+                    "text",
+                    "wide"
+                  ],
+                  "description": "text (default) or wide"
                 }
               },
               "required": [
@@ -6660,13 +6716,15 @@
                     "heading",
                     "paragraph",
                     "list",
+                    "quote",
+                    "divider",
                     "link",
                     "chart"
                   ]
                 },
                 "text": {
                   "type": "string",
-                  "description": "heading, paragraph or link words; plain text, never HTML or Markdown"
+                  "description": "words; except in a link, **bold**, *italic* and [words](address). Never HTML"
                 },
                 "level": {
                   "type": "integer",
@@ -6695,6 +6753,14 @@
                 "chart": {
                   "type": "string",
                   "description": "a chart block's chart id, from list_charts"
+                },
+                "width": {
+                  "type": "string",
+                  "enum": [
+                    "text",
+                    "wide"
+                  ],
+                  "description": "text (default) or wide"
                 }
               },
               "required": [
@@ -6714,13 +6780,15 @@
                     "heading",
                     "paragraph",
                     "list",
+                    "quote",
+                    "divider",
                     "link",
                     "chart"
                   ]
                 },
                 "text": {
                   "type": "string",
-                  "description": "heading, paragraph or link words; plain text, never HTML or Markdown"
+                  "description": "words; except in a link, **bold**, *italic* and [words](address). Never HTML"
                 },
                 "level": {
                   "type": "integer",
@@ -6749,6 +6817,14 @@
                 "chart": {
                   "type": "string",
                   "description": "a chart block's chart id, from list_charts"
+                },
+                "width": {
+                  "type": "string",
+                  "enum": [
+                    "text",
+                    "wide"
+                  ],
+                  "description": "text (default) or wide"
                 }
               },
               "required": [

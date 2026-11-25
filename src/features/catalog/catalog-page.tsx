@@ -2,20 +2,23 @@
 
 import * as React from "react"
 import { useCallback, useEffect, useMemo } from "react"
-import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
+import { Database, SearchX, Trash2 } from "lucide-react"
 
-import { PageHeader } from "@/components/patterns/page-header"
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
-import { DataTableSearch } from "@/components/data-table/data-table-search"
-import { DataTableSkeleton } from "@/components/data-table/data-table-skeleton"
+import { DataTableQueryKeysProvider } from "@/components/data-table/data-table-query-keys"
+import { useDataTableReset } from "@/components/data-table/data-table-reset-filters"
+import { DataTableSettingsMenu } from "@/components/data-table/data-table-settings-menu"
 import {
   ContextMenuItem,
   ContextMenuSeparator,
 } from "@/components/ui/context-menu"
+import { DropdownMenuItem } from "@rantai/design-system/ui/dropdown-menu"
 import { EmptyState, ErrorState } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
+import { Skeleton } from "@/components/ui/skeleton"
+import { useAuth } from "@/features/auth/auth-provider"
 import { useDataTable } from "@/hooks/use-data-table"
 import { useInfiniteTableQuery } from "@/hooks/use-infinite-table-query"
 import {
@@ -32,13 +35,13 @@ import {
   filterParam,
   removeFilter,
   setFilter,
-  toggleFilterValue,
 } from "@/lib/table-filter-link"
-import { DATA_LAYER_LABEL, type DataLayer } from "@/lib/status"
-import { cn } from "@/lib/utils"
-import { NamespaceFilterRow, NamespaceSummary, QuickFilterRow } from "./catalog-namespaces"
+import type { DataLayer } from "@/lib/status"
+import { AddDataButton, CatalogSearch, LayerSwitch } from "./catalog-frame"
+import { isCatalogQuickFilter } from "./catalog-layers"
+import { NamespaceLine, NamespacePicker } from "./catalog-namespaces"
 import { getAssetActions } from "./data-explorer-actions"
-import { DroppedTablesNote } from "./dropped-tables"
+import { DroppedTablesDialog, useDroppedTables } from "./dropped-tables"
 import { getDataExplorerColumns } from "./data-explorer-columns"
 
 /**
@@ -78,23 +81,6 @@ function legacyParamsToTableState(
 }
 
 /**
- * The layers worth a one-click filter. `semantic` is left out on purpose:
- * it is rare, and every layer remains available through the toolbar's own
- * Layer filter — these are shortcuts, not the whole set.
- */
-const QUICK_LAYERS: DataLayer[] = ["raw", "bronze", "silver", "gold"]
-
-/** Column labels, for telling the user which ones the window is too narrow for. */
-const WIDTH_HIDDEN_LABEL: Record<string, string> = {
-  tags: "Tags",
-  owner: "Owner",
-  sizeBytes: "Size",
-  freshnessLagSeconds: "Freshness",
-  type: "Type",
-  layer: "Layer",
-}
-
-/**
  * The Catalog (`WEB-3` S2-D1): every governed asset in one list, with the
  * search, filters and row actions the Data Explorer had and the namespace
  * grouping the old Catalog page had.
@@ -105,12 +91,23 @@ const WIDTH_HIDDEN_LABEL: Record<string, string> = {
  * namespace a user filters to is described above the rows (owner,
  * residency, source engine), so nothing the drawer showed is lost and there
  * is one place to find a table. `/data` redirects here.
+ *
+ * `UX-8` (mockup A, owner 2026-11-21) puts it in the app's one page frame
+ * (`DESIGN.md` §3): the title, then on the right the icon search, the ⋯
+ * (the table's settings menu: columns, grouping, export, refresh, layout,
+ * plus the dropped tables) and the primary Add data, on one row. Under it
+ * one filter row: the layer switch and the namespace picker, then the
+ * table's own Sort and Filter. The table is the same advanced data table.
  */
 export function CatalogPage() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const tableUrlState = useTableUrlState()
+  const { hasPermission } = useAuth()
   const namespaces = useService((s) => assetService.listNamespaces(s), [])
+  // `DATA-55`: read once here, so the ⋯ item can count them and the dialog list them.
+  const dropped = useDroppedTables()
+  const [droppedOpen, setDroppedOpen] = React.useState(false)
 
   // Rewrite legacy links before the table reads the URL. `replace` keeps the
   // old address out of history, so Back still leaves the page.
@@ -167,21 +164,25 @@ export function CatalogPage() {
     [router]
   )
 
-  // All eight columns need ~875px, and the content area is much narrower
-  // than the window once the sidebar is open — at a 900px window it is
-  // only ~604px. Rather than let the page scroll sideways (which drags
-  // the sidebar and navbar with it and clips the last columns outright),
-  // leave out the columns that earn their width least as space runs out.
+  // All columns need ~875px, and the content area is much narrower than
+  // the window once the sidebar is open — at a 900px window it is only
+  // ~604px. Rather than let the page scroll sideways (which drags the
+  // sidebar and navbar with it and clips the last columns outright), leave
+  // out the columns that earn their width least as space runs out.
   //
   // Order of sacrifice, least useful first: Tags and Owner (DATA-11; both
   // are on the detail page) → Size (nice to know) → Freshness (also shown on the detail page) → Type (largely implied by
-  // Layer). Name, Namespace, Tier and the actions menu always stay.
+  // Layer). Name, Tier and the actions menu always stay.
   //
   // The columns are hidden, not removed (DATA-24): they stay in the column
   // list, so their filters keep working in the toolbar's filter menu at
   // every width. They used to be dropped from the column list, which took
   // their filters with them — the Owner and Tags filters vanished on a
   // laptop.
+  //
+  // UX-8 (plan PR 1): the columns fold silently. The line that named them
+  // ("… hidden at this window width") is gone; the asset page shows
+  // everything, and the filters say for themselves that they still work.
   const width = useWindowWidth()
   const hiddenByWidth = useMemo(() => {
     // Before the first measurement, assume there is room: showing the full
@@ -214,38 +215,62 @@ export function CatalogPage() {
     return hidden
   }, [width])
 
-  const hiddenLabels = hiddenByWidth.map((id) => WIDTH_HIDDEN_LABEL[id] ?? id)
-
   // The quick filters each own one filter (`layer`, `namespace`) and
   // nothing else: they rewrite just that entry and carry the rest of the
   // URL — search, sort, other filters, column layout — through untouched.
+  //
+  // UX-8 (plan PR 1, "pick one and say which"): they are the Filter menu's
+  // own state, not a second filter. Both write the one `filters` entry for
+  // their column, so a layer picked in the switch is the Layer chip the
+  // menu shows, and a mix set in the menu (Silver and Gold) leaves no
+  // segment pressed. The menu keeps them because it is the only place for
+  // the rarer questions (Bronze (raw) alone, two namespaces at once), and
+  // because the table drops every filter whose column it cannot filter on
+  // (`getFiltersStateParser`), so the columns cannot leave the menu. A
+  // filter the switch or the picker shows gets no chip in the property bar
+  // (`isCatalogQuickFilter`), so it is on screen once; one they cannot show
+  // keeps its chip.
   const activeLayers = useMemo(
     () => activeFilterValues(tableUrlState.filters, "layer"),
     [tableUrlState.filters]
   )
-  const filtersHref = useCallback(
+  const pushFilters = useCallback(
     (filters: string) => {
       const next = new URLSearchParams(searchParams.toString())
       if (filters) next.set("filters", filters)
       else next.delete("filters")
       const query = next.toString()
-      return query ? `/catalog?${query}` : "/catalog"
+      router.push(query ? `/catalog?${query}` : "/catalog", { scroll: false })
     },
-    [searchParams]
+    [router, searchParams]
+  )
+  const pickLayers = useCallback(
+    (layers: DataLayer[]) =>
+      pushFilters(
+        layers.length === 0
+          ? removeFilter(tableUrlState.filters, "layer")
+          : setFilter(tableUrlState.filters, {
+              id: "layer",
+              value: layers,
+              variant: "multiSelect",
+              operator: "inArray",
+            })
+      ),
+    [pushFilters, tableUrlState.filters]
   )
 
   // A namespace counts as picked only when the filter names exactly one;
-  // two values typed into the toolbar are the user's own filter, and no
-  // chip claims it.
+  // two values typed into the toolbar are the user's own filter, and the
+  // picker does not claim it.
   const activeNamespaceValues = useMemo(
     () => activeFilterValues(tableUrlState.filters, "namespace"),
     [tableUrlState.filters]
   )
   const activeNamespaceId =
     activeNamespaceValues.length === 1 ? activeNamespaceValues[0] : null
-  const namespaceHref = useCallback(
+  const pickNamespace = useCallback(
     (namespaceId: string | null) =>
-      filtersHref(
+      pushFilters(
         namespaceId === null
           ? removeFilter(tableUrlState.filters, "namespace")
           : setFilter(tableUrlState.filters, {
@@ -255,7 +280,7 @@ export function CatalogPage() {
               operator: "eq",
             })
       ),
-    [filtersHref, tableUrlState.filters]
+    [pushFilters, tableUrlState.filters]
   )
   const activeNamespace =
     namespaces.status === "success" && activeNamespaceId !== null
@@ -292,11 +317,15 @@ export function CatalogPage() {
     // filter change actually refetch.
     shallow: false,
     getRowId: (row) => row.id,
+    // UX-8: the layer switch and the namespace picker show these filters,
+    // so the property bar draws no second chip for them.
+    meta: { isQuickFilter: isCatalogQuickFilter },
     initialState: {
       // `id` stays available in the column menu, filters and the row
-      // context menu; it is just noise as a column, since Name and
-      // Namespace together already identify the asset.
-      columnVisibility: { id: false, certification: false },
+      // context menu; it is just noise as a column. UX-8: Namespace joins
+      // it, since the address under each name already says the namespace;
+      // the Columns menu brings either back.
+      columnVisibility: { id: false, certification: false, namespace: false },
       // Keeps the ⋮ button reachable while the rest of the table scrolls
       // sideways — the actions are useless if you have to scroll to them.
       columnPinning: { right: ["actions"] },
@@ -316,134 +345,186 @@ export function CatalogPage() {
     [fetchNextPage, hasNextPage, isFetchingNextPage, rows.length, totalItems]
   )
 
+  const droppedCount = dropped.status === "success" ? dropped.data.length : null
+  const listShown = !error && (isLoading || supported)
+
   return (
-    <div className="flex flex-col gap-5">
-      <PageHeader
-        title="Catalog"
-        description="Every governed table and file. Search by name, column, tag, description or owner, narrow by namespace or layer, and open an asset for its schema, quality, lineage and access."
-      />
-
-      {/* `DATA-55`: the tables dropped from the console, with the days each has
-          left; each links to its page, where the restore lives. */}
-      <DroppedTablesNote />
-
-      {error ? (
-        // React Query widens whatever was thrown to `Error`; `ErrorState`
-        // branches on `ServiceError.code` (a 403 renders as a permission
-        // notice, not a generic failure), so it is narrowed back here.
-        <ErrorState
-          error={toServiceError(error)}
-          onRetry={() => void refetch()}
-        />
-      ) : !isLoading && !supported ? (
-        // A refused tenant-scoped caller gets an otherwise-200 empty page
-        // (`supported: false`), not an error — say why instead of showing
-        // an empty table that reads as "no assets exist."
-        <EmptyState
-          title="The catalog cannot list assets for you"
-          description={
-            unsupportedReason ??
-            "The API answered that listing assets is not supported for this account, and gave no reason."
-          }
-        />
-      ) : isLoading ? (
-        <DataTableSkeleton
-          columnCount={columns.length - hiddenByWidth.length}
-          rowCount={8}
-          filterCount={2}
-        />
-      ) : (
-        <DataTable
-          table={table}
-          groupSummaries={groupSummaries}
-          infinite={infiniteState}
-          onRowClick={openAsset}
-          // Same list the ⋮ button renders, from `getAssetActions` — the
-          // two menus cannot drift apart because only the markup differs.
-          // Right-click stays as the shortcut for people who know it;
-          // the pinned column is what makes the actions discoverable.
-          renderRowContextMenu={(row) => (
+    // The search, the ⋯ and the no-match Reset write the table's own URL
+    // keys, named by the table; the toolbar provides them to its own row, and
+    // this provides them to the rest of the page.
+    <DataTableQueryKeysProvider
+      keys={table.options.meta?.queryKeys}
+      paginationMode={table.options.meta?.paginationMode}
+      resetExtraKeys={table.options.meta?.memoryKeys}
+    >
+      <div className="flex min-w-0 flex-col gap-3">
+        {/* The page frame (`DESIGN.md` §3): title left; search, ⋯ and the
+            primary on the right, every control 32 px, one row. No
+            description under the title (plan decision 1). */}
+        <header className="flex min-w-0 items-center gap-2">
+          <h1 className="mr-2 shrink-0 text-xl leading-8 font-semibold tracking-tight">Catalog</h1>
+          <div aria-hidden className="flex-1" />
+          {/* With no list to act on (refused, failed, unsupported) the search
+              and the ⋯ would do nothing, so only the title and the state show. */}
+          {listShown ? (
             <>
-              {getAssetActions(row, { onOpen: openAsset }).map((action) => (
-                <React.Fragment key={action.id}>
-                  {action.separatorBefore ? <ContextMenuSeparator /> : null}
-                  <ContextMenuItem onSelect={action.onSelect}>
-                    <action.icon />
-                    {action.label}
-                  </ContextMenuItem>
-                </React.Fragment>
-              ))}
-            </>
-          )}
-        >
-          <DataTableAdvancedToolbar
-            table={table}
-            onRefresh={() => void refetch()}
-            exportName="Catalog"
-          >
-            <DataTableSearch placeholder="Search by name, column, tag, description or owner…" />
-          </DataTableAdvancedToolbar>
-          <div className="flex flex-col gap-2">
-            <NamespaceFilterRow
-              state={namespaces}
-              activeId={activeNamespaceId}
-              hrefFor={namespaceHref}
-            />
-            <QuickFilterRow label="Layer">
-              <Button
-                size="sm"
-                variant={activeLayers.length === 0 ? "secondary" : "ghost"}
-                render={
-                  <Link
-                    href={filtersHref(removeFilter(tableUrlState.filters, "layer"))}
-                  />
+              <CatalogSearch />
+              <DataTableSettingsMenu
+                table={table}
+                variant="page"
+                label="More catalog actions"
+                onRefresh={() => void refetch()}
+                exportName="Catalog"
+                extraItems={
+                  // `DATA-55`: offered while there is something to open, and when
+                  // the list could not be read (the dialog says so, with a Retry).
+                  (droppedCount !== null && droppedCount > 0) || dropped.status === "error" ? (
+                    <DropdownMenuItem onSelect={() => setDroppedOpen(true)}>
+                      <Trash2 className="text-muted-foreground" />
+                      Dropped tables
+                      {droppedCount !== null ? (
+                        <span className="ml-auto text-xs text-muted-foreground tabular-nums">{droppedCount}</span>
+                      ) : null}
+                    </DropdownMenuItem>
+                  ) : null
                 }
-              >
-                All
-              </Button>
-              {QUICK_LAYERS.map((layer) => {
-                const active = activeLayers.includes(layer)
-                return (
-                  <Button
-                    key={layer}
-                    size="sm"
-                    variant={active ? "secondary" : "ghost"}
-                    aria-pressed={active}
-                    className={cn("shrink-0", active && "font-semibold")}
-                    render={
-                      <Link
-                        href={filtersHref(
-                          toggleFilterValue(tableUrlState.filters, "layer", layer)
-                        )}
-                      />
-                    }
-                  >
-                    {DATA_LAYER_LABEL[layer]}
-                  </Button>
-                )
-              })}
-            </QuickFilterRow>
-            {activeNamespace ? (
-              <NamespaceSummary
-                namespace={activeNamespace}
-                clearHref={namespaceHref(null)}
               />
-            ) : null}
-            {hiddenLabels.length > 0 ? (
-              // Said out loud rather than left as a mystery: columns vanish
-              // as the window narrows, and without this the table simply
-              // looks like it lost data. The filters are still there
-              // (DATA-24), so it says so.
-              <p className="text-xs text-muted-foreground">
-                {hiddenLabels.join(", ")}{" "}
-                {hiddenLabels.length === 1 ? "is" : "are"} hidden at this
-                window width — widen the window, or open an asset to see
-                everything. The filters still work.
-              </p>
-            ) : null}
+            </>
+          ) : null}
+          {hasPermission("connector:manage") ? <AddDataButton /> : null}
+        </header>
+
+        {error ? (
+          // React Query widens whatever was thrown to `Error`; `ErrorState`
+          // branches on `ServiceError.code` (a 403 renders as a permission
+          // notice, not a generic failure), so it is narrowed back here.
+          <ErrorState
+            error={toServiceError(error)}
+            onRetry={() => void refetch()}
+          />
+        ) : !isLoading && !supported ? (
+          // A refused tenant-scoped caller gets an otherwise-200 empty page
+          // (`supported: false`), not an error — say why instead of showing
+          // an empty table that reads as "no assets exist."
+          <EmptyState
+            title="The catalog cannot list assets for you"
+            description={
+              unsupportedReason ??
+              "The API answered that listing assets is not supported for this account, and gave no reason."
+            }
+          />
+        ) : (
+          <>
+            <DataTableAdvancedToolbar
+              table={table}
+              settingsMenu={false}
+              onRefresh={() => void refetch()}
+              exportName="Catalog"
+            >
+              <LayerSwitch values={activeLayers} onPick={pickLayers} className="max-sm:w-full" />
+              <NamespacePicker
+                state={namespaces}
+                activeId={activeNamespaceId}
+                onPick={pickNamespace}
+              />
+            </DataTableAdvancedToolbar>
+            {activeNamespace ? <NamespaceLine namespace={activeNamespace} /> : null}
+            {isLoading ? (
+              <CatalogTableSkeleton />
+            ) : rows.length === 0 ? (
+              <CatalogNoRows />
+            ) : (
+              <DataTable
+                table={table}
+                groupSummaries={groupSummaries}
+                infinite={infiniteState}
+                onRowClick={openAsset}
+                // Same list the ⋮ button renders, from `getAssetActions` — the
+                // two menus cannot drift apart because only the markup differs.
+                // Right-click stays as the shortcut for people who know it;
+                // the pinned column is what makes the actions discoverable.
+                renderRowContextMenu={(row) => (
+                  <>
+                    {getAssetActions(row, { onOpen: openAsset }).map((action) => (
+                      <React.Fragment key={action.id}>
+                        {action.separatorBefore ? <ContextMenuSeparator /> : null}
+                        <ContextMenuItem onSelect={action.onSelect}>
+                          <action.icon />
+                          {action.label}
+                        </ContextMenuItem>
+                      </React.Fragment>
+                    ))}
+                  </>
+                )}
+              />
+            )}
+          </>
+        )}
+      </div>
+      <DroppedTablesDialog open={droppedOpen} onOpenChange={setDroppedOpen} state={dropped} />
+    </DataTableQueryKeysProvider>
+  )
+}
+
+/**
+ * The table while the first page loads, shaped like the rows it stands for
+ * (`DESIGN.md` §3, one loading state shaped like the page): the frame and
+ * the filter row above are already the real ones, so only the rows wait.
+ */
+function CatalogTableSkeleton() {
+  return (
+    <div role="status" aria-label="Loading the catalog" className="flex flex-col">
+      <div className="flex h-10 items-center gap-6 border-b border-border px-2">
+        {["w-12", "w-10", "w-8", "w-16", "w-10"].map((w, i) => (
+          <Skeleton key={i} className={`h-3 ${w} ${i === 0 ? "mr-auto" : ""}`} />
+        ))}
+      </div>
+      {Array.from({ length: 8 }, (_, i) => (
+        <div key={i} className="flex h-[53px] items-center gap-6 border-b border-border px-2 last:border-b-0">
+          <div className="mr-auto flex flex-col gap-1.5">
+            <Skeleton className="h-3.5 w-44" />
+            <Skeleton className="h-3 w-32" />
           </div>
-        </DataTable>
-      )}
+          <Skeleton className="h-3 w-16" />
+          <Skeleton className="h-5 w-12 rounded-full" />
+          <Skeleton className="h-3 w-16" />
+          <Skeleton className="h-3 w-12" />
+          <Skeleton className="size-6 rounded-md" />
+        </div>
+      ))}
     </div>
+  )
+}
+
+/**
+ * No rows: either nothing matches what the person narrowed to, which says
+ * so and offers the toolbar's own Reset, or the catalog holds nothing yet
+ * (plan decision 5: empty and no match are designed, not the table's bare
+ * "No results.").
+ */
+function CatalogNoRows() {
+  const { canReset, reset } = useDataTableReset()
+  const searchParams = useSearchParams()
+  const search = searchParams.get("search")
+  if (canReset) {
+    return (
+      <EmptyState
+        icon={SearchX}
+        title={search ? `Nothing matches “${search}”` : "No asset matches these filters"}
+        description="Search looks at names, columns, tags, descriptions and owners."
+        action={
+          <Button variant="outline" onClick={reset}>
+            {search ? "Clear search and filters" : "Clear filters"}
+          </Button>
+        }
+      />
+    )
+  }
+  return (
+    <EmptyState
+      icon={Database}
+      title="Nothing in the catalog yet"
+      description="Tables appear here once a source has loaded them."
+    />
   )
 }
