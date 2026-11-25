@@ -509,3 +509,63 @@ GitHub Pages cannot set response headers. A meta tag cannot carry the rest, so t
 - `2b52c39c8` `WEB-5 seo(site)`: the free offer and the Organization logo, plus the length test.
 - `518da111e` `WEB-5 sec(site)`: script hashes in the CSP instead of `'unsafe-inline'`.
 - `903ae2fa9` `WEB-5 a11y(site)`: the contrast changes above, alone so it can be reverted.
+
+## 2026-11-25 TBT pass (T3b)
+
+Goal: `/` from 86 to 90 or more (mobile performance, median of 3) with no visible change. Result: **reached, `/` 86 to 91, `/id/` 91 to 93.**
+
+### Method
+
+- Builds in copies outside the repo, "before" at `e98c90a73` on :3402, "after" on :3401, each `NEXT_PUBLIC_SITE_URL=https://example.invalid bun run build`; the same Lighthouse command as T3, runs alternating between the two ports.
+- **The clock matters.** `data-tod` follows the visitor's local hour (06:00 to 17:59 is day). The VM is on UTC, so every run made between 06:00 and 18:00 UTC measures the day hero, where the LCP element is the "Free & open source" line at 2.9 s (not the headline) and the score is 68 to 71 (LCP 4.7 s). The T3 and T4 numbers were taken at night. All numbers here run Chrome with `TZ=Asia/Jakarta` (19:00 WIB, night). The day-mode LCP is a finding for the owner, see "Not done".
+- The trace (unthrottled, one run) before the change: a style recalculation of the whole page (3,674 elements, 50 ms) and a layout of 2,513 objects (45 ms) right after parsing, a restyle of 3,244 elements (32 ms) in hydration, and a restyle of all 4,400 elements (59 ms, one task) when the intro's classes left `<html>`.
+
+### Levers
+
+| # | Lever | Kept | Effect | Commit |
+| --- | --- | --- | --- | --- |
+| 1 | `content-visibility: auto` on `#governance`, `#get-started`, `#faq` (home page only), with the measured content heights as `contain-intrinsic-block-size: auto` | yes | `/` TBT median 550 to 339 ms (3 pairs, before levers 4 and the hero fix); first layout and restyle skip about 470 elements | `3ba5d2acd` |
+| 4 | The intro's rules ended in `*`, `:not(h1)` and `:nth-child()`, so removing two classes from `<html>` restyled the whole page. The five hero-copy children and the backdrop layers now carry a class the rules end on | yes | end-of-intro restyle 4,407 elements / 38 ms to none (trace); `lk-gl-wait` toggling is also free | `3e95b4c97` |
+| 2 | Pause decorative loops until seen | not tried | CSS loops off screen did not show in the top tasks of the trace, so the budget went to 1 and 4 | none |
+| 3 | Hydration split | not tried | the hydration task is 78 to 93 ms (one `v8.callFunction`), and `3b3-` (framework) 51 to 66 ms; moving static parts out of client trees needs a separate pass | none |
+
+Intrinsic heights are exact (page height equal to the pixel, and `#get-started` lands at the same `scrollY`) at 390, 768 and 1190 px wide in English and Indonesian. At other widths the estimate can be off by a few pixels until the section has been seen once (then `auto` remembers its real height). Not included: the pinned and sticky sections (depths, dashboards, open) and the viewport-height-sized ones (assistant, final, footer), because their height is not a fixed number.
+
+### Before and after (median of 3, mobile, night)
+
+| Page | Build | Performance (runs) | TBT (runs) | Speed Index | LCP |
+| --- | --- | --- | --- | --- | --- |
+| `/` | before | 88 / 86 / 86, **86** | 414 / 435 / 507, **435 ms** | 2.77 s | 1.66 s |
+| `/` | after | 91 / 90 / 94, **91** | 348 / 381 / 258, **348 ms** | 2.79 s | 1.66 s |
+| `/id/` | before | 93 / 89 / 91, **91** | 279 / 425 / 362, **362 ms** | 1.66 s | 1.66 s |
+| `/id/` | after | 93 / 94 / 92, **93** | 279 / 258 / 321, **279 ms** | 1.66 s | 1.66 s |
+
+Earlier interleaved sets, for the spread (the VM is shared): `/` before 89 / 81 / 83 (TBT 409 / 728 / 550), with lever 1 only 90 / 92 / 91 (348 / 314 / 339); a later set of `/` with levers 1 and 4 and the hero fix 92 / 87 / 87 (314 / 461 / 469) against 82 / 85 / 88 before (593 / 540 / 425). Single runs swing by 40 to 100 ms; the medians favour the new build every time. Accessibility, SEO and best practices were 100 in every run.
+
+### Checks
+
+- `typecheck`, `lint` and `bun test src` (94 tests) pass; `bun run size`: 193.8 KB initial JS (budget 200).
+- Zero CSP violations and zero console errors after scrolling to the bottom (`/` at 1190, `/id/` at 390, and both with `lk-gl` preset), over CDP; the inline-script hash step now covers 39 scripts.
+- Page heights equal before and after: 14,799 / 14,864 px (EN / ID at 1190) and 16,549 / 16,760 px (390). `/#get-started` (and the "Install it" click) lands at `scrollY` 11,362 at 1190 and 12,555 / 12,683 at 390, in both builds.
+- Pixel comparison, reduced motion (settled), top plus 8 scroll positions, EN and ID, 1190x800 and 390x844 (two builds of the same code differ by 0 pixels): layout rectangles are identical (hero copy rects equal to 0.01 px). Remaining differences are raster only: text anti-aliasing at the top of the 1190 page, and in the governance section content snapped one pixel differently (`content-visibility` paints a section in its own coordinates). 390 ID has 46 differing pixels in one frame, all other frames at 390 differ by up to 6,900 pixels in one or two frames of text edges. No element moved.
+
+### Not done (would need the owner, or a visible change)
+
+- `content-visibility` on assistant, open, final and the footer: their heights follow the viewport height and width (final is 825 px at 1190x800 and 900 px at 1440x900), so the page would be a few pixels off until each had been seen.
+- **Day-mode LCP:** between 06:00 and 18:00 local time the LCP is the reassurance line (the hero headline's first paint is smaller than that line's), so a daytime visitor's LCP is about 2.9 s real, 4.7 s simulated. A fix needs the line to paint with the headline, which changes the intro's beats.
+- Lazy hydration of the sections below the fold, and moving static markup out of client trees (not attempted here).
+
+### Owner QA 2026-11-25: the DOM hero, then a jump to the 3D lake (`5a6a6549e`)
+
+- **Two causes.** (a) Without the first-visit intro (a refresh in the same session, `/id/`) the scene was only requested after load and an idle period, so the DOM hero (creature, sun or moon centred) showed for seconds before the lake replaced it. (b) A race from `ce10be3d6`: the inline probe runs after the first paint, and if hydration subscribed first, `subscribeWebgl` took the slow path even on the intro's 3D path; the 1.5 s hold then timed out into the DOM beats and the lake came in later.
+- **Fix.**
+  - Race: the inline probe calls `window.__lkGLHook` when it has answered; scene-mode registers it when hydration comes first, requests the scene chunk on "yes", and gives the answer. The slow path stays as the fallback.
+  - Memory: the answer is stored in `localStorage` (`lk-gl` = `1` or `0`, in a try). On a later load with `1` (not on the first-visit intro, not under reduced motion, not without JavaScript) a second inline script adds `lk-gl-wait` to `<html>`. It hides only `[data-hero-room]` (the creature) and the sun, moon, reflection, glitter and waterline layers (`.lk-hold`); the sky and sea, headline, copy and buttons are untouched, so the LCP is the same. The probe runs one task after the first paint and, on "yes", requests the scene chunk at once.
+  - Ending: the class stays while the lake is ready (the DOM hero is faded out anyway); it is removed if the probe says no (the answer is stored as `0`), if the scene or its chunk fails, or after 4 s, and the layers fade back in with the transitions they already have (0.4 s for the creature, the day/night 0.6 s for the sun and moon, 0.4 s for the waterline). A stale `1` corrects itself on the next load.
+- **Checked in headless Chrome (no GPU, so the probe says no):**
+  - `lk-gl` unset or `0`: the creature is at full opacity from the first sample; same as before.
+  - `lk-gl` = `1`, intro seen, `/` and `/id/`: `lk-gl-wait` is on and the creature at opacity 0 for the first 100 to 200 ms, then the probe says no, the class goes, the creature fades in over 0.4 s, `lk-gl` becomes `0`.
+  - With the probe forced to say yes by a fake context (the real renderer then fails): the scene tries, falls to `none`, the class goes and the creature fades in; never stuck hidden.
+  - First visit with the intro, with and without `lk-gl`: same as before. Reduced motion with `lk-gl` = `1`: the creature is visible at once.
+  - Zero CSP violations (the new inline script is hashed by the build step); Lighthouse LCP 1.66 s in every run of the table above (a fresh profile has no `lk-gl`).
+- **Not verified here:** the 3D path itself (no GPU in the VM): the real lake appearing without a DOM hero in between, on the Mac and the iPhone; the 4 s timeout with a slow real scene.
