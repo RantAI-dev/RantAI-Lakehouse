@@ -104,6 +104,26 @@ describe("AppShellSkeleton", () => {
   })
 })
 
+// WEB-18 T5: on a conversation the sidebar is the chat list, so the loading shell draws that shape.
+describe("AppShellSkeleton on a conversation", () => {
+  it("draws the chat list's rows, with the actions that do not depend on the person for real", () => {
+    shell("/copilot")
+    const chats = document.querySelector("[data-sidebar-view='chats']") as HTMLElement
+    expect(chats).not.toBeNull()
+    expect(chats.textContent).toContain("Back to menu")
+    expect(chats.textContent).toContain("New chat")
+    expect(chats.textContent).toContain("Search")
+    // AI settings depends on a permission, so it is a grey row; the chats are grey titles.
+    expect(chats.textContent).not.toContain("AI settings")
+    expect(chats.querySelectorAll("[data-slot='skeleton']").length).toBeGreaterThan(5)
+  })
+
+  it("draws the menu elsewhere", () => {
+    shell("/catalog")
+    expect(document.querySelector("[data-sidebar-view='chats']")).toBeNull()
+  })
+})
+
 describe("the dashboard's loading placeholders", () => {
   it("draws each placeholder tile in the real soft tile's box: no border, no pill", () => {
     render(<DashboardTilesSkeleton />)

@@ -17,7 +17,11 @@ import { SidebarProvider } from "@/components/ui/sidebar"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { forgetRow, readRow, rememberRow, setRowOwner } from "@/features/dashboards/dashboards-row"
 import { readLastBoard, rememberLastBoard } from "@/features/dashboards/last-board"
-import { PRODUCT_LOGO_DARK, PRODUCT_LOGO_LIGHT, PRODUCT_NAME } from "@/lib/product-branding"
+import {
+  PRODUCT_LOGO_DARK,
+  PRODUCT_LOGO_LIGHT,
+  PRODUCT_NAME,
+} from "@/lib/product-branding"
 import { AppSidebar } from "./app-sidebar"
 
 const json = (body: unknown, status = 200) =>
@@ -25,9 +29,19 @@ const json = (body: unknown, status = 200) =>
 
 const originalFetch = global.fetch
 
-// PR #541 review SHOULD-FIX 1: the remembered row is the signed-in person's, and the session
-// below is "u1"; a test that remembers a row before the session answers names "u1" as `AuthProvider` will.
-beforeEach(() => setRowOwner("u1"))
+beforeEach(() => {
+  // PR #541 review SHOULD-FIX 1: the remembered row is the signed-in person's, and the session
+  // below is "u1"; a test that remembers a row before the session answers names "u1" as `AuthProvider` will.
+  setRowOwner("u1")
+  // happy-dom starts on `about:blank`: a relative URL has no base to
+  // resolve against, so a picture with a relative source counts as broken
+  // and the branding falls back to the product's own file. The pictures
+  // must resolve the way they do in a browser (the same setup as
+  // `public-dashboard.test.tsx`, from main's #602).
+  ;(window as unknown as { happyDOM: { setURL: (url: string) => void } }).happyDOM.setURL(
+    "http://localhost/",
+  )
+})
 
 afterEach(() => {
   cleanup()
@@ -213,7 +227,7 @@ const SESSION = {
  * rendered.
  *
  * With `hold`, the branding answer waits for `release`, so a test can look
- * at the header while the answer is still on its way.
+ * at the header while the answer is still on its way (main's #602).
  */
 function stubApi(
   branding: unknown,
@@ -261,18 +275,6 @@ function renderBranded() {
 function pictures(container: HTMLElement): HTMLImageElement[] {
   return Array.from(container.querySelectorAll("img"))
 }
-
-beforeEach(() => {
-  // happy-dom starts on `about:blank`: a relative URL has no base to
-  // resolve against, so a picture with a relative source counts as broken
-  // and the branding falls back to the product's own file. The pictures
-  // must resolve the way they do in a browser (the same setup as
-  // `public-dashboard.test.tsx`).
-  ;(window as unknown as { happyDOM: { setURL: (url: string) => void } }).happyDOM.setURL(
-    "http://localhost/",
-  )
-})
-
 
 describe("the sidebar header shows the workspace's own branding (ADM-2)", () => {
   it("shows the workspace name and logo from settings, not a fixed product name", async () => {
