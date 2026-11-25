@@ -675,8 +675,17 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // any tenant, so it cannot be reachable by someone who merely holds
     // `pipeline:read`.
     ("POST", "/api/pipelines/runnable/{id}/compile",   Policy::RequiresPermission("pipeline:read")),
+    // BLD-14 D8: the chain sensor posts one outcome per re-upload and
+    // pipeline. Same floor as `lag-check`/`compile` above (`pipeline:read`),
+    // with the same handler-side refusal: only the orchestrator's service
+    // identity (or a Platform Admin) may record a step.
+    ("POST", "/api/pipelines/runnable/{id}/chain-step", Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/source",             Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs",              Policy::RequiresPermission("pipeline:read")),
+    // BLD-14 D8: the pipeline page reads the chain's newest outcome. Same
+    // read floor as `runs`, with the same `in_scope` gate in the handler:
+    // another tenant's id is a 404, not an empty answer.
+    ("GET",  "/api/pipelines/{id}/reupload-chain",    Policy::RequiresPermission("pipeline:read")),
     // Plan 1c (R2, day-1): runs × steps matrix for the recovery UI.
     // `pipeline:read` matches `{id}/runs` and `{runId}/steps` — the
     // matrix is "runs for this pipeline" + "steps for each run"
@@ -1291,13 +1300,17 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    runs-LIST routes: no assistant tool, console page, CLI or script
     //    calls them, so their entries were removed with the routes and the
     //    paths now answer 404. `agent:manage` stays a real permission — the
-    //    headless-run handler still uses it for a manual trigger — but no
-    //    route is gated on it at the policy layer any more. ────────────────
+    //    headless-run handler still uses it for a manual trigger, and SEC-68
+    //    gates `PUT /employees/{id}/read-roles` on it at the policy layer. ──
     // `GET /employees` feeds Dagster's code-load schedule factory and
     // `GET /employees/{id}` names the employee on the retained run-detail
     // page; both are live consumers (see `routes::agents_router`).
     ("GET",  "/api/agents/employees",                Policy::RequiresAuth),
     ("GET",  "/api/agents/employees/{id}",           Policy::RequiresAuth),
+    // SEC-68: assigning an agent's explicit read grant is an agent:manage
+    // action, with the handler's own no-escalation check on top (a caller
+    // without *:*/identity:write may only grant roles it holds itself).
+    ("PUT",  "/api/agents/employees/{id}/read-roles", Policy::RequiresPermission("agent:manage")),
     // `/employees/{id}/run` (T3.2, copilot-operations-handover plan): same
     // "floor" shape as `/api/alerts/run`/`/api/gold/export/{mart}` —
     // `RequiresAuth` here, PLUS `routes::agents::check_employee_run_auth`'s

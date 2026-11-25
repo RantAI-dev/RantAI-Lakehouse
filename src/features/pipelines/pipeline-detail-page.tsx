@@ -51,6 +51,7 @@ import {
 import { RunHistoryStrip, runFill, statusLabel } from "./run-history-strip"
 import { authorChoices, readsAs } from "./pipeline-reads-as"
 import { RunInspector } from "./run-inspector"
+import { ReuploadChainNote } from "./reupload-chain-note"
 import { ScheduleHistory } from "./schedule-history"
 import { PipelineFreshnessPanel } from "./pipeline-freshness-panel"
 
@@ -584,6 +585,8 @@ export function PipelineDetailPage() {
         </TabsList>
 
         <TabsContent value="runs" className="mt-3">
+          {/* BLD-14 D8: why this pipeline did or did not run after a re-upload. */}
+          {!isDraft && p.engine === "authored" ? <ReuploadChainNote pipelineId={p.id} /> : null}
           {runsState.status === "loading" ? (
             <LoadingSkeleton rows={6} />
           ) : runsState.status === "error" ? (
