@@ -51,7 +51,8 @@
 mod common;
 
 mod agents_approval;
-mod agents_employee_ceiling;
+// WEB-4: `agents_employee_ceiling` tested the retired employee-create
+// route's `agent:manage` ceiling; the route and its tests were removed.
 mod agents_run;
 mod ai_alert_tools;
 mod ai_ask_back_turn;
@@ -65,6 +66,7 @@ mod ai_dashboard_reach;
 mod ai_embed_tools;
 mod ai_export_tools;
 mod ai_next_step;
+mod ai_prompt_size;
 mod ai_report_tools;
 mod ai_sessions;
 mod ai_sql_help;
@@ -74,9 +76,13 @@ mod ai_written_tools;
 mod alert_targets_hidden;
 mod alert_test_route;
 mod assistant_settings_route;
+mod audit_compaction;
 mod audit_coverage;
 mod audit_search;
 mod auth_password_rules;
+mod bi_only_assistant_and_preview;
+mod bi_only_in_place_catalog;
+mod bi_only_query_mode;
 mod breakdown_cap;
 mod catalog_grants;
 mod catalog_restore;
@@ -84,6 +90,7 @@ mod chart_alerts;
 mod chart_lineage_routes;
 mod chart_numbers;
 mod chart_png;
+mod client_source;
 mod column_lineage_pipeline;
 mod column_lineage_route;
 mod column_lineage_sql_source;
@@ -139,6 +146,7 @@ mod pipeline_definition_save;
 mod pipeline_lag_check;
 mod pipeline_lag_page;
 mod pipeline_preview;
+mod pipeline_reupload_chain;
 mod pipeline_routing;
 mod public_links;
 mod quality_anomalies;

@@ -522,6 +522,17 @@ services:
       GOTENBERG_URL: ${GOTENBERG_URL:-http://gotenberg:3000}
       CONSOLE_INTERNAL_URL: ${CONSOLE_INTERNAL_URL:-http://console:3000}
       RENDER_TOKEN_SECRET: ${RENDER_TOKEN_SECRET:-}
+      # SEC-75 decision B: the proxies whose `X-Forwarded-For` the API reads.
+      # Empty by default: no header is trusted, the peer is the source, and
+      # the per-source 429 is off (counts and audit compaction still run).
+      # List only an edge proxy that OVERWRITES `X-Forwarded-For` with the
+      # address it saw: then the 429 applies, and every path to the API must
+      # go through that edge. Never list the console: its Next.js `/api`
+      # rewrite forwards a client-supplied header verbatim without appending
+      # the browser's address, so a caller could choose its own source. An
+      # entry that is not a network, address or service name stops the API at
+      # start (fail closed).
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
       # RPT-1: the console as people open it, for the link in a scheduled
       # report's email (`<this>/dashboards/<id>`). An address, not a credential;
       # empty means the email carries no link.
@@ -861,15 +872,17 @@ services:
       TENANT_SITE: ${TENANT_SITE:-}
       BRONZE_CURATED_SLUGS: ${BRONZE_CURATED_SLUGS:-}
       CATALOG_NAMESPACE_META: ${CATALOG_NAMESPACE_META:-}
-      # README.md "Environment variables" + docs/OPERATIONS.md "Upgrade
-      # note": UUID of the tenant owning this deployment's single shared
-      # catalog and its Dagster-job list. Both are no-tenant-column
-      # surfaces, so with >1 seeded tenant and this unset they are refused
-      # (fail closed) for every principal without the unrestricted grant —
-      # i.e. setting the value in .env alone does nothing, this service's
-      # block must forward it to the process (config.rs reads it from env
-      # only). Empty default: an unset value degrades to the documented
-      # refusal, not a boot failure.
+      # docs/OPERATIONS.md "Upgrade note": UUID of the tenant owning this
+      # deployment's single shared catalog and its Dagster-job list. With
+      # the four seeded tenants and this unset, every principal without
+      # the unrestricted `*:*` grant is refused not only those two lists
+      # but EVERY Silver and Gold query (dashboards, Query Studio,
+      # assistant): an unclaimed shared table is readable only by the
+      # catalog tenant. Scheduled jobs (no user) get a 422 naming this
+      # setting. Setting the value in .env alone does nothing, this
+      # service's block must forward it to the process (config.rs reads
+      # it from env only). Empty default: an unset value degrades to the
+      # documented refusal, not a boot failure.
       CATALOG_TENANT_ID: ${CATALOG_TENANT_ID:-}
       # Built-in "Main" dashboard tile catalog (Task 6, lakehouse-bi::specs):
       # this compose file's default tenant has the Dispar marts, so it points
@@ -1459,7 +1472,14 @@ services:
   # no separate self-registration call is needed for `admin` here (unlike
   # the other principals, see `lakekeeper-authz-init` below).
   lakekeeper-warehouse-init:
-    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+    # REL-16: curl and jq are baked into this image at build time (see
+    # ops/init/Dockerfile), so starting the job on an air-gapped host needs
+    # no Alpine package mirror. Both `image:` and `build:` are set the same
+    # way as the other first-party images: local/CI compose builds it,
+    # `render_compose.py` replaces it with the published digest in a release.
+    image: ${LAKEHOUSE_INIT_IMAGE:-rantai-lakehouse-init:local}
+    build:
+      context: ./ops/init
     depends_on:
       lakekeeper:
         condition: service_healthy
@@ -1490,7 +1510,7 @@ services:
     command:
       - |
         set -eu
-        apk add --no-cache curl jq >/dev/null
+        # REL-16: curl and jq are in the image; no apk at start.
         base="http://lakekeeper:8181"
         admin_token="$$(cat /tokens/admin.jwt)"
         auth="Authorization: Bearer $$admin_token"
@@ -1622,7 +1642,10 @@ services:
   #   - `unauthorized-test`: registered (Lakekeeper knows who it is) but
   #     NEVER granted anything — the negative-test principal.
   lakekeeper-authz-init:
-    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+    # REL-16: same offline init image as lakekeeper-warehouse-init.
+    image: ${LAKEHOUSE_INIT_IMAGE:-rantai-lakehouse-init:local}
+    build:
+      context: ./ops/init
     depends_on:
       lakekeeper-warehouse-init:
         condition: service_completed_successfully
@@ -1697,7 +1720,7 @@ services:
     command:
       - |
         set -eu
-        apk add --no-cache curl jq >/dev/null
+        # REL-16: curl and jq are in the image; no apk at start.
         base="http://lakekeeper:8181"
         admin_token="$$(cat /tokens/admin.jwt)"
         admin_auth="Authorization: Bearer $$admin_token"
@@ -2162,7 +2185,10 @@ services:
   # and warehouse name baked into the JSON body.
   lakekeeper-warehouse-init-seaweedfs:
     profiles: ["seaweedfs"]
-    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+    # REL-16: same offline init image as lakekeeper-warehouse-init.
+    image: ${LAKEHOUSE_INIT_IMAGE:-rantai-lakehouse-init:local}
+    build:
+      context: ./ops/init
     depends_on:
       lakekeeper:
         condition: service_healthy
@@ -2188,7 +2214,7 @@ services:
     command:
       - |
         set -eu
-        apk add --no-cache curl jq >/dev/null
+        # REL-16: curl and jq are in the image; no apk at start.
         base="http://lakekeeper:8181"
         admin_token="$$(cat /tokens/admin.jwt)"
         auth="Authorization: Bearer $$admin_token"
@@ -2247,7 +2273,10 @@ services:
   # per-warehouse); this job only grants.
   lakekeeper-authz-init-seaweedfs:
     profiles: ["seaweedfs"]
-    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+    # REL-16: same offline init image as lakekeeper-warehouse-init.
+    image: ${LAKEHOUSE_INIT_IMAGE:-rantai-lakehouse-init:local}
+    build:
+      context: ./ops/init
     depends_on:
       lakekeeper-warehouse-init-seaweedfs:
         condition: service_completed_successfully
@@ -2267,7 +2296,7 @@ services:
     command:
       - |
         set -eu
-        apk add --no-cache curl jq >/dev/null
+        # REL-16: curl and jq are in the image; no apk at start.
         base="http://lakekeeper:8181"
         admin_token="$$(cat /tokens/admin.jwt)"
         admin_auth="Authorization: Bearer $$admin_token"
@@ -4223,7 +4252,13 @@ services:
   # dial in this gate connects by) so the real, unrelaxed verification
   # path is what gets exercised end-to-end, not a weakened one.
   mssql-g6-cert-init:
-    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+    # REL-16: openssl is baked into this image at build time, so this job
+    # (and the G6 gate that depends on it) no longer needs the Alpine CDN
+    # at start. Gate-only, so `render_compose.py` drops it from a release;
+    # the local/CI compose file still builds it from ops/init.
+    image: ${LAKEHOUSE_INIT_IMAGE:-rantai-lakehouse-init:local}
+    build:
+      context: ./ops/init
     profiles: ["g6", "g6-sql"]
     restart: "no"
     volumes:
@@ -4240,7 +4275,9 @@ services:
     # NOT a real security gap, an artifact of regenerating the file out
     # from under an already-running server). Skips regeneration when a
     # cert already exists in the volume.
-    # `apk add` is retried: a one-off package-mirror error failed this
+    # REL-16: openssl comes from the init image. There is no runtime
+    # package-install retry loop here any more: an offline start has no
+    # mirror to retry against, and a runtime install was what failed this
     # job and, through `depends_on`, the whole gate stack.
     # PR #192 review BLOCKER 11: mint CA cert (`ca.crt`) and server pair
     # (`mssql-g6.pem`, `mssql-g6.key`) signed by CA with basicConstraints=CA:FALSE,
@@ -4249,8 +4286,7 @@ services:
     command:
       - >
         test -f /out/ca.crt && test -f /out/mssql-g6.pem && test -f /out/mssql-g6.key ||
-        { for i in 1 2 3 4 5; do apk add --no-cache openssl >/dev/null && break; sleep 3; done;
-        command -v openssl >/dev/null &&
+        {
         openssl req -x509 -newkey rsa:2048 -nodes -days 3650
         -keyout /out/ca.key -out /out/ca.crt
         -subj "/CN=mssql-g6-ca"

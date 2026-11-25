@@ -172,6 +172,15 @@ pub struct QueryOptions {
     /// the two paths a download reads through; the buffered
     /// [`ChClient::query_with_options`] leaves the engine's own default.
     pub max_memory_usage: Option<u64>,
+    /// Server-side query parameters: `(name, value)` pairs the engine
+    /// substitutes for `{name:Type}` placeholders in the SQL, sent as
+    /// `param_<name>=<value>` URL parameters of this request only.
+    ///
+    /// A value bound this way never appears in the statement text, so a
+    /// quote or a backslash in it cannot end a literal or start an escape
+    /// (AGENTS.md: SQL values must be bound). Used by the AI conversation
+    /// store (`SEC-60`) and available to any caller that needs bound values.
+    pub params: Vec<(String, String)>,
 }
 
 /// Most progress headers one limited request may receive; hyper's client
@@ -183,6 +192,16 @@ const PROGRESS_HEADERS_MAX: u128 = 80;
 /// [`PROGRESS_HEADERS_MAX`].
 fn progress_interval_ms(limit: std::time::Duration) -> u128 {
     (limit.as_millis() / PROGRESS_HEADERS_MAX).max(1000)
+}
+
+/// `param_<name>=<value>` pairs for the engine's server-side query
+/// parameters (`SEC-60`). The keys are owned because the `param_` prefix is
+/// added here; callers keep their placeholder names unprefixed.
+fn query_param_pairs(params: &[(String, String)]) -> Vec<(String, String)> {
+    params
+        .iter()
+        .map(|(name, value)| (format!("param_{name}"), value.clone()))
+        .collect()
 }
 
 /// The `max_execution_time` URL setting for `limit`: whole seconds, rounded
@@ -275,6 +294,17 @@ impl ChClient {
             user,
             password,
         }
+    }
+
+    /// The base URL every statement from this client is sent to, exactly as
+    /// [`ChClient::new`] received it.
+    ///
+    /// The identity a [`ChTableEnsured`] tracks its answer by: two clients
+    /// with the same URL talk to the same server, and a client with another
+    /// URL has not had its tables ensured yet.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
     }
 
     /// Run `sql` and return the structured result (`FORMAT JSON`).
@@ -388,7 +418,15 @@ impl ChClient {
             "cancel_http_readonly_queries_on_client_close",
             "1".to_owned(),
         ));
-        let borrowed: Vec<(&str, &str)> = settings.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        // Bound values travel beside the settings as `param_*` URL parameters
+        // (SEC-60): the statement is the one the caller wrote, with
+        // `{name:Type}` placeholders the engine fills from these pairs.
+        let params = query_param_pairs(&options.params);
+        let borrowed: Vec<(&str, &str)> = settings
+            .iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .chain(params.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .collect();
         self.query_with_settings(sql, &borrowed, options.request_timeout(), cancel)
             .await
     }
@@ -454,6 +492,25 @@ impl ChClient {
         cancel: Option<&CancellationToken>,
     ) -> Result<Vec<Map<String, Value>>, ChError> {
         Ok(self.query(sql, cancel).await?.data)
+    }
+
+    /// Run `sql` under `options` and return only its rows. Equivalent to
+    /// `self.query_with_options(sql, options, cancel).await?.data`.
+    ///
+    /// Unlike [`ChClient::rows`], this passes bound parameters through to the
+    /// engine (`SEC-60`), so a caller whose SQL uses `{name:Type}` placeholders
+    /// can supply the values without writing them into the statement.
+    ///
+    /// # Errors
+    ///
+    /// See [`ChClient::query_with_options`].
+    pub async fn rows_with_options(
+        &self,
+        sql: &str,
+        options: &QueryOptions,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<Map<String, Value>>, ChError> {
+        Ok(self.query_with_options(sql, options, cancel).await?.data)
     }
 
     /// Run a non-`SELECT` statement (DDL/DML: `CREATE`/`INSERT`/`ALTER`)
@@ -712,6 +769,79 @@ impl ChClient {
             bytes_read: 0,
             checked_first_chunk: false,
         })
+    }
+}
+
+/// Remembers, per `ClickHouse` base URL, that a table's DDL has already run
+/// in this process.
+///
+/// The one guard every `ensure_*_table` in this workspace shares
+/// (`AGENTS.md` rule 4: one helper, not one copy per table). It is keyed by
+/// [`ChClient::url`] because a process can talk to more than one engine —
+/// `cargo test`'s single-process integration binary runs the HTTP tests
+/// against a `wiremock` stand-in and the Gold publication tests against a
+/// real `ClickHouse` container in the same process. An unkeyed flag let the
+/// stand-in's `200 OK` for the DDL mark the table as created, so the
+/// container's tests then skipped `CREATE TABLE IF NOT EXISTS` and failed
+/// with `UNKNOWN_TABLE` (`Coverage & SBOM` runs 45545437095 and
+/// 45531180507).
+///
+/// A failed attempt is never remembered, so a transient `ClickHouse` outage
+/// does not wedge every later call.
+pub struct ChTableEnsured {
+    /// The URLs whose DDL has succeeded; `None` until the first call, so
+    /// [`ChTableEnsured::new`] can be `const` for use in a `static`.
+    ensured: std::sync::OnceLock<tokio::sync::RwLock<std::collections::HashSet<String>>>,
+}
+
+impl ChTableEnsured {
+    /// A guard that has not ensured anything yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            ensured: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The set behind a lock, created on first use.
+    fn set(&self) -> &tokio::sync::RwLock<std::collections::HashSet<String>> {
+        self.ensured
+            .get_or_init(|| tokio::sync::RwLock::new(std::collections::HashSet::new()))
+    }
+
+    /// Run `ddl` unless it has already succeeded for `ch`'s URL.
+    ///
+    /// The read lock answers the common, already-ensured case. Otherwise the
+    /// write lock serialises the DDL: one caller runs it, the rest wait and
+    /// then see the URL in the set. The write lock is held across `ddl`'s
+    /// await on purpose — it is what keeps two first callers from running
+    /// the same `CREATE TABLE` at once.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `ddl` returns. The URL is only remembered after `Ok(())`, so
+    /// a failure is retried by the next call.
+    pub async fn ensure<F, Fut>(&self, ch: &ChClient, ddl: F) -> Result<(), ChError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), ChError>>,
+    {
+        if self.set().read().await.contains(ch.url()) {
+            return Ok(());
+        }
+        let mut ensured = self.set().write().await;
+        if ensured.contains(ch.url()) {
+            return Ok(());
+        }
+        ddl().await?;
+        ensured.insert(ch.url().to_owned());
+        Ok(())
+    }
+}
+
+impl Default for ChTableEnsured {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1188,6 +1318,100 @@ mod tests {
         assert!(!rendered.contains(&addr.port().to_string()));
     }
 
+    // -- ChTableEnsured: one answer per ClickHouse URL ---------------------
+
+    /// Counts DDL runs without touching a server: the helper's contract is
+    /// about whether the closure runs, not about the statement.
+    fn counting_ddl(
+        calls: &std::sync::atomic::AtomicUsize,
+    ) -> impl Fn() -> std::future::Ready<Result<(), ChError>> + '_ {
+        move || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn table_ensured_runs_the_ddl_once_per_clickhouse_url() {
+        let ensured = ChTableEnsured::new();
+        let ch = client("http://ch-one.test:8123/");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        for _ in 0..3 {
+            ensured
+                .ensure(&ch, counting_ddl(&calls))
+                .await
+                .expect("the DDL succeeds");
+        }
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn table_ensured_does_not_cache_a_failed_ddl_attempt() {
+        let ensured = ChTableEnsured::new();
+        let ch = client("http://ch-two.test:8123/");
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+
+        let first = ensured
+            .ensure(&ch, || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Err(ChError::Server(
+                    "Code: 210. Connection refused".to_owned(),
+                )))
+            })
+            .await;
+        assert!(first.is_err(), "the failure is reported, not swallowed");
+
+        ensured
+            .ensure(&ch, counting_ddl(&attempts))
+            .await
+            .expect("the retry succeeds");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the failure was not remembered: the second call ran the DDL"
+        );
+
+        ensured
+            .ensure(&ch, counting_ddl(&attempts))
+            .await
+            .expect("an ensured URL is free");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the success was remembered: the third call ran nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn table_ensured_keeps_one_answer_per_url() {
+        let ensured = ChTableEnsured::new();
+        let first_engine = client("http://ch-three.test:8123/");
+        let second_engine = client("http://ch-four.test:8123/");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        ensured
+            .ensure(&first_engine, counting_ddl(&calls))
+            .await
+            .expect("the first engine's DDL succeeds");
+        ensured
+            .ensure(&second_engine, counting_ddl(&calls))
+            .await
+            .expect("the second engine's DDL runs: its URL was never ensured");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        ensured
+            .ensure(&first_engine, counting_ddl(&calls))
+            .await
+            .expect("the first engine is still ensured");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "ensuring another URL must not forget nor repeat the first"
+        );
+    }
+
     // -- FORMAT-clause detection edge cases -------------------------------
 
     #[test]
@@ -1432,6 +1656,7 @@ mod tests {
             query_id: Some("u:r:1".to_owned()),
             quote_decimals: false,
             max_memory_usage: None,
+            params: Vec::new(),
         };
         let result = client(&server.uri())
             .query_with_options("SELECT n FROM t", &options, None)
@@ -1443,6 +1668,40 @@ mod tests {
         assert!(
             !body.contains("SETTINGS"),
             "the SQL text stays as written: {body}"
+        );
+    }
+
+    /// SEC-60: `rows_with_options` carries the same bound values through the
+    /// `query_with_options` path that SELECTs use, without writing them into
+    /// the SQL body.
+    #[tokio::test]
+    async fn rows_with_options_binds_values_without_interpolating_them_into_the_sql() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(query_param("param_q", "sea'rch\\%"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"meta":[{"name":"n","type":"UInt64"}],"data":[{"n":1}],"rows":1}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let options = QueryOptions {
+            params: vec![("q".to_owned(), "sea'rch\\%".to_owned())],
+            ..QueryOptions::default()
+        };
+        let rows = client(&server.uri())
+            .rows_with_options("SELECT n FROM t WHERE title = {q:String}", &options, None)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert!(body.contains("WHERE title = {q:String}"), "{body}");
+        assert!(
+            !body.contains("sea'rch"),
+            "the value stays out of the SQL: {body}"
         );
     }
 

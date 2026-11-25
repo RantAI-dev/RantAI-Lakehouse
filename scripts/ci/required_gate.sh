@@ -72,6 +72,14 @@
 #                         accepted. An unset, empty or malformed value, or a
 #                         map that does not place the job in a group, requires
 #                         every gate job (fail closed).
+#   SCOPE_IMAGES          `false` when the two shared images were not needed
+#                         (`changes.outputs.images_needed`, OPS-CI-FAST). Only
+#                         the exact string `false` excuses a skipped `images`
+#                         and `image-smoke`; unset, empty, `TRUE` or any other
+#                         value keeps both required (fail closed). The scope
+#                         script answers `true` for every change that can alter
+#                         either image, for a selected gate group (every gate
+#                         job `needs: images`) and for `all`.
 #   GATE_PATHS_FILE       the gate path map: its `group` lines say which group
 #                         each gate job belongs to (OPS-25 D2). Defaults to
 #                         `gate_paths.txt` next to this script.
@@ -114,6 +122,7 @@ run_gate() {
   echo "SCOPE_ALL:            $scope_all"
   echo "PUSH_PROVEN:          $push_proven"
   echo "PR_DRAFT:             $pr_draft"
+  echo "SCOPE_IMAGES:         ${SCOPE_IMAGES:-unset}"
   if [ "$pr_draft" = "true" ]; then
     echo "PR is a draft: running fast checks only (heavy Rust, Dagster, image, and gate checks skipped)."
   fi
@@ -213,6 +222,22 @@ run_gate() {
   local req_gates="$req_acceptance"
   if [ "$push_proven" = "true" ]; then
     req_gates="false"
+  fi
+
+  # OPS-CI-FAST: `images` and `image-smoke` follow the acceptance scope, minus
+  # the one case the scope script proved cannot change either image (a
+  # lakehousectl-only, test-only, bench-only, `ops/bi-only` or
+  # `ops/landing-pages` change). Only the exact string `false` removes them:
+  # the scope script answers `true` for a selected gate group (`g1-rustfs`
+  # starts the images), for `all` and for an unreadable map, and an absent or
+  # mistyped value here keeps both required.
+  local req_images="$req_acceptance"
+  if [ "$req_acceptance" = "true" ] && [ "${SCOPE_IMAGES:-}" = "false" ]; then
+    req_images="false"
+  fi
+  local req_image_smoke="$req_gates"
+  if [ "$req_images" != "true" ]; then
+    req_image_smoke="false"
   fi
 
   # OPS-25 D7: a gate job is required when its group was selected. The value
@@ -342,8 +367,11 @@ run_gate() {
   # OPS-24 D5: `images` stays required on a proven push too, because it is the
   # only writer of the image layer cache the pull requests read; only
   # `image-smoke` is excused there.
-  check_job "images" "${IMAGES_RESULT:-skipped}" "$req_acceptance"
-  check_job "image-smoke" "${IMAGE_SMOKE_RESULT:-skipped}" "$req_gates"
+  # OPS-CI-FAST: `req_images` is that same requirement minus a change proved
+  # unable to alter either image (see above); `req_image_smoke` is it minus the
+  # proven push.
+  check_job "images" "${IMAGES_RESULT:-skipped}" "$req_images"
+  check_job "image-smoke" "${IMAGE_SMOKE_RESULT:-skipped}" "$req_image_smoke"
 
   if [ "$failures" -gt 0 ]; then
     echo "ci-required gate FAILED: $failures check(s) did not meet requirements."

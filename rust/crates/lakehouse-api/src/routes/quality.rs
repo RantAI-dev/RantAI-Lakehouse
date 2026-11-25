@@ -52,7 +52,7 @@ use axum::Extension;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use lakehouse_auth::Principal;
-use lakehouse_clickhouse::{ChClient, ChError};
+use lakehouse_clickhouse::{ChClient, ChError, ChTableEnsured};
 use lakehouse_core::ApiError;
 use lakehouse_core::ident::{Ident, SqlLiteral};
 use lakehouse_store::governance::QualityRule;
@@ -708,11 +708,11 @@ fn verdict(check: &Check, row: &Map<String, Value>) -> Verdict {
 
 // ── console.quality_run ────────────────────────────────────────────────
 
-static TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+static TABLE_ENSURED: ChTableEnsured = ChTableEnsured::new();
 
 async fn ensure_table(ch: &ChClient) -> Result<(), ChError> {
     TABLE_ENSURED
-        .get_or_try_init(|| async {
+        .ensure(ch, || async {
             ch.exec("CREATE DATABASE IF NOT EXISTS console", None)
                 .await?;
             ch.exec(
@@ -737,7 +737,6 @@ async fn ensure_table(ch: &ChClient) -> Result<(), ChError> {
             .await
         })
         .await
-        .map(drop)
 }
 
 async fn record_run(
@@ -857,26 +856,28 @@ struct RunRecord {
 /// # Errors
 ///
 /// `404` when no rule has that id, and for a rule on a table the caller may
-/// not read (the same answer, so the refusal says nothing about what the
-/// deployment holds); `503` when the store or the run table cannot be read
-/// (the cause is logged, not returned).
+/// not read or that lies outside their reach (the same answer, so the refusal
+/// says nothing about what the deployment holds); `503` when the store or the
+/// run table cannot be read (the cause is logged, not returned).
 pub async fn rule_runs(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<Value>> {
-    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4
-    if let Some(reason) =
-        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await?
-    {
-        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
-    }
+    // GOV-16: the one GOV-15 gate — catalog tenant first, role table access
+    // second — so a rule on a hidden table is answered before its id is read.
+    let access = quality_table_access(&state, Some(&principal), &headers).await?;
     let rules = lakehouse_store::governance::list_quality_rules(pool(&state)?).await?;
     let rule = rules
         .iter()
         .find(|r| r.id == id)
         .ok_or_else(|| ApiError::NotFound("Quality rule not found".to_owned()))?;
+    // GOV-16: a rule on a table the role hides reads as an unknown rule id,
+    // the same 404 an id no rule has gets (`GOV-15`'s `OutOfReach::UnknownRule`).
+    if !asset_readable(&access, Some(&rule.asset)) {
+        return Err(ApiError::NotFound("Quality rule not found".to_owned()).into());
+    }
     // `SEC-20` (plan ai-118): a rule names the table it checks, so a rule on
     // a table outside the caller's reach is not there for this caller: the
     // same 404 an unknown rule id gets, so the answer says nothing about the
@@ -974,6 +975,24 @@ pub(crate) fn unreadable_table(asset: &str) -> ApiError {
         "\"{asset}\" is not a table you can read. Pick the table as \
          silver.<table>, serving.<table> or bronze.<table>."
     ))
+}
+
+/// Whether a quality/governance row's `asset` names a table the caller's role
+/// may read (`GOV-16`, the D6 rule `GOV-15` applies to the rule list).
+///
+/// One predicate for every narrowed list — the rule list, the incident list,
+/// the schedule list and the classification list — so a row hidden on one
+/// surface cannot reappear on another (AGENTS.md rule 4). A missing, empty or
+/// unqualified name is hidden from a narrowed caller: nothing proves a grant
+/// covers it (fail closed). An unrestricted caller reads every row.
+pub(crate) fn asset_readable(
+    access: &crate::table_access::TableAccess,
+    asset: Option<&str>,
+) -> bool {
+    access.is_all()
+        || asset
+            .map(str::trim)
+            .is_some_and(|asset| access.allows_key(asset))
 }
 
 /// What a person acting on quality rules, schedules or incidents may read.
@@ -1874,6 +1893,28 @@ mod tests {
             unreachable!("a JSON object literal")
         };
         row
+    }
+
+    /// GOV-16: the one predicate every narrowed quality/governance list uses.
+    #[test]
+    fn asset_readable_hides_ungranted_and_unqualified_names() {
+        let access = crate::table_access::TableAccess::Listed(
+            [("silver".to_owned(), "orders".to_owned())]
+                .into_iter()
+                .collect(),
+            std::collections::HashSet::new(),
+        );
+        assert!(asset_readable(&access, Some(" silver.orders ")));
+        assert!(!asset_readable(&access, Some("silver.customers")));
+        assert!(
+            !asset_readable(&access, Some("orders")),
+            "a bare name is hidden, not guessed at"
+        );
+        assert!(
+            !asset_readable(&access, None),
+            "a row with no name is hidden"
+        );
+        assert!(asset_readable(&crate::table_access::TableAccess::All, None));
     }
 
     /// Every documented form parses, however the operator is spaced.

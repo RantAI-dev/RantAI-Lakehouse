@@ -6,6 +6,7 @@
 //! target (`src/main.rs`) is a thin wrapper that invokes [`run`].
 #![allow(clippy::multiple_crate_versions)]
 
+pub mod audit_compaction;
 pub mod audit_coverage;
 pub mod auth;
 pub mod bounded;
@@ -17,6 +18,7 @@ pub mod cdc_oracle;
 pub mod cdc_secrets;
 pub mod cdc_setup_check;
 pub mod cdc_setup_probe;
+pub mod client_source;
 pub mod config;
 pub mod connector_deprovision;
 pub mod connector_discover;
@@ -36,6 +38,7 @@ pub mod gold_export_history;
 pub mod gold_latest_copy;
 pub mod gold_lock;
 pub mod health;
+pub mod in_place;
 pub mod internal_hosts;
 pub mod json;
 pub mod kafka_connect;
@@ -213,6 +216,18 @@ pub async fn run() -> anyhow::Result<()> {
     // hour). Without a Postgres pool it logs once and spawns nothing —
     // cleanup depends on the database being reachable.
     spawn_auth_cleanup(&state);
+    // `SEC-75` decision 3: the sweep that writes the summary rows of the
+    // closed audit-compaction windows. It runs every minute, because a
+    // window is fifteen minutes long and a summary that waits for the next
+    // hour is a summary an operator reads too late.
+    spawn_audit_compaction(&state);
+    // `SEC-75` decision B: the trusted proxies' compose service names are
+    // resolved BEFORE the first request is served — a named proxy that is
+    // not resolved yet is not trusted, and then every caller looks like
+    // the proxy — and again every five minutes after that. See
+    // `resolve_trusted_proxies` and `spawn_trusted_proxy_refresh`.
+    resolve_trusted_proxies(&state).await;
+    spawn_trusted_proxy_refresh(&state);
     spawn_trash_sweep(&state);
     // SRC-11 D5/D6: the daily removal of run log lines and attempts older
     // than 30 days.
@@ -241,12 +256,66 @@ pub async fn run() -> anyhow::Result<()> {
         .with_context(|| format!("failed to bind {addr}"))?;
     tracing::info!(%addr, "lakehouse-api listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server error")?;
+    // `SEC-75` decision B: the API is served with the peer's address, so
+    // a request's source can be told from the proxy's `X-Forwarded-For`
+    // when the proxy is trusted (see `crate::client_source`). Without the
+    // connect information every request would look like it came from the
+    // proxy, and the per-source limit would be one limit for everybody.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("server error")?;
 
     Ok(())
+}
+
+/// How often the trusted proxies' compose service names are resolved
+/// again (`SEC-75` decision B): five minutes.
+///
+/// A compose network's addresses are not fixed — a container that is
+/// recreated comes back with another one — so a name resolved once at
+/// start-up would stop matching after the next deploy. Five minutes is
+/// short enough that a restarted proxy is trusted again while an
+/// operator is still looking at it, and long enough that the resolver
+/// asks the network's DNS almost never.
+const TRUSTED_PROXY_REFRESH: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Resolve the trusted proxies' compose service names now.
+///
+/// Before the first request is served: a named proxy that is not
+/// resolved yet is not trusted, and then every caller looks like the
+/// proxy itself — one source for everybody, which is the limit this
+/// feature exists to remove.
+///
+/// A name that does not resolve is logged and skipped (see
+/// [`crate::client_source::refresh_trusted_proxies`]): the proxy is then
+/// not trusted, which is the fail-closed direction.
+async fn resolve_trusted_proxies(state: &AppState) {
+    crate::client_source::refresh_trusted_proxies(&state.trusted_proxies).await;
+}
+
+/// Resolve the trusted proxies' service names again, every
+/// [`TRUSTED_PROXY_REFRESH`].
+///
+/// The names were resolved before the server started serving (see
+/// [`resolve_trusted_proxies`]); from here on they are resolved again
+/// every five minutes, because a compose network's addresses are not
+/// fixed.
+fn spawn_trusted_proxy_refresh(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + TRUSTED_PROXY_REFRESH,
+            TRUSTED_PROXY_REFRESH,
+        );
+        loop {
+            ticker.tick().await;
+            crate::client_source::refresh_trusted_proxies(&state.trusted_proxies).await;
+        }
+    });
 }
 
 /// How often [`spawn_database_retry`] re-checks an unreachable application
@@ -1164,7 +1233,7 @@ async fn bootstrap_ingest_run_service(state: &AppState) {
 /// plan T1: the schedule's nightly run reached the router and got `401`
 /// at `auth_gate`, every night, because no identity existed for it).
 ///
-/// # Why this identity gets NO scopes
+/// # Why this identity gets exactly one scope
 ///
 /// `POST /api/gold/export/{mart}` is `Policy::RequiresAuth`
 /// (`policy::POLICY_TABLE`) — a FLOOR, not a ceiling: `auth_gate` demands
@@ -1175,17 +1244,20 @@ async fn bootstrap_ingest_run_service(state: &AppState) {
 /// `Authorization: Bearer <GOLD_EXPORT_RUN_TOKEN>` clears the floor, and
 /// `x-run-token: <GOLD_EXPORT_RUN_TOKEN>` satisfies
 /// `check_export_token`'s token branch — which is what actually gates the
-/// export. An empty [`lakehouse_auth::PermissionSet`] still authenticates
-/// (`verify_service_token` builds it from `service_identity.scopes`
-/// regardless of whether that array is empty) and satisfies
-/// `RequiresAuth`; it simply satisfies no `RequiresPermission` check.
-/// Granting this identity `gold:export` would be strictly more privilege
-/// than the route it authenticates for ever inspects — a leaked
-/// `GOLD_EXPORT_RUN_TOKEN` would then also pass every permission check
-/// keyed to `gold:export` (e.g. the per-mart publication toggle this
-/// same plan gates behind it, whose UI decision is "who may switch
-/// publishing on", not "may the scheduler flip it"), instead of only the
-/// token-matched export.
+/// export. The write route inspects no permission, so it needs no scope.
+///
+/// SEC-66 made the Gold GETs permission-gated (`gold:read`), and this same
+/// schedule calls `GET /api/gold/publications` to learn which marts are
+/// switched on. A principal with no scopes authenticates but would now be
+/// refused at `auth_gate`, so this identity is seeded with exactly
+/// `gold:read` — the narrowest grant the GETs require. It deliberately
+/// does NOT get `gold:export`: a leaked `GOLD_EXPORT_RUN_TOKEN` would
+/// then also pass every permission check keyed to `gold:export` (e.g.
+/// the per-mart publication toggle, whose UI decision is "who may switch
+/// publishing on", not "may the scheduler flip it"). Migration
+/// `0153_sec66_read_permissions.sql` grants the same single scope to the
+/// identity on an existing deployment, where this bootstrap reuses rather
+/// than rewrites the row.
 ///
 /// # What happens when `GOLD_EXPORT_RUN_TOKEN` is absent
 ///
@@ -1200,7 +1272,7 @@ async fn bootstrap_gold_export_service(state: &AppState) {
         state,
         state.config.gold_export_run_token.clone(),
         GOLD_EXPORT_SERVICE_IDENTITY_NAME,
-        Vec::new(),
+        vec!["gold:read".to_owned()],
         "GOLD_EXPORT_RUN_TOKEN",
     )
     .await;
@@ -1330,6 +1402,42 @@ async fn shutdown_signal() {
         tracing::error!(%err, "failed to install ctrl-c handler");
         std::future::pending::<()>().await;
     }
+}
+
+/// Spawn the background task that writes the summary rows of the closed
+/// audit-compaction windows (`SEC-75`, plan `adm-130`, decision 3).
+///
+/// The trail records the first failure of a source, a principal and a
+/// route per window and counts the rest; when the window has closed, one
+/// summary row says how many failures came after it. This task runs every
+/// minute (missed ticks skipped), like [`spawn_auth_cleanup`] runs every
+/// hour. An error, or storage that is not configured, is logged and never
+/// takes the process down. Without a Postgres pool, logs once and spawns
+/// nothing.
+fn spawn_audit_compaction(state: &AppState) {
+    if state.pg.is_none() {
+        tracing::warn!("no Postgres pool configured; audit-compaction sweep will not run");
+        return;
+    }
+    let state = state.clone();
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            match audit_compaction::sweep(&state).await {
+                Ok(counts) if counts.summaries > 0 || counts.deleted > 0 => tracing::info!(
+                    summaries = counts.summaries,
+                    deleted = counts.deleted,
+                    "audit compaction sweep complete",
+                ),
+                Ok(_) => {}
+                Err(err) => tracing::warn!(%err, "audit compaction sweep failed"),
+            }
+        }
+    });
 }
 
 /// Spawn the background task that periodically purges expired sessions,
@@ -1590,20 +1698,6 @@ fn warn_if_catalog_tenant_unconfigured(config: &config::Config) {
     if config.catalog_tenant_id.is_none() {
         tracing::warn!("{CATALOG_TENANT_UNCONFIGURED_WARNING}");
     }
-}
-
-/// Drop the DATA MAP cache, so the next chat turn rebuilds it.
-///
-/// The cache is one entry for the whole process, kept for two minutes, and
-/// every chat turn reads it. A test that pins the system prompt's bytes needs
-/// the map it pins to be the one its own mocks produce, so it clears the
-/// cache before it chats (`AI-32`).
-///
-/// Production behaviour is unchanged: the same cache, the same TTL and the
-/// same cache hits. This is the seam that makes the pin deterministic in one
-/// process.
-pub async fn clear_data_map_cache() {
-    routes::ai::data_map::clear_cache().await;
 }
 
 #[cfg(test)]
@@ -2643,12 +2737,13 @@ mod tests {
         }
 
         /// With `GOLD_EXPORT_RUN_TOKEN` set, boot seeds exactly one
-        /// identity (no scopes — see [`bootstrap_gold_export_service`]'s
-        /// doc comment for why) and one matching credential; the token
-        /// authenticates a real service principal that nonetheless does
-        /// NOT hold `gold:export` — the route it authenticates for is
-        /// gated by `check_export_token`'s token branch, not by that
-        /// permission (gold-publish-per-mart plan T1).
+        /// identity with only `gold:read` (see
+        /// [`bootstrap_gold_export_service`]'s doc comment for why) and one
+        /// matching credential; the token authenticates a real service
+        /// principal that can read the scheduler's publication list but
+        /// does NOT hold `gold:export` — the write route is gated by
+        /// `check_export_token`'s token branch, not by that permission
+        /// (gold-publish-per-mart plan T1; SEC-66 for the read scope).
         #[tokio::test]
         async fn bootstrap_gold_export_service_seeds_identity_and_credential() {
             let mut overrides = HashMap::new();
@@ -2670,7 +2765,7 @@ mod tests {
                     .fetch_one(pool)
                     .await
                     .expect("read the seeded identity's scopes");
-            assert_eq!(scopes, Vec::<String>::new());
+            assert_eq!(scopes, vec!["gold:read".to_owned()]);
 
             let principal = lakehouse_auth::service_token::verify_service_token(
                 pool,
@@ -2678,6 +2773,7 @@ mod tests {
             )
             .await
             .expect("the configured token must authenticate a real service principal");
+            assert!(principal.permissions.has("gold:read"));
             assert!(!principal.permissions.has("gold:export"));
         }
 
@@ -2716,6 +2812,7 @@ mod tests {
             )
             .await
             .expect("the original token must still authenticate after a second boot");
+            assert!(principal.permissions.has("gold:read"));
             assert!(!principal.permissions.has("gold:export"));
         }
 

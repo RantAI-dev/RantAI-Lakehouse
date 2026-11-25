@@ -11,6 +11,7 @@ import {
   PencilIcon,
   PlayIcon,
   RadarIcon,
+  RefreshCwIcon,
   RotateCcwIcon,
   Trash2Icon,
 } from "lucide-react"
@@ -51,6 +52,7 @@ import {
 import { RunHistoryStrip, runFill, statusLabel } from "./run-history-strip"
 import { authorChoices, readsAs } from "./pipeline-reads-as"
 import { RunInspector } from "./run-inspector"
+import { ReuploadChainNote } from "./reupload-chain-note"
 import { ScheduleHistory } from "./schedule-history"
 import { PipelineFreshnessPanel } from "./pipeline-freshness-panel"
 
@@ -146,6 +148,30 @@ function SettingsTab({ p, scheduleText }: { p: PipelineDetail; scheduleText: str
             // so one job-level boolean would not be honest (routes::pipelines).
             { label: "SLA", value: p.slaOk === null ? "Not defined per pipeline" : p.slaOk ? "OK" : "Breached" },
             { label: "Freshness", value: <FreshnessIndicator lagSeconds={p.freshnessLagSeconds} /> },
+            // BLD-12: the materialization config is a fact about the stored
+            // definition, so it belongs beside the other pipeline settings.
+            {
+              label: "Materialization",
+              value: p.kind === "incremental" ? "Incremental" : "Full rebuild",
+            },
+            ...(p.kind === "incremental"
+              ? [
+                  {
+                    label: "Strategy",
+                    value: p.incrementalStrategy === "partition_replace" ? "Replace time partitions" : "Append new rows",
+                  },
+                  { label: "Cursor column", value: p.incrementalColumn ?? "—" },
+                  ...(p.incrementalStrategy === "partition_replace"
+                    ? [
+                        {
+                          label: "Partition granularity",
+                          value: p.partitionGranularity === "month" ? "Month" : "Day",
+                        },
+                        { label: "Lookback hours", value: String(p.lookbackHours ?? 0) },
+                      ]
+                    : []),
+                ]
+              : []),
           ]}
         />
       </section>
@@ -293,13 +319,21 @@ export function PipelineDetailPage() {
       pipelineService.triggerRun(id, signal)
     )
   )
+  // BLD-12: an authored incremental pipeline can be rebuilt in full without
+  // editing its definition. The toast confirms what the launch actually does.
+  const fullRefresh = useServiceAction(
+    withNotify(
+      { success: "Full refresh launched — the whole target is being rebuilt", error: "The full refresh could not be launched" },
+      (_signal, id: string) => pipelineService.triggerPipeline(id, { fullRefresh: true })
+    )
+  )
   const pause = useServiceAction(
-    withNotify({ success: "Schedule paused", error: "The schedule could not be paused" }, (signal, id: string) =>
+    withNotify({ success: "Pipeline paused", error: "The pipeline could not be paused" }, (signal, id: string) =>
       pipelineService.pausePipeline(id, signal)
     )
   )
   const resume = useServiceAction(
-    withNotify({ success: "Schedule resumed", error: "The schedule could not be resumed" }, (signal, id: string) =>
+    withNotify({ success: "Pipeline resumed", error: "The pipeline could not be resumed" }, (signal, id: string) =>
       pipelineService.resumePipeline(id, signal)
     )
   )
@@ -374,6 +408,12 @@ export function PipelineDetailPage() {
   // cron text is stored; a cron the orchestrator never builds must not be
   // named as if it fired.
   const trigger = triggerSummary(schedule, p.targetLag)
+  // BLD-18: any automatic authored trigger can be paused. A target lag
+  // runs a freshness sensor (not the stored cron), a dependency chain runs
+  // an `_after` sensor, and a cron runs a schedule — pausing stops all
+  // three in Dagster, so none of them is a reason to hide the button.
+  const hasAutomaticTrigger =
+    authored && (schedule.kind === "cron" || isLagTrigger(trigger) || (p.dependsOn?.length ?? 0) > 0)
   const scheduleText = isLagTrigger(trigger)
     ? trigger.label
     : schedule.kind === "manual"
@@ -434,10 +474,9 @@ export function PipelineDetailPage() {
   ) : (
     <>
       {authoredMenu}
-      {/* BLD-11 review R1: D3 hides Pause for a target-lag pipeline (its
-          lag sensor is only skipped at the next orchestrator reload, F10),
-          but a pipeline that is ALREADY paused must keep Resume so an
-          operator can get it running again. */}
+      {/* BLD-18: Pause is offered for target-lag pipelines too — the API
+          now stops the freshness sensor explicitly before the reload. A
+          paused pipeline always keeps Resume so it can be turned back on. */}
       {schedulePaused ? (
         <Button
           variant="outline"
@@ -448,12 +487,12 @@ export function PipelineDetailPage() {
           }}
         >
           <PlayIcon data-icon="inline-start" />
-          {resume.status === "pending" ? "Resuming…" : "Resume schedule"}
+          {resume.status === "pending" ? "Resuming…" : "Resume"}
         </Button>
-      ) : schedule.kind === "cron" && !p.targetLag ? (
+      ) : hasAutomaticTrigger ? (
         <Button variant="outline" size="sm" disabled={pause.status === "pending"} onClick={() => setPauseOpen(true)}>
           <PauseIcon data-icon="inline-start" />
-          Pause schedule
+          Pause
         </Button>
       ) : null}
       <Button
@@ -466,6 +505,20 @@ export function PipelineDetailPage() {
         <PlayIcon data-icon="inline-start" />
         {runNow.status === "pending" ? "Launching…" : "Run now"}
       </Button>
+      {p.engine === "authored" && p.kind === "incremental" ? (
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={fullRefresh.status === "pending"}
+          onClick={async () => {
+            if (await fullRefresh.run(pipelineId)) afterLaunch(true)
+          }}
+          title="Rebuild the whole target atomically instead of applying the incremental strategy"
+        >
+          <RefreshCwIcon data-icon="inline-start" />
+          {fullRefresh.status === "pending" ? "Rebuilding…" : "Full refresh"}
+        </Button>
+      ) : null}
     </>
   )
 
@@ -579,6 +632,8 @@ export function PipelineDetailPage() {
         </TabsList>
 
         <TabsContent value="runs" className="mt-3">
+          {/* BLD-14 D8: why this pipeline did or did not run after a re-upload. */}
+          {!isDraft && p.engine === "authored" ? <ReuploadChainNote pipelineId={p.id} /> : null}
           {runsState.status === "loading" ? (
             <LoadingSkeleton rows={6} />
           ) : runsState.status === "error" ? (
@@ -707,10 +762,10 @@ export function PipelineDetailPage() {
       <ConfirmActionDialog
         open={pauseOpen}
         onOpenChange={setPauseOpen}
-        title="Pause schedule"
-        description={`Pause ${p.name}'s schedule? It will not fire until resumed.`}
+        title="Pause pipeline"
+        description={`Pause ${p.name}'s automatic runs? Its schedule, dependency sensor and target-lag sensor stop until resumed.`}
         impact="Runs already in flight continue. Run now still works while paused."
-        confirmLabel="Pause schedule"
+        confirmLabel="Pause"
         confirming={pause.status === "pending"}
         onConfirm={async () => {
           if (await pause.run(pipelineId)) {

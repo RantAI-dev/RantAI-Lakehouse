@@ -30,9 +30,6 @@ use lakehouse_bi::store::{ChartInput, InlineSql, spec_from_inline_sql};
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ident::Ident;
 use serde_json::Value;
-use testcontainers::ImageExt;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::clickhouse::ClickHouse;
 
 /// The table of the rounding rule: two `a` rows and one `b`, so an average of
 /// `a` is `1.666667` to six decimals and a maximum of it is `2`.
@@ -53,28 +50,13 @@ const SUMS_TABLE: &str = "default.bi57_sums";
 
 /// ONE `ClickHouse` per test binary (the arrangement of
 /// `tests/breakdown_cap.rs`); the container is never stopped by the test.
-static CLICKHOUSE: tokio::sync::OnceCell<(String, testcontainers::ContainerAsync<ClickHouse>)> =
+static CLICKHOUSE: tokio::sync::OnceCell<lakehouse_test_support::clickhouse::Started> =
     tokio::sync::OnceCell::const_new();
 
-async fn shared_clickhouse() -> &'static (String, testcontainers::ContainerAsync<ClickHouse>) {
+async fn shared_clickhouse() -> &'static lakehouse_test_support::clickhouse::Started {
     CLICKHOUSE
         .get_or_init(|| async {
-            // The compose service's env trio, all three required — see
-            // `tests/gold_publication.rs` for why.
-            let container = ClickHouse::default()
-                .with_env_var("CLICKHOUSE_USER", "default")
-                .with_env_var("CLICKHOUSE_PASSWORD", "")
-                .with_env_var("CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT", "1")
-                .with_tag("26.8")
-                .start()
-                .await
-                .expect("start the ClickHouse testcontainer");
-            let host = container.get_host().await.expect("container host");
-            let port = container
-                .get_host_port_ipv4(8123)
-                .await
-                .expect("container HTTP port");
-            let url = format!("http://{host}:{port}");
+            let (url, container) = lakehouse_test_support::clickhouse::start().await;
             let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
             seed(&ch).await;
             (url, container)

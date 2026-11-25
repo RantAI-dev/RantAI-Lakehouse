@@ -10,21 +10,31 @@
 //! create, 404 on a missing id, 409 on a duplicate name or a re-decided
 //! approval, 400 on a malformed body, 503 with no database pool.
 //!
-//! # Scope: no execution runtime
+//! # Scope: no general agent runtime
 //!
-//! `AgentService` has no "run this agent"/"invoke this tool" method, and
-//! this module does not add one. `listRuns`/`getRun` serve historical run
-//! *records* (seeded the same way every other Phase 2 domain seeds its
-//! fixtures) — nothing here launches an agent or a tool. See
-//! `lakehouse_store::agents`'s module doc comment.
+//! `getRun` serves a historical run *record* — nothing here launches an
+//! arbitrary agent or tool. The one real execution door is the headless
+//! employee run (`POST /api/agents/employees/{id}/run`), which dispatches
+//! only the registered copilot tools. See `lakehouse_store::agents`'s
+//! module doc comment.
 //!
-//! # Console surface removed
+//! # Retired and retained surfaces (`WEB-4`)
 //!
-//! `WS1` task 1.11 removed the Agent Workflows and Tool Registry pages:
-//! nothing executes an authored workflow, and the agent runtime never
-//! reads the tool registry. `/api/agents/workflows` still serves real
-//! `Postgres` CRUD, stays registered and `POLICY_TABLE`-classified, and is
-//! left for a later workstream to reuse or retire.
+//! `WS1` task 1.11 removed the Agent Workflows and Tool Registry pages,
+//! and `WEB-3` slice 1 removed the employee and runs-list pages. `WEB-4`
+//! audited every caller before retiring the routes those pages used:
+//! workflows (GET/POST), employee creation and the suspend/resume/revoke
+//! lifecycle, and the runs LIST had no assistant tool, console page, CLI or
+//! script caller, so their handlers, policy entries, audit entries and
+//! tests were removed with them.
+//!
+//! Three `/api/agents/employees*` routes stayed because they are **live**,
+//! not console leftovers: `GET /employees` is read at code-load by Dagster's
+//! schedule factory (`dagster/dispar_orchestrate/agent_runs.py`), `GET
+//! /employees/{id}` names the employee on the retained run-detail page, and
+//! `POST /employees/{id}/run` is the scheduled/manual trigger that same
+//! job calls. `GET /runs/{id}` stays because an assistant approval creates
+//! a real `agent_run` and `/agents/runs/[runId]` shows its trace.
 //!
 //! `GET /api/agents/tools` (WS7 item G4) no longer serves that unread
 //! `agent_tool` Postgres table — it now reflects
@@ -41,13 +51,16 @@
 
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
-use lakehouse_auth::{PermissionSet, Principal};
+// SEC-68's run-principal builder needs `PrincipalId`; WEB-4 removed the
+// retired create/lifecycle handlers that were the only users of a
+// module-level `StatusCode` (the tests import their own).
+use axum::http::HeaderMap;
+use lakehouse_auth::{PermissionSet, Principal, PrincipalId};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
+use lakehouse_store::StoreError;
 use lakehouse_store::agents::{
-    self, AgentRun, AgentWorkflow, ApprovalItem, CreateEmployeeInput, CreateWorkflowInput,
-    Decision, DigitalEmployee, LinkedApprovalRequest, RunStep,
+    self, AgentRun, ApprovalItem, Decision, DigitalEmployee, LinkedApprovalRequest, RunStep,
 };
 use lakehouse_store::audit::NewAuditEvent;
 use serde::Deserialize;
@@ -78,14 +91,6 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiErro
     serde_json::from_slice(body).map_err(|err| ApiError::BadRequest(format!("invalid JSON: {err}")))
 }
 
-fn required(field: &str, value: &str) -> Result<String, ApiError> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(ApiError::BadRequest(format!("{field} is required")));
-    }
-    Ok(trimmed.to_owned())
-}
-
 /// The detail a run's step, or a run's outcome, keeps of a tool's result.
 ///
 /// A run's detail is read by a browser on the run page, so it takes the
@@ -97,61 +102,6 @@ fn required(field: &str, value: &str) -> Result<String, ApiError> {
 /// is stored as the tool returned it.
 fn stored_tool_detail(shown: &Value) -> String {
     serde_json::to_string(shown).unwrap_or_default()
-}
-
-const VALID_AUTONOMY: [&str; 4] = ["L1", "L2", "L3", "L4"];
-
-/// `agent_employee.mode`'s `CHECK` constraint values
-/// (`0025_agent_schedule.sql`) — a headless run uses this to pick the
-/// copilot's `SYSTEM_ASK_SUFFIX`/`SYSTEM_BUILD_SUFFIX` equivalent.
-const VALID_MODE: [&str; 2] = ["ask", "build"];
-
-// ── Workflows ──────────────────────────────────────────────────────────
-
-/// `GET /api/agents/workflows`.
-///
-/// # Errors
-///
-/// 503 if no pool is configured; 500 on a database failure.
-pub async fn list_workflows(
-    State(state): State<AppState>,
-) -> ApiResult<ApiJson<Vec<AgentWorkflow>>> {
-    Ok(ApiJson(agents::list_workflows(pool(&state)?).await?))
-}
-
-/// The `POST /api/agents/workflows` body. Mirrors `CreateWorkflowInput`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateWorkflowBody {
-    name: String,
-    trigger: String,
-    #[serde(default)]
-    step_kinds: Vec<String>,
-    approval_required: bool,
-    #[serde(default)]
-    owner: Option<String>,
-}
-
-/// `POST /api/agents/workflows` — create a workflow. Returns 201.
-///
-/// # Errors
-///
-/// 400 on a malformed body or a blank required field; 409 if the name is
-/// taken; 503/500 as above.
-pub async fn create_workflow(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> ApiResult<(StatusCode, ApiJson<AgentWorkflow>)> {
-    let body: CreateWorkflowBody = parse_body(&body)?;
-    let input = CreateWorkflowInput {
-        name: required("name", &body.name)?,
-        trigger: required("trigger", &body.trigger)?,
-        step_count: i64::try_from(body.step_kinds.len()).unwrap_or(i64::MAX),
-        approval_required: body.approval_required,
-        owner: body.owner,
-    };
-    let created = agents::create_workflow(pool(&state)?, &input).await?;
-    Ok((StatusCode::CREATED, ApiJson(created)))
 }
 
 // ── Employees ──────────────────────────────────────────────────────────
@@ -185,128 +135,114 @@ pub async fn get_employee(
     Ok(ApiJson(employee))
 }
 
-/// The `POST /api/agents/employees` body. Mirrors `CreateEmployeeInput`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateEmployeeBody {
-    name: String,
-    purpose: String,
-    autonomy: String,
-    #[serde(default)]
-    allowed_tools: Vec<String>,
-    data_scope: String,
-    budget_limit: f64,
-    #[serde(default)]
-    owner: Option<String>,
-    #[serde(default)]
-    prompt: Option<String>,
-    #[serde(default)]
-    schedule_cron: Option<String>,
-    #[serde(default)]
-    mode: Option<String>,
-    #[serde(default)]
-    permissions: Option<String>,
+// WEB-4 retired `POST /api/agents/employees` (and with it the request body,
+// the `agent:manage` permission ceiling and the create-time validation).
+// The store function stays, so a future scheduler or operator tool can
+// reuse it without a migration. SEC-68's dedicated read-roles route and its
+// validation helpers below were NOT retired — they are live.
+
+/// A role set is a set: trim, drop blanks, dedupe in first-seen order so the
+/// same name is never validated or stored twice (ADM-4 D1's shape, reused
+/// here rather than re-derived — `SEC-68`).
+fn normalize_role_names(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in raw {
+        let name = name.trim();
+        if !name.is_empty() && !out.iter().any(|held| held == name) {
+            out.push(name.to_owned());
+        }
+    }
+    out
 }
 
-/// `POST /api/agents/employees` — create a digital employee. Returns 201.
+/// `SEC-68` no-escalation check for an agent's explicit read grant.
 ///
-/// # T3.2 fix: `mode` used to reach the database unvalidated
+/// 1. Every name must exist in Postgres `role` (`400` for an unknown name).
+///    Role names are readable by any authenticated user
+///    (`GET /api/identity/roles`), so answering `400` here leaks nothing.
+/// 2. A caller who is NOT unrestricted (`*:*`) and does NOT hold
+///    `identity:write` may grant ONLY roles it holds itself. This is the
+///    privilege ceiling: a person who may manage agents must not be able
+///    to let one read a table their own role hides. The `403` names the
+///    first role it tried to grant.
 ///
-/// `agent_employee.mode` carries a `CHECK (mode IN ('ask', 'build'))`
-/// constraint (`0025_agent_schedule.sql`), but nothing validated `body.mode`
-/// before this handler handed it to [`agents::create_employee`] — an
-/// invalid value (`{"mode": "sleep"}`) surfaced as a raw Postgres
-/// constraint-violation error (an opaque 500) instead of a clean 400,
-/// exactly the gap [`VALID_MODE`] closes here, the same way [`VALID_AUTONOMY`]
-/// already does for `autonomy`.
-///
-/// # The permissions never exceed the creator's (`SEC-20`, plan 97)
-///
-/// A scheduled run takes its [`PermissionSet`] from the employee's own
-/// `permissions` column and needs no `agent:manage`, so an employee holding
-/// more than its creator would let the creator read what their own roles do
-/// not allow. The route needs `agent:manage` (`POLICY_TABLE`), and
-/// [`check_permission_ceiling`] refuses every permission the creator does not
-/// hold, `*:*` included.
+/// A grant of `[]` is valid and means "reads no tables" (fail closed) —
+/// there is nothing to escalate.
 ///
 /// # Errors
 ///
-/// 400 on a malformed body, a blank required field, an unrecognized
-/// `autonomy`, an unrecognized `mode`, or a `permissions` token that is not
-/// `resource:action`; 403 when `permissions` names one the creator does not
-/// hold; 409 if the name is taken; 503/500 as above.
-pub async fn create_employee(
-    State(state): State<AppState>,
-    Extension(principal): Extension<Principal>,
-    body: Bytes,
-) -> ApiResult<(StatusCode, ApiJson<DigitalEmployee>)> {
-    let body: CreateEmployeeBody = parse_body(&body)?;
-    let autonomy = required("autonomy", &body.autonomy)?;
-    if !VALID_AUTONOMY.contains(&autonomy.as_str()) {
-        return Err(ApiError::BadRequest(format!(
-            "autonomy must be one of {VALID_AUTONOMY:?}, got {autonomy:?}"
-        ))
-        .into());
+/// `400` for an unknown role name; `403` for a role the caller does not hold;
+/// `500` (classified) if the role names cannot be read at all — a store that
+/// cannot say which roles exist must not be read as "any grant is fine".
+async fn validate_read_roles(
+    pg: &PgPool,
+    caller: &Principal,
+    requested: &[String],
+) -> Result<(), ApiError> {
+    if requested.is_empty() {
+        return Ok(());
     }
-    if let Some(mode) = &body.mode
-        && !VALID_MODE.contains(&mode.as_str())
+    // Names are bound, never formatted into the statement (rule 4).
+    let found: Vec<String> = sqlx::query_scalar("SELECT name FROM role WHERE name = ANY($1)")
+        .bind(requested)
+        .fetch_all(pg)
+        .await
+        .map_err(StoreError::from)?;
+    if found.len() != requested.len() {
+        let unknown = requested
+            .iter()
+            .find(|name| !found.iter().any(|existing| existing == *name))
+            .cloned()
+            .unwrap_or_default();
+        return Err(ApiError::BadRequest(format!(
+            "unknown role name: {}",
+            unknown.chars().take(64).collect::<String>()
+        )));
+    }
+    let may_escalate =
+        crate::routes::catalog::is_unrestricted(caller) || caller.has("identity:write");
+    if !may_escalate
+        && let Some(role) = requested
+            .iter()
+            .find(|name| !caller.role_names.iter().any(|held| held == *name))
     {
-        return Err(ApiError::BadRequest(format!(
-            "mode must be one of {VALID_MODE:?}, got {mode:?}"
-        ))
-        .into());
-    }
-    check_permission_ceiling(&principal, body.permissions.as_deref())?;
-    let input = CreateEmployeeInput {
-        name: required("name", &body.name)?,
-        purpose: required("purpose", &body.purpose)?,
-        autonomy,
-        allowed_tools: body.allowed_tools,
-        data_scope: required("dataScope", &body.data_scope)?,
-        budget_limit: body.budget_limit,
-        owner: body.owner,
-        prompt: body.prompt,
-        schedule_cron: body.schedule_cron,
-        mode: body.mode,
-        permissions: body.permissions,
-    };
-    let created = agents::create_employee(pool(&state)?, &input).await?;
-    Ok((StatusCode::CREATED, ApiJson(created)))
-}
-
-/// `SEC-20`, plan 97: refuses a `permissions` value that grants more than
-/// `creator` holds.
-///
-/// Walks the tokens [`PermissionSet::parse`] yields, because a run parses the
-/// stored column the same way. A non-blank token that does not parse as
-/// `resource:action` would grant nothing when parsed and so slip past this
-/// check unseen; it is refused with a 400 instead of being stored, which keeps
-/// the stored string equal to what was checked. [`PermissionSet::has`] answers
-/// per token, so `*:*` and `resource:*` pass only for a creator whose own
-/// grant is as wide.
-///
-/// # Errors
-///
-/// 400 for a token that is not `resource:action`; 403 naming the first
-/// permission `creator` does not hold. The name comes from the request.
-fn check_permission_ceiling(creator: &Principal, asked: Option<&str>) -> Result<(), ApiError> {
-    for token in asked.unwrap_or("").split(',') {
-        let token = token.trim();
-        if token.is_empty() {
-            continue;
-        }
-        let Some(permission) = PermissionSet::parse(token).as_strings().pop() else {
-            return Err(ApiError::BadRequest(
-                "permissions must be comma-separated resource:action pairs".to_owned(),
-            ));
-        };
-        if !creator.permissions.has(&permission) {
-            return Err(ApiError::PermissionDenied(format!(
-                "you cannot give an employee the permission {permission}, which you do not hold"
-            )));
-        }
+        return Err(ApiError::PermissionDenied(format!(
+            "you cannot grant the role {role} to an agent because you do not hold it"
+        )));
     }
     Ok(())
+}
+
+/// The `PUT /api/agents/employees/{id}/read-roles` body. A complete
+/// replacement, not a delta: omitting a role revokes it, and `[]` means the
+/// agent reads no tables at all.
+#[derive(Debug, Deserialize)]
+pub struct SetEmployeeReadRolesBody {
+    roles: Vec<String>,
+}
+
+/// `PUT /api/agents/employees/{id}/read-roles` — set an employee's explicit
+/// table-access grant (`SEC-68`). Needs `agent:manage` (`POLICY_TABLE`) AND
+/// passes [`validate_read_roles`]'s unknown-name and no-escalation checks.
+/// The central audit writer records the change under `agent.read_roles.set`.
+///
+/// # Errors
+///
+/// `400` on a malformed body or an unknown role name; `403` when a restricted
+/// caller names a role it does not hold; `404` if `id` is unknown; `503` with
+/// no Postgres pool; `500` (classified) on a storage failure.
+pub async fn set_employee_read_roles(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<DigitalEmployee>> {
+    let body: SetEmployeeReadRolesBody = parse_body(&body)?;
+    let roles = normalize_role_names(&body.roles);
+    let pg = pool(&state)?;
+    validate_read_roles(pg, &principal, &roles).await?;
+    let result = agents::set_employee_read_roles(pg, &id, &roles).await;
+    map_transition_result(&id, result)
 }
 
 fn map_transition_result(
@@ -322,44 +258,11 @@ fn map_transition_result(
     }
 }
 
-/// `POST /api/agents/employees/{id}/suspend`.
-///
-/// # Errors
-///
-/// 404 if `id` is unknown; 503/500 as above.
-pub async fn suspend_employee(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<ApiJson<DigitalEmployee>> {
-    let result = agents::suspend_employee(pool(&state)?, &id).await;
-    map_transition_result(&id, result)
-}
-
-/// `POST /api/agents/employees/{id}/resume`.
-///
-/// # Errors
-///
-/// 404 if `id` is unknown; 503/500 as above.
-pub async fn resume_employee(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<ApiJson<DigitalEmployee>> {
-    let result = agents::resume_employee(pool(&state)?, &id).await;
-    map_transition_result(&id, result)
-}
-
-/// `POST /api/agents/employees/{id}/revoke`.
-///
-/// # Errors
-///
-/// 404 if `id` is unknown; 503/500 as above.
-pub async fn revoke_employee(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<ApiJson<DigitalEmployee>> {
-    let result = agents::revoke_employee(pool(&state)?, &id).await;
-    map_transition_result(&id, result)
-}
+// WEB-4 retired the `{id}/{suspend,resume,revoke}` lifecycle routes (no
+// caller outside the removed console pages). The store functions stay, so a
+// future scheduler or operator tool can reuse them without a migration.
+// The `map_transition_result` helper above is retained: SEC-68's
+// `PUT /employees/{id}/read-roles` still needs it.
 
 // ── Tools ──────────────────────────────────────────────────────────────
 
@@ -460,49 +363,23 @@ pub async fn list_tools(
 
 // ── Runs ───────────────────────────────────────────────────────────────
 
-/// Query parameters shared by `GET /api/agents/runs` and
-/// `GET /api/agents/approvals`.
+/// Query parameters for `GET /api/agents/approvals`.
+///
+/// The runs LIST was retired by WEB-4 (no caller), so this filter is now
+/// only the approvals inbox's `?employeeId=`.
 #[derive(Debug, Deserialize)]
 pub struct EmployeeQuery {
     /// `?employeeId=<id>` — restrict to one employee.
     employee_id: Option<String>,
 }
 
-/// `GET /api/agents/runs?employeeId=` — mirrors `AgentService::listRuns`.
-///
-/// `SEC-20` (plan ai-118): a run belongs to the deployment, not to a tenant
-/// — `agent_employee` has no tenant column and its `owner` is free text — so
-/// the shared catalog's own rule decides who reads the run history: the
-/// tenant that owns the shared catalog, or an unrestricted caller. A caller
-/// the rule refuses gets the empty list, so the answer says nothing about
-/// what the deployment ran.
-///
-/// # Errors
-///
-/// 503 if no pool is configured; 500 on a database failure.
-pub async fn list_runs(
-    State(state): State<AppState>,
-    Extension(principal): Extension<Principal>,
-    headers: HeaderMap,
-    Query(query): Query<EmployeeQuery>,
-) -> ApiResult<ApiJson<Vec<AgentRun>>> {
-    if crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers)
-        .await?
-        .is_some()
-    {
-        return Ok(ApiJson(Vec::new()));
-    }
-    Ok(ApiJson(
-        agents::list_runs(pool(&state)?, query.employee_id.as_deref()).await?,
-    ))
-}
-
 /// `GET /api/agents/runs/{id}`.
 ///
 /// `SEC-20` (plan ai-118): the run history is the deployment's, so the
-/// shared catalog's own rule decides who reads it (see [`list_runs`]). A
-/// caller the rule refuses gets the unknown 404, so the answer says nothing
-/// about whether the run exists.
+/// shared catalog's own rule decides who reads it. A caller the rule
+/// refuses gets the unknown 404, so the answer says nothing about whether
+/// the run exists. This route stays: an assistant approval creates a real
+/// `agent_run` and `/agents/runs/[runId]` shows its trace (`WEB-3` D3).
 ///
 /// # Errors
 ///
@@ -1011,12 +888,84 @@ enum RunAuth {
 /// the live principal the auth middleware built for this request, so
 /// `RunAuth::Principal` hands it back by reference and `RunAuth::Token`
 /// (a schedule or service token, with no interactive user behind it)
-/// yields `None`. `run_headless_loop` forwards this same value to every
-/// `ai_tools::run_tool` call for the run's whole duration.
+/// yields `None`. `SEC-68` now derives the run's actual tool principal from
+/// the employee's read grant instead, so this stays for the auth-shape
+/// tests only.
+#[cfg(test)]
 fn principal_for_run_auth(auth: &RunAuth) -> Option<&Principal> {
     match auth {
         RunAuth::Token => None,
         RunAuth::Principal(p) => Some(p),
+    }
+}
+
+/// `SEC-68`: the role names an agent run uses for table access, derived from
+/// the agent's OWN explicit grant — never from whatever the trigger happens
+/// to carry.
+///
+/// * A scheduled/service run (`RunAuth::Token`, no caller) uses strictly
+///   `grant`.
+/// * An unrestricted caller (`*:*`) or one holding `identity:write` also
+///   uses `grant` in full — they are allowed to manage agents whose tables
+///   exceed their own role's.
+/// * Any other human is intersected with the grant: the run can read only
+///   roles the human actually holds AND the agent was granted.
+/// * An empty result becomes [`NO_GRANT_ROLE`], a name no role carries, so
+///   every `for_roles` call site resolves it to ZERO tables. That is the
+///   fail-closed case: a grant-less agent run never becomes `All`.
+///
+/// [`NO_GRANT_ROLE`]: crate::table_access::NO_GRANT_ROLE
+fn effective_read_roles(grant: &[String], caller: Option<&Principal>) -> Vec<String> {
+    let may_exceed = caller.is_some_and(|principal| {
+        crate::routes::catalog::is_unrestricted(principal) || principal.has("identity:write")
+    });
+    let mut roles: Vec<String> = match caller {
+        None => grant.to_vec(),
+        Some(_) if may_exceed => grant.to_vec(),
+        Some(human) => grant
+            .iter()
+            .filter(|role| human.role_names.iter().any(|held| held == *role))
+            .cloned()
+            .collect(),
+    };
+    roles.dedup();
+    if roles.is_empty() {
+        vec![crate::table_access::NO_GRANT_ROLE.to_owned()]
+    } else {
+        roles
+    }
+}
+
+/// The [`Principal`] an agent run acts as for every tool call (`SEC-68`).
+///
+/// A human-triggered run keeps the human's identity, permissions and tenants
+/// (so tenant scoping and audit stay truthful) but carries the narrowed
+/// [`effective_read_roles`] as its role names. A scheduled run has no caller,
+/// so it gets a synthetic service principal carrying the same roles and the
+/// employee's own permission ceiling — tools that require a principal can
+/// now run, but only within the grant. Audit identity is derived separately
+/// from [`RunAuth`] and is unaffected.
+fn build_run_principal(
+    auth: &RunAuth,
+    roles: Vec<String>,
+    perms: &PermissionSet,
+    actor_label: &str,
+) -> Principal {
+    match auth {
+        RunAuth::Principal(human) => {
+            let mut run = human.clone();
+            run.role_names = roles;
+            run
+        }
+        RunAuth::Token => Principal {
+            id: PrincipalId::Service(Uuid::nil()),
+            tenant_ids: Vec::new(),
+            display_name: actor_label.to_owned(),
+            permissions: perms.clone(),
+            provider: "service".to_owned(),
+            must_change_password: false,
+            role_names: roles,
+        },
     }
 }
 
@@ -1974,13 +1923,22 @@ pub async fn run_employee(
 
     let (trigger, principal_id, principal_kind, actor) =
         run_employee_audit_identity(&auth, &config.name);
-    let principal = principal_for_run_auth(&auth);
+    let perms = PermissionSet::parse(&config.permissions);
+    let is_build = config.mode == "build";
+
+    // SEC-68: table access for this run comes from the agent's OWN explicit
+    // grant, narrowed further by a restricted human trigger. Resolve it
+    // BEFORE the run starts: a store that cannot say what the grant reads is
+    // a refusal (500, no upstream text), never an implicit "all tables".
+    let roles = effective_read_roles(
+        &config.read_roles,
+        principal.as_ref().map(|Extension(principal)| principal),
+    );
+    let run_principal = build_run_principal(&auth, roles, &perms, &actor);
+    crate::table_access::for_principal(state.pg.as_deref(), &run_principal).await?;
 
     let run_id = format!("run-emp-{}", Uuid::new_v4());
     agents::create_run(pg, &run_id, &id, trigger, &actor).await?;
-
-    let perms = PermissionSet::parse(&config.permissions);
-    let is_build = config.mode == "build";
 
     let outcome = run_headless_loop(
         &state,
@@ -1989,7 +1947,7 @@ pub async fn run_employee(
         &prompt,
         is_build,
         &perms,
-        principal,
+        Some(&run_principal),
         principal_id,
         principal_kind,
         &actor,
@@ -2016,7 +1974,7 @@ mod tests {
     use std::collections::HashMap;
 
     use axum::body::to_bytes;
-    use axum::http::Request;
+    use axum::http::{Request, StatusCode};
     use lakehouse_auth::PrincipalId;
     use serde_json::Value;
     use tower::ServiceExt;
@@ -2032,12 +1990,13 @@ mod tests {
 
     #[tokio::test]
     async fn every_database_backed_route_returns_503_without_a_pool() {
+        // Only the routes WEB-4 kept: the retired workflows, employee
+        // create/lifecycle and runs-list paths are asserted 404 in
+        // `tests/route_auth.rs`'s WEB-4 regression instead.
         let paths = [
-            "/api/agents/workflows",
             "/api/agents/employees",
             "/api/agents/employees/emp-x",
             "/api/agents/tools",
-            "/api/agents/runs",
             "/api/agents/runs/run-x",
             "/api/agents/approvals",
         ];
@@ -2104,22 +2063,149 @@ mod tests {
         );
     }
 
+    // ── SEC-68: runtime narrowing and grant validation ──────────────────
+
+    fn principal_with(permissions: &str, roles: &[&str]) -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(7)),
+            tenant_ids: Vec::new(),
+            display_name: "Tester".to_owned(),
+            permissions: PermissionSet::parse(permissions),
+            provider: "local".to_owned(),
+            must_change_password: false,
+            role_names: roles.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
+    fn grant(roles: &[&str]) -> Vec<String> {
+        roles.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// SEC-68 D1: a grant-less scheduled run carries the sentinel role, so
+    /// `for_roles` resolves it to ZERO tables — never `All`.
     #[test]
-    fn create_employee_body_rejects_unknown_autonomy() {
-        let body = CreateEmployeeBody {
-            name: "n".to_owned(),
-            purpose: "p".to_owned(),
-            autonomy: "L9".to_owned(),
-            allowed_tools: vec![],
-            data_scope: "d".to_owned(),
-            budget_limit: 0.0,
-            owner: None,
-            prompt: None,
-            schedule_cron: None,
-            mode: None,
-            permissions: None,
-        };
-        assert!(!VALID_AUTONOMY.contains(&body.autonomy.as_str()));
+    fn a_grantless_scheduled_run_carries_the_no_grant_sentinel() {
+        assert_eq!(
+            effective_read_roles(&[], None),
+            vec![crate::table_access::NO_GRANT_ROLE.to_owned()]
+        );
+    }
+
+    /// SEC-68 D2: a scheduled run uses strictly its own grant; an empty grant
+    /// fails closed even when the trigger is a restricted human.
+    #[test]
+    fn a_scheduled_run_uses_only_the_agents_grant() {
+        assert_eq!(
+            effective_read_roles(&grant(&["Finance"]), None),
+            grant(&["Finance"])
+        );
+        assert_eq!(
+            effective_read_roles(&[], Some(&principal_with("agent:manage", &[]))),
+            vec![crate::table_access::NO_GRANT_ROLE.to_owned()]
+        );
+    }
+
+    /// SEC-68 D3: a restricted human cannot widen an agent past its grant OR
+    /// its own roles; an admin/identity writer keeps the whole grant.
+    #[test]
+    fn a_restricted_human_is_intersected_with_the_grant() {
+        let human = principal_with("agent:manage", &["Finance"]);
+        assert_eq!(
+            effective_read_roles(&grant(&["Finance", "HR"]), Some(&human)),
+            grant(&["Finance"])
+        );
+        let admin = principal_with("*:*", &["Finance"]);
+        assert_eq!(
+            effective_read_roles(&grant(&["Finance", "HR"]), Some(&admin)),
+            grant(&["Finance", "HR"])
+        );
+        let identity_writer = principal_with("identity:write", &[]);
+        assert_eq!(
+            effective_read_roles(&grant(&["HR"]), Some(&identity_writer)),
+            grant(&["HR"])
+        );
+    }
+
+    /// The tool principal carries the narrowed roles while keeping the
+    /// human's identity, and a scheduled run gets a synthetic service
+    /// principal bounded by the employee's permission ceiling.
+    #[test]
+    fn the_run_principal_carries_the_narrowed_roles() {
+        let human = principal_with("agent:manage, query:read", &["Finance"]);
+        let auth = RunAuth::Principal(human);
+        let run = build_run_principal(&auth, grant(&["Finance"]), &PermissionSet::parse(""), "x");
+        assert_eq!(run.role_names, grant(&["Finance"]));
+        assert_eq!(run.id, PrincipalId::User(Uuid::from_u128(7)));
+        assert!(run.has("query:read"));
+
+        let run = build_run_principal(
+            &RunAuth::Token,
+            grant(&[crate::table_access::NO_GRANT_ROLE]),
+            &PermissionSet::parse("query:read"),
+            "Scheduled Agent",
+        );
+        assert_eq!(run.id, PrincipalId::Service(Uuid::nil()));
+        assert_eq!(run.role_names, grant(&[crate::table_access::NO_GRANT_ROLE]));
+        assert!(run.has("query:read"));
+    }
+
+    async fn seed_role(pool: &PgPool, name: &str, permissions: &str) {
+        sqlx::query(
+            "INSERT INTO role (name, permissions) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING",
+        )
+        .bind(name)
+        .bind(permissions)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// An unknown role name is a 400, whatever the caller's own roles.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_unknown_role_name_is_a_bad_request(pool: PgPool) -> sqlx::Result<()> {
+        let admin = principal_with("identity:write", &[]);
+        let err = validate_read_roles(&pool, &admin, &["No Such Role".to_owned()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+        Ok(())
+    }
+
+    /// SEC-68 no-escalation: a restricted `agent:manage` caller may grant a
+    /// role it holds, but not one it does not.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_restricted_caller_cannot_grant_a_role_it_does_not_hold(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        seed_role(&pool, "Finance", "query:read").await;
+        seed_role(&pool, "HR", "query:read").await;
+        let manager = principal_with("agent:manage", &["Finance"]);
+        assert!(
+            validate_read_roles(&pool, &manager, &["Finance".to_owned()])
+                .await
+                .is_ok()
+        );
+        let err = validate_read_roles(&pool, &manager, &["HR".to_owned()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::PermissionDenied(_)), "{err:?}");
+        Ok(())
+    }
+
+    /// A caller holding `identity:write` may grant any EXISTING role, and an
+    /// empty grant is always valid (it means "reads no tables").
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_identity_writer_may_grant_any_existing_role(pool: PgPool) -> sqlx::Result<()> {
+        seed_role(&pool, "HR", "query:read").await;
+        let admin = principal_with("identity:write", &[]);
+        assert!(
+            validate_read_roles(&pool, &admin, &["HR".to_owned()])
+                .await
+                .is_ok()
+        );
+        let restricted = principal_with("agent:manage", &[]);
+        assert!(validate_read_roles(&pool, &restricted, &[]).await.is_ok());
+        Ok(())
     }
 
     #[test]
@@ -2310,28 +2396,6 @@ mod tests {
         assert_eq!(principal_id, None);
         assert_eq!(principal_kind, "schedule");
         assert_eq!(actor, "Nightly Ingest Bot");
-    }
-
-    /// D (T3.2's fix): `create_employee` must validate `mode` the same way
-    /// it already validates `autonomy` — an unrecognized value never
-    /// reaches `agents::create_employee` to surface as a raw DB `CHECK`
-    /// violation.
-    #[test]
-    fn create_employee_body_rejects_unknown_mode() {
-        let body = CreateEmployeeBody {
-            name: "n".to_owned(),
-            purpose: "p".to_owned(),
-            autonomy: "L1".to_owned(),
-            allowed_tools: vec![],
-            data_scope: "d".to_owned(),
-            budget_limit: 0.0,
-            owner: None,
-            prompt: None,
-            schedule_cron: None,
-            mode: Some("sleep".to_owned()),
-            permissions: None,
-        };
-        assert!(!VALID_MODE.contains(&body.mode.as_deref().unwrap()));
     }
 
     fn admin_perms() -> PermissionSet {
@@ -2603,7 +2667,7 @@ mod tests {
 
             let state = state_for(&pool, &server.uri());
 
-            let input = CreateEmployeeInput {
+            let input = store_agents::CreateEmployeeInput {
                 name: "budget-test-employee".to_owned(),
                 purpose: "p".to_owned(),
                 autonomy: "L2".to_owned(),
@@ -2615,6 +2679,7 @@ mod tests {
                 schedule_cron: None,
                 mode: Some("build".to_owned()),
                 permissions: Some("*:*".to_owned()),
+                read_roles: Vec::new(),
             };
             let employee = store_agents::create_employee(&pool, &input).await.unwrap();
             store_agents::create_run(&pool, "run-budget-1", &employee.id, "manual", "tester")
@@ -2682,7 +2747,7 @@ mod tests {
 
             let state = state_for(&pool, &server.uri());
 
-            let input = CreateEmployeeInput {
+            let input = store_agents::CreateEmployeeInput {
                 name: "under-budget-employee".to_owned(),
                 purpose: "p".to_owned(),
                 autonomy: "L2".to_owned(),
@@ -2694,6 +2759,7 @@ mod tests {
                 schedule_cron: None,
                 mode: Some("build".to_owned()),
                 permissions: Some("*:*".to_owned()),
+                read_roles: Vec::new(),
             };
             let employee = store_agents::create_employee(&pool, &input).await.unwrap();
             store_agents::create_run(&pool, "run-budget-2", &employee.id, "manual", "tester")
@@ -2755,7 +2821,7 @@ mod tests {
 
             let state = state_for(&pool, &server.uri());
 
-            let input = CreateEmployeeInput {
+            let input = store_agents::CreateEmployeeInput {
                 name: "unconfigured-budget-employee".to_owned(),
                 purpose: "p".to_owned(),
                 autonomy: "L2".to_owned(),
@@ -2767,6 +2833,7 @@ mod tests {
                 schedule_cron: None,
                 mode: Some("build".to_owned()),
                 permissions: Some("*:*".to_owned()),
+                read_roles: Vec::new(),
             };
             let employee = store_agents::create_employee(&pool, &input).await.unwrap();
             store_agents::create_run(&pool, "run-budget-3", &employee.id, "manual", "tester")

@@ -37,7 +37,9 @@ use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ident::{Ident, SqlLiteral};
 use lakehouse_store::PgPool;
 use lakehouse_store::governance;
+use lakehouse_trino::TrinoClient;
 
+use crate::config::QueryEngine;
 use crate::sql_rewrite::{self, ObligationsSource, SystemTablesCatalog, TableObligations};
 use crate::state::AppState;
 
@@ -368,8 +370,11 @@ pub async fn rewrite_sql_for_roles_reporting<D: Dialect + Sync>(
     placeholders: &sql_rewrite::PlaceholderValues,
     obligations_source: &PolicyEngineObligations<'_>,
 ) -> Result<RoleRewrite, EnforcementError> {
-    let tables =
-        sql_rewrite::referenced_tables(sql, dialect).ok_or(PolicyEngineError::Unparseable)?;
+    // Both keys per table: a policy authored on a 3-part external catalog
+    // binds to that catalog only, while a 2-part policy still binds to the
+    // same table in every catalog (`BI-44` slice 2).
+    let keys =
+        sql_rewrite::referenced_table_keys(sql, dialect).ok_or(PolicyEngineError::Unparseable)?;
     // GOV-7 D5: what the principal may read at all is settled BEFORE any
     // obligation is prefetched, so a hidden table never reaches the mask
     // path (which would answer "no policy", not "hidden").
@@ -384,7 +389,7 @@ pub async fn rewrite_sql_for_roles_reporting<D: Dialect + Sync>(
         }
     }
     let (obligations, views) = obligations_source
-        .prefetch_for_tables(&tables, roles)
+        .prefetch_for_table_keys(&keys, roles)
         .await?;
     // QS-10 (LH-QS-2-05), D4: read what the rewrite is about to apply before
     // handing the obligations to `enforce` — it borrows them, so nothing is
@@ -512,6 +517,13 @@ pub struct PolicyEngineObligations<'a> {
     /// resolved when `system.columns` does not list it (see
     /// [`Self::iceberg_columns`]).
     iceberg_db: Option<&'a Ident>,
+    /// A `bi-only` install has no loaded tables to ask `ClickHouse` about
+    /// columns. The active engine's in-place introspection is the only
+    /// honest source of a governed external table's real columns
+    /// (`BI-44` slice 2). `None` means `full` mode and the existing path.
+    in_place_engine: Option<QueryEngine>,
+    /// The one installed engine's client, when that engine is `Trino`.
+    trino: Option<&'a TrinoClient>,
 }
 
 impl<'a> PolicyEngineObligations<'a> {
@@ -525,6 +537,8 @@ impl<'a> PolicyEngineObligations<'a> {
             pg,
             ch,
             iceberg_db: None,
+            in_place_engine: None,
+            trino: None,
         }
     }
 
@@ -534,8 +548,29 @@ impl<'a> PolicyEngineObligations<'a> {
     /// from another.
     #[must_use]
     pub fn from_state(state: &'a AppState) -> Self {
+        let engine = state
+            .config
+            .is_bi_only()
+            .then_some(state.config.query_engine);
+        let trino = (engine == Some(QueryEngine::Trino)).then_some(state.trino.as_ref());
         Self::new(state.pg.as_deref(), &state.clickhouse)
             .with_iceberg_db(state.config.iceberg_query_db.as_ref())
+            .with_in_place_engine(engine, trino)
+    }
+
+    /// Enables in-place column resolution for a `bi-only` installation.
+    /// `trino` must be `Some` when `engine` is `Trino`; a missing client
+    /// fails closed rather than falling back to a `ClickHouse` dial the
+    /// installation did not start.
+    #[must_use]
+    pub fn with_in_place_engine(
+        mut self,
+        engine: Option<QueryEngine>,
+        trino: Option<&'a TrinoClient>,
+    ) -> Self {
+        self.in_place_engine = engine;
+        self.trino = trino;
+        self
     }
 
     /// Resolve Iceberg tables' columns through `db` (a `DataLakeCatalog`
@@ -653,6 +688,56 @@ impl<'a> PolicyEngineObligations<'a> {
         Ok(crate::table_access::for_roles(self.pg, roles).await?)
     }
 
+    /// The real columns of a governed table in a `bi-only` installation,
+    /// from the one engine that is actually installed. A two-part key on
+    /// `Trino` names no catalog, so it cannot be introspected honestly and
+    /// fails closed; the three-part key of the same physical table does
+    /// carry the catalog and is used for that engine's column lookup.
+    async fn in_place_columns(&self, table: &str) -> Option<Vec<(String, String, String)>> {
+        let engine = self.in_place_engine?;
+        match engine {
+            QueryEngine::Trino => {
+                let parts: Vec<&str> = table.split('.').collect();
+                if parts.len() != 3 {
+                    return None;
+                }
+                let client = self.trino?;
+                let columns =
+                    crate::in_place::introspect_trino_columns(client, parts[0], parts[1], parts[2])
+                        .await
+                        .ok()?;
+                // The rewrite needs names only; no computed-column
+                // defaults exist on an external table, so both default
+                // slots stay empty and the mask closure has nothing to
+                // widen. (`BI-44` slice 2.)
+                Some(
+                    columns
+                        .into_iter()
+                        .map(|column| (column.name, String::new(), String::new()))
+                        .collect(),
+                )
+            }
+            QueryEngine::ClickHouse => {
+                let short = sql_rewrite::short_key_of(table);
+                let (database, name) = short.split_once('.')?;
+                let columns =
+                    crate::in_place::introspect_clickhouse_columns(self.ch, database, name)
+                        .await
+                        .ok()?;
+                // The rewrite needs names only; no computed-column
+                // defaults exist on an external table, so both default
+                // slots stay empty and the mask closure has nothing to
+                // widen. (`BI-44` slice 2.)
+                Some(
+                    columns
+                        .into_iter()
+                        .map(|column| (column.name, String::new(), String::new()))
+                        .collect(),
+                )
+            }
+        }
+    }
+
     /// The mask/row-filter obligations `table` carries for a principal
     /// holding `roles`, unioning every matching `status = 'ready'` policy
     /// (masks union; row filters `AND` together) — or `None` if none
@@ -706,11 +791,19 @@ impl<'a> PolicyEngineObligations<'a> {
                 real_columns: None,
             }));
         };
-        // A `ClickHouse` table first; an Iceberg table (canonicalized from
-        // a `DataLakeCatalog` read, see `sql_rewrite::canonicalize`) second.
-        let columns = match self.real_columns_with_defaults(schema, table_name).await {
-            Some(cols) => Some(cols),
-            None => self.iceberg_columns(schema, table_name).await,
+        // In a `bi-only` install the active engine is the only column
+        // source: there is no loaded `ClickHouse` table or Iceberg catalog
+        // to ask. In `full` mode the two existing lookups are unchanged.
+        let columns = if self.in_place_engine.is_some() {
+            self.in_place_columns(table).await
+        } else {
+            // A `ClickHouse` table first; an Iceberg table (canonicalized
+            // from a `DataLakeCatalog` read, see
+            // `sql_rewrite::canonicalize`) second.
+            match self.real_columns_with_defaults(schema, table_name).await {
+                Some(cols) => Some(cols),
+                None => self.iceberg_columns(schema, table_name).await,
+            }
         };
         let real_columns = columns
             .as_ref()
@@ -846,14 +939,44 @@ impl<'a> PolicyEngineObligations<'a> {
         tables: &[String],
         roles: &[String],
     ) -> Result<(PrefetchedObligations, PrefetchedViews), PolicyEngineError> {
+        let keys: Vec<sql_rewrite::TableKeys> = tables
+            .iter()
+            .map(|table| sql_rewrite::TableKeys {
+                short: table.clone(),
+                full: table.clone(),
+            })
+            .collect();
+        self.prefetch_for_table_keys(&keys, roles).await
+    }
+
+    /// The same prefetch, for callers that see both keys of every table.
+    /// A three-part policy is fetched under its full key and a two-part
+    /// policy under the short one; the rewrite merges both when a query
+    /// matches both. Views are still looked up under the short key, which
+    /// is the shape `system.tables` actually holds.
+    ///
+    /// # Errors
+    /// [`PolicyEngineError`] per [`Self::obligations_for_async`] and
+    /// [`Self::has_any_obligation_async`].
+    pub async fn prefetch_for_table_keys(
+        &self,
+        keys: &[sql_rewrite::TableKeys],
+        roles: &[String],
+    ) -> Result<(PrefetchedObligations, PrefetchedViews), PolicyEngineError> {
         let has_any = self.has_any_obligation_async(roles).await?;
         let mut obligations = std::collections::HashMap::new();
-        for table in tables {
-            if let Some(obl) = self.obligations_for_async(table, roles).await? {
-                obligations.insert(table.clone(), obl);
+        for key in keys {
+            if let Some(obl) = self.obligations_for_async(&key.short, roles).await? {
+                obligations.insert(key.short.clone(), obl);
+            }
+            if key.full != key.short
+                && let Some(obl) = self.obligations_for_async(&key.full, roles).await?
+            {
+                obligations.insert(key.full.clone(), obl);
             }
         }
-        let views = self.engine_and_definitions(tables).await;
+        let short_tables: Vec<String> = keys.iter().map(|key| key.short.clone()).collect();
+        let views = self.engine_and_definitions(&short_tables).await;
         Ok((
             PrefetchedObligations {
                 map: obligations,
@@ -1018,6 +1141,42 @@ mod tests {
             has_any: true,
         };
         assert_eq!(none.applied(), Vec::<&str>::new());
+    }
+
+    /// SEC-73: a narrowed principal must not escape the tenant gate by
+    /// writing a `WITH` name that differs from the bare table only in case.
+    /// `ClickHouse` matches `WITH` names by exact case, so `FROM t` is a real
+    /// table in the connection's database, not the `` `T` `` CTE.
+    #[test]
+    fn a_mixed_case_cte_does_not_hide_a_bare_table_from_the_gate() {
+        use sqlparser::dialect::ClickHouseDialect;
+
+        let access = crate::table_access::TableAccess::Listed(
+            [("silver".to_owned(), "orders".to_owned())]
+                .into_iter()
+                .collect(),
+            std::collections::HashSet::new(),
+        );
+        assert!(
+            matches!(
+                hidden_read(
+                    "WITH T AS (SELECT 1) SELECT * FROM t",
+                    &ClickHouseDialect {},
+                    &access
+                ),
+                Some(HiddenRead::Table(table)) if table == "t"
+            ),
+            "the bare table `t` must reach the gate"
+        );
+        assert!(
+            hidden_read(
+                "WITH T AS (SELECT 1) SELECT * FROM T",
+                &ClickHouseDialect {},
+                &access
+            )
+            .is_none(),
+            "an exact-case CTE reference names no table to gate"
+        );
     }
 
     #[test]
@@ -1390,5 +1549,124 @@ mod tests {
             );
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod external_catalog_columns {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_store::governance::CreatePolicyInput;
+    use lakehouse_test_support as _;
+    use sqlx::PgPool;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    async fn seed(pool: &PgPool, table: &str, name: &str) {
+        governance::create_policy(
+            pool,
+            &CreatePolicyInput {
+                name: name.to_owned(),
+                kind: "Row filter".to_owned(),
+                subjects: "Analyst".to_owned(),
+                resources: table.to_owned(),
+                effect: "Permit with obligation".to_owned(),
+                conditions: Some(format!(
+                    r#"{{"roles":["Analyst"],"table":"{table}","mask":["email"],"rowFilter":"id <= 4"}}"#
+                )),
+                activate: true,
+                owner: None,
+            },
+        )
+        .await
+        .expect("seed the governing policy");
+    }
+
+    /// A 3-part authored policy resolves its real columns through the
+    /// active engine's in-place introspection, not through a `ClickHouse`
+    /// `system.columns` read. The installed `Trino` is the only dial.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_three_part_policy_resolves_columns_through_trino_introspection(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        seed(&pool, "erp_pg.public.customers", "trino-catalog-mask").await;
+        // `Trino`'s REST envelope carries positional rows, not named ones.
+        let trino_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/statement"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "q1",
+                "columns": [
+                    {"name": "Column", "type": "varchar"},
+                    {"name": "Type", "type": "varchar"}
+                ],
+                "data": [["id", "bigint"], ["email", "varchar"], ["tenant_id", "varchar"]],
+            })))
+            .mount(&trino_server)
+            .await;
+
+        let trino = lakehouse_trino::TrinoClient::new(lakehouse_trino::TrinoConfig::new(
+            trino_server.uri(),
+        ));
+        // A dead `ClickHouse`: if the resolver dialed it, this test would
+        // fail with `real_columns: None` instead of the introspected list.
+        let ch = ChClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            "test".to_owned(),
+            String::new(),
+        );
+        let source = PolicyEngineObligations::new(Some(&pool), &ch)
+            .with_in_place_engine(Some(QueryEngine::Trino), Some(&trino));
+        let roles = ["Analyst".to_owned()];
+        let obl = source
+            .obligations_for_async("erp_pg.public.customers", &roles)
+            .await
+            .unwrap()
+            .expect("governed");
+        assert_eq!(
+            obl.real_columns,
+            Some(vec![
+                "id".to_owned(),
+                "email".to_owned(),
+                "tenant_id".to_owned()
+            ])
+        );
+        assert_eq!(obl.mask, vec!["email".to_owned()]);
+        assert_eq!(obl.row_filter.as_deref(), Some("(id <= 4)"));
+        Ok(())
+    }
+
+    /// The two-part policy on the same physical table is still resolved,
+    /// and a second catalog's table does not inherit the 3-part policy.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn both_scopes_are_prefetched_and_only_the_own_catalog_matches(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        seed(&pool, "public.customers", "short-scope-mask").await;
+        seed(&pool, "erp_pg.public.customers", "catalog-scope-mask").await;
+        let ch = ChClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            "test".to_owned(),
+            String::new(),
+        );
+        let source = PolicyEngineObligations::new(Some(&pool), &ch);
+        let roles = ["Analyst".to_owned()];
+        let keys = vec![
+            sql_rewrite::TableKeys {
+                short: "public.customers".to_owned(),
+                full: "erp_pg.public.customers".to_owned(),
+            },
+            sql_rewrite::TableKeys {
+                short: "public.customers".to_owned(),
+                full: "crm_pg.public.customers".to_owned(),
+            },
+        ];
+        let (obligations, _) = source.prefetch_for_table_keys(&keys, &roles).await.unwrap();
+        assert!(obligations.map.contains_key("public.customers"));
+        assert!(obligations.map.contains_key("erp_pg.public.customers"));
+        assert!(!obligations.map.contains_key("crm_pg.public.customers"));
+        Ok(())
     }
 }

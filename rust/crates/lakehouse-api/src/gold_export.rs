@@ -46,10 +46,15 @@
 //! 2. **Bounded batches, not one whole-mart materialization.** Rows are
 //!    read `GOLD_EXPORT_BATCH_SIZE`
 //!    (`crate::config::Config::gold_export_batch_size`) at a time
-//!    (`SELECT ... LIMIT n OFFSET n FORMAT JSON`) and appended to Iceberg
-//!    per batch (one `GoldTable::append` — one new Parquet file/snapshot —
-//!    per batch), so peak memory is bounded by one batch, not the whole
-//!    mart. This is `LIMIT`/`OFFSET` pagination over repeated HTTP
+//!    (`SELECT ... LIMIT n OFFSET n FORMAT JSON`) and written to Parquet
+//!    one batch at a time with `GoldTable::stage_batch`. All the staged
+//!    Parquet files are then committed in ONE `GoldTable::commit_staged`
+//!    transaction after the loop (DATA-63): only the small `Vec<DataFile>`
+//!    descriptors survive between batches, never the `RecordBatch` data,
+//!    so peak memory is bounded by one batch, not the whole mart. An
+//!    outside reader therefore sees either none of the new copy or ALL of
+//!    it in one atomic snapshot, never a prefix of it. This is
+//!    `LIMIT`/`OFFSET` pagination over repeated HTTP
 //!    requests, not a single streaming response — a true single-pass
 //!    streaming rewrite (reading `ClickHouse`'s `FORMAT JSONEachRow` as an
 //!    incremental byte stream) would remove the pagination-stability
@@ -73,11 +78,14 @@ use arrow_array::{
     ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, RecordBatch,
     StringArray, TimestampMicrosecondArray,
 };
-use iceberg::spec::{NestedField, PrimitiveType, Type};
+use iceberg::spec::{DataFile, NestedField, PrimitiveType, Type};
 use lakehouse_clickhouse::{ChClient, ChColumn, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_core::secret::SecretValue;
-use lakehouse_iceberg::{IcebergClient, IcebergClientConfig, IcebergError, gold};
+use lakehouse_iceberg::{
+    IcebergClient, IcebergClientConfig, IcebergError,
+    gold::{self, PublishZone},
+};
 use serde_json::{Map, Value};
 use thiserror::Error;
 use time::Date;
@@ -823,6 +831,25 @@ fn build_array(
     })
 }
 
+/// Builds one publish batch's Arrow [`RecordBatch`] from `rows`, stamping
+/// every row with the publish's single `_exported_at` value (`DATA-6` M2).
+/// Split out of [`export_mart`] so its stage-accumulate-commit loop stays
+/// small enough to review in one screen.
+fn build_publish_batch(
+    plan: &[ColumnPlan],
+    arrow_schema: &Arc<arrow_schema::Schema>,
+    copy_exported_at: i64,
+    rows: &[Map<String, Value>],
+) -> Result<RecordBatch, GoldExportError> {
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(plan.len() + 1);
+    arrays.push(exported_at_column(copy_exported_at, rows.len()));
+    for column in plan {
+        arrays.push(build_array(column, rows)?);
+    }
+    RecordBatch::try_new(arrow_schema.clone(), arrays)
+        .map_err(|e| GoldExportError::Batch(format!("RecordBatch::try_new failed: {e}")))
+}
+
 /// The result of one export run.
 pub struct GoldExportResult {
     /// The Gold namespace exported into (always [`gold::GOLD_NAMESPACE`]).
@@ -872,9 +899,9 @@ pub(crate) fn copy_exported_at_micros(now: time::OffsetDateTime) -> i64 {
 /// is identifiable (the latest-copy op filters on it) and the trim's
 /// distinct-value count is a copy count, not a batch count. It still
 /// matches the "one partition value per batch" assumption
-/// `gold::partition_key_for` documents (each batch is one Parquet
-/// file/append, so each needs exactly one partition value derived from
-/// it).
+/// `gold::partition_key_for` documents (each batch is staged as one Parquet
+/// file, so each needs exactly one partition value derived from it; the
+/// whole publish's files are committed together afterward — DATA-63).
 fn exported_at_column(now_micros: i64, batch_rows: usize) -> ArrayRef {
     Arc::new(TimestampMicrosecondArray::from(vec![
         now_micros;
@@ -908,11 +935,12 @@ fn exported_at_column(now_micros: i64, batch_rows: usize) -> ArrayRef {
 /// [`GoldExportError::PolicyRefused`] (WS7 item D2) is returned when
 /// [`export_batch_sql`] cannot resolve obligations for `roles` or the
 /// rewrite is refused — checked on every batch, so a refusal aborts
-/// before that batch's rows are read, but a refusal on any batch after
-/// the first means earlier, already-masked/filtered batches were already
-/// appended to Iceberg (see [`export_batch_sql`]'s own doc comment on why
-/// this is re-checked per batch rather than assumed stable for the whole
-/// export); and [`GoldExportError::TenantGateRefused`] (`SEC-50`) is
+/// before that batch's rows are read, and a refusal on any batch after
+/// the first discards the earlier staged batches without committing them:
+/// the single commit happens only after the loop, so no partial copy
+/// becomes visible (DATA-63; see [`export_batch_sql`]'s own doc comment
+/// on why this is re-checked per batch rather than assumed stable for the
+/// whole export); and [`GoldExportError::TenantGateRefused`] (`SEC-50`) is
 /// returned when the tenant gate refuses the export — before any row is
 /// read.
 ///
@@ -938,6 +966,11 @@ fn exported_at_column(now_micros: i64, batch_rows: usize) -> ArrayRef {
               indirection away from every call site, not reduce what a caller must \
               supply"
 )]
+#[allow(
+    dead_code,
+    reason = "the pre-DATA-65 Gold-only export entry point is kept for backward compatibility \
+              and its own gate/round-trip tests; production callers now pass an explicit zone"
+)]
 pub(crate) async fn export_mart(
     state: &AppState,
     actor: crate::routes::query::GateActor<'_>,
@@ -951,7 +984,50 @@ pub(crate) async fn export_mart(
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &crate::policy_engine::PolicyEngineObligations<'_>,
 ) -> Result<GoldExportResult, GoldExportError> {
-    let namespace = gold::GOLD_NAMESPACE.to_owned();
+    export_mart_for_zone(
+        state,
+        actor,
+        ch,
+        iceberg_config,
+        source_table,
+        mart_name,
+        max_rows,
+        batch_size,
+        roles,
+        placeholders,
+        obligations,
+        PublishZone::Gold,
+    )
+    .await
+}
+
+/// DATA-65: the zone-aware export behind [`export_mart`]. `source_table`
+/// is the fully-qualified `ClickHouse` table the caller chose from `zone` —
+/// `silver.<mart>` for Silver, `{gold_source_schema}.<mart>` for Gold — so
+/// the SEC-50 gate and every batch read name exactly the table being
+/// published. The Iceberg table is created/loaded in `zone`'s namespace
+/// through the same format-v2, `day(_exported_at)`, single-snapshot
+/// `append_batches` mechanics ADR 0010/DATA-63 established for Gold.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "same parameter set as export_mart plus the DATA-65 zone; grouping them \
+              into a struct would only add indirection at every call site"
+)]
+pub(crate) async fn export_mart_for_zone(
+    state: &AppState,
+    actor: crate::routes::query::GateActor<'_>,
+    ch: &ChClient,
+    iceberg_config: &IcebergClientConfig,
+    source_table: &str,
+    mart_name: &str,
+    max_rows: u64,
+    batch_size: u64,
+    roles: &[String],
+    placeholders: &crate::sql_rewrite::PlaceholderValues,
+    obligations: &crate::policy_engine::PolicyEngineObligations<'_>,
+    zone: PublishZone,
+) -> Result<GoldExportResult, GoldExportError> {
+    let namespace = zone.namespace_name().to_owned();
     let sanitized_table =
         gold::sanitize_mart_name(mart_name).map_err(|e| GoldExportError::Batch(e.to_string()))?;
 
@@ -1026,7 +1102,7 @@ pub(crate) async fn export_mart(
 
     let client = IcebergClient::connect(iceberg_config).await?;
     let mut table = client
-        .create_or_load_gold_table(mart_name, domain_fields)
+        .create_or_load_published_table(zone, mart_name, domain_fields)
         .await?;
     // DATA-6 D7: a mart whose own Iceberg table is ANOTHER mart's
     // latest-copy table (the `rantai.latest-copy-of` marker the Dagster op
@@ -1046,7 +1122,13 @@ pub(crate) async fn export_mart(
     // `select` in the `gold` namespace — and only there. The namespace
     // exists now (the export just created or loaded its table in it),
     // so the grant can be made.
-    grant_outside_readers_select(state, &client).await;
+    // ADR 0016 point 3's door serves the `gold` namespace only: a Silver
+    // publish gets the same table mechanics but no Silver namespace grant,
+    // because the door's own path guard would refuse a `silver` read
+    // anyway. Granting it here would widen access the door cannot use.
+    if zone == PublishZone::Gold {
+        grant_outside_readers_select(state, &client).await;
+    }
 
     let arrow_schema = Arc::new(
         iceberg::arrow::schema_to_arrow_schema(table.schema())
@@ -1054,9 +1136,10 @@ pub(crate) async fn export_mart(
     );
 
     // DATA-6 M2: ONE `_exported_at` per publish, computed before the loop
-    // and reused by every batch. The batch loop below still writes one
-    // Parquet file per batch, but every row of this publish now carries
-    // the same stamp, so "the rows of this one publish" can be picked
+    // and reused by every batch. The batch loop below still stages one
+    // Parquet file per batch (all committed in one snapshot after it), but
+    // every row of this publish carries the same stamp, so "the rows of
+    // this one publish" can be picked
     // out of the table (the latest-copy op filters on it). This also
     // corrects DATA-2's trim: `run_trim_for_mart` counts DISTINCT
     // `_exported_at` values as copies, and a mart over the batch size
@@ -1064,6 +1147,11 @@ pub(crate) async fn export_mart(
     // rather than 7 copies.
     let copy_exported_at = copy_exported_at_micros(time::OffsetDateTime::now_utc());
 
+    // DATA-63: stage each batch's Parquet file(s) into this accumulator but
+    // do NOT commit until every batch has succeeded. Only the small
+    // `DataFile` descriptors live across iterations; the `RecordBatch` data
+    // is dropped as soon as it is staged, keeping peak memory at one batch.
+    let mut staged_data_files: Vec<DataFile> = Vec::new();
     let mut offset = 0u64;
     let mut rows_exported = 0usize;
     loop {
@@ -1089,16 +1177,10 @@ pub(crate) async fn export_mart(
         }
         let batch_rows = batch_result.data.len();
 
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(plan.len() + 1);
-        arrays.push(exported_at_column(copy_exported_at, batch_rows));
-        for column in &plan {
-            arrays.push(build_array(column, &batch_result.data)?);
-        }
+        let record_batch =
+            build_publish_batch(&plan, &arrow_schema, copy_exported_at, &batch_result.data)?;
 
-        let record_batch = RecordBatch::try_new(arrow_schema.clone(), arrays)
-            .map_err(|e| GoldExportError::Batch(format!("RecordBatch::try_new failed: {e}")))?;
-
-        table.append(client.as_catalog(), record_batch).await?;
+        staged_data_files.extend(table.stage_batch(record_batch).await?);
         rows_exported += batch_rows;
 
         if (batch_rows as u64) < batch_size {
@@ -1108,6 +1190,15 @@ pub(crate) async fn export_mart(
         }
         offset += batch_size;
     }
+
+    // DATA-63: ONE commit for the whole publish. Every staged Parquet file
+    // lands in the same fast-append snapshot, so an outside reader sees
+    // either none of the new copy (a failure above returned before here)
+    // or all of it — never a prefix of it. An empty accumulator (a publish
+    // that staged nothing) is a documented no-op in `commit_staged`.
+    table
+        .commit_staged(client.as_catalog(), staged_data_files)
+        .await?;
 
     Ok(GoldExportResult {
         namespace,
@@ -1225,8 +1316,26 @@ pub async fn read_back_row_count(
     iceberg_config: &IcebergClientConfig,
     mart_name: &str,
 ) -> Result<Option<GoldReadBack>, GoldExportError> {
+    read_back_row_count_for_zone(iceberg_config, mart_name, PublishZone::Gold).await
+}
+
+/// DATA-65: read back the published table in `zone`'s namespace. The
+/// mechanics are identical to [`read_back_row_count`]; only the namespace
+/// changes.
+///
+/// # Errors
+///
+/// See [`read_back_row_count`].
+pub async fn read_back_row_count_for_zone(
+    iceberg_config: &IcebergClientConfig,
+    mart_name: &str,
+    zone: PublishZone,
+) -> Result<Option<GoldReadBack>, GoldExportError> {
     let client = IcebergClient::connect(iceberg_config).await?;
-    let Some(table) = client.load_gold_table_if_exists(mart_name).await? else {
+    let Some(table) = client
+        .load_published_table_if_exists(zone, mart_name)
+        .await?
+    else {
         return Ok(None);
     };
     let format_version = table.format_version() as u8;

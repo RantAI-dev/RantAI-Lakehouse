@@ -68,6 +68,7 @@ use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_core::ident::Ident;
 use lakehouse_core::secret::SecretValue;
+use lakehouse_iceberg::gold::PublishZone;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -141,6 +142,34 @@ pub struct ExportQuery {
     /// trigger — which sends nothing — can never accidentally skip.
     #[serde(rename = "ifChanged")]
     if_changed: Option<String>,
+    /// DATA-65: which publication zone this request addresses. `None`
+    /// means Gold, so every pre-DATA-65 URL is unchanged.
+    zone: Option<String>,
+}
+
+/// DATA-65: parse an optional `?zone=` into a [`PublishZone`], with a
+/// fixed, non-echoing `400` for anything else (AGENTS.md rule 4: an
+/// upstream or caller-supplied string never reaches a response). The
+/// `serving` alias is accepted for consistency with BLD-19.
+///
+/// # Errors
+///
+/// Returns [`ApiError::BadRequest`] with a fixed sentence for an
+/// unrecognised zone.
+fn parse_zone(raw: Option<&str>) -> Result<PublishZone, ApiError> {
+    match raw {
+        None => Ok(PublishZone::Gold),
+        Some(value) => PublishZone::parse(value).ok_or_else(|| {
+            ApiError::BadRequest("invalid zone: expected one of silver, gold or serving".to_owned())
+        }),
+    }
+}
+
+/// DATA-65: the single-flight key for one publication. Silver and Gold
+/// marts with the same bare name are different publications and publish
+/// concurrently; two exports of the same pair still collide.
+fn zone_lock_key(zone: PublishZone, mart: &str) -> String {
+    format!("{}:{mart}", zone.namespace_name())
 }
 
 /// DATA-10 review SHOULD-FIX 2 / DATA-10 / DATA-1: `?ifChanged=true` skip decision.
@@ -197,18 +226,21 @@ fn skipped_body(reason: &str) -> Value {
 async fn unchanged_since_last_export_reason(
     state: &AppState,
     mart: &str,
+    zone: PublishZone,
     current_fingerprint: Option<&str>,
 ) -> Result<Option<String>, ApiError> {
-    let newest = gold_export_history::last_export_run(&state.clickhouse, mart)
+    let zone_name = zone.namespace_name();
+    let newest = gold_export_history::last_export_run_for_zone(&state.clickhouse, mart, zone_name)
         .await
         .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     let newest_failed = newest.as_ref().is_some_and(|run| run.status == "failed");
     if newest_failed {
         return Ok(None);
     }
-    let last_export = gold_export_history::last_success_export(&state.clickhouse, mart)
-        .await
-        .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
+    let last_export =
+        gold_export_history::last_success_export_for_zone(&state.clickhouse, mart, zone_name)
+            .await
+            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     let last_fp = last_export.as_ref().map(|e| e.content_fingerprint.as_str());
     let last_started_ms = last_export.as_ref().and_then(|e| e.started_at_ms);
     Ok(if_changed_skip_reason(
@@ -287,6 +319,24 @@ fn check_export_token(
                 .to_owned(),
         )),
     }
+}
+
+/// `SEC-66`: the read-only Gold routes accept `gold:read` where
+/// [`check_export_token`] used to demand `gold:export`. The shared-token
+/// match and the service-identity fallback are delegated to that guard
+/// unchanged, so the scheduler's `x-run-token` path and the no-token
+/// service path behave exactly as before. The WRITE route still calls
+/// [`check_export_token`] directly: `gold:read` must never open an export.
+fn check_gold_read_token(
+    configured: Option<&str>,
+    header_token: Option<&str>,
+    query_token: Option<&str>,
+    principal: Option<&Principal>,
+) -> Result<(), ApiError> {
+    if principal.is_some_and(|p| p.has("gold:read")) {
+        return Ok(());
+    }
+    check_export_token(configured, header_token, query_token, principal)
 }
 
 /// Reads the `gold-export` principal's Lakekeeper bearer token from
@@ -376,8 +426,13 @@ async fn gated_source_table(
     state: &AppState,
     mart: &str,
     actor: crate::routes::query::GateActor<'_>,
+    zone: PublishZone,
 ) -> Result<String, ApiError> {
-    let source_table = format!("{}.`{}`", state.config.gold_source_schema, mart);
+    let source_table = format!(
+        "{}.`{}`",
+        zone.source_ch_schema(&state.config.gold_source_schema),
+        mart
+    );
     crate::routes::query::gate_statement(
         state,
         &gold_export::mart_count_sql(&source_table),
@@ -471,6 +526,7 @@ pub async fn export(
         principal.as_ref().map(|Extension(p)| p),
     )?;
 
+    let zone = parse_zone(query.zone.as_deref())?;
     let mart_ident =
         Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
 
@@ -480,21 +536,22 @@ pub async fn export(
     // BEFORE the first read of the mart — the fingerprint below is that
     // read — so a deployment that holds several tenants and names no
     // catalog tenant refuses the export before anything reaches
-    // `ClickHouse`.
+    // `ClickHouse`. DATA-65: the statement names the zone's source table
+    // (`silver.<mart>` for Silver), so the gate measures the same table
+    // the export actually reads.
     let actor = gold_export_gate_actor(principal.as_ref().map(|Extension(p)| p), &headers);
-    let source_table = gated_source_table(&state, mart_ident.as_str(), actor).await?;
+    let source_table = gated_source_table(&state, mart_ident.as_str(), actor, zone).await?;
 
     let triggered_by = triggered_by(principal.as_ref().map(|Extension(p)| p));
 
     // #484 review R4 (DATA-56): from here on the caller is
     // authenticated and allowed and the mart is shown to be theirs, so every
     // failure below is a failed publish and is recorded as one.
-    let attempt = Attempt::open(&state, mart_ident.as_str(), &triggered_by).await?;
+    let attempt = Attempt::open(&state, mart_ident.as_str(), &triggered_by, zone).await?;
 
     // DATA-10 review SHOULD-FIX 1 / DATA-10 D2: The fingerprint is computed before
     // the export reads rows, and written on the history row of that export.
-    let current_fingerprint =
-        read_content_fingerprint(&attempt, &state.config.gold_source_schema).await?;
+    let current_fingerprint = read_content_fingerprint(&attempt).await?;
 
     // DATA-10 / DATA-1 task 4 — `?ifChanged=true`: a proven-unchanged mart is
     // skipped BEFORE the single-flight lock is taken (a skip holds
@@ -514,9 +571,13 @@ pub async fn export(
     // (DATA-56): the publish that holds the lock records its own row, and
     // a row written by the call it turned away would be newer and hide
     // that result.
+    // DATA-65: the lock is keyed by (zone, mart), so `silver.orders` and
+    // `serving.orders` can publish concurrently, while two exports of the
+    // same publication still answer 409.
+    let lock_key = zone_lock_key(zone, mart_ident.as_str());
     let export_guard = state
         .gold_export_locks
-        .try_acquire(mart_ident.as_str())
+        .try_acquire(&lock_key)
         .await
         .map_err(|_| {
             ApiError::Conflict(format!(
@@ -560,7 +621,7 @@ pub async fn export(
     let obligations = crate::policy_engine::PolicyEngineObligations::from_state(&state);
 
     let started_at = time::OffsetDateTime::now_utc();
-    let export_result = gold_export::export_mart(
+    let export_result = gold_export::export_mart_for_zone(
         &state,
         actor,
         &state.clickhouse,
@@ -572,6 +633,7 @@ pub async fn export(
         &roles,
         &placeholders,
         &obligations,
+        zone,
     )
     .await;
     let finished_at = time::OffsetDateTime::now_utc();
@@ -583,6 +645,7 @@ pub async fn export(
     record_export_history(
         &state,
         mart_ident.as_str(),
+        zone,
         &triggered_by,
         started_at,
         finished_at,
@@ -613,7 +676,11 @@ pub async fn export(
         "copyExportedAt": result
             .copy_exported_at_micros
             .and_then(crate::gold_latest_copy::micros_to_rfc3339),
-        "latestCopy": latest_copy_answer(&state, mart_ident.as_str(), &result).await,
+        // DATA-65: the explicit zone alongside the namespace, so a
+        // caller never has to infer it from a string that used to be
+        // hardcoded to "gold".
+        "zone": zone.namespace_name(),
+        "latestCopy": latest_copy_answer(&state, mart_ident.as_str(), zone, &result).await,
     })))
 }
 
@@ -626,6 +693,7 @@ pub async fn export(
 async fn latest_copy_answer(
     state: &AppState,
     mart: &str,
+    zone: PublishZone,
     result: &gold_export::GoldExportResult,
 ) -> Value {
     let (true, Some(copy_micros)) = (result.rows_exported > 0, result.copy_exported_at_micros)
@@ -633,6 +701,7 @@ async fn latest_copy_answer(
         return Value::Null;
     };
     let request = crate::gold_latest_copy::LatestCopyRequest {
+        zone,
         mart,
         table: &result.table,
         copy_exported_at_micros: copy_micros,
@@ -640,7 +709,11 @@ async fn latest_copy_answer(
     };
     let status = crate::gold_latest_copy::launch(&state.dagster, &state.clickhouse, &request).await;
     json!({
-        "table": format!("gold.{}", lakehouse_iceberg::gold::latest_table_name(&result.table)),
+        "table": format!(
+            "{}.{}",
+            zone.namespace_name(),
+            lakehouse_iceberg::gold::latest_table_name(&result.table)
+        ),
         "status": status,
     })
 }
@@ -668,6 +741,7 @@ async fn latest_copy_answer(
 async fn record_export_history(
     state: &AppState,
     mart: &str,
+    zone: PublishZone,
     triggered_by: &str,
     started_at: time::OffsetDateTime,
     finished_at: time::OffsetDateTime,
@@ -691,7 +765,12 @@ async fn record_export_history(
         started_at_ms: started_at.unix_timestamp() * 1000,
         finished_at_ms: finished_at.unix_timestamp() * 1000,
     };
-    if let Err(err) = gold_export_history::record_export_run(&state.clickhouse, &history_row).await
+    if let Err(err) = gold_export_history::record_export_run_for_zone(
+        &state.clickhouse,
+        &history_row,
+        zone.namespace_name(),
+    )
+    .await
     {
         tracing::error!(%err, mart, "failed to record gold export history");
     }
@@ -720,6 +799,9 @@ struct Attempt<'a> {
     /// Whether `system.tables` lists the mart. The one answer that is never
     /// recorded with a failed run (see [`early_failure`]).
     exists: bool,
+    /// DATA-65: the zone whose source schema was checked and whose
+    /// history this attempt writes.
+    zone: PublishZone,
     mart: &'a str,
     triggered_by: &'a str,
     /// When this attempt's row starts: the moment the mart was found to exist.
@@ -740,13 +822,19 @@ impl<'a> Attempt<'a> {
         state: &'a AppState,
         mart: &'a str,
         triggered_by: &'a str,
+        zone: PublishZone,
     ) -> Result<Self, ApiError> {
-        let exists = mart_exists(&state.clickhouse, &state.config.gold_source_schema, mart)
-            .await
-            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
+        let exists = mart_exists(
+            &state.clickhouse,
+            zone.source_ch_schema(&state.config.gold_source_schema),
+            mart,
+        )
+        .await
+        .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
         Ok(Self {
             state,
             exists,
+            zone,
             mart,
             triggered_by,
             started_at: time::OffsetDateTime::now_utc(),
@@ -763,7 +851,9 @@ impl<'a> Attempt<'a> {
     /// Returns the classified history-read failure, after [`early_failure`] has
     /// recorded it for a mart that exists.
     async fn skip_body(&self, fingerprint: Option<&str>) -> Result<Option<Value>, ApiError> {
-        match unchanged_since_last_export_reason(self.state, self.mart, fingerprint).await {
+        match unchanged_since_last_export_reason(self.state, self.mart, self.zone, fingerprint)
+            .await
+        {
             Ok(Some(reason)) => Ok(Some(skipped_body(&reason))),
             Ok(None) => Ok(None),
             Err(err) => Err(early_failure(self, fingerprint.unwrap_or(""), err).await),
@@ -796,10 +886,7 @@ impl<'a> Attempt<'a> {
 ///
 /// Returns the classified `ClickHouse` failure (`422`/`503` with a reference),
 /// after [`early_failure`] has recorded it for a mart that exists.
-async fn read_content_fingerprint(
-    attempt: &Attempt<'_>,
-    schema: &str,
-) -> Result<Option<String>, ApiError> {
+async fn read_content_fingerprint(attempt: &Attempt<'_>) -> Result<Option<String>, ApiError> {
     if !attempt.exists {
         // DATA-56 D23: a name that is not a table goes on as it did before —
         // it is not refused here and no early failure is recorded for it.
@@ -807,7 +894,9 @@ async fn read_content_fingerprint(
     }
     match gold_export_history::mart_content_fingerprint(
         &attempt.state.clickhouse,
-        schema,
+        attempt
+            .zone
+            .source_ch_schema(&attempt.state.config.gold_source_schema),
         attempt.mart,
     )
     .await
@@ -852,12 +941,8 @@ async fn early_failure(
     content_fingerprint: &str,
     err: ApiError,
 ) -> ApiError {
-    if let Ok(_guard) = attempt
-        .state
-        .gold_export_locks
-        .try_acquire(attempt.mart)
-        .await
-    {
+    let lock_key = zone_lock_key(attempt.zone, attempt.mart);
+    if let Ok(_guard) = attempt.state.gold_export_locks.try_acquire(&lock_key).await {
         record_early_failure(attempt, content_fingerprint, &err).await;
     }
     err
@@ -883,6 +968,7 @@ async fn record_early_failure(attempt: &Attempt<'_>, content_fingerprint: &str, 
         record_export_history(
             attempt.state,
             attempt.mart,
+            attempt.zone,
             attempt.triggered_by,
             attempt.started_at,
             time::OffsetDateTime::now_utc(),
@@ -929,10 +1015,20 @@ fn millis_to_rfc3339(ms: i64) -> Option<String> {
 ///
 /// # Errors
 ///
-/// Returns 401/503 from [`check_export_token`] (same guard as `POST` —
-/// this still reveals row counts, not public data), 503 if the Lakekeeper
-/// token cannot be read, or 500 if the catalog refuses or fails the call
-/// for any reason other than "table not found", or the Iceberg read fails.
+/// Returns 401/503 from [`check_gold_read_token`] (`SEC-66`: the read-side
+/// guard also accepts `gold:read`; this still reveals row counts, not
+/// public data), 422 with the tenant gate's fixed sentence when the
+/// deployment holds several tenants and names no catalog tenant
+/// (`DATA-64`/`SEC-50`), 404 with the gate's own table sentence for a
+/// signed-in person whose tenant does not own the shared catalog
+/// (`DATA-64`/`SEC-50`), 503 with the shared catalog's own sentence when
+/// the deployment cannot count its tenants (`SEC-50` R5), 503 if the
+/// Lakekeeper token cannot be read, or 500 if the catalog refuses or fails
+/// the call for any reason other than "table not found", or the Iceberg
+/// read fails. The `DATA-64` tenant gate runs right after the mart name is
+/// validated and BEFORE the Lakekeeper token file or Iceberg is touched,
+/// so a caller whose reach does not cover the shared catalog learns
+/// nothing about the mart.
 pub async fn read_back(
     State(state): State<AppState>,
     Path(mart): Path<String>,
@@ -941,15 +1037,25 @@ pub async fn read_back(
     principal: Option<Extension<Principal>>,
 ) -> ApiResult<ApiJson<Value>> {
     let header_token = headers.get("x-run-token").and_then(|v| v.to_str().ok());
-    check_export_token(
+    check_gold_read_token(
         state.config.gold_export_run_token.as_deref(),
         header_token,
         query.token.as_deref(),
         principal.as_ref().map(|Extension(p)| p),
     )?;
 
+    let zone = parse_zone(query.zone.as_deref())?;
     let mart_ident =
         Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+
+    // DATA-64 / SEC-50: read-back reads the SHARED catalog, so the gate
+    // asks whose reach covers it — a signed-in person's own tenant, or the
+    // catalog's own tenant for a job with no user (`export`'s own rule,
+    // R4/D3). It runs BEFORE the Lakekeeper token file and the Iceberg read
+    // below, so a caller whose reach does not cover the shared catalog is
+    // refused with the gate's 404/422/503 and learns nothing about the mart.
+    let actor = gold_export_gate_actor(principal.as_ref().map(|Extension(p)| p), &headers);
+    let _ = gated_source_table(&state, mart_ident.as_str(), actor, zone).await?;
 
     let token = read_catalog_token(&state.config.lakekeeper_gold_export_token_file).await?;
     let iceberg_config = gold_export::iceberg_config(
@@ -958,13 +1064,15 @@ pub async fn read_back(
         Some(token),
     );
 
-    let readback = gold_export::read_back_row_count(&iceberg_config, mart_ident.as_str())
-        .await
-        .map_err(ApiError::from)?;
+    let readback =
+        gold_export::read_back_row_count_for_zone(&iceberg_config, mart_ident.as_str(), zone)
+            .await
+            .map_err(ApiError::from)?;
 
-    Ok(ApiJson(read_back_body(
+    Ok(ApiJson(read_back_body_for_zone(
         mart_ident.as_str(),
         readback.as_ref(),
+        zone,
     )))
 }
 
@@ -976,10 +1084,26 @@ pub async fn read_back(
 /// other fact `null`, never an error and never an invented number: the
 /// console treats "no export" as a normal state, and a 404 would make it a
 /// failed request in the browser for something that is not an error.
+#[allow(
+    dead_code,
+    reason = "the Gold-only read-back body is kept for pre-DATA-65 callers and pinned by tests; \
+              production callers now go through read_back_body_for_zone"
+)]
 pub(crate) fn read_back_body(mart: &str, readback: Option<&gold_export::GoldReadBack>) -> Value {
+    read_back_body_for_zone(mart, readback, PublishZone::Gold)
+}
+
+/// DATA-65: zone-aware read-back body. `zone` is added to the response;
+/// every pre-existing field keeps its name and shape.
+pub(crate) fn read_back_body_for_zone(
+    mart: &str,
+    readback: Option<&gold_export::GoldReadBack>,
+    zone: PublishZone,
+) -> Value {
     match readback {
         None => json!({
-            "namespace": lakehouse_iceberg::gold::GOLD_NAMESPACE,
+            "zone": zone.namespace_name(),
+            "namespace": zone.namespace_name(),
             "table": mart,
             "published": false,
             "formatVersion": Value::Null,
@@ -988,7 +1112,8 @@ pub(crate) fn read_back_body(mart: &str, readback: Option<&gold_export::GoldRead
             "exportedAt": Value::Null,
         }),
         Some(readback) => json!({
-            "namespace": lakehouse_iceberg::gold::GOLD_NAMESPACE,
+            "zone": zone.namespace_name(),
+            "namespace": zone.namespace_name(),
             "table": mart,
             "published": true,
             "formatVersion": readback.format_version,
@@ -1003,9 +1128,11 @@ pub(crate) fn read_back_body(mart: &str, readback: Option<&gold_export::GoldRead
 #[derive(Debug, Deserialize)]
 pub struct ExportsQuery {
     mart: String,
-    /// Same shared-token/permission gate as `export`/`read_back` — see
-    /// [`check_export_token`].
+    /// Same shared-token/permission gate as `read_back` — see
+    /// [`check_gold_read_token`].
     token: Option<String>,
+    /// DATA-65: the publication zone whose runs are listed.
+    zone: Option<String>,
 }
 
 /// `GET /api/gold/exports?mart=` — the most recent export attempts for one
@@ -1016,8 +1143,16 @@ pub struct ExportsQuery {
 /// # Errors
 ///
 /// Returns 400 if `mart` is missing/blank or not a valid identifier,
-/// 401/503 from [`check_export_token`], or 500 if the `ClickHouse` query
-/// fails.
+/// 401/503 from [`check_gold_read_token`] (`SEC-66`: the read-side guard
+/// also accepts `gold:read`), 422 with the tenant gate's fixed sentence
+/// when the deployment holds several tenants and names no catalog tenant
+/// (`DATA-64`/`SEC-50`), 404 with the gate's own table sentence for a
+/// signed-in person whose tenant does not own the shared catalog
+/// (`DATA-64`/`SEC-50`), 503 with the shared catalog's own sentence when
+/// the deployment cannot count its tenants (`SEC-50` R5), or 500 if the
+/// `ClickHouse` query fails. The `DATA-64` tenant gate runs right after
+/// the mart name is validated and BEFORE `ClickHouse` is touched, so
+/// history the caller may not read is never queried.
 pub async fn exports(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1025,23 +1160,40 @@ pub async fn exports(
     principal: Option<Extension<Principal>>,
 ) -> ApiResult<ApiJson<Value>> {
     let header_token = headers.get("x-run-token").and_then(|v| v.to_str().ok());
-    check_export_token(
+    check_gold_read_token(
         state.config.gold_export_run_token.as_deref(),
         header_token,
         query.token.as_deref(),
         principal.as_ref().map(|Extension(p)| p),
     )?;
 
+    let zone = parse_zone(query.zone.as_deref())?;
     let mart_ident = Ident::new(query.mart.trim())
         .map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
 
-    let runs = gold_export_history::list_export_runs(&state.clickhouse, mart_ident.as_str(), 50)
-        .await
-        .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
+    // DATA-64 / SEC-50: the history reveals the shared catalog mart's row
+    // counts and timing, so it is gated exactly as `read_back` is — the
+    // signed-in person as themselves, a job with no user as the catalog's
+    // own tenant (R4, D3). The gate runs BEFORE `ClickHouse` is read, so a
+    // caller whose reach does not cover the shared catalog gets the gate's
+    // 404/422/503 and no history query is issued.
+    let actor = gold_export_gate_actor(principal.as_ref().map(|Extension(p)| p), &headers);
+    let _ = gated_source_table(&state, mart_ident.as_str(), actor, zone).await?;
 
-    Ok(ApiJson(
-        json!({ "mart": mart_ident.as_str(), "runs": runs }),
-    ))
+    let runs = gold_export_history::list_export_runs_for_zone(
+        &state.clickhouse,
+        mart_ident.as_str(),
+        50,
+        zone.namespace_name(),
+    )
+    .await
+    .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
+
+    Ok(ApiJson(json!({
+        "mart": mart_ident.as_str(),
+        "zone": zone.namespace_name(),
+        "runs": runs,
+    })))
 }
 
 /// `GET /api/gold/export/{mart}/consumers` — who read this mart's
@@ -1072,10 +1224,20 @@ pub async fn exports(
 pub async fn consumers(
     State(state): State<AppState>,
     Path(mart): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<ExportQuery>,
+    principal: Option<Extension<Principal>>,
 ) -> ApiResult<ApiJson<Value>> {
+    let zone = parse_zone(query.zone.as_deref())?;
     let mart_ident =
         Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
     let mart_name = mart_ident.as_str();
+
+    // DATA-64 follow-up / SEC-50: this route reveals a mart's read
+    // counts, so it is gated on the zone's source table exactly as the
+    // export and read-back are — before the door or the engine is touched.
+    let actor = gold_export_gate_actor(principal.as_ref().map(|Extension(p)| p), &headers);
+    let _ = gated_source_table(&state, mart_name, actor, zone).await?;
 
     // The door's own readiness decides whether the count is measured at
     // all (D4, D7). Its refusal text is the door's own, so the console
@@ -1083,6 +1245,7 @@ pub async fn consumers(
     if let Err(problem) = crate::routes::iceberg_door::setup(&state).await {
         return Ok(ApiJson(json!({
             "mart": mart_name,
+            "zone": zone.namespace_name(),
             "supported": false,
             "consumers": Value::Null,
             "reason": problem.reason(),
@@ -1100,7 +1263,7 @@ pub async fn consumers(
     let since = time::OffsetDateTime::now_utc().date() - time::Duration::days(WINDOW_DAYS - 1);
     let consumers = lakehouse_store::outside_reads::outside_readers_of(
         pool,
-        crate::routes::iceberg_door::GOLD_NAMESPACE,
+        zone.namespace_name(),
         &table,
         since,
     )
@@ -1109,6 +1272,7 @@ pub async fn consumers(
 
     Ok(ApiJson(json!({
         "mart": mart_name,
+        "zone": zone.namespace_name(),
         "supported": true,
         "windowDays": WINDOW_DAYS,
         "consumers": consumers,
@@ -1221,6 +1385,7 @@ pub fn compute_changed_since_export(
 async fn publication_body(
     state: &AppState,
     mart: &str,
+    zone: PublishZone,
     enabled: bool,
     updated_at: Option<String>,
     can_edit: bool,
@@ -1230,22 +1395,21 @@ async fn publication_body(
     // paths cannot drift. Its answer is the table name the export reads;
     // this body reads through the fingerprint helpers, which take the
     // schema and the mart, so only the refusal is used here.
-    gated_source_table(state, mart, actor).await?;
-    let last_changed_at =
-        mart_last_changed_at(&state.clickhouse, &state.config.gold_source_schema, mart)
-            .await
-            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
-    let last_export = gold_export_history::last_success_export(&state.clickhouse, mart)
+    gated_source_table(state, mart, actor, zone).await?;
+    let source_schema = zone.source_ch_schema(&state.config.gold_source_schema);
+    let zone_name = zone.namespace_name();
+    let last_changed_at = mart_last_changed_at(&state.clickhouse, source_schema, mart)
         .await
         .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
+    let last_export =
+        gold_export_history::last_success_export_for_zone(&state.clickhouse, mart, zone_name)
+            .await
+            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     // DATA-10 review SHOULD-FIX 1: mart_content_fingerprint moved to gold_export_history
-    let current_fingerprint = gold_export_history::mart_content_fingerprint(
-        &state.clickhouse,
-        &state.config.gold_source_schema,
-        mart,
-    )
-    .await
-    .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
+    let current_fingerprint =
+        gold_export_history::mart_content_fingerprint(&state.clickhouse, source_schema, mart)
+            .await
+            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     let changed_since_export = compute_changed_since_export(
         current_fingerprint.as_deref(),
         last_export.as_ref().map(|e| e.content_fingerprint.as_str()),
@@ -1254,11 +1418,12 @@ async fn publication_body(
     // `DATA-49` (QA `LH-DATA-1-01`): the newest run of any status, so the card
     // can say the last publish failed instead of reading "Up to date" through
     // five failed runs. A failed read here is classified like its neighbours.
-    let newest_run = gold_export_history::last_export_run(&state.clickhouse, mart)
-        .await
-        .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
+    let newest_run =
+        gold_export_history::last_export_run_for_zone(&state.clickhouse, mart, zone_name)
+            .await
+            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     // PR #105 removed From<ChError>; classify, never surface ClickHouse text.
-    let last_trim = gold_export_history::last_trim(&state.clickhouse, mart)
+    let last_trim = gold_export_history::last_trim_for_zone(&state.clickhouse, mart, zone_name)
         .await
         .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     // DATA-6 D4: the latest-copy table's name, what it holds, and the
@@ -1268,11 +1433,12 @@ async fn publication_body(
     let sanitized_mart = lakehouse_iceberg::gold::sanitize_mart_name(mart)
         .map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
     let (latest_holds, latest_run) =
-        crate::gold_latest_copy::latest_copy_state(&state.clickhouse, mart)
+        crate::gold_latest_copy::latest_copy_state_for_zone(&state.clickhouse, mart, zone)
             .await
             .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     Ok(json!({
         "mart": mart,
+        "zone": zone_name,
         "enabled": enabled,
         "updatedAt": updated_at,
         "lastChangedAt": last_changed_at.and_then(millis_to_rfc3339),
@@ -1282,7 +1448,11 @@ async fn publication_body(
         "canEdit": can_edit,
         "trim": last_trim,
         "latestCopy": {
-            "table": format!("gold.{}", lakehouse_iceberg::gold::latest_table_name(&sanitized_mart)),
+            "table": format!(
+                "{}.{}",
+                zone_name,
+                lakehouse_iceberg::gold::latest_table_name(&sanitized_mart)
+            ),
             "holds": latest_holds,
             "lastRun": latest_run,
         },
@@ -1329,17 +1499,17 @@ fn pool(state: &AppState) -> Result<&sqlx::PgPool, ApiError> {
 /// deployment publishes exactly this list, which is empty until a
 /// `gold:export` principal switches a mart on.
 ///
-/// The floor is `RequiresAuth` (see `POLICY_TABLE`) PLUS
-/// [`check_export_token`] in the handler, same two-layer shape as the
-/// export routes: the scheduler authenticates with its run token or
-/// service identity; a human session needs `gold:export`. A publication
-/// list is not secret the way row data is, but it does reveal what a
-/// deployment considers its "open format" copy — same posture as
-/// `GET /api/gold/exports`.
+/// The floor is the SEC-66 read grant (`gold:read`, or the wider
+/// `gold:export`) in `POLICY_TABLE` PLUS [`check_gold_read_token`] in the
+/// handler, same two-layer shape as the other Gold GETs: the scheduler
+/// authenticates with its run token or service identity; a human session
+/// needs one of the two Gold grants. A publication list is not secret the
+/// way row data is, but it does reveal what a deployment considers its
+/// "open format" copy — same posture as `GET /api/gold/exports`.
 ///
 /// # Errors
 ///
-/// Returns 401/503 from [`check_export_token`], 503 when Postgres is not
+/// Returns 401/503 from [`check_gold_read_token`], 503 when Postgres is not
 /// configured ([`pool`]; this feature is Postgres-backed, unlike the
 /// export routes), or 500 for a store failure (classified, never raw
 /// upstream text).
@@ -1350,7 +1520,7 @@ pub async fn publications(
     principal: Option<Extension<Principal>>,
 ) -> ApiResult<ApiJson<Value>> {
     let header_token = headers.get("x-run-token").and_then(|v| v.to_str().ok());
-    check_export_token(
+    check_gold_read_token(
         state.config.gold_export_run_token.as_deref(),
         header_token,
         query.token.as_deref(),
@@ -1363,7 +1533,14 @@ pub async fn publications(
         .map_err(ApiError::from)?;
     let publications: Vec<Value> = enabled
         .iter()
-        .map(|p| json!({ "mart": p.mart, "enabled": p.enabled, "updatedAt": p.updated_at }))
+        .map(|p| {
+            json!({
+                "zone": p.zone,
+                "mart": p.mart,
+                "enabled": p.enabled,
+                "updatedAt": p.updated_at
+            })
+        })
         .collect();
     Ok(ApiJson(json!({ "publications": publications })))
 }
@@ -1391,14 +1568,20 @@ pub async fn publication(
     State(state): State<AppState>,
     Path(mart): Path<String>,
     headers: HeaderMap,
+    Query(query): Query<ExportQuery>,
     principal: Option<Extension<Principal>>,
 ) -> ApiResult<ApiJson<Value>> {
+    let zone = parse_zone(query.zone.as_deref())?;
     let mart_ident =
         Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
     let pool = pool(&state)?;
-    let stored = lakehouse_store::gold_publication::get(pool, mart_ident.as_str())
-        .await
-        .map_err(ApiError::from)?;
+    let stored = lakehouse_store::gold_publication::get_in_zone(
+        pool,
+        zone.namespace_name(),
+        mart_ident.as_str(),
+    )
+    .await
+    .map_err(ApiError::from)?;
     let (enabled, updated_at) = stored.map_or((false, None), |p| (p.enabled, Some(p.updated_at)));
     let can_edit = principal
         .as_ref()
@@ -1410,6 +1593,7 @@ pub async fn publication(
     let body = publication_body(
         &state,
         mart_ident.as_str(),
+        zone,
         enabled,
         updated_at,
         can_edit,
@@ -1475,12 +1659,14 @@ pub async fn set_publication(
     State(state): State<AppState>,
     Path(mart): Path<String>,
     headers: HeaderMap,
+    Query(query): Query<ExportQuery>,
     principal: Option<Extension<Principal>>,
     // The body extractor is deliberately LAST: axum requires consuming
     // extractors at the end of the argument list (every sibling handler
     // here follows the same order).
     Json(body): Json<PublicationBody>,
 ) -> ApiResult<ApiJson<Value>> {
+    let zone = parse_zone(query.zone.as_deref())?;
     let Some(Extension(principal)) = principal else {
         return Err(ApiError::unauthorized().into());
     };
@@ -1489,7 +1675,7 @@ pub async fn set_publication(
     let pool = pool(&state)?;
     let exists = mart_exists(
         &state.clickhouse,
-        &state.config.gold_source_schema,
+        zone.source_ch_schema(&state.config.gold_source_schema),
         mart_ident.as_str(),
     )
     .await
@@ -1503,8 +1689,9 @@ pub async fn set_publication(
         .into());
     }
 
-    let updated = lakehouse_store::gold_publication::upsert(
+    let updated = lakehouse_store::gold_publication::upsert_in_zone(
         pool,
+        zone.namespace_name(),
         mart_ident.as_str(),
         body.enabled,
         principal.id.uuid(),
@@ -1516,6 +1703,7 @@ pub async fn set_publication(
     let body = publication_body(
         &state,
         mart_ident.as_str(),
+        zone,
         updated.enabled,
         Some(updated.updated_at),
         true,
@@ -1630,6 +1818,55 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// `SEC-66`: a person holding the read grant can open the Gold GETs
+    /// whether or not a run token is configured, without presenting one —
+    /// the policy gate admits them and this handler guard must not undo it.
+    #[test]
+    fn gold_read_permission_passes_the_read_guard_with_or_without_a_configured_token() {
+        assert!(
+            check_gold_read_token(None, None, None, Some(&human_principal_with("gold:read")))
+                .is_ok()
+        );
+        assert!(
+            check_gold_read_token(
+                Some("secret"),
+                None,
+                None,
+                Some(&human_principal_with("gold:read")),
+            )
+            .is_ok()
+        );
+    }
+
+    /// `SEC-66`: the read grant stays read-only — the export WRITE still
+    /// calls `check_export_token` directly and must refuse it.
+    #[test]
+    fn gold_read_permission_does_not_pass_the_write_guard() {
+        assert!(
+            check_export_token(None, None, None, Some(&human_principal_with("gold:read"))).is_err()
+        );
+        assert!(
+            check_export_token(
+                Some("secret"),
+                None,
+                None,
+                Some(&human_principal_with("gold:read")),
+            )
+            .is_err()
+        );
+    }
+
+    /// `SEC-66`: the scheduler's two token paths are unchanged by the new
+    /// read guard — the shared token and an unscoped service principal
+    /// still pass exactly as they did through `check_export_token`.
+    #[test]
+    fn read_guard_still_accepts_the_shared_token_and_an_unscoped_service_principal() {
+        assert!(check_gold_read_token(Some("secret"), Some("secret"), None, None).is_ok());
+        let mut service = service_principal();
+        service.permissions = PermissionSet::parse("");
+        assert!(check_gold_read_token(None, None, None, Some(&service)).is_ok());
     }
 
     #[test]
@@ -2006,6 +2243,7 @@ mod tests {
             State(state),
             Path("orders_rollup".to_owned()),
             HeaderMap::new(),
+            Query(ExportQuery::default()),
             Some(Extension(person)),
         )
         .await;
@@ -2070,6 +2308,7 @@ mod tests {
         let attempt = Attempt {
             state: &state,
             exists: true,
+            zone: PublishZone::Gold,
             mart: "orders_rollup",
             triggered_by: "user:operator",
             started_at: time::OffsetDateTime::now_utc(),
@@ -2109,12 +2348,13 @@ mod tests {
         let state = state_with_clickhouse(&server.uri());
         let _in_flight = state
             .gold_export_locks
-            .try_acquire("orders_rollup")
+            .try_acquire(&zone_lock_key(PublishZone::Gold, "orders_rollup"))
             .await
             .expect("no publish of the mart is running yet");
         let attempt = Attempt {
             state: &state,
             exists: true,
+            zone: PublishZone::Gold,
             mart: "orders_rollup",
             triggered_by: "user:operator",
             started_at: time::OffsetDateTime::now_utc(),
@@ -2143,7 +2383,9 @@ mod tests {
         env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
         env.insert("CLICKHOUSE_URL".to_owned(), "http://127.0.0.1:1".to_owned());
         let state = AppState::new(Config::from_map(&env).unwrap());
-        let result = unchanged_since_last_export_reason(&state, "orders", Some("10:1:2")).await;
+        let result =
+            unchanged_since_last_export_reason(&state, "orders", PublishZone::Gold, Some("10:1:2"))
+                .await;
         assert!(
             result.is_err(),
             "ClickHouse failure must surface as an error, never a silent skip"
@@ -2154,5 +2396,80 @@ mod tests {
             matches!(result.unwrap_err(), ApiError::Unavailable(_)),
             "an unreachable ClickHouse is classified as Unavailable"
         );
+    }
+}
+
+#[cfg(test)]
+mod zone_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn an_absent_or_gold_zone_is_gold() {
+        assert_eq!(parse_zone(None).unwrap(), PublishZone::Gold);
+        assert_eq!(parse_zone(Some("gold")).unwrap(), PublishZone::Gold);
+        assert_eq!(parse_zone(Some("serving")).unwrap(), PublishZone::Gold);
+        assert_eq!(parse_zone(Some("silver")).unwrap(), PublishZone::Silver);
+    }
+
+    #[test]
+    fn an_unknown_zone_answers_a_fixed_message_that_does_not_echo_it() {
+        let err = parse_zone(Some("<script>alert(1)</script>")).unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+        let text = err.to_string();
+        assert_eq!(
+            text,
+            "invalid zone: expected one of silver, gold or serving"
+        );
+        assert!(!text.contains("script"), "{text}");
+    }
+
+    #[test]
+    fn the_single_flight_lock_is_scoped_by_zone_and_mart() {
+        assert_eq!(zone_lock_key(PublishZone::Gold, "orders"), "gold:orders");
+        assert_eq!(
+            zone_lock_key(PublishZone::Silver, "orders"),
+            "silver:orders"
+        );
+        assert_ne!(
+            zone_lock_key(PublishZone::Silver, "orders"),
+            zone_lock_key(PublishZone::Gold, "orders")
+        );
+    }
+
+    #[test]
+    fn the_read_back_body_names_the_requested_zone_and_namespace() {
+        let silver = read_back_body_for_zone("orders", None, PublishZone::Silver);
+        assert_eq!(silver["zone"], "silver");
+        assert_eq!(silver["namespace"], "silver");
+        assert!(!silver.is_null());
+        assert_eq!(silver["published"], false);
+
+        let gold = read_back_body("orders", None);
+        assert_eq!(gold["zone"], "gold");
+        assert_eq!(gold["namespace"], lakehouse_iceberg::gold::GOLD_NAMESPACE);
+    }
+
+    #[tokio::test]
+    async fn silver_and_gold_exports_of_the_same_mart_can_run_concurrently() {
+        let locks = crate::gold_lock::MartLocks::default();
+        let silver = locks
+            .try_acquire(&zone_lock_key(PublishZone::Silver, "orders"))
+            .await
+            .expect("the Silver export takes its own lock");
+        let gold = locks
+            .try_acquire(&zone_lock_key(PublishZone::Gold, "orders"))
+            .await
+            .expect("the Gold export is not blocked by the Silver one");
+        assert!(
+            locks
+                .try_acquire(&zone_lock_key(PublishZone::Gold, "orders"))
+                .await
+                .is_err(),
+            "a second Gold export still conflicts"
+        );
+        drop(silver);
+        drop(gold);
     }
 }

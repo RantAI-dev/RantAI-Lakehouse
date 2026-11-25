@@ -62,13 +62,16 @@ import datetime
 from dataclasses import dataclass
 from typing import Any
 
-from dagster import Failure, job, op
+from dagster import Field, Failure, job, op
 
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, _ch_exec
 from dispar_orchestrate.gold_export import (
+    DEFAULT_ZONE,
     INVALID_ORPHAN_MIN_AGE_REASON,
     GoldExportConfig,
     InvalidOrphanMinAgeError,
+    ZONE_GOLD,
+    ZONE_SILVER,
     _enabled_publication_marts,
     _sql_dt64,
     _sql_num,
@@ -157,6 +160,10 @@ def ensure_gold_latest_copy_run_table(target: ClickHouseTarget) -> None:
             finished_at DateTime64(3)
         ) ENGINE = MergeTree ORDER BY (mart, started_at)""",
     )
+    _ch_exec(
+        target,
+        "ALTER TABLE console.gold_latest_copy_run ADD COLUMN IF NOT EXISTS zone String DEFAULT 'gold'",
+    )
 
 
 def record_gold_latest_copy_run(
@@ -164,6 +171,7 @@ def record_gold_latest_copy_run(
     *,
     mart: str,
     latest_table: str,
+    zone: str = DEFAULT_ZONE,
     status: str,
     reason: str | None = None,
     copy_exported_at_micros: int | None = None,
@@ -185,9 +193,9 @@ def record_gold_latest_copy_run(
     finished_at = finished_at or datetime.datetime.now(datetime.timezone.utc)
     sql = (
         f"INSERT INTO console.gold_latest_copy_run ("
-        f"id, mart, latest_table, status, reason, copy_exported_at, rows, "
+        f"id, mart, zone, latest_table, status, reason, copy_exported_at, rows, "
         f"snapshot_id, cleanup, started_at, finished_at) VALUES ("
-        f"{_sql_str(run_id)}, {_sql_str(mart)}, {_sql_str(latest_table)}, "
+        f"{_sql_str(run_id)}, {_sql_str(mart)}, {_sql_str(zone)}, {_sql_str(latest_table)}, "
         f"{_sql_str(status)}, {_sql_str(reason)}, "
         f"{_sql_dt64_micros(copy_exported_at_micros)}, {_sql_num(rows)}, "
         f"{_sql_num(snapshot_id)}, {_sql_str(cleanup)}, "
@@ -205,6 +213,10 @@ class LatestCopyRequest:
     latest_table: str
     copy_exported_at_micros: int
     rows: int
+    # DATA-65: added LAST with a default, so every pre-DATA-65 constructor
+    # (and the five-key Gold run config the Rust API still sends) keeps
+    # working and means Gold.
+    zone: str = DEFAULT_ZONE
 
     @classmethod
     def from_op_config(cls, config: dict) -> "LatestCopyRequest":
@@ -236,9 +248,15 @@ class LatestCopyRequest:
             raise InvalidLatestCopyRequest("copy_exported_at_micros must be an integer >= 1")
         if not isinstance(rows, int) or isinstance(rows, bool) or rows < 1:
             raise InvalidLatestCopyRequest("rows must be an integer >= 1")
+        zone = config.get("zone", DEFAULT_ZONE)
+        if zone not in (ZONE_SILVER, ZONE_GOLD):
+            raise InvalidLatestCopyRequest(
+                f"zone must be one of {ZONE_SILVER!r} or {ZONE_GOLD!r}"
+            )
         return cls(
             mart=mart, table=table, latest_table=latest_table,
             copy_exported_at_micros=micros, rows=rows,
+            zone=zone,
         )
 
 
@@ -291,6 +309,7 @@ def refresh_latest_copy(
             record_gold_latest_copy_run(
                 cfg.ch,
                 mart=req.mart,
+                zone=req.zone,
                 latest_table=req.latest_table,
                 status=status,
                 reason=reason,
@@ -313,7 +332,11 @@ def refresh_latest_copy(
             log.error(f"the publication list could not be read: {exc}")
         record("failed", REASON_PUBLICATION_STATE_UNAVAILABLE)
         return {"status": "failed", "reason": REASON_PUBLICATION_STATE_UNAVAILABLE}
-    if req.mart not in enabled and req.mart not in cfg.marts:
+    enabled_zone = enabled.zone_of(req.mart) if hasattr(enabled, "zone_of") else DEFAULT_ZONE
+    if not (
+        (req.mart in enabled and enabled_zone == req.zone)
+        or (req.mart in cfg.marts and req.zone == ZONE_GOLD)
+    ):
         record("skipped", REASON_PUBLISHING_OFF)
         return {"status": "skipped", "reason": REASON_PUBLISHING_OFF}
 
@@ -321,10 +344,10 @@ def refresh_latest_copy(
     # removed fails here-or-below, honestly, not as a fake success).
     try:
         catalog = load_gold_catalog(cfg)
-        main = catalog.load_table(f"gold.{req.table}")
+        main = catalog.load_table(f"{req.zone}.{req.table}")
     except Exception as exc:  # noqa: BLE001
         if log:
-            log.error(f"failed to load gold.{req.table}: {exc}")
+            log.error(f"failed to load {req.zone}.{req.table}: {exc}")
         record("failed", REASON_CATALOG_UNAVAILABLE)
         return {"status": "failed", "reason": REASON_CATALOG_UNAVAILABLE}
 
@@ -333,12 +356,12 @@ def refresh_latest_copy(
 
     latest: Any = None
     try:
-        latest = catalog.load_table(f"gold.{req.latest_table}")
+        latest = catalog.load_table(f"{req.zone}.{req.latest_table}")
     except NoSuchTableError:
         latest = None
     except Exception as exc:  # noqa: BLE001
         if log:
-            log.error(f"failed to load gold.{req.latest_table}: {exc}")
+            log.error(f"failed to load {req.zone}.{req.latest_table}: {exc}")
         record("failed", REASON_CATALOG_UNAVAILABLE)
         return {"status": "failed", "reason": REASON_CATALOG_UNAVAILABLE}
 
@@ -347,8 +370,8 @@ def refresh_latest_copy(
         if latest.properties.get(LATEST_COPY_OF_PROPERTY) != req.table:
             if log:
                 log.error(
-                    f"gold.{req.latest_table} exists without the marker of "
-                    f"gold.{req.table}: it belongs to someone else"
+                    f"{req.zone}.{req.latest_table} exists without the marker of "
+                    f"{req.zone}.{req.table}: it belongs to someone else"
                 )
             record("failed", REASON_NAME_TAKEN)
             return {"status": "failed", "reason": REASON_NAME_TAKEN}
@@ -356,7 +379,7 @@ def refresh_latest_copy(
         if _columns(latest.schema()) != _columns(main.schema()):
             if log:
                 log.error(
-                    f"gold.{req.latest_table} columns differ from gold.{req.table}"
+                    f"{req.zone}.{req.latest_table} columns differ from {req.zone}.{req.table}"
                 )
             record("failed", REASON_SCHEMA_INCOMPATIBLE)
             return {"status": "failed", "reason": REASON_SCHEMA_INCOMPATIBLE}
@@ -369,7 +392,7 @@ def refresh_latest_copy(
             held = latest.scan(selected_fields=("_exported_at",), limit=1).to_arrow()
         except Exception as exc:  # noqa: BLE001
             if log:
-                log.error(f"the held copy of gold.{req.latest_table} could not be read: {exc}")
+                log.error(f"the held copy of {req.zone}.{req.latest_table} could not be read: {exc}")
             record("failed", REASON_CATALOG_UNAVAILABLE)
             return {"status": "failed", "reason": REASON_CATALOG_UNAVAILABLE}
         if held.num_rows:
@@ -405,13 +428,13 @@ def refresh_latest_copy(
         ).to_arrow()
     except Exception as exc:  # noqa: BLE001
         if log:
-            log.error(f"the copy of gold.{req.table} could not be read: {exc}")
+            log.error(f"the copy of {req.zone}.{req.table} could not be read: {exc}")
         record("failed", REASON_CATALOG_UNAVAILABLE)
         return {"status": "failed", "reason": REASON_CATALOG_UNAVAILABLE}
     if df.num_rows != req.rows:
         if log:
             log.error(
-                f"gold.{req.table} holds {df.num_rows} rows for this publish's "
+                f"{req.zone}.{req.table} holds {df.num_rows} rows for this publish's "
                 f"_exported_at, the publish wrote {req.rows}"
             )
         record("failed", REASON_COPY_INCOMPLETE)
@@ -426,7 +449,7 @@ def refresh_latest_copy(
     try:
         if latest is None:
             with catalog.create_table_transaction(
-                f"gold.{req.latest_table}",
+                f"{req.zone}.{req.latest_table}",
                 schema=main.schema(),
                 properties={
                     LATEST_COPY_OF_PROPERTY: req.table,
@@ -439,12 +462,12 @@ def refresh_latest_copy(
                 tx.overwrite(df)
     except (CommitFailedException, TableAlreadyExistsError) as exc:
         if log:
-            log.error(f"the one-commit write of gold.{req.latest_table} conflicted: {exc}")
+            log.error(f"the one-commit write of {req.zone}.{req.latest_table} conflicted: {exc}")
         record("failed", REASON_COMMIT_CONFLICT)
         return {"status": "failed", "reason": REASON_COMMIT_CONFLICT}
     except Exception as exc:  # noqa: BLE001 - fixed reason, detail to the log
         if log:
-            log.error(f"the one-commit write of gold.{req.latest_table} failed: {exc}")
+            log.error(f"the one-commit write of {req.zone}.{req.latest_table} failed: {exc}")
         record("failed", REASON_WRITE_FAILED)
         return {"status": "failed", "reason": REASON_WRITE_FAILED}
 
@@ -456,12 +479,12 @@ def refresh_latest_copy(
     # cleanup (there is no table handle to clean) and say so in the row.
     snapshot_id: int | None = None
     try:
-        latest = catalog.load_table(f"gold.{req.latest_table}")
+        latest = catalog.load_table(f"{req.zone}.{req.latest_table}")
         current = latest.current_snapshot()
         snapshot_id = current.snapshot_id if current else None
     except Exception as exc:  # noqa: BLE001
         if log:
-            log.error(f"gold.{req.latest_table} could not be reloaded after the commit: {exc}")
+            log.error(f"{req.zone}.{req.latest_table} could not be reloaded after the commit: {exc}")
         record(
             "success",
             copy_exported_at_micros=req.copy_exported_at_micros,
@@ -493,16 +516,16 @@ def refresh_latest_copy(
                 expire_all_but_current_snapshot(latest)
             except Exception as exc:  # noqa: BLE001
                 if log:
-                    log.error(f"failed to expire snapshots of gold.{req.latest_table}: {exc}")
+                    log.error(f"failed to expire snapshots of {req.zone}.{req.latest_table}: {exc}")
                 cleanup = "expire_snapshots_failed"
         if cleanup is None:
             try:
                 remove_gold_orphan_files(
-                    cfg, f"gold.{req.latest_table}", orphan_age
+                    cfg, f"{req.zone}.{req.latest_table}", orphan_age
                 )
             except Exception as exc:  # noqa: BLE001
                 if log:
-                    log.error(f"failed to remove orphan files of gold.{req.latest_table}: {exc}")
+                    log.error(f"failed to remove orphan files of {req.zone}.{req.latest_table}: {exc}")
                 cleanup = "orphan_cleanup_failed"
 
     # 9. Success, with the copy's own facts (D12).
@@ -523,6 +546,9 @@ def refresh_latest_copy(
         "latest_table": str,
         "copy_exported_at_micros": int,
         "rows": int,
+        # DATA-65: optional so the Rust API's pre-existing five-key Gold
+        # launch config stays valid; a Silver launch adds `zone: silver`.
+        "zone": Field(str, is_required=False, default_value=DEFAULT_ZONE),
     },
     retry_policy=DEFAULT_RETRY_POLICY,
     tags=source_metadata(

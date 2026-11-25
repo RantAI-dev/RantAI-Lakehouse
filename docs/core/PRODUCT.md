@@ -87,7 +87,7 @@ The modules are the groups in the console's navigation
 | --- | --- | --- |
 | **Home** | Starts work: ask, instruct, see what needs attention | Built |
 | **History (Ask AI)** | Returns to past conversations with the assistant, which answers questions and performs actions; a conversation starts on Home (PR #68) | Built; needs a model endpoint |
-| **Dashboards** | Builds and views dashboards; filters, drills, shares, embeds | Built; behind Metabase on filters, calculations, formatting and delivery (BI matrix: 39 have, 39 partial, 68 missing) |
+| **Dashboards** | Builds and views dashboards; filters, drills, shares, embeds | Built; the base (create, browse, every chart kind, threshold alerts, viewer access, phone width) accepted by the product owner 2026-11-21 (`BI-56`, `features/dashboards-basics.md`); behind Metabase on filters, calculations, formatting and delivery (BI matrix: 39 have, 39 partial, 68 missing) |
 | **Data** | Browses the catalog and assets; registers sources; uploads a file; switches a Gold table's open-format publishing on or off from its page | Built; publishing (PR #64) and file upload (PR #71) are merged but not yet accepted |
 | **Query Studio** | Writes SQL or asks in plain language; saves queries; downloads results; explains a query in plain words and, for a failed ClickHouse query, proposes a fix as a diff to accept or reject | Built; in the Data menu today. A main module of its own, shared by BI and the lakehouse (product owner, 2026-10-07). Matrix: 4 have, 11 partial, 11 missing |
 | **Build** | Creates, schedules and operates pipelines | Built |

@@ -707,6 +707,27 @@ pub struct NewConnectionBody {
     dial: Value,
 }
 
+/// `BI-44` slice 2's one connector-source gate. `full` mode is left exactly
+/// as it was; a `bi-only` install refuses, with a 400 carrying the honest
+/// `supported: false` reason, any source the active engine cannot read in
+/// place. This runs before SSRF checks and before any credential is stored,
+/// so a refused source leaves nothing behind.
+fn refuse_unsupported_in_place_source(state: &AppState, source_type: &str) -> Result<(), ApiError> {
+    if !state.config.is_bi_only() {
+        return Ok(());
+    }
+    let support = crate::in_place::source_support(state.config.query_engine, source_type);
+    if support.supported {
+        return Ok(());
+    }
+    let reason = support
+        .reason
+        .unwrap_or_else(|| "the active engine does not support this source in place".to_owned());
+    Err(ApiError::BadRequest(format!(
+        "source type {source_type:?} is not supported in place by the installed engine: {reason}"
+    )))
+}
+
 /// The `POST /api/connectors` response: the created
 /// [`connectors::Connector`] plus its credential reference NAMES. For an
 /// `env`/`file` source those are what an operator must provision; for a
@@ -854,6 +875,11 @@ pub async fn create(
         ))
         .into());
     }
+    // `BI-44` slice 2: a `bi-only` install reads sources in place through ONE
+    // engine. Refuse a source that engine cannot read BEFORE any row, secret
+    // or probe exists, and say why. `full` mode is unchanged — it copies
+    // data and its connector set is not narrowed by the query engine.
+    refuse_unsupported_in_place_source(&state, &body.kind)?;
     // QA LH-SRC-3-11 (SRC-41 D11): the console sends the connection settings
     // with the create, so a refused dial creates nothing. The save that stores
     // them checks again.
@@ -1142,6 +1168,9 @@ pub async fn test_connection(
     let Some(dial_info) = dial_info else {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
     };
+    // `BI-44` slice 2: a stored connector whose source the installed engine
+    // cannot read in place is refused on test too, before any probe dial.
+    refuse_unsupported_in_place_source(&state, &dial_info.kind)?;
     // `SRC-4` T1.1: a type only the orchestrator can dial (Oracle) is tested
     // there. The answer is "running", never a success this API has not seen.
     if connector_probe::is_tested_in_orchestrator(&dial_info) {

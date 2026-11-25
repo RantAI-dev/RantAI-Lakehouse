@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::cli::InstallArgs;
+use crate::cli::{InstallArgs, InstallModeArg, QueryEngineArg};
 use crate::docker;
 use crate::error::ToolError;
 use crate::files;
@@ -64,6 +64,7 @@ const DEFAULT_CONSOLE_PORT: u16 = 3000;
 /// what failed; the ones that come from the machine say what to fix.
 pub fn command(args: &InstallArgs) -> Result<(), ToolError> {
     preflight::validate_ignored(&args.ignore_preflight).map_err(ToolError::Usage)?;
+    let (mode, engine) = args.validated_install()?;
 
     let release = release::obtain(
         args.bundle.as_deref(),
@@ -94,7 +95,7 @@ pub fn command(args: &InstallArgs) -> Result<(), ToolError> {
 
     check_preflight(args, &release.compose)?;
 
-    let secrets = write_layout(&args.dir, &release, &manifest, &shipped)?;
+    let secrets = write_layout_with_mode(&args.dir, &release, &manifest, &shipped, mode, engine)?;
     let env = crate::env::read(&args.dir.join(".env"));
 
     images::fetch(&manifest, release.bundle_dir.as_deref())?;
@@ -123,12 +124,35 @@ fn check_preflight(args: &InstallArgs, compose: &str) -> Result<(), ToolError> {
     Err(ToolError::Preflight(failures.len()))
 }
 
-/// Write the install's layout (REL-2 decision D5).
+/// Write the install's layout for the unchanged default (REL-2 decision D5).
+///
+/// Production installs pass the parsed flags to `write_layout_with_mode`;
+/// this default-only entry point stays for the existing full-mode tests.
+#[cfg(test)]
 fn write_layout(
     dir: &Path,
     release: &release::Release,
     manifest: &Manifest,
     shipped: &files::ShippedFiles,
+) -> Result<secrets::Secrets, ToolError> {
+    write_layout_with_mode(
+        dir,
+        release,
+        manifest,
+        shipped,
+        InstallModeArg::Full,
+        QueryEngineArg::ClickHouse,
+    )
+}
+
+/// Write the install's layout with the installer's mode and engine (`BI-44`).
+fn write_layout_with_mode(
+    dir: &Path,
+    release: &release::Release,
+    manifest: &Manifest,
+    shipped: &files::ShippedFiles,
+    mode: InstallModeArg,
+    engine: QueryEngineArg,
 ) -> Result<secrets::Secrets, ToolError> {
     // The state of an earlier install is not overwritten: the same
     // release may be installed again, and any other release is refused
@@ -167,7 +191,7 @@ fn write_layout(
     // re-install of the same release changes nothing of it.
     state::write_initial(dir, &manifest.version)?;
 
-    secrets::write_env(&dir.join(".env")).map_err(|source| ToolError::Io {
+    secrets::write_env_with_mode(&dir.join(".env"), mode, engine).map_err(|source| ToolError::Io {
         context: format!("{} could not be written", dir.join(".env").display()),
         source,
     })
@@ -426,6 +450,73 @@ mod tests {
                 .expect("the state is read"),
             "not json\n",
             "the state was overwritten"
+        );
+    }
+
+    #[test]
+    fn a_bi_only_layout_writes_the_mode_engine_and_one_engine_url() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        write_layout_with_mode(
+            directory.path(),
+            &release_of("0.2.0"),
+            &manifest_of("0.2.0"),
+            &files::ShippedFiles::new(),
+            InstallModeArg::BiOnly,
+            QueryEngineArg::Trino,
+        )
+        .expect("the layout is written");
+
+        let text =
+            std::fs::read_to_string(directory.path().join(".env")).expect("the .env is readable");
+        assert_eq!(
+            secrets::read_value(&text, "LAKEHOUSE_INSTALL_MODE").as_deref(),
+            Some("bi-only"),
+            "the mode was not written"
+        );
+        assert_eq!(
+            secrets::read_value(&text, "LAKEHOUSE_QUERY_ENGINE").as_deref(),
+            Some("trino"),
+            "the engine was not written"
+        );
+        assert_eq!(
+            secrets::read_value(&text, "TRINO_URL").as_deref(),
+            Some("http://trino:8080"),
+            "the Trino URL was not written"
+        );
+        assert_eq!(
+            secrets::read_value(&text, "CH_URL"),
+            None,
+            "a second engine was left set"
+        );
+    }
+
+    #[test]
+    fn a_full_layout_keeps_its_env_without_mode_variables() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        write_layout(
+            directory.path(),
+            &release_of("0.2.0"),
+            &manifest_of("0.2.0"),
+            &files::ShippedFiles::new(),
+        )
+        .expect("the layout is written");
+
+        let text =
+            std::fs::read_to_string(directory.path().join(".env")).expect("the .env is readable");
+        assert_eq!(
+            secrets::read_value(&text, "LAKEHOUSE_INSTALL_MODE"),
+            None,
+            "a full install must not claim a mode"
+        );
+        assert_eq!(
+            secrets::read_value(&text, "LAKEHOUSE_QUERY_ENGINE"),
+            None,
+            "a full install must not name one engine"
+        );
+        assert_eq!(
+            secrets::read_value(&text, "TRINO_URL"),
+            None,
+            "a full install must not set the other engine's URL"
         );
     }
 }

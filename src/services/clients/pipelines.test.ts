@@ -209,6 +209,34 @@ describe("dagsterPipelineService refusals on a write", () => {
   })
 })
 
+describe("dagsterPipelineService re-upload chain read", () => {
+  it("reads the newest chain step from the pipeline's own route", async () => {
+    const step = {
+      rootRunId: "root-1",
+      sourceTable: "bronze.orders",
+      outcome: "started",
+      reason: null,
+      runId: "run-42",
+      causePipelineId: null,
+      causePipelineName: null,
+      recordedAt: "2026-11-20T10:02:11Z",
+    }
+    const calls = stubFetch(() => json({ last: step }))
+
+    const signal = new AbortController().signal
+    const body = await dagsterPipelineService.getReuploadChain("pl gold", signal)
+
+    expect(body).toEqual({ last: step })
+    expect(calls[0].url).toContain("/api/pipelines/pl%20gold/reupload-chain")
+    expect(calls[0].init?.signal).toBe(signal)
+  })
+
+  it("reads a null last step before any re-upload", async () => {
+    stubFetch(() => json({ last: null }))
+    expect(await dagsterPipelineService.getReuploadChain("pl-1")).toEqual({ last: null })
+  })
+})
+
 // BLD-16 / J6: the SQL of one form step of an unsaved definition. The body
 // and the answer are the plan's contract; a 400 keeps the API's sentence so
 // the editor can select the step and the row it names (D7).
@@ -264,5 +292,17 @@ describe("dagsterPipelineService.stepSql", () => {
     expect(err.message).toBe(
       "steps[0].on[0]: a column must be a plain name (letters, digits and underscores, not starting with a digit)"
     )
+  })
+})
+
+describe("dagsterPipelineService.triggerPipeline (BLD-12)", () => {
+  it("sends { fullRefresh: true } in the trigger body, and an empty body for a normal run", async () => {
+    const calls = stubFetch(() => json({ id: "run-1", status: "started" }))
+    await dagsterPipelineService.triggerPipeline("pl-1", { fullRefresh: true })
+    expect(calls[0]?.url).toBe("/api/pipelines/pl-1/trigger")
+    expect(JSON.parse(String(calls[0]?.init.body))).toEqual({ fullRefresh: true })
+
+    await dagsterPipelineService.triggerPipeline("pl-1")
+    expect(calls[1]?.init.body).toBeUndefined()
   })
 })

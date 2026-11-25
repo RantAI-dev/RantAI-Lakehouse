@@ -500,7 +500,7 @@ function TableView({ columns, rows, settings = {}, labels = {}, style }: { colum
         <tbody>
           {rows.map((r, i) => (
             <tr key={i} className="border-b border-border/40 last:border-0">
-              {shown.map((c) => <td key={c} style={{ ...columnStyle(settings[c]), ...conditionalCss(style?.conditional, c, r[c], domains) }} className={cellClass(settings[c])}><CellValue value={r[c]} setting={settings[c]} format={style?.valueFormats?.[c] ?? style?.format} /></td>)}
+              {shown.map((c) => <td key={c} style={{ ...columnStyle(settings[c]), ...conditionalCss(style?.conditional, c, r[c], domains) }} className={cellClass(settings[c])}><CellValue value={r[c]} setting={settings[c]} format={style?.valueFormats?.[c] ?? style?.format} column={c} /></td>)}
             </tr>
           ))}
         </tbody>

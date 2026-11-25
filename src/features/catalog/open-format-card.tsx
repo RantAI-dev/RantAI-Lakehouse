@@ -29,16 +29,24 @@ import type {
   GoldPublication,
   GoldReadBack,
   GoldTrimSummary,
+  GoldZone,
 } from "@/services/contracts/gold"
+// Shared with the asset "Connect" dialog: both name the mart the Gold export
+// routes use, not the `serving.`-prefixed catalog id.
+import { martFromAssetId as trimmedMart } from "./asset-connect-snippets"
 
-function trimmedMart(assetId: string): string {
-  return assetId.startsWith("serving.") ? assetId.slice("serving.".length) : assetId
-}
-
-function LastFiveRuns({ mart, runsKey }: { mart: string; runsKey: number }) {
+function LastFiveRuns({
+  mart,
+  zone,
+  runsKey,
+}: {
+  mart: string
+  zone: GoldZone
+  runsKey: number
+}) {
   const state = useService<GoldExportRun[]>(
-    (signal) => goldService.listExportRuns(mart, signal),
-    [mart, runsKey]
+    (signal) => goldService.listExportRuns(mart, signal, zone),
+    [mart, zone, runsKey]
   )
   if (state.status === "loading") return <LoadingSkeleton rows={3} />
   if (state.status === "error") return <ErrorState error={state.error} onRetry={state.reload} />
@@ -195,10 +203,13 @@ function ReadersValue({ state }: { state: ServiceState<GoldConsumers> }) {
 }
 
 export function OpenFormatCard({ assetId }: { assetId: string }) {
-  const mart = trimmedMart(assetId)
+  // DATA-65: a Silver asset publishes to the `silver` Iceberg namespace;
+  // every other asset (Gold `serving.*`) keeps the old gold behavior.
+  const zone: GoldZone = assetId.startsWith("silver.") ? "silver" : "gold"
+  const mart = trimmedMart(assetId).replace(/^silver\./, "")
   const pub = useService<GoldPublication>(
-    (signal) => goldService.getPublication(mart, signal),
-    [mart]
+    (signal) => goldService.getPublication(mart, signal, zone),
+    [mart, zone]
   )
   // QA LH-DATA-1-02 (plan D7): the publish history is read through routes
   // that need gold:export. A person without it got a 4xx there, and the
@@ -211,16 +222,16 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
   // published".
   const lastExport = useService<GoldReadBack | null>(async (signal) => {
     if (!mayReadHistory) return null
-    return await goldService.getLastExport(mart, signal)
-  }, [mart, mayReadHistory])
+    return await goldService.getLastExport(mart, signal, zone)
+  }, [mart, zone, mayReadHistory])
   const readers = useService<GoldConsumers>(
-    (signal) => goldService.getConsumers(mart, signal),
-    [mart]
+    (signal) => goldService.getConsumers(mart, signal, zone),
+    [mart, zone]
   )
   const toggle = useServiceAction(
-    (signal, enabled: boolean) => goldService.setPublication(mart, enabled, signal)
+    (signal, enabled: boolean) => goldService.setPublication(mart, enabled, signal, zone)
   )
-  const exportNow = useServiceAction((signal) => goldService.triggerExport(mart, signal))
+  const exportNow = useServiceAction((signal) => goldService.triggerExport(mart, signal, zone))
   // Bumped after a publish so `LastFiveRuns` reads again: its `useService` is keyed
   // on the mart alone, so a new run would otherwise stay unseen.
   const [runsKey, setRunsKey] = React.useState(0)
@@ -248,7 +259,7 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
   return (
     <SectionCard
       title="Publish in open format (Iceberg)"
-      description="A copy in open Iceberg format that outside tools can read. Publishing adds one full copy each time; old copies stay. A second table holds only the newest copy, for tools that do not filter on export time."
+      description={`A copy in open Iceberg format that outside tools can read. This ${zone === "silver" ? "Silver" : "Gold"} asset publishes to ${zone}.${mart}; publishing adds one full copy each time and old copies stay. A second table holds only the newest copy, for tools that do not filter on export time.`}
       action={
         <label className="flex items-center gap-2" data-testid="open-format-switch">
           <Switch
@@ -312,6 +323,12 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
             Publishing is off; this copy is no longer updated.
           </p>
         )}
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <span className="text-muted-foreground">Iceberg table:</span>
+          <code data-testid="iceberg-table" className="font-mono text-xs">
+            {zone}.{mart}
+          </code>
+        </div>
         <dl className="grid grid-cols-3 gap-1 text-sm">
           <dt className="text-muted-foreground">Readers (7 days)</dt>
           <dd className="col-span-2">
@@ -429,7 +446,7 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
             {canEdit && (
               <div>
                 <h4 className="mb-1 text-sm font-medium">Last 5 publish runs</h4>
-                <LastFiveRuns mart={mart} runsKey={runsKey} />
+                <LastFiveRuns mart={mart} zone={zone} runsKey={runsKey} />
               </div>
             )}
             <Link
