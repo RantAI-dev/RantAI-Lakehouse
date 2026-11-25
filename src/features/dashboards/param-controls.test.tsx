@@ -5,6 +5,11 @@ import type { ParamControl } from "@/lib/params"
 
 afterEach(cleanup)
 
+/** BI-61 T3: each parameter is a chip; its control is in the panel the chip opens. */
+function openChip(name: string) {
+  fireEvent.click(screen.getByRole("button", { name: new RegExp(`^${name}`) }))
+}
+
 const number: ParamControl = {
   param: { id: "p_1", name: "target", label: "Target", type: "number", default: 1000, min: 0, max: 5000 },
   value: 1000,
@@ -17,16 +22,40 @@ const pick: ParamControl = {
 describe("ParamControls", () => {
   it("draws one control per parameter, showing the value in force and the range", () => {
     render(<ParamControls controls={[number, pick]} onChange={mock(() => {})} />)
+    // The chips name the parameter and the value in force.
+    expect(screen.getByRole("button", { name: /^Target/ }).textContent).toContain("1000")
+    expect(screen.getByRole("button", { name: /^Measure/ }).textContent).toContain("Rooms")
+    openChip("Target")
     const input = screen.getByLabelText("Target") as HTMLInputElement
     expect(input.value).toBe("1000")
     expect(input.getAttribute("min")).toBe("0")
     expect(input.getAttribute("max")).toBe("5000")
-    expect(screen.getByRole("combobox", { name: "Measure" }).textContent).toContain("Rooms")
+    expect(screen.getByText("0 to 5000")).toBeTruthy()
+    cleanup()
+    render(<ParamControls controls={[number, pick]} onChange={mock(() => {})} />)
+    openChip("Measure")
+    expect(screen.getByRole("radio", { name: "Rooms" }).getAttribute("aria-checked")).toBe("true")
+    expect(screen.getByRole("radio", { name: "Visitors" }).getAttribute("aria-checked")).toBe("false")
+  })
+
+  it("reports a list value as soon as it is picked", () => {
+    const onChange = mock(() => {})
+    render(<ParamControls controls={[pick]} onChange={onChange} />)
+    openChip("Measure")
+    fireEvent.click(screen.getByRole("radio", { name: "Visitors" }))
+    expect(onChange).toHaveBeenCalledWith("pick", "visitors")
+  })
+
+  it("tints a chip whose value differs from the saved one, and only that one", () => {
+    render(<ParamControls controls={[number, pick]} onChange={mock(() => {})} defaults={{ target: 1000, pick: "visitors" }} />)
+    expect(screen.getByRole("button", { name: /^Target/ }).parentElement?.className).not.toContain("bg-primary/12")
+    expect(screen.getByRole("button", { name: /^Measure/ }).parentElement?.className).toContain("bg-primary/12")
   })
 
   it("reports a number once the viewer leaves the field, as a number", () => {
     const onChange = mock(() => {})
     render(<ParamControls controls={[number]} onChange={onChange} />)
+    openChip("Target")
     const input = screen.getByLabelText("Target") as HTMLInputElement
     fireEvent.change(input, { target: { value: "500" } })
     expect(onChange).not.toHaveBeenCalled()
@@ -37,6 +66,7 @@ describe("ParamControls", () => {
   it("puts an emptied or unchanged field back instead of reporting it", () => {
     const onChange = mock(() => {})
     render(<ParamControls controls={[number]} onChange={onChange} />)
+    openChip("Target")
     const input = screen.getByLabelText("Target") as HTMLInputElement
     fireEvent.change(input, { target: { value: "" } })
     fireEvent.blur(input)
@@ -46,14 +76,16 @@ describe("ParamControls", () => {
 
   it("follows a value the server gave back", () => {
     const { rerender } = render(<ParamControls controls={[number]} onChange={mock(() => {})} />)
+    openChip("Target")
     rerender(<ParamControls controls={[{ ...number, value: 250 }]} onChange={mock(() => {})} />)
     expect((screen.getByLabelText("Target") as HTMLInputElement).value).toBe("250")
   })
 
-  // QA LH-BI-11-05 (BI-52): the refusal is under its own control, and the
+  // QA LH-BI-11-05 (BI-52): the refusal is beside its own chip, and the
   // control goes back to the value in force.
   it("a refusal is shown under its control and the control goes back to the value in force", () => {
     const { rerender } = render(<ParamControls controls={[number]} onChange={mock(() => {})} />)
+    openChip("Target")
     const input = screen.getByLabelText("Target") as HTMLInputElement
     fireEvent.change(input, { target: { value: "999" } })
     fireEvent.blur(input)
