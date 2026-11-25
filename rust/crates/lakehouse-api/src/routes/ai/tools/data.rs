@@ -1087,29 +1087,121 @@ pub(super) async fn lakehouse_overview(state: &AppState, principal: Option<&Prin
     })
 }
 
-/// The recorded lineage around a dataset or table: the same graph
-/// `GET /api/governance/lineage` serves (`routes::lineage`), so the
-/// copilot and the Lineage page can never disagree. `chain` lists every
-/// edge as one line for the model; `nodes`/`edges` carry the graph.
+/// The one sentence for a call that names both subjects or neither
+/// (`AI-13` decision 1): a slug (or its legacy alias `focus`) and a chart id.
+const ONE_SUBJECT: &str = "Call get_lineage with exactly one of slug (a dataset slug or a table name) or chart (a chart id).";
+
+/// The one refusal for every failure of the chart read (`AI-13` decision 3):
+/// an unknown id, somebody else's personal chart, a caller without
+/// `dashboard:read`, a caller the shared catalog refuses, and a read that
+/// failed all answer the same sentence, so no answer says the chart exists,
+/// and no upstream error text reaches the answer (principle 4).
+const NO_VISIBLE_CHART: &str = "No chart lineage is available for that id.";
+
+/// The compact path for the model (`AI-13`): the chart route answer's own
+/// steps, nearest the chart first, each with its refresh time or "not
+/// recorded". The arrow between two steps is the kind of the edge that
+/// connects them, the `{from} -[{kind}]-> {to}` shape the slug path prints
+/// per edge; a pair with no edge (branches of the same table) reads
+/// `upstream`.
+fn chart_chain(answer: &Value) -> String {
+    let Some(steps) = answer["steps"].as_array().filter(|s| !s.is_empty()) else {
+        return "no recorded lineage".to_owned();
+    };
+    let kinds: std::collections::HashMap<(&str, &str), &str> = answer["edges"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let from = e.get("from")?.as_str()?;
+            let to = e.get("to")?.as_str()?;
+            Some(((from, to), e.get("kind")?.as_str()?))
+        })
+        .collect();
+    let mut chain = String::new();
+    let mut previous: Option<&str> = None;
+    for step in steps {
+        let (Some(id), Some(label), Some(kind)) = (
+            step.get("id").and_then(Value::as_str),
+            step.get("label").and_then(Value::as_str),
+            step.get("kind").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if let Some(to) = previous {
+            let edge = kinds.get(&(id, to)).copied().unwrap_or("upstream");
+            chain.push_str(&format!(" -[{edge}]-> "));
+        }
+        chain.push_str(label);
+        chain.push_str(&format!(" ({kind}"));
+        match (
+            step.get("refreshedAt").and_then(Value::as_str),
+            step.get("refreshSource").and_then(Value::as_str),
+        ) {
+            (Some(at), Some(source)) => chain.push_str(&format!(", refreshed {at} via {source}")),
+            (Some(at), None) => chain.push_str(&format!(", refreshed {at}")),
+            (None, _) if step.get("notRecorded") == Some(&json!(true)) => {
+                chain.push_str(", refresh not recorded")
+            }
+            (None, _) => {}
+        }
+        chain.push(')');
+        previous = Some(id);
+    }
+    chain
+}
+
+/// The `chart` path (`AI-13` decision 1): the chart-lineage route's own
+/// read, never a graph built here — `charts::read` is where every gate
+/// lives (`dashboard:read`, the shared catalog, the chart's visibility,
+/// per-role table hiding), so whatever it answers is what the route would.
+async fn chart_lineage_answer(state: &AppState, principal: &Principal, chart: &str) -> Value {
+    // `headers: HeaderMap::new()` — no `X-Tenant` selection from the copilot:
+    // the tenant resolves from the principal, the same default an interactive
+    // caller gets by omitting the header.
+    let Ok(answer) = crate::routes::lineage::charts::read(
+        state,
+        principal,
+        &axum::http::HeaderMap::new(),
+        chart,
+    )
+    .await
+    else {
+        return json!({ "error": NO_VISIBLE_CHART });
+    };
+    let mut out = answer;
+    out["chain"] = json!(chart_chain(&out));
+    out
+}
+
+/// The recorded lineage around a dataset, a table or a chart: the same
+/// graph `GET /api/governance/lineage` serves (`routes::lineage`), and for a
+/// chart the same path `GET /api/dashboard/charts/{id}/lineage` serves
+/// (`routes::lineage::charts`), so the copilot and the pages can never
+/// disagree. `chain` lists the path as one string for the model;
+/// `nodes`/`edges` carry the graph. A `slug` answer also carries `usedBy`,
+/// the charts that read the table, from the used-by route's own read.
 pub(super) async fn get_lineage(
     state: &AppState,
     principal: Option<&Principal>,
     args: &Map<String, Value>,
 ) -> Value {
-    let focus = {
-        let slug = arg_str(args, "slug");
-        if slug.is_empty() {
-            arg_str(args, "focus")
-        } else {
-            slug
-        }
+    let slug = arg_str(args, "slug");
+    let focus = if slug.is_empty() {
+        arg_str(args, "focus")
+    } else {
+        slug
     };
-    if focus.is_empty() {
-        return json!({ "error": "slug is required: a dataset slug or a table name such as serving.<table>" });
+    let chart = arg_str(args, "chart");
+    if (chart.is_empty() && focus.is_empty()) || (!chart.is_empty() && !focus.is_empty()) {
+        return json!({ "error": ONE_SUBJECT });
     }
     let Some(principal) = principal else {
         return json!({ "error": "lineage needs a signed-in user" });
     };
+    if !chart.is_empty() {
+        return chart_lineage_answer(state, principal, &chart).await;
+    }
     // SEC-20, plan 95: a caller the shared-catalog rule refuses gets no graph
     // at all from the tool. (`GET /api/governance/lineage` keeps drawing the
     // tenant's own records for such a caller, and since plan 96 its builder
@@ -1155,6 +1247,28 @@ pub(super) async fn get_lineage(
         )
     } else {
         json!(chain.join("\n"))
+    };
+    // `AI-13` decision 2: the page's other promise — the charts that read
+    // this table — from the used-by route's own read under the same caller,
+    // never a second list built here. The route caps the list (`MAX_CHARTS`);
+    // its answer passes through as it is. `headers: HeaderMap::new()` for the
+    // same reason as the chart read above.
+    out["usedBy"] = match crate::routes::lineage::used_by::read(
+        state,
+        principal,
+        &axum::http::HeaderMap::new(),
+        &focus,
+    )
+    .await
+    {
+        Ok(answer) => answer,
+        // A focus that is not a table name (a dataset slug, say) has no
+        // used-by answer; an honest refusal, never an empty list that would
+        // read as "no chart uses it". The cause stays out of the answer.
+        Err(_) => json!({
+            "supported": false,
+            "reason": "charts are listed for a table name such as serving.<table>, not this focus",
+        }),
     };
     out
 }

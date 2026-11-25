@@ -24,6 +24,20 @@
     ]
   },
   {
+    "id": "ai13_chart_number_lineage",
+    "mode": "ask",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Board Lineage"}, "id_at": "board.id"},
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Events Total Lineage", "kind": "kpi", "mart": "mart_event", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "context": "The user is viewing the dashboard \"Eval Board Lineage\" (board id: {board}). Time grain: each chart's own. Active filters: none. Tiles and the data they currently show (built-in tiles are not editable):\n- \"Eval Events Total Lineage\" (kpi, id {chart}; mart_event): not loaded",
+    "turns": ["Where does this number come from?"],
+    "expect_tool": {"name": "get_lineage", "args_contains": {"chart": "{chart}"}},
+    "facts": [
+      {"label": "source table", "kind": "text", "values": ["mart_event"]}
+    ]
+  },
+  {
     "id": "dash_mart_columns",
     "mode": "ask",
     "turns": ["What can I chart from the events mart?"],

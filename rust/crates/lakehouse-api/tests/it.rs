@@ -65,6 +65,7 @@ mod ai_comment_tool;
 mod ai_dashboard_reach;
 mod ai_embed_tools;
 mod ai_export_tools;
+mod ai_lineage_chart_tool;
 mod ai_next_step;
 mod ai_prompt_size;
 mod ai_report_tools;

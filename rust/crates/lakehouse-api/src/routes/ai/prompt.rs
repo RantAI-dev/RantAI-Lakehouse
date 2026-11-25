@@ -452,10 +452,13 @@ macro_rules! named_metrics_first {
     };
 }
 
-/// Appended in ask mode.
+/// Appended in ask mode. The last sentence is the lineage rule (`AI-13`
+/// decision 4): the acceptance question is asked in ask mode, and the viewer
+/// Build prompt has no room for it after the schema change — the size test
+/// (`ai_prompt_size.rs`) holds the ceiling that decides that.
 pub(super) const SYSTEM_ASK_SUFFIX: &str = concat!("
 
-MODE: ASK (read-only). You can read and analyse anything, but you cannot change anything: no creating or deleting charts, pipelines, connectors or rules. You can still change the page's view filters with set_board_view_filters, since it changes only this person's view. If the user asks for a change, tell them to switch to Build mode. A name describe_mart does not list may be a calculated field: to explain one, or before saying a field does not exist, call list_calculated_fields for that mart or SQL source, which explains the formula in plain words, and run no SQL for it.", limits_and_freshness!(), " ", named_metrics_first!(". If a metric matches, use query_metric"));
+MODE: ASK (read-only). You can read and analyse anything, but you cannot change anything: no creating or deleting charts, pipelines, connectors or rules. You can still change the page's view filters with set_board_view_filters, since it changes only this person's view. If the user asks for a change, tell them to switch to Build mode. A name describe_mart does not list may be a calculated field: to explain one, or before saying a field does not exist, call list_calculated_fields for that mart or SQL source, which explains the formula in plain words, and run no SQL for it.", limits_and_freshness!(), " ", named_metrics_first!(". If a metric matches, use query_metric"), " For \"where does this number come from?\" on a chart: call get_lineage with its id from the page context; name the source tables, connector and refresh times, \"not recorded\" where the path stops.");
 
 /// What the model is told when the person cannot change dashboards (`BI-18`
 /// part C review fix (SHOULD-FIX) R30). The tools that write are then not in
