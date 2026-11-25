@@ -2,6 +2,7 @@ import * as React from "react";
 import { ArrowUpRight } from "lucide-react";
 import type { HomeCopy } from "@/lib/copy";
 import { GET_STARTED_COMMANDS, LINKS } from "@/lib/home-content";
+import { WrapCommand } from "@/components/shared/wrap-command";
 import { Container, CtaLink, DisplayHeading, Eyebrow, LeadText } from "@/components/shared/primitives";
 import { CopyButton } from "@/components/shared/copy-button";
 import { Reveal } from "@/components/shared/reveal";
@@ -67,12 +68,17 @@ export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarte
                     const id = `get-started-${i}-${j}`;
                     return (
                       <li key={cmd} className="flex items-center gap-1 py-0.5 pr-1 pl-4">
-                        <code className="min-w-0 flex-1 overflow-x-auto py-2.5 pr-6 text-[13px] leading-5 whitespace-nowrap text-[#E8F4FF] [mask-image:linear-gradient(90deg,#000_calc(100%-24px),transparent)] [scrollbar-width:none] sm:text-[13.5px] [&::-webkit-scrollbar]:hidden" tabIndex={0}>
+                        {/* Owner QA 2026-11-25 (nothing scrolls sideways on a phone): below 1024 px a long command wraps. */}
+                        <code className="min-w-0 flex-1 overflow-x-auto py-2.5 pr-6 text-[13px] leading-5 whitespace-nowrap text-[#E8F4FF] [mask-image:linear-gradient(90deg,#000_calc(100%-24px),transparent)] [scrollbar-width:none] max-lg:overflow-visible max-lg:pr-2 max-lg:whitespace-normal max-lg:[overflow-wrap:anywhere] max-lg:[mask-image:none] sm:text-[13.5px] [&::-webkit-scrollbar]:hidden" tabIndex={0}>
                           <span aria-hidden="true" className="mr-2 text-[#44A6FA] select-none">
                             $
                           </span>
-                          <span id={id}>
+                          {/* The copy button reads `id`, the plain command; a phone shows it wrapping. */}
+                          <span id={id} className="max-lg:hidden">
                             {cmd}
+                          </span>
+                          <span className="lg:hidden">
+                            <WrapCommand text={cmd} />
                           </span>
                         </code>
                         <CopyButton targetId={id} text={copyText} className="h-10! min-w-10 justify-center bg-transparent px-2.5! ring-0! hover:bg-white/[0.08] [&[data-state=idle]>span:last-child]:sr-only" />

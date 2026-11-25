@@ -2,6 +2,7 @@ import { CtaLink, DisplayHeading } from "@/components/shared/primitives";
 import { LINKS } from "@/lib/home-content";
 import type { CommonCopy } from "@/lib/copy";
 import { CopyButton } from "./copy-button";
+import { WrapCommand } from "@/components/shared/wrap-command";
 
 /**
  * The footer's call to action (owner QA 2026-11-08, after comparing three variants): no card, no
@@ -28,16 +29,23 @@ export function FooterCta({
       <DisplayHeading id="footer-cta-heading" as="h2" size="lg" className="max-w-[14ch]">
         {copy.title}
       </DisplayHeading>
-      <div className="lk-term mt-8 flex max-w-3xl items-center gap-2 rounded-2xl bg-[var(--lk-n-surface)] p-2 pl-4 md:mt-10">
+      {/* Below 1024 px the command wraps (`WrapCommand`) and Copy takes its own row, so the command keeps the width. */}
+      <div className="lk-term mt-8 flex max-w-3xl items-center gap-2 rounded-2xl bg-[var(--lk-n-surface)] p-2 pl-4 max-lg:flex-wrap md:mt-10">
         <span aria-hidden="true" className="text-[#8fcbff]/60 select-none">$</span>
         <div
-          className="min-w-0 flex-1 overflow-x-auto [mask-image:linear-gradient(90deg,#000_calc(100%-36px),transparent)] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          // Owner QA 2026-11-25 (nothing scrolls sideways on a phone): below 1024 px the command wraps.
+          className="min-w-0 flex-1 overflow-x-auto [mask-image:linear-gradient(90deg,#000_calc(100%-36px),transparent)] [scrollbar-width:none] max-lg:basis-[calc(100%-1.5rem)] max-lg:overflow-visible max-lg:[mask-image:none] [&::-webkit-scrollbar]:hidden"
           tabIndex={0}
           aria-label={copy.commandLabel}
         >
-          <code className="block py-3 pr-9 whitespace-nowrap text-[14px] leading-5 text-[#E8F4FF] select-all sm:text-[15px]">{CLONE}</code>
+          <code className="block py-3 pr-9 whitespace-nowrap text-[14px] leading-5 text-[#E8F4FF] select-all max-lg:pt-2 max-lg:pr-1 max-lg:pb-0 max-lg:whitespace-normal max-lg:[overflow-wrap:anywhere] sm:text-[15px]">
+            <span className="max-lg:hidden">{CLONE}</span>
+            <span className="lg:hidden">
+              <WrapCommand text={CLONE} />
+            </span>
+          </code>
         </div>
-        <CopyButton text={CLONE} label={copy.copy} copiedLabel={copy.copied} failedLabel={copy.copyFailed} ariaLabel={copy.copyCommand} />
+        <CopyButton text={CLONE} label={copy.copy} copiedLabel={copy.copied} failedLabel={copy.copyFailed} ariaLabel={copy.copyCommand} className="max-lg:ml-auto" />
       </div>
       {/* WEB-5 M9 (phone pass): on the home page, below 1024 px, this line goes: it repeats the Get
           started steps just above, and ran to three lines. The contact page keeps it (nothing above

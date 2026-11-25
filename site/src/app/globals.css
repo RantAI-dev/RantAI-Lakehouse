@@ -3393,13 +3393,15 @@ html[data-tod="day"] footer .lk-wm [class*="text-[#E8F4FF]/[0.12]"] {
 }
 [data-home] #governance { contain-intrinsic-block-size: auto 1618.02px; }
 :lang(id) [data-home] #governance { contain-intrinsic-block-size: auto 1638.27px; }
-[data-home] #get-started { contain-intrinsic-block-size: auto 788.56px; }
+[data-home] #get-started { contain-intrinsic-block-size: auto 848.56px; }
 [data-home] #faq { contain-intrinsic-block-size: auto 635px; }
-:lang(id) [data-home] #get-started { contain-intrinsic-block-size: auto 753.63px; }
+:lang(id) [data-home] #get-started { contain-intrinsic-block-size: auto 813.63px; }
 :lang(id) [data-home] #faq { contain-intrinsic-block-size: auto 688.88px; }
-/* Narrower phones: the English governance section is taller (measured at 375 and 360). */
+/* Narrower phones: the English governance section and the Indonesian Get started are taller
+   (measured at 375 and 360). */
 @media (max-width: 389.98px) {
   [data-home] #governance { contain-intrinsic-block-size: auto 1638.27px; }
+  :lang(id) [data-home] #get-started { contain-intrinsic-block-size: auto 848.56px; }
 }
 @media (max-width: 374.98px) {
   [data-home] #governance { contain-intrinsic-block-size: auto 1684.66px; }
@@ -3408,7 +3410,7 @@ html[data-tod="day"] footer .lk-wm [class*="text-[#E8F4FF]/[0.12]"] {
   [data-home] #governance,
   :lang(id) [data-home] #governance { contain-intrinsic-block-size: auto 899.23px; }
   [data-home] #get-started,
-  :lang(id) [data-home] #get-started { contain-intrinsic-block-size: auto 491px; }
+  :lang(id) [data-home] #get-started { contain-intrinsic-block-size: auto 511px; }
   [data-home] #faq,
   :lang(id) [data-home] #faq { contain-intrinsic-block-size: auto 645.88px; }
 }

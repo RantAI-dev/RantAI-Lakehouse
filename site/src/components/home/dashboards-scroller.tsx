@@ -96,13 +96,13 @@ export function DashboardsScroller({
 
         {/* The rail. Pinned: transformed by scroll. Reduced motion: a native horizontal scroller.
             Phone: one tile wide (`--lk-tw`), centred, the next one stepping in; under reduced
-            motion it is a swipe row that snaps each tile to the centre. */}
+            motion the tiles stack (owner QA 2026-11-25: nothing scrolls sideways on a phone). */}
         <div
           ref={railRef}
-          className="relative z-10 mt-8 md:mt-12 motion-reduce:overflow-x-auto motion-reduce:pb-4 max-lg:mt-7 max-lg:[scrollbar-width:none] max-lg:motion-reduce:snap-x max-lg:motion-reduce:snap-mandatory max-lg:[&::-webkit-scrollbar]:hidden"
+          className="relative z-10 mt-8 md:mt-12 motion-reduce:overflow-x-auto motion-reduce:pb-4 max-lg:mt-7 max-lg:[scrollbar-width:none] max-lg:motion-reduce:overflow-visible max-lg:[&::-webkit-scrollbar]:hidden"
         >
           <m.ul
-            className="flex w-max gap-4 motion-reduce:transform-none! pr-4 pl-[max(1rem,calc((100vw-1120px)/2+1.5rem))] max-lg:gap-3 max-lg:px-[calc((100vw-var(--lk-tw))/2)] max-lg:[--lk-tw:min(calc(100vw-2rem),30rem)] max-lg:motion-reduce:[--lk-tw:min(calc(100vw-3.5rem),30rem)] md:gap-5"
+            className="flex w-max gap-4 motion-reduce:transform-none! pr-4 pl-[max(1rem,calc((100vw-1120px)/2+1.5rem))] max-lg:gap-3 max-lg:px-[calc((100vw-var(--lk-tw))/2)] max-lg:[--lk-tw:min(calc(100vw-2rem),30rem)] max-lg:motion-reduce:w-full max-lg:motion-reduce:flex-col max-lg:motion-reduce:items-center md:gap-5"
             style={{ x }}
           >
             {children}
