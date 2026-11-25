@@ -91,6 +91,7 @@ pub(crate) mod params;
 // an early answer left behind, so the client is not left writing into a
 // closed connection. See the module's own doc comment.
 mod picture_drain;
+pub(crate) mod pipeline_chain;
 mod pipeline_preview;
 mod pipelines;
 mod quality;
@@ -479,7 +480,15 @@ fn pipeline_preview_router() -> Router<AppState> {
 /// [`crate::policy`], and keeping them together makes that pairing the
 /// thing a reader sees first.
 fn authored_pipelines_router() -> Router<AppState> {
-    pipeline_compile_router().route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+    pipeline_compile_router()
+        .route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+        .route(
+            "/api/pipelines/{id}/schedule-ticks",
+            get(authored_pipelines::schedule_ticks),
+        )
+        // BLD-14: the chain-step write is orchestrator-only here as well as
+        // in `POLICY_TABLE`, so it sits with `runnable` and `compile`.
+        .merge(pipeline_chain_routes())
 }
 
 /// The `/api/pipelines/*` sub-router (Task 2.5), split out of [`router`]
@@ -508,18 +517,13 @@ fn pipelines_router() -> Router<AppState> {
                 .delete(authored_pipelines::delete),
         )
         .route("/api/pipelines/{id}/source", get(pipelines::source))
-        .route(
-            "/api/pipelines/{id}/schedule-ticks",
-            get(authored_pipelines::schedule_ticks),
-        )
-        // BLD-2: the two target-lag routes live in `target_lag_routes`,
-        // merged in above.
+        // BLD-2: target-lag routes live in `target_lag_routes`.
         .merge(target_lag_routes())
         .route("/api/pipelines/{id}/runs", get(pipelines::runs))
-        // Plan R4 2b: definition version history. Static under
-        // `{id}/versions`, so it is registered BEFORE
-        // `{id}/versions/{version}/restore` (which would otherwise
-        // match `{version}/restore` as `{version}`).
+        // BLD-14 review R5: beside `runs`, not in the orchestrator-only router.
+        .merge(chain_read_routes())
+        // Plan R4 2b: static `{id}/versions` comes BEFORE
+        // `{id}/versions/{version}/restore` (which would match `{version}/restore`).
         .route(
             "/api/pipelines/{id}/versions",
             get(pipelines::list_versions),
@@ -658,6 +662,25 @@ fn target_lag_routes() -> Router<AppState> {
             "/api/pipelines/{id}/target-lag",
             put(authored_pipelines::set_target_lag),
         )
+}
+
+/// `BLD-14` D8: the chain sensor's one write per (re-upload, pipeline).
+/// Orchestrator-only like `lag-check`, hence under `/runnable/`.
+fn pipeline_chain_routes() -> Router<AppState> {
+    Router::new().route(
+        "/api/pipelines/runnable/{id}/chain-step",
+        post(pipeline_chain::record_chain_step),
+    )
+}
+
+/// BLD-14 review R5: the page's reason-read is merged into
+/// [`pipelines_router`] beside `runs`, not into the orchestrator-only
+/// [`authored_pipelines_router`] next to `compile`/`lag-check`.
+fn chain_read_routes() -> Router<AppState> {
+    Router::new().route(
+        "/api/pipelines/{id}/reupload-chain",
+        get(pipelines::reupload_chain),
+    )
 }
 
 /// The `/api/storage/*` sub-router (Task 2.6), split out for the same

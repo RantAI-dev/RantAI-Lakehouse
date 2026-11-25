@@ -499,6 +499,23 @@ export type ScheduleTicks = {
   unavailable: string | null
 }
 
+/**
+ * `GET /api/pipelines/{id}/reupload-chain` — the newest outcome recorded for
+ * a re-upload chain step (BLD-14 D8). The record holds codes and ids, never
+ * orchestrator or engine text; a cause's name is present only when that
+ * pipeline is in the same tenant.
+ */
+export type ReuploadChainStep = {
+  rootRunId: string
+  sourceTable: string
+  outcome: "started" | "not_run" | "superseded" | string
+  reason: "upstream_failed" | "upstream_cancelled" | "wait_expired" | string | null
+  runId: string | null
+  causePipelineId: string | null
+  causePipelineName: string | null
+  recordedAt: string
+}
+
 export interface PipelineService {
   listPipelines(signal?: AbortSignal): Promise<PipelineList>
   getPipeline(id: string, signal?: AbortSignal): Promise<PipelineDetail>
@@ -535,6 +552,8 @@ export interface PipelineService {
   deletePipeline(id: string, signal?: AbortSignal): Promise<void>
   /** `GET /api/pipelines/{id}/schedule-ticks` — the schedule's recent evaluations. */
   getScheduleTicks(id: string, signal?: AbortSignal): Promise<ScheduleTicks>
+  /** `GET /api/pipelines/{id}/reupload-chain` — the newest chain outcome (BLD-14 D8). */
+  getReuploadChain(id: string, signal?: AbortSignal): Promise<{ last: ReuploadChainStep | null }>
   /** `PUT /api/pipelines/{id}/target-lag` — set or clear an authored pipeline's target lag (BLD-2 D8). */
   setTargetLag(id: string, targetLag: TargetLag | null, signal?: AbortSignal): Promise<Pipeline>
   /**
