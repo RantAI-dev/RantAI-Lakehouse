@@ -245,6 +245,12 @@ pub struct DigitalEmployee {
     /// (see `lakehouse_auth::permissions::PermissionSet::parse`). Empty
     /// means authenticated-only, no permissioned tools.
     pub permissions: String,
+    /// Explicit table-access grant (`SEC-68`, migration `0155`): the NAMES of
+    /// the roles this agent may read as, regardless of who triggers a run.
+    /// Empty means NO grant, so a run reads ZERO tables (fail closed) —
+    /// never `TableAccess::All`. Serialized as `readRoles`. An unknown name
+    /// contributes nothing at read time; the write path refuses one with 400.
+    pub read_roles: Vec<String>,
 }
 
 // WS7 item G3: budget_spent/approval_rate/success_rate/recent_runs are
@@ -258,7 +264,7 @@ pub struct DigitalEmployee {
 // `get_employee_with_metrics` (below) is the FULL projection, used by the
 // single-row DETAIL route where the cost is free.
 const EMPLOYEE_COLUMNS: &str = "id, name, purpose, owner, autonomy, status, budget_limit, \
-     allowed_tools, data_scope, prompt, schedule_cron, mode, permissions";
+     allowed_tools, data_scope, prompt, schedule_cron, mode, permissions, read_roles";
 
 /// The narrow [`EMPLOYEE_COLUMNS`] projection, row-for-row — kept as its
 /// own `FromRow` type (rather than reusing [`DigitalEmployee`] directly)
@@ -283,6 +289,10 @@ struct EmployeeListRow {
     schedule_cron: Option<String>,
     mode: String,
     permissions: String,
+    // `SEC-68`: the explicit read grant travels with every employee
+    // projection (list, detail and run config), so no read path can forget
+    // it and fall back to "no restriction".
+    read_roles: Vec<String>,
 }
 
 impl EmployeeListRow {
@@ -312,6 +322,7 @@ impl EmployeeListRow {
             schedule_cron: self.schedule_cron,
             mode: self.mode,
             permissions: self.permissions,
+            read_roles: self.read_roles,
         }
     }
 }
@@ -319,7 +330,7 @@ impl EmployeeListRow {
 /// [`EMPLOYEE_COLUMNS`] plus the four real metric columns WS7 item G3
 /// recomputes — backs [`get_employee_with_metrics`] only.
 const FULL_EMPLOYEE_COLUMNS: &str = "id, name, purpose, owner, autonomy, status, budget_limit, allowed_tools, data_scope, \
-     prompt, schedule_cron, mode, permissions, budget_spent, approval_rate, success_rate, \
+     prompt, schedule_cron, mode, permissions, read_roles, budget_spent, approval_rate, success_rate, \
      recent_runs";
 
 /// List every digital employee, newest first. Metric columns
@@ -432,6 +443,10 @@ pub struct EmployeeRunConfig {
     /// Ceiling on what this employee's runs may do, in `role.permissions`
     /// format.
     pub permissions: String,
+    /// Explicit read grant (`SEC-68`): role NAMES this agent may read as.
+    /// Empty means no grant, so the run is narrowed to zero tables rather
+    /// than falling back to `TableAccess::All`.
+    pub read_roles: Vec<String>,
     /// Token ceiling for a headless run of this employee (WS7 item G2:
     /// `budget_limit`/`budget_consumed` are measured in tokens, not
     /// currency — `lakehouse-llm` has no price table, see
@@ -451,7 +466,7 @@ pub async fn get_employee_run_config(
     id: &str,
 ) -> Result<Option<EmployeeRunConfig>, StoreError> {
     let row: Option<EmployeeRunConfig> = sqlx::query_as(
-        "SELECT id, name, status, prompt, mode, permissions, budget_limit \
+        "SELECT id, name, status, prompt, mode, permissions, read_roles, budget_limit \
          FROM agent_employee WHERE id = $1",
     )
     .bind(id)
@@ -488,6 +503,10 @@ pub struct CreateEmployeeInput {
     /// Ceiling on what this employee's runs may do, in `role.permissions`
     /// format; defaults to `""` (authenticated-only) when absent.
     pub permissions: Option<String>,
+    /// Explicit read grant (`SEC-68`): role NAMES this agent may read as.
+    /// Empty means no grant — a run reads zero tables (fail closed). The
+    /// API route validates names and the privilege ceiling before storing.
+    pub read_roles: Vec<String>,
 }
 
 const DEFAULT_MODE: &str = "build";
@@ -508,8 +527,8 @@ pub async fn create_employee(
     let permissions = input.permissions.as_deref().unwrap_or("");
     let sql = format!(
         "INSERT INTO agent_employee (id, name, purpose, owner, autonomy, status, budget_limit, \
-         allowed_tools, data_scope, prompt, schedule_cron, mode, permissions) \
-         VALUES ($1, $2, $3, $4, $5, 'draft', $6, $7, $8, $9, $10, $11, $12) \
+         allowed_tools, data_scope, prompt, schedule_cron, mode, permissions, read_roles) \
+         VALUES ($1, $2, $3, $4, $5, 'draft', $6, $7, $8, $9, $10, $11, $12, $13) \
          RETURNING {EMPLOYEE_COLUMNS}"
     );
     // safe: only the constant `EMPLOYEE_COLUMNS` is formatted in; values are bound.
@@ -526,9 +545,36 @@ pub async fn create_employee(
         .bind(&input.schedule_cron)
         .bind(mode)
         .bind(permissions)
+        .bind(&input.read_roles)
         .fetch_one(pool)
         .await?;
     Ok(row.without_metrics())
+}
+
+/// Replace an employee's explicit read grant (`SEC-68`) and return the
+/// updated row. This is a whole-set replacement, matching `set_user_roles`:
+/// the endpoint sends the complete grant, so an absent role is revoked and
+/// an empty list means "reads no tables" (fail closed), never "all".
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `id` is unknown.
+pub async fn set_employee_read_roles(
+    pool: &PgPool,
+    id: &str,
+    read_roles: &[String],
+) -> Result<DigitalEmployee, StoreError> {
+    let sql = format!(
+        "UPDATE agent_employee SET read_roles = $2 WHERE id = $1 RETURNING {EMPLOYEE_COLUMNS}"
+    );
+    // safe: only the constant `EMPLOYEE_COLUMNS` is formatted in; values are bound.
+    let row: Option<EmployeeListRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .bind(read_roles)
+        .fetch_optional(pool)
+        .await?;
+    row.map(EmployeeListRow::without_metrics)
+        .ok_or(StoreError::NotFound)
 }
 
 /// Set an employee's `status` and return the updated row. Metric columns
@@ -2375,6 +2421,121 @@ mod access_request_tests {
             .expect("found by username");
         assert_eq!(found2.id, u2_id);
 
+        Ok(())
+    }
+}
+
+// ── SEC-68: explicit per-agent read grant ───────────────────────────────
+#[cfg(test)]
+mod read_roles_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    // Links the ctor-started Postgres testcontainer into this `--lib` test
+    // binary (same idiom `access_request_tests` uses above).
+    use lakehouse_test_support as _;
+
+    fn input(name: &str, read_roles: Vec<String>) -> CreateEmployeeInput {
+        CreateEmployeeInput {
+            name: name.to_owned(),
+            purpose: "p".to_owned(),
+            autonomy: "L1".to_owned(),
+            allowed_tools: Vec::new(),
+            data_scope: "d".to_owned(),
+            budget_limit: 0.0,
+            owner: None,
+            prompt: None,
+            schedule_cron: None,
+            mode: None,
+            permissions: None,
+            read_roles,
+        }
+    }
+
+    /// SEC-68: the grant is stored verbatim and returned by both employee
+    /// reads (list and detail projections share `EMPLOYEE_COLUMNS`).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_employee_persists_the_read_grant(pool: PgPool) -> sqlx::Result<()> {
+        let created = create_employee(
+            &pool,
+            &input(
+                "granted-agent",
+                vec!["Finance".to_owned(), "Analyst".to_owned()],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            created.read_roles,
+            vec!["Finance".to_owned(), "Analyst".to_owned()]
+        );
+        assert_eq!(
+            get_employee(&pool, &created.id)
+                .await
+                .unwrap()
+                .expect("the employee exists")
+                .read_roles,
+            created.read_roles
+        );
+        assert_eq!(
+            get_employee_with_metrics(&pool, &created.id)
+                .await
+                .unwrap()
+                .expect("the employee exists")
+                .read_roles,
+            created.read_roles
+        );
+        Ok(())
+    }
+
+    /// SEC-68: no grant means an EMPTY role list, which the runtime resolves
+    /// to zero tables — never `All`. The migration's `'{}'` default makes an
+    /// upgrade fail closed for every pre-existing employee.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_employee_created_without_a_grant_has_no_read_roles(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let created = create_employee(&pool, &input("ungranted-agent", Vec::new()))
+            .await
+            .unwrap();
+        assert_eq!(created.read_roles, Vec::<String>::new());
+        let config = get_employee_run_config(&pool, &created.id)
+            .await
+            .unwrap()
+            .expect("the run config exists");
+        assert_eq!(config.read_roles, Vec::<String>::new());
+        Ok(())
+    }
+
+    /// SEC-68: the grant is a whole-set replacement and `set_employee_read_roles`
+    /// reports an unknown id as `NotFound`, so the route answers 404 rather
+    /// than silently creating a grant for nobody.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn setting_read_roles_replaces_the_grant(pool: PgPool) -> sqlx::Result<()> {
+        let created = create_employee(&pool, &input("replace-agent", vec!["Finance".to_owned()]))
+            .await
+            .unwrap();
+        let updated = set_employee_read_roles(&pool, &created.id, &["HR".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(updated.read_roles, vec!["HR".to_owned()]);
+        assert_eq!(
+            get_employee(&pool, &created.id)
+                .await
+                .unwrap()
+                .expect("the employee exists")
+                .read_roles,
+            vec!["HR".to_owned()]
+        );
+        // Clearing the grant is allowed and yields the empty (zero-table) set.
+        let cleared = set_employee_read_roles(&pool, &created.id, &[])
+            .await
+            .unwrap();
+        assert_eq!(cleared.read_roles, Vec::<String>::new());
+        assert!(matches!(
+            set_employee_read_roles(&pool, "emp-nope", &[]).await,
+            Err(StoreError::NotFound)
+        ));
         Ok(())
     }
 }

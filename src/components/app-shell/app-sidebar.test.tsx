@@ -213,7 +213,7 @@ const SESSION = {
  */
 function stubApi(
   branding: unknown,
-  options: { hold?: boolean } = {},
+  options: { hold?: boolean; permissions?: string[]; deployment?: unknown } = {},
 ): { requested: string[]; release: () => void } {
   const requested: string[] = []
   let release: () => void = () => {}
@@ -224,7 +224,10 @@ function stubApi(
     const url = String(input)
     requested.push(url)
     if (url.includes("/api/auth/me")) {
-      return json(SESSION)
+      return json({ ...SESSION, permissions: options.permissions ?? SESSION.permissions })
+    }
+    if (url.includes("/api/settings/deployment")) {
+      return json(options.deployment ?? { features: [] })
     }
     if (url.includes("/api/branding")) {
       if (options.hold) await held
@@ -385,5 +388,42 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
       "/api/branding/images/logo?v=v1",
       "/api/branding/images/logo-dark?v=v2",
     ])
+  })
+})
+
+describe("BI-44: the sidebar asks for the install mode only where it may", () => {
+  it("fires no deployment request for a principal without settings:write", async () => {
+    const { requested } = stubApi({ workspaceName: null, logo: null, logoDark: null, icon: null })
+    renderBranded()
+    expect(await screen.findByText("Dashboards")).toBeTruthy()
+    expect(requested.some((url) => url.includes("/api/settings/deployment"))).toBe(false)
+  })
+
+  it("hides warehouse-only pages for an admin whose deployment is bi-only", async () => {
+    const { requested } = stubApi(
+      { workspaceName: null, logo: null, logoDark: null, icon: null },
+      {
+        permissions: ["*:*"],
+        deployment: { features: [], installMode: "bi-only", queryEngine: "clickhouse" },
+      },
+    )
+    renderBranded()
+    await waitFor(() =>
+      expect(requested.some((url) => url.includes("/api/settings/deployment"))).toBe(true),
+    )
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Build" })).toBeNull())
+    expect(screen.queryByRole("link", { name: /^pipelines/i })).toBeNull()
+    // The Data section is still there; its items render when the section
+    // is opened, which is a separate user action from hiding Build.
+    expect(screen.getByRole("button", { name: "Data" })).toBeTruthy()
+  })
+
+  it("keeps the full menu for an admin whose deployment reports full mode", async () => {
+    stubApi(
+      { workspaceName: null, logo: null, logoDark: null, icon: null },
+      { permissions: ["*:*"], deployment: { features: [], installMode: "full" } },
+    )
+    renderBranded()
+    expect(await screen.findByRole("link", { name: /^pipelines/i })).toBeTruthy()
   })
 })

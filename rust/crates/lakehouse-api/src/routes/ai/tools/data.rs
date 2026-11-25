@@ -74,6 +74,49 @@ pub(super) async fn run_sql(
                        which has no user to run as",
         });
     };
+    // `BI-44` slice 3: a `bi-only` install that runs `Trino` must never dial
+    // `ClickHouse` — it was not deployed. Skip the `EXPLAIN AST` dry run below
+    // (a `ClickHouse` round trip) and use the SAME engine-aware choke point
+    // `POST /api/query/run` uses: `run_statement` applies `is_trino_safe`
+    // and the `Engine::Trino` governance rewrite before it dials `Trino`.
+    // The full stack, and a `bi-only` install on `ClickHouse`, keep the
+    // byte-for-byte path below.
+    if state.config.is_bi_only() && state.config.query_engine == crate::config::QueryEngine::Trino {
+        match crate::sql_rewrite::classify_statement(
+            &sql,
+            &crate::sql_rewrite::TrinoDialect::default(),
+        ) {
+            Err(crate::sql_rewrite::RewriteError::Unparseable) | Ok(()) => {}
+            Err(refusal) => {
+                let message = crate::policy_engine::refusal_message(&refusal).to_owned();
+                let refused: ApiResult<ApiJson<Value>> =
+                    Err(ApiError::Unprocessable(message).into());
+                return api_result_to_value(refused).await;
+            }
+        }
+        if !crate::sql_guard::is_trino_safe(&sql) {
+            return json!({
+                "error": "This statement is not permitted against Trino (write, session, or \
+                           procedure keyword detected).",
+            });
+        }
+        let (result, browser) = match crate::routes::query::run_statement(
+            state,
+            Some(principal),
+            &axum::http::HeaderMap::new(),
+            &sql,
+            "trino",
+        )
+        .await
+        {
+            Ok(ok) => (api_result_to_value(Ok(ok)).await, None),
+            Err(failure) => {
+                let failed: ApiResult<ApiJson<Value>> = Err(failure.response.into());
+                (api_result_to_value(failed).await, Some(failure.browser))
+            }
+        };
+        return compact_query_result(result, browser);
+    }
     // SEC-9: the policy refusals that need no database (a table function, a
     // refused system table) come BEFORE the engine dry run below. `EXPLAIN
     // AST` parses and never fetches, but it still sends the caller's
@@ -527,7 +570,10 @@ async fn table_access(
     state: &AppState,
     principal: &Principal,
 ) -> Result<crate::table_access::TableAccess, &'static str> {
-    crate::table_access::for_roles(state.pg.as_deref(), &principal.role_names)
+    // SEC-68: `for_principal` distinguishes a genuine `*:*` admin from a
+    // role-less service identity; the latter must not silently read every
+    // table through `for_roles(&[])`.
+    crate::table_access::for_principal(state.pg.as_deref(), principal)
         .await
         .map_err(|_| "the table access rule could not be read right now")
 }
@@ -619,6 +665,120 @@ fn layers_for(
     })
 }
 
+/// The dataset list of a `bi-only` install: the active engine's own external
+/// tables, never the lakehouse registry, `ClickHouse` (when Trino is active)
+/// or `Lakekeeper`. The fields the assistant already reads keep their names;
+/// every warehouse statistic is `null` because an in-place source has no
+/// parts, row counts or freshness to report (`AGENTS.md` principle 2).
+async fn bi_only_list_datasets(state: &AppState, args: &Map<String, Value>) -> Value {
+    let engine = state.config.query_engine;
+    let cap = 200_usize;
+    let outcome = match engine {
+        crate::config::QueryEngine::Trino => {
+            crate::in_place::introspect_trino_tables(&state.trino, cap).await
+        }
+        crate::config::QueryEngine::ClickHouse => {
+            crate::in_place::introspect_clickhouse_external_tables(&state.clickhouse, cap).await
+        }
+    };
+    let tables = match outcome {
+        Ok(tables) => tables,
+        Err(err) => {
+            // `IntrospectionError` is already classified by `upstream_error`:
+            // render its `ApiError` through the same JSON body the routes use,
+            // so the SEC-11 guard sees no error text interpolated here.
+            let failed: ApiResult<ApiJson<Value>> = Err(err.into_api_error().into());
+            return api_result_to_value(failed).await;
+        }
+    };
+    let term = arg_str(args, "search").trim().to_lowercase();
+    let hits: Vec<Value> = tables
+        .iter()
+        .filter(|table| {
+            term.is_empty()
+                || format!("{} {}", table.full_name, table.name)
+                    .to_lowercase()
+                    .contains(&term)
+        })
+        .take(40)
+        .map(|table| {
+            json!({
+                "slug": table.full_name,
+                "title": table.name,
+                "sourceKind": "external",
+                "goldTable": Value::Null,
+                "zone": "external",
+                "engine": engine.name(),
+                "fullName": table.full_name,
+                "rows": Value::Null,
+                "sizeBytes": Value::Null,
+                "columnCount": Value::Null,
+            })
+        })
+        .collect();
+    json!({ "total": hits.len(), "datasets": hits })
+}
+
+/// `describe_dataset` over an in-place table. The identifier is the dotted
+/// name the active engine reads: `catalog.schema.table` on `Trino`,
+/// `schema.table` on `ClickHouse`. A short or over-long name is refused
+/// before an engine is dialed; an upstream failure is the classified
+/// `in_place::IntrospectionError` text (a fixed sentence and a reference
+/// id), never the engine's own message.
+async fn bi_only_describe_dataset(state: &AppState, args: &Map<String, Value>) -> Value {
+    let engine = state.config.query_engine;
+    let slug = arg_str(args, "slug");
+    let parts: Vec<&str> = slug.split('.').collect();
+    let outcome = match engine {
+        crate::config::QueryEngine::Trino => {
+            if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+                return json!({
+                    "error": "an in-place Trino table is named catalog.schema.table",
+                });
+            }
+            crate::in_place::introspect_trino_columns(&state.trino, parts[0], parts[1], parts[2])
+                .await
+        }
+        crate::config::QueryEngine::ClickHouse => {
+            if parts.len() != 2 || parts.iter().any(|p| p.is_empty()) {
+                return json!({
+                    "error": "an in-place ClickHouse table is named schema.table",
+                });
+            }
+            crate::in_place::introspect_clickhouse_columns(&state.clickhouse, parts[0], parts[1])
+                .await
+        }
+    };
+    let columns = match outcome {
+        Ok(columns) => columns,
+        Err(err) => {
+            // `IntrospectionError` is already classified by `upstream_error`:
+            // render its `ApiError` through the same JSON body the routes use,
+            // so the SEC-11 guard sees no error text interpolated here.
+            let failed: ApiResult<ApiJson<Value>> = Err(err.into_api_error().into());
+            return api_result_to_value(failed).await;
+        }
+    };
+    json!({
+        "slug": slug,
+        "title": slug,
+        "description": format!("External table read in place through {}. No lakehouse copy exists.", engine.name()),
+        "sourceKind": "external",
+        "zone": "external",
+        "engine": engine.name(),
+        "layers": {
+            "bronze": { "registered": false },
+            "silver": { "present": false },
+            "gold": { "present": false },
+            "external": { "present": true, "table": slug, "rows": Value::Null },
+        },
+        "columns": columns
+            .iter()
+            .map(|c| json!({ "name": c.name, "type": c.data_type, "description": Value::Null }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 pub(super) async fn list_datasets(
     state: &AppState,
     principal: Option<&Principal>,
@@ -629,6 +789,12 @@ pub(super) async fn list_datasets(
     let Some(principal) = principal else {
         return json!({ "error": DATASETS_NEED_A_USER });
     };
+    // `BI-44` slice 3: a `bi-only` install has no registry to read. Return
+    // before any tenant/registry check that would dial the missing
+    // lakehouse services; the active engine's own catalog is the answer.
+    if state.config.is_bi_only() {
+        return bi_only_list_datasets(state, args).await;
+    }
     // SEC-20, plan 95: the registry is the shared catalog's, so a tenant that
     // does not own it is refused before the registry is read.
     if let Some(refusal) = shared_catalog_refusal(state, principal).await {
@@ -723,6 +889,11 @@ pub(super) async fn describe_dataset(
     let Some(principal) = principal else {
         return json!({ "error": DATASETS_NEED_A_USER });
     };
+    // `BI-44` slice 3: as in `list_datasets`, no shared registry is dialed
+    // in a `bi-only` install.
+    if state.config.is_bi_only() {
+        return bi_only_describe_dataset(state, args).await;
+    }
     if let Some(refusal) = shared_catalog_refusal(state, principal).await {
         return refusal;
     }

@@ -16,14 +16,14 @@ import type { ColumnSetting } from "@/lib/table-types";
  * loaded only from https, sends no referrer and has a fixed maximum height;
  * everything else is text (`lib/cell-format`).
  */
-export function CellValue({ value, setting, format }: { readonly value: unknown; readonly setting?: ColumnSetting; readonly format?: ValueFormat }) {
+export function CellValue({ value, setting, format, column }: { readonly value: unknown; readonly setting?: ColumnSetting; readonly format?: ValueFormat; readonly column?: string }) {
   const { numberLocale } = useReporting();
   // BI-17: the chart's number format reaches a number the column setting leaves to `auto`.
   const auto = !setting?.format || setting.format === "auto";
   if (format && auto && typeof value === "number" && asNumber(value) !== null) {
-    return <>{formatValue(value, format, numberLocale, setting?.decimals ?? decimalsFor([value]))}</>;
+    return <>{formatValue(value, format, numberLocale, setting?.decimals ?? decimalsFor([value]), column)}</>;
   }
-  const c = cellContent(value, setting, numberLocale);
+  const c = cellContent(value, setting, numberLocale, column);
   if (c.kind === "link") {
     return <a href={c.href} target="_blank" rel="noopener noreferrer" className="text-primary underline-offset-2 hover:underline">{c.text}</a>;
   }

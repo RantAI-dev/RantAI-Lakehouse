@@ -3,9 +3,10 @@
 Plan: `docs/superpowers/plans/2026-10-24-bi-4-caching-parallel-tiles.md`
 (tasks T1, T2). Feature page: `docs/core/features/result-caching-and-parallel-tiles.md`
 (decisions 3 and 9). Written by the developer; the planner reads and signs.
-This file states what was measured, how, and what was not. It states no
-verdict on the 3-second target: that target is for a warm cache (part B), and
-no real-engine number exists yet.
+This file states what was measured, how, and what was not. Sections 1 to 4 cover the
+mock-engine scheduling check, what was not measured then, and the cache-fingerprint
+checks; section 5 (2026-11-21) is the real-engine timing of a 12-tile dashboard and
+states the verdict on the 3-second target, measured cold and remembered (`BI-56` D3).
 
 ## 1. What was measured: a mock engine, in-process
 
@@ -42,7 +43,9 @@ far, and it shows the scheduling, not the speed of a real board.
   the shared stacks on this machine run other branches. The script for it
   exists (`ops/bench/dashboard_open_bench.py`, T2) and has not been run
   against anything. Machine, data size and ClickHouse version are therefore
-  not recorded.
+  not recorded. (**`BI-4-AC3` was amended on 2026-11-21, `BI-56` D3: it
+  measures cold vs remembered, which section 5 does; the pre-cache build is
+  no longer required.**)
 - Warm-cache open time and the 3-second target: part B.
 - Behaviour under real engine limits (connection pool, `max_concurrent_queries`)
   with 24 tiles in flight per process.
@@ -94,14 +97,16 @@ empty.
 
 ### 4.2 What was NOT measured (not verified)
 
-- The warm-cache open time of a 12-tile dashboard and the **3-second target**: the API binary
-  was not built or run on this machine (disk and memory; AGENTS.md), no console, no data of
-  the size a customer has. The target is **neither met nor failed**. The in-process facts that
-  stand behind it are the unit tests in `result_cache::tests` and
+- The warm-cache open time of a 12-tile dashboard and the **3-second target** were not
+  measured in part B: the API binary was not built or run on this machine (disk and memory;
+  AGENTS.md), no console, no data of the size a customer has. **Section 5 (2026-11-21)
+  measures them on the QA stack: the target is met (1.51 s remembered and 1.69 s cold,
+  console to all tiles drawn, medians of 5).** The in-process facts that stood behind the
+  question are the unit tests in `result_cache::tests` and
   `routes::dashboard::time_grain::a_second_open_is_remembered_and_fresh_computes_again`
   (a second open is served without a tile query; only the one fingerprint read goes to the
-  engine). Take the number with `ops/bench/dashboard_open_bench.py` (section 3) twice on the
-  same board, first open then second open, and paste the raw output here.
+  engine). For a repeat, take the number with `ops/bench/dashboard_open_bench.py` (section 3)
+  twice on the same board, first open then second open, and paste the raw output here.
 - That `referenced_tables` on the rewritten statement names the physical tables when masking
   wraps them: the cache reads them from the same rewritten statement the engine runs, and a
   table it cannot find in `system.parts` is treated as unwatchable (10 minutes), so a wrapping
@@ -116,3 +121,52 @@ empty.
   machine). `moka` 0.12.16 with only the `future` feature was already in `Cargo.lock` through
   `iceberg`; the lockfile change is the one line that adds `moka` to `lakehouse-api`'s
   dependency list, no new crate.
+
+## 5. `BI-4-AC3` timing on a real engine (`BI-66`, 2026-11-21)
+
+This closes the gap section 4.2 names: the open time of a 12-tile dashboard and the
+3-second target.
+
+- **Stack:** the QA stack (ClickHouse 26.8, 8 CPU, 11 GB; marts in `serving`, `mart_wisman`
+  720 rows; a 518,400-row SQL source for the heavy board).
+- **Boards:** `qa BI-56 twelve tiles`, 12 stored charts on three marts (KPI, bar, line,
+  donut, horizontal bar, area, heatmap, table, treemap, stacked bar, funnel, box plot); and
+  `qa BI-56 twelve tiles heavy`, 12 charts on the one 518,400-row source.
+- **Method:** `GET /api/dashboard?board=<id>`, timed from outside the stack's tunnel, 5 reads
+  each. Cold is `fresh=1` (what the console sends for Refresh: every tile computed again,
+  none remembered); remembered is the plain read right after (all 12 tiles
+  `remembered: true`). A second set times the console in headless Chrome, from navigation
+  to 12 drawn tiles with no skeleton, with the board's own freshness rule set to `fresh`
+  (cold) or `default` (remembered). The workspace setting was not changed.
+
+**Not recorded here:** the exact command lines, the headless-Chrome timing script and the raw
+per-read output; the run's report is held outside this repository. The "API on the machine"
+row records one value per state, not a median and range.
+
+| Measure | Cold, median (range) | Remembered, median (range) |
+| --- | --- | --- |
+| 12 tiles, API through the tunnel | 0.321 s (0.296–0.496) | 0.318 s (0.282–0.344) |
+| 12 tiles, API on the machine | 0.229 s | 0.220 s |
+| Heavy board, API through the tunnel | 0.361 s (0.322–0.529) | 0.328 s (0.308–0.578) |
+| 12 tiles, console to all tiles drawn | 1.69 s (1.45–2.42) | 1.51 s (1.34–1.62) |
+| Heavy board, console to all tiles drawn | 1.30 s (1.13–1.40) | 1.25 s (1.20–1.30) |
+
+The tunnel adds about 0.09–0.10 s at the 12-tile size (the difference between the two
+12-tile rows: 0.321 − 0.229 and 0.318 − 0.220, derived rather than timed on a trivial
+route); the heavy board has no on-machine row.
+
+**Reading.** The 3-second target holds with and without remembered results. **This
+supersedes the earlier acceptance-run figures recorded in `BI-66` (547 ms cold; 347 / 268 /
+201 ms remembered on 2026-11-16):** with the method above the medians are 0.321 s cold and
+0.318 s remembered on the 12-tile board, and the earlier remembered step-down did not
+reproduce; that run's board, method and raw reads are not recorded in the repo. At this data
+size the difference between the medians is 0.003 s on the 12-tile board and 0.033 s on the
+heavy board, both inside the ranges: ClickHouse answers these tiles well under a second
+either way. The cache's gain shows only on slower queries than these, which this stack does
+not have.
+
+**Not measured:** the pre-cache build's 12-tile timing (`feat/bi-phase-4`); `BI-56` D3
+(owner, 2026-11-21) defines "before and after" for `BI-4-AC3` as cold vs remembered, so
+that build is no longer required. Also not measured: concurrent users, and tiles that take
+seconds each.
+
