@@ -2040,3 +2040,48 @@ Not verified:
 - **320 px wide by day.** The reassurance line is still the LCP there (28,086 px against the headline's 25,344 px). A fix would change what is seen.
 - Host limits, not passes: no HSTS, no `frame-ancestors`, no `X-Content-Type-Options` on Pages.
 - Owner acceptance and the acceptor's checklist run are open; the merger flips the WEB-5 status after merge (step 6).
+
+## 12. Addendum: the phone pass (owner, 2026-11-25)
+
+The owner asked for a phone audit "like rantai.dev". Below 1024 px a component may differ from desktop when that fits a small screen better, and copy that is too long on a phone gets a shorter phone version, in EN and ID. Desktop (≥ 1024 px) does not change. The owner approved all items on 2026-11-25 and will QA them on an iPhone 13 (Safari).
+
+- **Reference:** rantai-page commits `0e32fa9` ("make every page work properly on phones") and `65b91e6` ("polish the mobile experience"). Those commits cover:
+  - pinned scroll storytelling fitted to a phone;
+  - demos drawn at phone size with readable text;
+  - swipeable rows with snap;
+  - stacked footer groups with 40 px taps;
+  - shorter CTA copy;
+  - no long empty gaps.
+- **Audit:** planner, 2026-11-25. Checked at 390×844 and 360×740, EN and ID: no horizontal overflow, and no heading over 2 lines.
+
+### Tasks M1–M11 (phone only, one commit each or grouped by section)
+
+1. **M1 Assistant card.** On a phone the chat box is about a screen tall and empty for the first 1–2 s.
+   - Fit its fixed height to the phone.
+   - Show the first exchange at once, then let the loop continue. It stays a fixed-height chat (DESIGN.md: new messages push old ones up).
+2. **M2 Dashboards.** The pinned sideways rail leaves large empty bands above and below and cuts tiles at the edges.
+   - Keep scroll-driven storytelling, but fitted: the heading at the top, one large tile centred at a time, and no dead space.
+   - Or a native swipe row with snap, if pinning cannot be made tight. Pick the one that feels better, and say why.
+3. **M3 Governance bento.** Seven stacked cards fill about 3 screens, and the lineage picture is cramped (10–11 px mono).
+   - On a phone, the cards become one swipeable row with snap, with edge fades and a visible hint that it scrolls.
+   - The lineage is drawn vertically: Bronze → Silver → Gold, with readable text.
+4. **M4 Open-source code block.** Lines are cut at the right edge. On a phone, show a shorter excerpt whose lines fit.
+5. **M5 "Your servers or ours" stack.** Eight service cards with 11 px subtitles. On a phone, show the name and "Started" only.
+6. **M6 Footer.** Product and Connect sit side by side in two columns on a phone, roughly halving its height. Tap targets are ≥ 40 px.
+   - The footer is a 1:1 copy of rantai.dev's (DESIGN.md §5), so follow rantai.dev's own phone footer where it differs.
+7. **M7 Hero description (ID).** It runs to 3 lines at 390 px (the rule is 2). Phone copy: "Dashboard bawaan, tabel terbuka, dan jawaban dalam bahasa sehari-hari." Check EN stays ≤ 2 lines.
+8. **M8 Get started, step 2.** It runs to 4 lines.
+   - Phone copy, EN: "Writes `.env` with secrets. Set the first admin's email and password there."
+   - ID: "Membuat `.env` berisi secret. Isi email dan password admin pertama di sana."
+9. **M9 Final CTA line.** "Then sh ops/init-env.sh … · Full guide →" repeats Get started just above it and runs to 3 lines. Hide it on a phone.
+10. **M10 Text size.** Readable text is at least 12 px on a phone: the source chips, "Scroll to dive", and the labels inside mocks that carry meaning.
+11. **M11 Tap targets ≥ 40 px.** The Analyst/Admin toggle (32 px), "Full guide →" (18 px) and the footer social icons (36 px).
+
+**Accept:**
+- Phone screenshots before and after for each item, at 390 and 360, EN and ID.
+- The desktop at 1190×800 and 1440×900 is pixel-unchanged.
+- No horizontal overflow.
+- Lighthouse mobile stays ≥ 90 on `/` and `/id/`, accessibility, SEO and best practices stay 100, `bun run size` ≤ 200 KB, and there are zero CSP violations.
+- The owner's iPhone QA.
+
+Not in scope: the 3D dive band after the hero, which needs a GPU. The owner checks it on the iPhone.
