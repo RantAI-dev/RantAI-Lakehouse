@@ -10,6 +10,7 @@ import {
   sceneStateAt,
   smoothstep,
   DIVE,
+  heroPull,
   type SceneLayout,
 } from "./scroll-timeline";
 
@@ -177,5 +178,42 @@ test("both pictures are drawn only while the waterline can be on screen", () => 
   for (let y = -0.5; y <= 0.5; y += 0.005) {
     const c = lensCoverage(y);
     if (Math.abs(y) <= LENS.half + LENS.wave) assert.ok(c.above && c.below, `y ${y}`);
+  }
+});
+
+// WEB-5 owner QA 2026-11-25: the engine pulls a narrow screen's camera back from what it looks at
+// (`distScaleHero`, about 1.95 at 390x844). The camera it really uses must still dive.
+const cameraY = (y: number, distScaleHero: number) => {
+  const s = sceneStateAt(y, layout);
+  return s.look[1] + (s.position[1] - s.look[1]) * heroPull(distScaleHero, s);
+};
+
+test("a desktop camera is not pulled back: its height is the path's", () => {
+  for (let y = 0; y <= DIVE.under * VH; y += 10) {
+    assert.equal(heroPull(1, sceneStateAt(y, layout)), 1);
+    assert.ok(Math.abs(cameraY(y, 1) - sceneStateAt(y, layout).position[1]) < 1e-12);
+  }
+});
+
+test("a phone's pulled-back camera is under the water from the end of the waterline stretch on", () => {
+  for (const dist of [1.4, 1.95, 2.6]) {
+    for (let y = DIVE.waterlineBelow * VH; y <= layout.depthsTop; y += 5) {
+      assert.ok(cameraY(y, dist) < 0, `above the water at ${y / VH} vh (scale ${dist})`);
+    }
+    assert.ok(Math.abs(cameraY(DIVE.tipDown * VH, dist) - sceneStateAt(DIVE.tipDown * VH, layout).position[1]) < 1e-9);
+  }
+});
+
+test("a phone's pulled-back camera only ever sinks, and its waterline sweeps up gradually", () => {
+  const dist = 1.95;
+  let prev = Infinity;
+  for (let y = 0; y <= DIVE.under * VH; y += 1) {
+    const now = cameraY(y, dist);
+    assert.ok(now <= prev + 1e-9, `rose at ${y / VH} vh`);
+    // At most 4 % of the screen's height per 1 % of a viewport of scroll while the line is on screen.
+    if (prev < Infinity && Math.abs(lensLine(now)) <= 1.1) {
+      assert.ok((lensLine(now) - lensLine(prev)) / 2 <= 0.04 / (0.01 * VH), `the line jumped at ${y / VH} vh`);
+    }
+    prev = now;
   }
 });

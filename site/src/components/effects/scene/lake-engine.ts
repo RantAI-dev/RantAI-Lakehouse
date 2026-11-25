@@ -15,7 +15,7 @@ import {
   Vector3,
   WebGLRenderer,
 } from "three";
-import { LENS, lensCoverage, sceneStateAt, smoothstep, type SceneLayout, type SceneState } from "@/lib/scroll-timeline";
+import { heroPull, LENS, lensCoverage, sceneStateAt, smoothstep, type SceneLayout, type SceneState } from "@/lib/scroll-timeline";
 import { displayedHex, publishSceneColours } from "@/lib/scene-colour";
 import { createLens } from "./lens";
 import { createMascot, type Aim } from "./mascot";
@@ -761,8 +761,11 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
       state.position[2],
     );
     // On a narrow screen the camera stays pulled back so the creature, and later
-    // the slabs, fit the width.
-    const dist = view === "final" ? distScaleFinal : lerp(distScaleHero, distScaleDepths, state.depthsWeight);
+    // the slabs, fit the width. The hero's pull-back eases out as the camera
+    // crosses the waterline (`heroPull`, owner QA 2026-11-25: pulled back along
+    // a line of sight that points down, it rose out of the water on phones).
+    const dist =
+      view === "final" ? distScaleFinal : lerp(heroPull(distScaleHero, state), distScaleDepths, state.depthsWeight);
     camera.position.sub(look).multiplyScalar(dist).add(look);
     camera.lookAt(look);
     applyView(state.heroWeight, state.depthsWeight);

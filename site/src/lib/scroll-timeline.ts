@@ -48,6 +48,11 @@ export type SceneState = {
   /** Weights for the view-offset anchors: the hero layout and the depths layout. */
   heroWeight: number;
   depthsWeight: number;
+  /**
+   * How much of a narrow screen's hero pull-back still applies: 1 above the waterline stretch,
+   * 0 once through it (see `heroPull`).
+   */
+  pullBack: number;
 };
 
 export const clamp01 = (x: number): number => Math.min(1, Math.max(0, x));
@@ -250,5 +255,24 @@ export function sceneStateAt(scrollY: number, layout: SceneLayout): SceneState {
     slabsReveal: smoothstep(vh * DIVE.under, depthsTop, scrollY),
     heroWeight: 1 - smoothstep(0.4 * vh, DIVE.waterlineBelow * vh, scrollY),
     depthsWeight: smoothstep(depthsTop - 0.9 * vh, depthsTop - 0.1 * vh, scrollY),
+    pullBack: 1 - smoothstep(DIVE.waterlineAbove * vh, DIVE.waterlineBelow * vh, scrollY),
   };
+}
+
+/**
+ * WEB-5 owner QA 2026-11-25, the phone dive ("dia kek ga masuk ke dalam air"). On a narrow screen
+ * the engine pulls the camera back from what it looks at, `distScaleHero` times (about 1.9 at
+ * 390x844), so the creature fits the width. The pull is along the line of sight, and once the
+ * camera tips down under the water that line points steeply down: pulled back along it, the
+ * camera rose to about 2.4 above the water at `tipDown` (its path says -0.8) and only went under
+ * again near the end of the sources section. The lens and the water follow the camera's real
+ * height, so the phone saw the surface from above, with its glitter, behind the sources, and the
+ * crossing came late and abruptly. Desktop is not pulled back (the scale is 1), so it dived.
+ *
+ * The pull-back now eases out over the waterline stretch (`pullBack`): the camera moves in as it
+ * crosses, as a diver would, and below the water it follows the same path as on desktop. Returns
+ * the distance scale to use for the hero part of the path; 1 stays 1.
+ */
+export function heroPull(distScaleHero: number, state: Pick<SceneState, "pullBack">): number {
+  return 1 + (distScaleHero - 1) * state.pullBack;
 }
