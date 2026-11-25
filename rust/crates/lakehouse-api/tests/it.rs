@@ -80,6 +80,8 @@ mod audit_compaction;
 mod audit_coverage;
 mod audit_search;
 mod auth_password_rules;
+mod bi_only_assistant_and_preview;
+mod bi_only_in_place_catalog;
 mod bi_only_query_mode;
 mod breakdown_cap;
 mod catalog_grants;
