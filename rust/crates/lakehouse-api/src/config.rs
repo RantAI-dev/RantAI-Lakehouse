@@ -309,7 +309,8 @@ impl InstallMode {
 /// The ONE query engine a `bi-only` installation reads its source through
 /// (`BI-44`). In `Full` mode both engines may run; this value names the
 /// default for ad hoc queries, not a restriction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum QueryEngine {
     /// `ClickHouse` external engines (`PostgreSQL`, `MySQL`, remote
     /// `ClickHouse`). The default, matching every pre-`BI-44` config.

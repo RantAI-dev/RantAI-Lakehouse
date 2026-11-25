@@ -15,6 +15,8 @@ import {
 import { SqlEditor } from "@/components/sql-editor"
 import { formatSql, type KeywordCase } from "@/lib/sql-format"
 import { formatDuration } from "@/lib/format"
+import { queryEngineLabel } from "@/lib/status"
+import type { QueryEngine } from "@/services/contracts/queries"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
@@ -63,6 +65,7 @@ export function SqlPanel({
   onSaveAsSource,
   onToggleSchema,
   schemaOpen = false,
+  availableEngines = ["clickhouse", "trino"],
 }: {
   readonly studio: ReturnType<typeof useQueryStudio>
   readonly onSave: () => void
@@ -71,6 +74,12 @@ export function SqlPanel({
   /** Present when the page has a schema browser to open and close. */
   readonly onToggleSchema?: () => void
   readonly schemaOpen?: boolean
+  /**
+   * The engines this installation can run (`BI-44`). A `bi-only` install
+   * has exactly one; the default keeps every other caller's both-engine
+   * selector unchanged. The API still refuses a stale engine at run time.
+   */
+  readonly availableEngines?: readonly QueryEngine[]
 }) {
   const {
     sql,
@@ -153,12 +162,15 @@ export function SqlPanel({
       />
       <div className="flex flex-wrap items-center gap-2">
         <Select value={engine} onValueChange={(v) => setEngine(v as typeof engine)}>
-          <SelectTrigger size="sm" className="w-32">
+          <SelectTrigger size="sm" className="w-32" aria-label="Query engine">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="clickhouse">ClickHouse</SelectItem>
-            <SelectItem value="trino">Trino</SelectItem>
+            {availableEngines.map((option) => (
+              <SelectItem key={option} value={option}>
+                {queryEngineLabel(option)}
+              </SelectItem>
+            ))}
           </SelectContent>
         </Select>
         <Button

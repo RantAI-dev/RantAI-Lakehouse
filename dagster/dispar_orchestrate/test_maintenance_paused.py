@@ -88,6 +88,22 @@ class PausedMaintenanceTest(unittest.TestCase):
         expiring.assert_not_called()
         self.assertNotIn("expire_snapshots", " ".join(result["skipped_verbs"]))
 
+    def test_the_pyiceberg_fallback_is_not_reached_while_the_pause_is_on(self) -> None:
+        """The fallback that expires snapshots through the catalog when
+        Trino is absent WRITES catalog metadata (it removes snapshot
+        entries), and it is the first step of a chain whose next verb
+        deletes files, so the pause covers it as well — a job that
+        removes what a restored catalog still names breaks the table it
+        names (REL-2 S4 D16). The catalog is never even built."""
+        with mock.patch.object(
+            maintenance,
+            "_pyiceberg_catalog",
+            side_effect=AssertionError("the catalog was written to"),
+        ) as catalog:
+            result, _recorded = self.run_paused()
+        catalog.assert_not_called()
+        self.assertNotIn("expire_snapshots", " ".join(result["skipped_verbs"]))
+
     def test_the_reason_is_recorded_in_the_skipped_verbs(self) -> None:
         result, recorded = self.run_paused()
         self.assertTrue(result["skipped_verbs"], "the reason was not recorded")
