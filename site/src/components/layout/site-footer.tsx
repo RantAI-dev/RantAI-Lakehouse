@@ -137,7 +137,7 @@ export function SiteFooter({
             <a
               href={page === "home" ? "#hero" : home}
               aria-label={copy.home}
-              className="inline-flex items-center gap-2.5 text-[#E8F4FF] transition-opacity hover:opacity-75"
+              className="inline-flex items-center gap-2.5 text-[#E8F4FF] transition-opacity hover:opacity-75 max-sm:-my-1.5 max-sm:min-h-10"
             >
               <MascotMark className="h-7 w-auto" />
               <span className="text-[19px] font-semibold tracking-[-0.03em]">RantAI Lakehouse</span>
@@ -150,7 +150,7 @@ export function SiteFooter({
                     href={social.href}
                     aria-label={social.label}
                     {...(social.external ? { target: "_blank", rel: "noopener noreferrer" } : {})}
-                    className="grid size-9 place-items-center rounded-full text-[#E8F4FF]/55 transition-colors hover:bg-[#E8F4FF]/5 hover:text-[#E8F4FF]"
+                    className="grid size-9 place-items-center rounded-full text-[#E8F4FF]/55 transition-colors hover:bg-[#E8F4FF]/5 hover:text-[#E8F4FF] max-sm:size-10"
                   >
                     {social.icon}
                   </a>
@@ -159,9 +159,13 @@ export function SiteFooter({
             </ul>
           </Reveal>
 
-          <nav aria-label={copy.nav} className="grid gap-y-9 sm:grid-cols-3 sm:gap-x-10 sm:gap-y-10 lg:gap-x-16">
+          {/* WEB-5 M6 (phone pass): below 640 px Product and Connect share one row, two columns,
+              and the RantAI products take the full width under them (rantai-page stacks all three);
+              the rest of the phone footer is rantai-page's own (15 px links, 40 px taps). Under
+              400 px the two columns' links are 14 px, so the longest Indonesian ones fit a line. */}
+          <nav aria-label={copy.nav} className="grid grid-cols-[auto_auto] gap-x-2 gap-y-9 max-sm:justify-between sm:grid-cols-3 sm:gap-x-10 sm:gap-y-10 lg:gap-x-16">
             {columns.map((column, i) => (
-              <Reveal key={column.title} index={i + 1}>
+              <Reveal key={column.title} index={i + 1} className={i === 2 ? "max-sm:col-span-2" : undefined}>
                 <p className="text-sm font-medium text-[#E8F4FF]">{column.title}</p>
                 <ul className="mt-2 sm:mt-4 sm:space-y-3">
                   {column.links.map((link) => (
@@ -170,14 +174,14 @@ export function SiteFooter({
                         href={link.href}
                         aria-current={link.current && page === "home" ? "page" : undefined}
                         {...(link.external ? { target: "_blank", rel: "noopener noreferrer" } : {})}
-                        className={`group inline-flex items-center gap-1 text-sm text-[#E8F4FF]/65 transition-colors hover:text-[#E8F4FF] max-sm:min-h-10 max-sm:bg-none max-sm:text-[15px] ${linkUnderline}`}
+                        className={`group inline-flex items-center gap-1 text-sm text-[#E8F4FF]/65 transition-colors hover:text-[#E8F4FF] max-sm:min-h-10 max-sm:bg-none max-sm:text-[15px] ${i < 2 ? "max-[400px]:text-[14px]!" : ""} ${linkUnderline}`}
                       >
                         {/* O27: every mark sits in the same centred 20 px slot, so all the labels start at one x. */}
                         {link.logo && <span className="mr-1 inline-flex w-5 shrink-0 justify-center">{link.logo}</span>}
                         {link.label}
                         {/* The site's own content: this product is the current site. */}
                         {link.current && (
-                          <span className="ml-1 rounded-full bg-[#44A6FA]/15 px-2 py-0.5 text-[11px] leading-4 font-medium text-[#8fcbff]">
+                          <span className="ml-1 rounded-full bg-[#44A6FA]/15 px-2 py-0.5 text-[11px] leading-4 font-medium text-[#8fcbff] max-sm:text-[12px]">
                             {copy.current}
                           </span>
                         )}
