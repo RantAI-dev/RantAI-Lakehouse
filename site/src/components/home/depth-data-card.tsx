@@ -9,6 +9,7 @@ import {
   DEPTH_TABLES,
   GOLD_ROWS,
   GOLD_TOTAL,
+  PHONE_ROW_IDS,
   RAW_RECORDS,
   SILVER_CHECKS,
   SILVER_RECORDS,
@@ -64,6 +65,19 @@ function slotOf(id: string, stage: Stage): number {
   if (silver?.duplicate) return index;
   return SILVER_RECORDS.slice(0, index).filter((r) => !r.duplicate).length;
 }
+
+/**
+ * Owner QA 2026-11-25: the row's place on a phone, where only `PHONE_ROW_IDS` show (the CSS uses it
+ * below 1024 px instead of `slotOf`). Gold is the same groups as on desktop.
+ */
+const PHONE_RAW = RAW_RECORDS.filter((r) => PHONE_ROW_IDS.includes(r.id));
+function phoneSlotOf(id: string, stage: Stage): number {
+  if (stage === 2) return slotOf(id, 2);
+  const index = Math.max(0, PHONE_RAW.findIndex((r) => r.id === id));
+  if (stage === 0 || SILVER_BY_ID.get(id)?.duplicate) return index;
+  return PHONE_RAW.slice(0, index).filter((r) => !SILVER_BY_ID.get(r.id)?.duplicate).length;
+}
+const PHONE_KEPT = PHONE_RAW.filter((r) => !SILVER_BY_ID.get(r.id)?.duplicate).length;
 
 const SCRAMBLE_MS = 520;
 const COUNT_MS = 900;
@@ -144,8 +158,17 @@ export function DepthDataCard({
               </span>
             ))}
           </span>
-          <span className="lk-depth-count shrink-0 text-[11px] text-[#E8F4FF]/60 tabular-nums">
+          <span className="lk-depth-count shrink-0 text-[11px] text-[#E8F4FF]/60 tabular-nums max-lg:hidden">
             {rowCount} {stage === 2 ? copy.cities : copy.rows}
+          </span>
+          {/* Owner QA 2026-11-25: a phone shows some of the rows, and says so. */}
+          <span className="lk-depth-count shrink-0 text-[11px] text-[#E8F4FF]/60 tabular-nums lg:hidden">
+            {stage === 2
+              ? `${rowCount} ${copy.cities}`
+              : copy.ofCount
+                  .replace("{shown}", String(stage === 0 ? PHONE_RAW.length : PHONE_KEPT))
+                  .replace("{total}", String(rowCount))
+                  .replace("{unit}", copy.rows)}
           </span>
         </div>
 
@@ -161,7 +184,7 @@ export function DepthDataCard({
               {copy.columns.city}
               <CheckMark ok />
             </span>
-            <span>{copy.columns.date}</span>
+            <span className="lk-depth-date">{copy.columns.date}</span>
             <span className="text-right">
               {copy.columns.amount}
               <CheckMark ok={false} />
@@ -179,7 +202,10 @@ export function DepthDataCard({
                 key={raw.id}
                 className="lk-depth-row lk-depth-grid"
                 data-dup={dup || undefined}
-                style={{ "--slot": slotOf(raw.id, stage), "--i": RAW_RECORDS.indexOf(raw) } as React.CSSProperties}
+                data-phone-hide={PHONE_ROW_IDS.includes(raw.id) ? undefined : ""}
+                style={
+                  { "--slot": slotOf(raw.id, stage), "--pslot": phoneSlotOf(raw.id, stage), "--i": RAW_RECORDS.indexOf(raw) } as React.CSSProperties
+                }
               >
                 {/* O31: the source as its glyph only; its name is in the Bronze footer and on hover. */}
                 <span className="lk-depth-src relative flex items-center text-[#E8F4FF]/60">
@@ -190,7 +216,7 @@ export function DepthDataCard({
                   {raw.order}
                 </span>
                 <Word raw={raw.city} clean={clean?.city ?? raw.city} value={city} twice={dup} />
-                <Word raw={raw.date} clean={clean?.date ?? raw.date} value={date} />
+                <Word raw={raw.date} clean={clean?.date ?? raw.date} value={date} className="lk-depth-date" />
                 <span className="text-right tabular-nums">
                   {raw.amount === null ? (
                     <span className="lk-depth-empty inline-flex items-center gap-1 rounded px-1.5 text-[10px] leading-4">
@@ -268,7 +294,8 @@ export function DepthDataCard({
               <RefreshCw className="lk-depth-spin size-3" strokeWidth={2.25} />
               {copy.lag}
             </span>
-            <span className="flex min-w-0 items-center gap-1 text-[11px] text-[#E8F4FF]/70">
+            {/* Owner QA 2026-11-25: a phone keeps the lag only; "feeds dashboards" is what the next sections show. */}
+            <span className="flex min-w-0 items-center gap-1 text-[11px] text-[#E8F4FF]/70 max-lg:hidden">
               <CornerDownRight className="lk-depth-hint size-3.5 shrink-0" strokeWidth={2} />
               <span className="lk-depth-feeds line-clamp-2">{copy.feeds}</span>
             </span>
@@ -280,12 +307,12 @@ export function DepthDataCard({
 }
 
 /** A cell whose text Silver may rewrite; it keeps both spellings for the re-spelling. */
-function Word({ raw, clean, value, twice }: { raw: string; clean: string; value: string; twice?: boolean }) {
+function Word({ raw, clean, value, twice, className }: { raw: string; clean: string; value: string; twice?: boolean; className?: string }) {
   const fixed = raw !== clean;
   // A trailing space is invisible; Bronze shows where it is.
   const trailing = /\s$/.test(raw);
   return (
-    <span className="lk-depth-word relative min-w-0 truncate" data-fix={fixed || undefined}>
+    <span className={`lk-depth-word relative min-w-0 truncate ${className ?? ""}`} data-fix={fixed || undefined}>
       <span data-word data-raw={raw} data-clean={clean} className="whitespace-pre">
         {value}
       </span>

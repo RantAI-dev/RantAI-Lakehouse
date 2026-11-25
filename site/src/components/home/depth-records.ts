@@ -144,6 +144,15 @@ export function toGold(rows: readonly CleanRecord[]): GoldRow[] {
 }
 
 export const SILVER_RECORDS = toSilver(RAW_RECORDS);
+
+/**
+ * WEB-5 owner QA 2026-11-25 ("karena dia versi mobile jadi terkesan banyak banget datanya"): below
+ * 1024 px the Bronze and Silver cards show three of the five rows, one per problem the section
+ * names: the misspelt "jakarta" (r1), the order that arrived twice (r4, marked ×2) and the empty
+ * amount spelt "JKT" (r5). The headers say "3 of 5 rows" and "2 of 4 rows", and Gold is built from
+ * all five rows as on desktop, so nothing a phone shows contradicts the totals.
+ */
+export const PHONE_ROW_IDS: readonly string[] = ["r1", "r4", "r5"];
 export const SILVER_CHECKS = silverChecks(SILVER_RECORDS);
 export const GOLD_ROWS = toGold(SILVER_RECORDS);
 export const GOLD_TOTAL = GOLD_ROWS.reduce((sum, g) => sum + g.revenue, 0);

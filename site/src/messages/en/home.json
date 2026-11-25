@@ -64,6 +64,7 @@
       "numberLocale": "en-US",
       "rows": "rows",
       "cities": "cities",
+      "ofCount": "{shown} of {total} {unit}",
       "columns": {
         "order": "Order",
         "city": "City",

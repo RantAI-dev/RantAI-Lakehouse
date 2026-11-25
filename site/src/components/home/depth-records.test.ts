@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   GOLD_ROWS,
   GOLD_TOTAL,
+  PHONE_ROW_IDS,
   RAW_RECORDS,
   SILVER_CHECKS,
   SILVER_RECORDS,
@@ -41,5 +42,16 @@ describe("the depths section's example records (WEB-5 O21)", () => {
       { city: "Bandung", orders: 1, revenue: 280_000 },
     ]);
     expect(GOLD_TOTAL).toBe(1_050_000);
+  });
+
+  test("the phone's three rows still show every problem: a misspelt city, a duplicate and an empty amount", () => {
+    const rows = RAW_RECORDS.filter((r) => PHONE_ROW_IDS.includes(r.id));
+    expect(rows.length).toBe(3);
+    const clean = SILVER_RECORDS.filter((r) => PHONE_ROW_IDS.includes(r.id));
+    expect(rows.some((r) => r.city !== standardCity(r.city))).toBe(true);
+    expect(clean.filter((r) => r.duplicate).length).toBe(1);
+    expect(rows.filter((r) => r.amount === null).length).toBe(1);
+    // Every city a phone's Silver keeps is one Gold shows.
+    for (const r of clean.filter((c) => !c.duplicate)) expect(GOLD_ROWS.some((g) => g.city === r.city)).toBe(true);
   });
 });

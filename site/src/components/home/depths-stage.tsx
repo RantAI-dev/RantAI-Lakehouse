@@ -113,7 +113,10 @@ export function DepthsStage({ copy }: { copy: HomeCopy["depths"] }) {
           {/* The card on its slab. With the canvas the 3D slab is drawn under
               the card's box (`data-depths-card`, lake-engine.ts); without one,
               the CSS slab below stands in, in the same place. */}
-          <div className="lk-depth-pair relative mx-auto w-full max-w-[460px] md:mr-0">
+          {/* Owner QA 2026-11-25: below 768 px the shorter card and its slab are one block, centred in
+              the space under the copy (the margin keeps the slab's room), so the screen has no dark
+              band under the slab. The slab follows the card (lake-engine.ts, `fitSlabsToCard`). */}
+          <div className="lk-depth-pair relative mx-auto w-full max-w-[460px] max-md:mb-[22svh] max-md:self-center md:mr-0">
             <DepthDataCard stage={active} copy={copy.card} className="lk-depth-on-slab relative z-10" />
             {mode !== "full" && <CssSlab active={active} />}
           </div>

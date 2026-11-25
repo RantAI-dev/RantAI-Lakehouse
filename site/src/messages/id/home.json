@@ -64,6 +64,7 @@
       "numberLocale": "id-ID",
       "rows": "baris",
       "cities": "kota",
+      "ofCount": "{shown} dari {total} {unit}",
       "columns": {
         "order": "Pesanan",
         "city": "Kota",

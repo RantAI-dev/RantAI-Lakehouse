@@ -3530,3 +3530,32 @@ html[data-tod="day"] footer .lk-wm [class*="text-[#E8F4FF]/[0.12]"] {
     font-size: 15.5px;
   }
 }
+
+/* Owner QA 2026-11-25 ("terkesan banyak banget datanya"): the depths card on a phone shows three
+   rows, one per problem (depth-records.ts, `PHONE_ROW_IDS`), and three columns, Order, City and
+   Amount: the source glyph and the date go. Rows are a little shorter, the Gold groups too, and
+   each row takes its phone place (`--pslot`). Gold is built from all five rows, as on desktop. */
+@media (max-width: 1023.98px) {
+  .lk-depth-card {
+    --lk-depth-row: 34px;
+    --lk-depth-group: 36px;
+  }
+  .lk-depth-body {
+    height: calc(28px + 3 * var(--lk-depth-row) + 16px);
+  }
+  .lk-depth-row {
+    --slot: var(--pslot) !important;
+  }
+  .lk-depth-row[data-phone-hide],
+  .lk-depth-src,
+  .lk-depth-date {
+    display: none;
+  }
+  .lk-depth-ord {
+    display: block;
+  }
+  .lk-depth-grid {
+    grid-template-columns: 58px minmax(0, 1fr) 84px;
+    column-gap: 10px;
+  }
+}
