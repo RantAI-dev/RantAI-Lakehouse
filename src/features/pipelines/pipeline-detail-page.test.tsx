@@ -131,7 +131,11 @@ type Stub = {
   resumed?: string[]
 }
 
+/** Every `POST .../trigger` body, so a full refresh can be pinned. */
+const triggerBodies: unknown[] = []
+
 function stubApi(stub: Stub) {
+  triggerBodies.length = 0
   let detailIndex = 0
   let current = stub.pipeline ?? PIPELINE
   return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -163,6 +167,7 @@ function stubApi(stub: Stub) {
       return json(current)
     }
     if (path.endsWith("/api/pipelines/pl-connector-1/trigger") && method === "POST") {
+      triggerBodies.push(init?.body ? JSON.parse(String(init.body)) : {})
       if (stub.triggerError) return json({ error: stub.triggerError }, 409)
       return json(run("running"))
     }
@@ -602,5 +607,47 @@ describe("the pipeline page's form steps in words (BLD-16)", () => {
     within(chart).getByText("joined").closest("button")?.click()
     expect(await screen.findByText("Step 1 of 1 · join")).toBeTruthy()
     expect(document.body.textContent).toContain('"left": "orders"')
+  })
+})
+
+describe("BLD-12 materialization on the pipeline page", () => {
+  const incremental: PipelineDetail = {
+    ...PIPELINE,
+    kind: "incremental",
+    incrementalColumn: "event_time",
+    incrementalStrategy: "partition_replace",
+    partitionGranularity: "month",
+    lookbackHours: 24,
+  }
+
+  it("shows the materialization settings in the Settings tab", async () => {
+    search = "tab=settings"
+    stubApi({ status: () => "completed", pipeline: incremental })
+    renderPage()
+
+    const settings = await screen.findByRole("tabpanel", { name: "Settings" })
+    expect(within(settings).getByText("Incremental")).toBeTruthy()
+    expect(within(settings).getByText("Replace time partitions")).toBeTruthy()
+    expect(within(settings).getByText("event_time")).toBeTruthy()
+    expect(within(settings).getByText("Month")).toBeTruthy()
+    expect(within(settings).getByText("24")).toBeTruthy()
+  })
+
+  it("offers Full refresh only for an authored incremental pipeline and sends fullRefresh: true", async () => {
+    stubApi({ status: () => "completed", pipeline: incremental })
+    renderPage()
+    expect(await screen.findByRole("button", { name: /full refresh/i })).toBeTruthy()
+    expect(triggerBodies).toEqual([])
+
+    fireEvent.click(screen.getByRole("button", { name: /full refresh/i }))
+    await waitFor(() => expect(triggerBodies.length).toBe(1))
+    expect(triggerBodies[0]).toEqual({ fullRefresh: true })
+  })
+
+  it("does not offer Full refresh for a full-rebuild pipeline", async () => {
+    stubApi({ status: () => "completed" })
+    renderPage()
+    await screen.findByRole("button", { name: /run now/i })
+    expect(screen.queryByRole("button", { name: /full refresh/i })).toBeNull()
   })
 })

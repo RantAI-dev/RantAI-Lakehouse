@@ -142,6 +142,9 @@ async fn create_pipeline(
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             name: name.to_owned(),

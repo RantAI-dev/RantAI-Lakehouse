@@ -13,6 +13,7 @@ import type {
   CreatePipelineInput,
   GeneratePipelineInput,
   ScheduleTicks,
+  ReuploadChainStep,
   UpdatePipelineInput,
 } from "../contracts/pipelines";
 import { apiFetch } from "../http";
@@ -96,6 +97,14 @@ export const dagsterPipelineService: PipelineService = {
   },
   async triggerRun(id, signal) {
     return getJson<PipelineRun>(`/api/pipelines/${encodeURIComponent(id)}/trigger`, { method: "POST", signal });
+  },
+  async triggerPipeline(id, options) {
+    const { fullRefresh, signal } = options ?? {};
+    return postJson<PipelineRun>(
+      `/api/pipelines/${encodeURIComponent(id)}/trigger`,
+      fullRefresh ? { fullRefresh: true } : undefined,
+      signal
+    );
   },
   // WS4 item F1: `GET /api/pipelines/{id}` now returns the real detail
   // (engine, op graph, config, authored definition) directly — no more
@@ -190,6 +199,14 @@ export const dagsterPipelineService: PipelineService = {
       `/api/pipelines/${encodeURIComponent(id)}/target-lag`,
       { targetLag },
       signal
+    );
+  },
+  // BLD-14 D8: the page's one-sentence reason. Through `apiFetch` like every
+  // other read; the route's `in_scope` gate answers another tenant's id as 404.
+  async getReuploadChain(id, signal) {
+    return getJson<{ last: ReuploadChainStep | null }>(
+      `/api/pipelines/${encodeURIComponent(id)}/reupload-chain`,
+      { signal }
     );
   },
 };
