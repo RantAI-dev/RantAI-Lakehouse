@@ -13,6 +13,7 @@ import {
   GitBranch,
   Layers,
   MoreHorizontal,
+  Pause,
   Play,
   Timer,
   User,
@@ -67,9 +68,15 @@ function pipelineOrigin(pipeline: Pipeline): "orchestrator" | "authored" {
 export function getPipelineColumns({
   onView,
   onTrigger,
+  onPause,
+  onResume,
 }: {
   onView?: (pipeline: Pipeline) => void
   onTrigger?: (pipeline: Pipeline) => void
+  /** BLD-18: pause an authored pipeline's automatic runs (cron, chain or freshness sensor). */
+  onPause?: (pipeline: Pipeline) => void
+  /** BLD-18: turn automatic runs back on after a pause. */
+  onResume?: (pipeline: Pipeline) => void
 } = {}): ColumnDef<Pipeline>[] {
   return [
     {
@@ -283,7 +290,16 @@ export function getPipelineColumns({
         // cron never fires — name the lag, which is the real trigger.
         const trigger = triggerSummary(parsed, row.original.targetLag)
         if (isLagTrigger(trigger)) {
-          return <span className="text-xs text-foreground">{trigger.label}</span>
+          // BLD-18: the lag sensor, not the stored cron, is what can run this
+          // row — say `paused` here too, not only in the status column.
+          return (
+            <span className="text-xs text-foreground">
+              {trigger.label}
+              {row.original.status === "paused" ? (
+                <span className="text-amber-600 dark:text-amber-400"> · paused</span>
+              ) : null}
+            </span>
+          )
         }
         if (parsed.kind === "manual") return <span className="text-xs text-muted-foreground">On demand</span>
         if (parsed.kind === "other") {
@@ -484,6 +500,27 @@ export function getPipelineColumns({
                       <span>Trigger run — mark it ready first</span>
                     </DropdownMenuItem>
                   )
+                ) : null}
+                {pipelineOrigin(pipeline) === "authored" && pipeline.status !== "draft" ? (
+                  // BLD-18: Pause/Resume are no longer hidden for a row whose
+                  // trigger is a target lag. The API stops the freshness
+                  // sensor next to the cron schedule and dependency sensor,
+                  // so the action is real for every automated authored row.
+                  pipeline.status === "paused" ? (
+                    onResume ? (
+                      <DropdownMenuItem onClick={() => onResume(pipeline)}>
+                        <Play className="size-4" />
+                        <span>Resume</span>
+                      </DropdownMenuItem>
+                    ) : null
+                  ) : pipeline.targetLag != null || parseSchedule(pipeline.schedule).kind === "cron" ? (
+                    onPause ? (
+                      <DropdownMenuItem onClick={() => onPause(pipeline)}>
+                        <Pause className="size-4" />
+                        <span>Pause</span>
+                      </DropdownMenuItem>
+                    ) : null
+                  ) : null
                 ) : null}
                 <DropdownMenuSeparator />
                 <DropdownMenuItem

@@ -2797,7 +2797,6 @@ dependencies = [
  "sqlx",
  "tempfile",
  "testcontainers",
- "testcontainers-modules",
  "thiserror",
  "tiberius",
  "time",

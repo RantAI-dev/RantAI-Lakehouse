@@ -253,6 +253,18 @@ async fn fixture(secret: Option<&str>) -> Fixture {
 }
 
 fn render_token(user: Uuid, board: &str, age: f64, lifetime: f64) -> String {
+    render_token_for(user, board, None, age, lifetime)
+}
+
+/// A token minted under an explicit acting tenant (`SEC-54`), so a test can
+/// prove the print view reads under that tenant and not the person's first.
+fn render_token_for(
+    user: Uuid,
+    board: &str,
+    tenant: Option<&str>,
+    age: f64,
+    lifetime: f64,
+) -> String {
     let iat = (unix_now() - age).floor();
     sign_render(
         &RenderClaims {
@@ -261,6 +273,7 @@ fn render_token(user: Uuid, board: &str, age: f64, lifetime: f64) -> String {
             chart: None,
             report: None,
             principal: user.to_string(),
+            tenant: tenant.map(str::to_owned),
             filters: Some(r#"[{"column":"region","values":["north"]}]"#.to_owned()),
             params: None,
             grain: None,
@@ -489,6 +502,7 @@ async fn a_render_token_signed_with_the_embed_secret_is_refused() {
         chart: None,
         report: None,
         principal: f.owner.to_string(),
+        tenant: None,
         filters: None,
         params: None,
         grain: None,
@@ -547,6 +561,11 @@ async fn a_revoked_permission_or_a_download_switch_inside_the_tokens_life_stops_
 
 /// A token for one chart of a board.
 fn chart_token(user: Uuid, board: &str, chart: &str) -> String {
+    chart_token_for(user, board, chart, None)
+}
+
+/// A chart-image token with an explicit acting tenant (`SEC-54`).
+fn chart_token_for(user: Uuid, board: &str, chart: &str, tenant: Option<&str>) -> String {
     let iat = unix_now().floor();
     sign_render(
         &RenderClaims {
@@ -555,6 +574,7 @@ fn chart_token(user: Uuid, board: &str, chart: &str) -> String {
             chart: Some(chart.to_owned()),
             report: None,
             principal: user.to_string(),
+            tenant: tenant.map(str::to_owned),
             filters: None,
             params: None,
             grain: None,
@@ -648,6 +668,91 @@ async fn a_person_of_another_tenant_sees_the_tile_refused() {
             .iter()
             .any(|sql| sql.contains("FROM serving.mart_x") && !sql.contains("system.")),
         "nothing is read when the person may not read the mart"
+    );
+}
+
+/// `SEC-54` (SEC-50 slice 2 M5): the tenant in the token, not the person's
+/// first tenant, decides which data the PDF and the chart image read. `owner`
+/// belongs to both tenants; the seeded ids sort so the catalog tenant is
+/// first and the retail tenant second (`lakehouse_auth::repository` orders
+/// `app_user_tenant` by `tenant_id`).
+#[tokio::test]
+async fn a_token_carries_the_second_tenant_the_person_exported_under() {
+    let f = fixture(Some(SECRET)).await;
+    sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(f.owner)
+    .bind(OTHER_TENANT.parse::<Uuid>().unwrap())
+    .execute(&f.app.pool)
+    .await
+    .unwrap();
+
+    // Control: the catalog tenant is the first one and its mart is readable.
+    let first = render_token_for(
+        f.owner,
+        PUBLIC_BOARD,
+        Some(common::CATALOG_TENANT),
+        5.0,
+        120.0,
+    );
+    let (status, body) = post(&f.app, &json!({ "token": first }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["results"]["c_one"].is_object() && body["results"]["c_one"].get("rows").is_some(),
+        "CONTROL: the first tenant's mart is readable: {body}"
+    );
+
+    // The same person, same board and same token shape, but the second
+    // tenant: the shared mart belongs to no tenant, so only the catalog
+    // tenant reads it. This fails if the print view falls back to the first.
+    let second = render_token_for(f.owner, PUBLIC_BOARD, Some(OTHER_TENANT), 5.0, 120.0);
+    let (status, body) = post(&f.app, &json!({ "token": second }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"]["c_one"]["error"], REFUSAL, "{body}");
+
+    // A chart image follows the same tenant: only that chart is returned,
+    // with the gate's refusal in its own slot rather than the first tenant's
+    // rows drawn into the file.
+    let image = chart_token_for(f.owner, PUBLIC_BOARD, "c_one", Some(OTHER_TENANT));
+    let (status, body) = post(&f.app, &json!({ "token": image }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["charts"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(body["results"]["c_one"]["error"], REFUSAL, "{body}");
+    assert!(body["results"]["c_one"].get("rows").is_none(), "{body}");
+}
+
+/// `SEC-54`: membership is checked when the token is SPENT, not when it was
+/// minted. A person who left the tenant named in the token inside its two
+/// minutes gets the one fixed refusal, not the data of a tenant they no
+/// longer belong to.
+#[tokio::test]
+async fn a_token_for_a_tenant_the_person_has_since_left_is_refused_at_render_time() {
+    let f = fixture(Some(SECRET)).await;
+    let retail = OTHER_TENANT.parse::<Uuid>().unwrap();
+    sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(f.owner)
+    .bind(retail)
+    .execute(&f.app.pool)
+    .await
+    .unwrap();
+    let token = render_token_for(f.owner, PUBLIC_BOARD, Some(OTHER_TENANT), 5.0, 120.0);
+
+    // The person leaves the second tenant while the token is still valid.
+    sqlx::query("DELETE FROM app_user_tenant WHERE user_id = $1 AND tenant_id = $2")
+        .bind(f.owner)
+        .bind(retail)
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = post(&f.app, &json!({ "token": token }), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(
+        body["error"], "render token is invalid or expired",
+        "{body}"
     );
 }
 

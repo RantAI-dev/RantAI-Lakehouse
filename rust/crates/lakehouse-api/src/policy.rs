@@ -76,6 +76,21 @@
 //! the same act as editing a chart (`dashboard:write`, which is not enough).
 //! Listing, validating and the usage of a metric need `dashboard:read` only.
 //!
+//! # `gold:read` / `agent:read` (SEC-66)
+//!
+//! The read side of Gold exports and of agent runs was `RequiresAuth`, so a
+//! signed-in Dashboard Viewer could open `/gold-exports` and
+//! `/agents/runs/[runId]` by address. These two read-only strings close that
+//! hole; `migrations/0153_sec66_read_permissions.sql` grants them on upgrade
+//! to every built-in role except the two people whose remit is dashboards
+//! and the assistant (Dashboard Viewer, Assistant only). Platform Admin's
+//! `*:*` already satisfies both. Gold's GETs keep `gold:export` as a second
+//! accepted grant so a principal that could publish before the upgrade can
+//! still read, and the shared-token/service-identity path is preserved by
+//! seeding `gold:read` on the `gold-export-scheduler` identity. WEB-4
+//! retired the runs-LIST route (`GET /api/agents/runs`); the only agent-run
+//! read left is `GET /api/agents/runs/{id}`, and it carries `agent:read`.
+//!
 //! # `agent:manage` / `workload:cancel` / `storage:restore` / `alert:write`
 //!
 //! Four more route groups had the identical problem: any authenticated
@@ -86,16 +101,17 @@
 //! alongside these table entries rather than gating them behind a token
 //! nothing can hold:
 //!
-//! * `agent:manage` (`POST /api/agents/employees` and
-//!   `/api/agents/employees/{id}/{suspend,resume,revoke}`)
-//!   — same `agent` resource family as Approver's seeded `agent:approve`,
-//!   but a different action: lifecycle control of the employee identity
-//!   itself (a kill switch), not approving one action it proposed.
-//!   Deliberately gets NO seed grant: Approver's remit is narrow
+//! * `agent:manage` — same `agent` resource family as Approver's seeded
+//!   `agent:approve`, but a different action: lifecycle control of the
+//!   employee identity itself (a kill switch), not approving one action it
+//!   proposed. Deliberately gets NO seed grant: Approver's remit is narrow
 //!   per-decision approval, not blanket administration of the employees
 //!   themselves, and no other seeded role plausibly owns "agent
 //!   operations" — reachable only via Platform Admin's `*:*`, same as
-//!   `identity:write`.
+//!   `identity:write`. WEB-4 retired the policy-gated create/suspend/resume/
+//!   revoke routes; the permission is kept because `routes::agents::
+//!   check_employee_run_auth` still uses it to let a person trigger a
+//!   headless run manually.
 //! * `workload:cancel` (`/api/ops/workloads/{id}/cancel`) — granted to
 //!   Data Engineer (`0020`) alongside its existing `pipeline:*`: Data
 //!   Engineer is the role that operates pipelines end-to-end and is the
@@ -341,6 +357,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET", "/api/lakehouse/tables/{ns}/{table}/maintenance", Policy::RequiresPermission("catalog:read")),
     ("POST", "/api/lakehouse/tables/{ns}/{table}/maintenance", Policy::RequiresPermission("governance:write")),
     ("GET", "/api/lakehouse/capacity",                        Policy::RequiresPermission("catalog:read")),
+    // OPS-21: measured small-file counts feed a warning on the table page
+    // and on System status. The list is scoped to the caller's tenant/roles
+    // in the handler, so the same `catalog:read` floor as the table listing
+    // applies here too.
+    ("GET", "/api/lakehouse/compaction-status",               Policy::RequiresPermission("catalog:read")),
     ("GET", "/api/lakehouse/maintenance-policies",            Policy::RequiresAuth),
 
     // ── Overview / alerts: the Home read surfaces have no single seeded
@@ -529,33 +550,39 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST",   "/api/alerts/run",  Policy::RequiresAuth),
 
     // ── Gold export (ADR 0010, Rust/Phase-P6-only — no TypeScript route to
-    //    port): same "floor" shape as `/api/alerts/run` — `RequiresAuth`
-    //    here, PLUS `routes::gold::check_export_token`'s own stricter D4
-    //    guard inside the handler (shared-token match, or a service-
-    //    identity principal when `GOLD_EXPORT_RUN_TOKEN` is unset). ──────
-    ("GET",  "/api/gold/export/{mart}",  Policy::RequiresAuth),
+    //    port): the WRITE still has the "floor" shape of `/api/alerts/run`
+    //    — `RequiresAuth` here, PLUS `routes::gold::check_export_token`'s
+    //    own stricter D4 guard inside the handler (shared-token match, or
+    //    a service-identity principal when `GOLD_EXPORT_RUN_TOKEN` is
+    //    unset). The GETs are SEC-66's dedicated read grant: a signed-in
+    //    user without `gold:read` must not read an export by address.
+    //    `gold:export` also passes them — it is the strictly wider grant
+    //    and its holders (custom roles, service identities) must not lose
+    //    a read they had before the permission existed. The token and
+    //    service-identity paths stay intact: `gold-export-scheduler` is
+    //    seeded with `gold:read` (see `lib.rs`) and the handler's token
+    //    branch is unchanged. ────────────────────────────────────────────
+    ("GET",  "/api/gold/export/{mart}",  Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
     ("POST", "/api/gold/export/{mart}",  Policy::RequiresAuth),
-    // History (WS6 item 3): same RequiresAuth floor as export/read-back —
-    // row counts and run timing, not public data.
-    ("GET",  "/api/gold/exports",        Policy::RequiresAuth),
+    // History (WS6 item 3): the same read grant as read-back — row counts
+    // and run timing, not public data.
+    ("GET",  "/api/gold/exports",        Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
     // Consumers (WS6 item 4): an honest supported:false stub — no
-    // ClickHouse/Iceberg/Trino data is ever returned, but the floor stays
-    // RequiresAuth (not a public route) to match every other route under
-    // /api/gold/export/{mart}.
-    ("GET",  "/api/gold/export/{mart}/consumers", Policy::RequiresAuth),
+    // ClickHouse/Iceberg/Trino data is ever returned, but the route stays
+    // permission-gated (not public) to match every other gold GET.
+    ("GET",  "/api/gold/export/{mart}/consumers", Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
 
     // DATA-1 — per-mart publish-to-Iceberg switches. `publications` is
-    // what the scheduler reads (RequiresAuth floor PLUS
-    // `check_export_token` in the handler, same two-layer shape as the
-    // export routes above); the detail GET is read-only state for the
-    // asset page (RequiresAuth floor, `canEdit` reports — never implies —
-    // the permission); the PUT is the one WRITE, floored at the existing
-    // `gold:export` permission so whoever may trigger an export by hand
-    // is exactly who may switch automatic publishing on. Switching off
-    // flips a flag only; no route under /api/gold ever drops Iceberg
-    // data.
-    ("GET", "/api/gold/publications",              Policy::RequiresAuth),
-    ("GET",  "/api/gold/export/{mart}/publication", Policy::RequiresAuth),
+    // what the scheduler reads (same SEC-66 read grant PLUS
+    // `check_export_token` in the handler); the detail GET is read-only
+    // state for the asset page (`canEdit` reports — never implies — the
+    // `gold:export` permission); the PUT is the one WRITE, floored at the
+    // existing `gold:export` permission so whoever may trigger an export
+    // by hand is exactly who may switch automatic publishing on.
+    // Switching off flips a flag only; no route under /api/gold ever
+    // drops Iceberg data.
+    ("GET", "/api/gold/publications",              Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
+    ("GET",  "/api/gold/export/{mart}/publication", Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
     ("PUT",  "/api/gold/export/{mart}/publication", Policy::RequiresPermission("gold:export")),
 
     // ── Query: seeded Analyst permission `query:read`. ───────────────────
@@ -648,8 +675,17 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // any tenant, so it cannot be reachable by someone who merely holds
     // `pipeline:read`.
     ("POST", "/api/pipelines/runnable/{id}/compile",   Policy::RequiresPermission("pipeline:read")),
+    // BLD-14 D8: the chain sensor posts one outcome per re-upload and
+    // pipeline. Same floor as `lag-check`/`compile` above (`pipeline:read`),
+    // with the same handler-side refusal: only the orchestrator's service
+    // identity (or a Platform Admin) may record a step.
+    ("POST", "/api/pipelines/runnable/{id}/chain-step", Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/source",             Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs",              Policy::RequiresPermission("pipeline:read")),
+    // BLD-14 D8: the pipeline page reads the chain's newest outcome. Same
+    // read floor as `runs`, with the same `in_scope` gate in the handler:
+    // another tenant's id is a 404, not an empty answer.
+    ("GET",  "/api/pipelines/{id}/reupload-chain",    Policy::RequiresPermission("pipeline:read")),
     // Plan 1c (R2, day-1): runs × steps matrix for the recovery UI.
     // `pipeline:read` matches `{id}/runs` and `{runId}/steps` — the
     // matrix is "runs for this pipeline" + "steps for each run"
@@ -1257,22 +1293,24 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/knowledge/vector-jobs",   Policy::RequiresAuth),
     ("POST", "/api/knowledge/vector-jobs",   Policy::RequiresAuth),
 
-    // ── Agents (digital employees / workflows / tools / runs): no seeded
-    //    resource for most of this domain — auth only. `approvals` maps to
-    //    the seeded Approver permission `agent:approve`. Employee lifecycle
-    //    control (suspend/resume/revoke) requires `agent:manage`,
-    //    deliberately Platform-Admin-only — see module doc comment. ──────
-    ("GET",  "/api/agents/workflows",                Policy::RequiresAuth),
-    ("POST", "/api/agents/workflows",                Policy::RequiresAuth),
+    // ── Agents (digital employees / tools / runs): no seeded resource for
+    //    most of this domain — auth only. `approvals` maps to the seeded
+    //    Approver permission `agent:approve`. WEB-4 retired the workflows,
+    //    employee-create, employee lifecycle (suspend/resume/revoke) and
+    //    runs-LIST routes: no assistant tool, console page, CLI or script
+    //    calls them, so their entries were removed with the routes and the
+    //    paths now answer 404. `agent:manage` stays a real permission — the
+    //    headless-run handler still uses it for a manual trigger, and SEC-68
+    //    gates `PUT /employees/{id}/read-roles` on it at the policy layer. ──
+    // `GET /employees` feeds Dagster's code-load schedule factory and
+    // `GET /employees/{id}` names the employee on the retained run-detail
+    // page; both are live consumers (see `routes::agents_router`).
     ("GET",  "/api/agents/employees",                Policy::RequiresAuth),
-    // SEC-20, plan 97: a scheduled run takes its permissions from the
-    // employee's own column and needs no `agent:manage`, so creating one is
-    // the gate (the handler also caps its permissions at the creator's).
-    ("POST", "/api/agents/employees",                Policy::RequiresPermission("agent:manage")),
     ("GET",  "/api/agents/employees/{id}",           Policy::RequiresAuth),
-    ("POST", "/api/agents/employees/{id}/suspend",   Policy::RequiresPermission("agent:manage")),
-    ("POST", "/api/agents/employees/{id}/resume",    Policy::RequiresPermission("agent:manage")),
-    ("POST", "/api/agents/employees/{id}/revoke",    Policy::RequiresPermission("agent:manage")),
+    // SEC-68: assigning an agent's explicit read grant is an agent:manage
+    // action, with the handler's own no-escalation check on top (a caller
+    // without *:*/identity:write may only grant roles it holds itself).
+    ("PUT",  "/api/agents/employees/{id}/read-roles", Policy::RequiresPermission("agent:manage")),
     // `/employees/{id}/run` (T3.2, copilot-operations-handover plan): same
     // "floor" shape as `/api/alerts/run`/`/api/gold/export/{mart}` —
     // `RequiresAuth` here, PLUS `routes::agents::check_employee_run_auth`'s
@@ -1286,8 +1324,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // POST /api/agents/tools removed (WS7 item G4): the real tool
     // registry (ai_registry::TOOLS) has no "register" concept.
     ("GET",  "/api/agents/tools",                    Policy::RequiresAuth),
-    ("GET",  "/api/agents/runs",                     Policy::RequiresAuth),
-    ("GET",  "/api/agents/runs/{id}",                Policy::RequiresAuth),
+    // SEC-66: the retained run-detail read is read-only but was open to any
+    // signed-in user. `agent:read` now gates it; `agent:approve` and
+    // `agent:manage` holders are deliberately NOT widened here — the two
+    // are decision/lifecycle powers, not a licence to read every run.
+    // WEB-4 retired the runs-LIST route (`GET /api/agents/runs`), so only
+    // the detail route remains in this table.
+    ("GET",  "/api/agents/runs/{id}",                Policy::RequiresPermission("agent:read")),
     ("GET",  "/api/agents/approvals",                Policy::RequiresPermission("agent:approve")),
     ("POST", "/api/agents/approvals/{id}/decide",    Policy::RequiresPermission("agent:approve")),
 
@@ -1975,39 +2018,111 @@ mod tests {
         );
     }
 
-    /// #1: digital-employee lifecycle control (`agent:manage`) is
-    /// deliberately Platform-Admin-only — an Analyst (and even Approver,
-    /// whose `agent:approve` is a narrower per-decision grant) must be
-    /// denied; only `*:*` gets through.
+    // WEB-4 removed the `agent:manage`-gated lifecycle routes, so there is
+    // no route left for the both-ways table check this block used to hold.
+    // The permission stays: the seed-alignment test below still pins it, and
+    // `routes::agents::check_employee_run_auth` uses it for a manual run.
+
+    /// `SEC-66`: the Gold GETs are no longer open to any signed-in user.
+    /// A Dashboard Viewer is refused; both the new `gold:read` grant and
+    /// the pre-existing `gold:export` grant still read (no reader loses
+    /// access on upgrade), and the two WRITE routes keep their old gates.
     #[test]
-    fn agent_lifecycle_routes_deny_analyst_and_approver_allow_platform_admin() {
+    fn gold_read_routes_refuse_a_dashboard_viewer_and_accept_both_gold_grants() {
         use lakehouse_auth::PermissionSet;
 
-        for path in [
-            "/api/agents/employees/{id}/suspend",
-            "/api/agents/employees/{id}/resume",
-            "/api/agents/employees/{id}/revoke",
-        ] {
-            assert_denied_then_allowed(
-                "POST",
-                path,
-                &PermissionSet::parse("query:read, catalog:read, lineage:read"),
-                "an Analyst",
-                &PermissionSet::parse("*:*"),
-                "a Platform Admin (*:*)",
+        const GOLD_GETS: [&str; 5] = [
+            "/api/gold/export/{mart}",
+            "/api/gold/exports",
+            "/api/gold/export/{mart}/consumers",
+            "/api/gold/publications",
+            "/api/gold/export/{mart}/publication",
+        ];
+        let viewer = PermissionSet::parse("dashboard:read");
+        let reader = PermissionSet::parse("gold:read");
+        let exporter = PermissionSet::parse("gold:export");
+        let admin = PermissionSet::parse("*:*");
+
+        for path in GOLD_GETS {
+            let Some(Policy::RequiresAnyPermission(perms)) = policy_for("GET", path) else {
+                panic!("GET {path} must require a Gold read permission");
+            };
+            assert_eq!(perms.len(), 2, "GET {path} must name both Gold grants");
+            assert_eq!(perms[0], "gold:read");
+            assert_eq!(perms[1], "gold:export");
+            assert!(
+                !perms.iter().any(|perm| viewer.has(perm)),
+                "a Dashboard Viewer must be denied GET {path}"
             );
-            assert_denied_then_allowed(
-                "POST",
-                path,
-                &PermissionSet::parse("agent:approve, policy:review"),
-                "an Approver (agent:approve only)",
-                &PermissionSet::parse("*:*"),
-                "a Platform Admin (*:*)",
+            assert!(
+                perms.iter().any(|perm| reader.has(perm)),
+                "a gold:read holder must be allowed GET {path}"
+            );
+            assert!(
+                perms.iter().any(|perm| exporter.has(perm)),
+                "a gold:export holder must keep its read of GET {path}"
+            );
+            assert!(
+                perms.iter().any(|perm| admin.has(perm)),
+                "a Platform Admin (*:*) must be allowed GET {path}"
             );
         }
+
+        assert_eq!(
+            policy_for("POST", "/api/gold/export/{mart}"),
+            Some(Policy::RequiresAuth),
+            "the export WRITE keeps its token-guarded auth floor"
+        );
+        assert_eq!(
+            policy_for("PUT", "/api/gold/export/{mart}/publication"),
+            Some(Policy::RequiresPermission("gold:export")),
+            "the publication WRITE stays gold:export-only"
+        );
     }
 
-    /// #2: cancelling a workload (`workload:cancel`) is granted to Data
+    /// `SEC-66`: the retained agent-run detail read requires its own
+    /// `agent:read` grant. A Dashboard Viewer (and a person holding only
+    /// `agent:approve`, a narrower decision power) is refused; `agent:read`
+    /// and `*:*` pass. WEB-4 retired the runs-LIST route (`GET
+    /// /api/agents/runs`), so only the detail route is checked here.
+    #[test]
+    fn agent_run_read_routes_refuse_a_dashboard_viewer_and_accept_agent_read() {
+        use lakehouse_auth::PermissionSet;
+
+        assert_eq!(
+            policy_for("GET", "/api/agents/runs"),
+            None,
+            "WEB-4 retired the runs-LIST route; the table must not classify it"
+        );
+        let path = "/api/agents/runs/{id}";
+        assert_eq!(
+            policy_for("GET", path),
+            Some(Policy::RequiresPermission("agent:read")),
+            "GET {path} must require agent:read"
+        );
+        assert_denied_then_allowed(
+            "GET",
+            path,
+            &PermissionSet::parse("dashboard:read"),
+            "a Dashboard Viewer",
+            &PermissionSet::parse("agent:read"),
+            "an agent:read holder",
+        );
+        assert_denied_then_allowed(
+            "GET",
+            path,
+            &PermissionSet::parse("agent:approve"),
+            "an Approver (agent:approve only)",
+            &PermissionSet::parse("agent:read"),
+            "an agent:read holder",
+        );
+        assert!(
+            PermissionSet::parse("*:*").has("agent:read"),
+            "a Platform Admin (*:*) must satisfy agent:read on {path}"
+        );
+    }
+
+    /// #1: cancelling a workload (`workload:cancel`) is granted to Data
     /// Engineer (0020) — an Analyst must be denied, Data Engineer allowed.
     #[test]
     fn workload_cancel_denies_analyst_allows_data_engineer() {
@@ -2023,7 +2138,7 @@ mod tests {
         );
     }
 
-    /// #3: storage restore (`storage:restore`) is deliberately
+    /// #2: storage restore (`storage:restore`) is deliberately
     /// Platform-Admin-only — Data Engineer, despite operating pipelines and
     /// connectors, must still be denied; only `*:*` gets through.
     #[test]
@@ -2040,7 +2155,7 @@ mod tests {
         );
     }
 
-    /// #4 (changed by `BI-19` part C, C3): alert rule CRUD is "signed in" at the
+    /// #3 (changed by `BI-19` part C, C3): alert rule CRUD is "signed in" at the
     /// router, because a person who can view a chart may alert on it for
     /// themselves. `alert:write` is judged in the handler
     /// (`tests/route_auth.rs`, `the_alert_routes_are_signed_in_at_the_router_and_the_handler_asks_for_the_right`).

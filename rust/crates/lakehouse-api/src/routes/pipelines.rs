@@ -424,6 +424,29 @@ pub async fn runs(
     (StatusCode::OK, ApiJson(body)).into_response()
 }
 
+/// `GET /api/pipelines/{id}/reupload-chain` — the newest chain outcome the
+/// page shows as one sentence (BLD-14 D8). It is a page read like [`runs`],
+/// so it lives here rather than in the orchestrator-only authored router.
+///
+/// BLD-14 review R5: the per-tenant gate runs first, exactly as [`runs`]
+/// does; an id in another tenant and an unknown id are the same 404.
+///
+/// # Errors
+///
+/// 404 for an unknown id or one outside the caller's tenant; 503 with no
+/// database; 500 on a store failure.
+pub async fn reupload_chain(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id).await?;
+    let pool = pool(&state)?;
+    let last = lakehouse_store::pipeline_chain::latest_chain_step(pool, &id).await?;
+    Ok(ApiJson(json!({ "last": last })))
+}
+
 async fn runs_body(state: &AppState, id: &str) -> Value {
     // An authored pipeline's runs belong to its `authored__<id>` job; the
     // `pl-` id itself names no job, so asking for it always found none.
@@ -4109,48 +4132,109 @@ async fn authored_status(
 ) -> Result<Option<pipelines::Pipeline>, ApiError> {
     let status = if paused { "paused" } else { "ready" };
     let updated = pipelines::set_status(pool(state)?, id, status).await?;
-    if updated.is_some() {
-        // The status is the record; the orchestrator's schedule is what
-        // actually fires. Its stored on/off state outlives a reload, so it
-        // is switched directly as well as rebuilt. An authored pipeline
-        // with no cron schedule has none to switch, which is not an error.
-        let schedule = authored_pipelines::schedule_name(id);
-        let switched = if paused {
-            state.dagster.stop_schedule(&schedule).await
+    if let Some(pipeline) = updated.as_ref() {
+        // Only `kind: "lag"` builds a polling freshness sensor; a
+        // `downstream` target is refreshed by its readers' checks and is
+        // guarded at the lag-check choke point instead (BLD-18).
+        let has_lag_sensor = matches!(pipeline.target_lag, Some(pipelines::TargetLag::Lag { .. }));
+        if paused {
+            // Stop BEFORE the reload: the sensors and schedule still exist
+            // in the current code location, so their stored instigation
+            // state really moves to STOPPED. Stopping after the reload
+            // would find no sensor (the Python factory omits it for a
+            // `paused` row) and leave the old RUNNING state stored.
+            toggle_authored_automation(state, id, false, has_lag_sensor).await;
+            authored_pipelines::reload_orchestrator(state).await;
         } else {
-            state.dagster.start_schedule(&schedule).await
-        };
-        if let Ok(ScheduleOutcome {
-            error: Some(err), ..
-        }) = switched
-        {
-            tracing::info!(%err, pipeline_id = id, "authored schedule not switched");
+            // Reload BEFORE starting: a paused pipeline's `_lag` sensor has
+            // no definition in the current code location. Dagster preserves
+            // the stored STOPPED state when the factory re-emits it, and
+            // `default_status=RUNNING` applies only to freshly created
+            // sensors, not to one whose state survived a reload. Starting
+            // first would hit `SensorNotFoundError` and leave it stopped.
+            authored_pipelines::reload_orchestrator(state).await;
+            toggle_authored_automation(state, id, true, has_lag_sensor).await;
         }
-        // F1.2 (#57): chained pipelines ALSO ship an
-        // `authored__<id>_after` run-status sensor. Like the schedule,
-        // its stored RUNNING/STOPPED state outlives a code-location
-        // reload, so a `paused` pipeline keeps firing the chain
-        // unless the sensor is switched explicitly. `default_status`
-        // on the Python side does NOT apply to stored state -- only
-        // to freshly created ones. A pipeline with no `dependsOn`
-        // has no sensor to switch; the `set_sensor_running` method
-        // treats that as already-stopped (SensorNotFoundError
-        // tolerated on `running=false`).
-        let sensor = authored_pipelines::sensor_name(id);
-        let sensor_switched = if paused {
-            state.dagster.set_sensor_running(&sensor, false).await
-        } else {
-            state.dagster.set_sensor_running(&sensor, true).await
-        };
-        if let Ok(SensorOutcome {
-            error: Some(err), ..
-        }) = &sensor_switched
-        {
-            tracing::info!(%err, pipeline_id = id, "authored sensor not switched");
-        }
-        authored_pipelines::reload_orchestrator(state).await;
     }
     Ok(updated)
+}
+
+/// Switch the stored Dagster state of every automation that can launch an
+/// authored pipeline: its cron schedule, its dependency `_after` sensor, the
+/// re-upload chain `_chain` sensor (BLD-14) and — for `targetLag.kind ==
+/// "lag"` — its freshness `_lag` sensor (BLD-18).
+///
+/// Each flip is best effort: the status is the record, and a definition that
+/// was never built (no cron schedule, no `dependsOn`, no chain sensor, no
+/// target lag) is not an error. [`lakehouse_dagster::DgClient::set_sensor_running`]
+/// already treats a missing sensor on `running=false` as already stopped; a
+/// missing schedule or a `startSensor` on an undefined sensor comes back as an
+/// `Ok` outcome with `error` set, which is logged here and never surfaced.
+async fn toggle_authored_automation(
+    state: &AppState,
+    id: &str,
+    running: bool,
+    has_lag_sensor: bool,
+) {
+    // The status is the record; the orchestrator's schedule is what
+    // actually fires. Its stored on/off state outlives a reload, so it
+    // is switched directly as well as rebuilt. An authored pipeline
+    // with no cron schedule has none to switch, which is not an error.
+    let schedule = authored_pipelines::schedule_name(id);
+    let switched = if running {
+        state.dagster.start_schedule(&schedule).await
+    } else {
+        state.dagster.stop_schedule(&schedule).await
+    };
+    if let Ok(ScheduleOutcome {
+        error: Some(err), ..
+    }) = switched
+    {
+        tracing::info!(%err, pipeline_id = id, "authored schedule not switched");
+    }
+    // F1.2 (#57): chained pipelines ALSO ship an
+    // `authored__<id>_after` run-status sensor. Like the schedule,
+    // its stored RUNNING/STOPPED state outlives a code-location
+    // reload, so a `paused` pipeline keeps firing the chain
+    // unless the sensor is switched explicitly.
+    let sensor = authored_pipelines::sensor_name(id);
+    let sensor_switched = state.dagster.set_sensor_running(&sensor, running).await;
+    if let Ok(SensorOutcome {
+        error: Some(err), ..
+    }) = &sensor_switched
+    {
+        tracing::info!(%err, pipeline_id = id, "authored sensor not switched");
+    }
+    // BLD-18: the freshness sensor is a THIRD automation. The Python
+    // factory omits it for a `paused` row but keeps its stored instigation
+    // state across reloads, so only an explicit stop here truly stops a
+    // target-lag pipeline's automatic runs.
+    if has_lag_sensor {
+        let lag_sensor = authored_pipelines::lag_sensor_name(id);
+        let lag_switched = state.dagster.set_sensor_running(&lag_sensor, running).await;
+        if let Ok(SensorOutcome {
+            error: Some(err), ..
+        }) = &lag_switched
+        {
+            tracing::info!(%err, pipeline_id = id, "authored lag sensor not switched");
+        }
+    }
+    // BLD-14 D6/D7: the re-upload chain sensor is a fourth automation for
+    // the same pipeline. Its stored state also outlives a reload, so a
+    // paused pipeline would otherwise keep launching the downstream chain.
+    // A pipeline without a chain sensor is tolerated just like a missing
+    // `_after` sensor (SensorNotFoundError on stop, error outcome on start).
+    let chain_sensor = authored_pipelines::chain_sensor_name(id);
+    let chain_switched = state
+        .dagster
+        .set_sensor_running(&chain_sensor, running)
+        .await;
+    if let Ok(SensorOutcome {
+        error: Some(err), ..
+    }) = &chain_switched
+    {
+        tracing::info!(%err, pipeline_id = id, "authored chain sensor not switched");
+    }
 }
 
 async fn dagster_schedule_toggle(state: &AppState, job_name: &str, paused: bool) -> Response {
@@ -9414,6 +9498,224 @@ mod tests {
                 .expect("get_pipeline")
                 .expect("the row exists");
             assert_eq!(current.status, "paused");
+        }
+
+        // ── BLD-18: Pause must stop a target-lag pipeline ───────────────
+        // The Python factory drops a `paused` row's `_lag` sensor on the
+        // next reload, but Dagster preserves a sensor's stored
+        // RUNNING/STOPPED state across that reload. These tests pin both
+        // halves of the fix: an explicit stop BEFORE the reload on pause,
+        // and a reload BEFORE an explicit start on resume.
+
+        /// A ready authored pipeline with `targetLag.kind == "lag"` and no
+        /// cron schedule (a lag replaces the schedule, BLD-2 D3).
+        async fn create_lag_pipeline(state: &AppState) -> pipelines::Pipeline {
+            let pool = state.pg.as_deref().expect("DATABASE_URL was set");
+            let pipeline = lakehouse_store::pipelines::create_pipeline(
+                pool,
+                &CreatePipelineInput {
+                    // BLD-12 (migration `0156`) / PR #715 merge: a `batch`
+                    // fixture keeps the migration's defaults — full rebuild,
+                    // no lookback — so the lag tests exercise BLD-18 only.
+                    incremental_strategy: "append".to_owned(),
+                    partition_granularity: "day".to_owned(),
+                    lookback_hours: 0,
+                    inputs: Vec::new(),
+                    steps: Vec::new(),
+                    name: format!("bld18-lag-{}", uuid::Uuid::new_v4()),
+                    kind: "batch".to_owned(),
+                    source_zone: "bronze".to_owned(),
+                    source_table: "t".to_owned(),
+                    incremental_column: None,
+                    transforms: Vec::new(),
+                    fbic_enabled: false,
+                    target_zone: "silver".to_owned(),
+                    target_table: "t".to_owned(),
+                    schedule: "manual".to_owned(),
+                    owner: None,
+                    description: None,
+                    max_retries: None,
+                    tenant_id: None,
+                    depends_on: Vec::new(),
+                    connector_id: None,
+                    id: None,
+                    target_lag: Some(pipelines::TargetLag::Lag { minutes: 15 }),
+                    run_as: None,
+                },
+                None,
+            )
+            .await
+            .expect("create a target-lag pipeline");
+            pipelines::set_status(pool, &pipeline.id, "ready")
+                .await
+                .expect("mark the pipeline ready");
+            pipeline
+        }
+
+        /// The Dagster answers the three automation mutations need. The
+        /// schedule mutations deliberately say `ScheduleNotFoundError`:
+        /// a target-lag pipeline has no cron schedule, and stopping/starting
+        /// one must not fail the pause or the resume (BLD-18).
+        async fn mount_lag_automation_mocks(server: &wiremock::MockServer) {
+            use wiremock::matchers::{body_string_contains, method};
+            use wiremock::{Mock, ResponseTemplate};
+
+            for mutation in ["stopRunningSchedule", "startSchedule"] {
+                Mock::given(method("POST"))
+                    .and(body_string_contains(mutation))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "data": { mutation: {
+                            "__typename": "ScheduleNotFoundError",
+                            "message": "a target-lag pipeline has no cron schedule"
+                        } }
+                    })))
+                    .mount(server)
+                    .await;
+            }
+            Mock::given(method("POST"))
+                .and(body_string_contains("sensorOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "sensorOrError": {
+                        "__typename": "Sensor",
+                        "sensorState": { "id": "sensor-state-id", "status": "RUNNING" }
+                    } }
+                })))
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("stopSensor"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "stopSensor": {
+                        "__typename": "StopSensorMutationResult",
+                        "instigationState": { "id": "sensor-state-id", "status": "STOPPED" }
+                    } }
+                })))
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("startSensor"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "startSensor": {
+                        "__typename": "Sensor",
+                        "sensorState": { "status": "RUNNING" }
+                    } }
+                })))
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("reloadRepositoryLocation"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "reloadRepositoryLocation": {
+                        "__typename": "WorkspaceLocationEntry",
+                        "locationOrLoadError": { "__typename": "Loaded" }
+                    } }
+                })))
+                .mount(server)
+                .await;
+        }
+
+        fn request_bodies(requests: &[wiremock::Request]) -> Vec<String> {
+            requests
+                .iter()
+                .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+                .collect()
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn pausing_a_target_lag_pipeline_stops_its_freshness_sensor_before_the_reload(
+            pool: sqlx::PgPool,
+        ) {
+            let dagster = wiremock::MockServer::start().await;
+            mount_lag_automation_mocks(&dagster).await;
+            let state = state_with_dagster(&pool, &dagster.uri());
+            let pipeline = create_lag_pipeline(&state).await;
+            let lag_sensor = authored_pipelines::lag_sensor_name(&pipeline.id);
+
+            let response = pause(
+                State(state),
+                Some(Extension(fixture_unrestricted_principal())),
+                HeaderMap::new(),
+                Path(pipeline.id.clone()),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a missing cron schedule must not fail a target-lag pause"
+            );
+            let stored = pipelines::get_pipeline(&pool, &pipeline.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row exists");
+            assert_eq!(stored.status, "paused");
+
+            let requests = dagster.received_requests().await.expect("read requests");
+            let bodies = request_bodies(&requests);
+            assert!(
+                bodies
+                    .iter()
+                    .any(|b| b.contains("sensorOrError") && b.contains(&lag_sensor)),
+                "the freshness sensor {lag_sensor} must be looked up for the stop: {bodies:?}"
+            );
+            let stop = bodies
+                .iter()
+                .position(|b| b.contains("stopSensor"))
+                .expect("stopSensor was called");
+            let reload = bodies
+                .iter()
+                .position(|b| b.contains("reloadRepositoryLocation"))
+                .expect("the code location was reloaded");
+            assert!(
+                stop < reload,
+                "stop the live sensor before the reload removes its definition: {bodies:?}"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn resuming_a_target_lag_pipeline_reloads_then_starts_its_freshness_sensor(
+            pool: sqlx::PgPool,
+        ) {
+            let dagster = wiremock::MockServer::start().await;
+            mount_lag_automation_mocks(&dagster).await;
+            let state = state_with_dagster(&pool, &dagster.uri());
+            let pipeline = create_lag_pipeline(&state).await;
+            pipelines::set_status(&pool, &pipeline.id, "paused")
+                .await
+                .expect("the pipeline starts paused");
+            let lag_sensor = authored_pipelines::lag_sensor_name(&pipeline.id);
+
+            let response = resume(
+                State(state),
+                Some(Extension(fixture_unrestricted_principal())),
+                HeaderMap::new(),
+                Path(pipeline.id.clone()),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a missing cron schedule must not fail a target-lag resume"
+            );
+            let stored = pipelines::get_pipeline(&pool, &pipeline.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row exists");
+            assert_eq!(stored.status, "ready");
+
+            let requests = dagster.received_requests().await.expect("read requests");
+            let bodies = request_bodies(&requests);
+            let reload = bodies
+                .iter()
+                .position(|b| b.contains("reloadRepositoryLocation"))
+                .expect("the code location was reloaded");
+            let start = bodies
+                .iter()
+                .position(|b| b.contains("startSensor") && b.contains(&lag_sensor))
+                .expect("the freshness sensor was started");
+            assert!(
+                reload < start,
+                "the sensor has no definition until the reload re-emits it: {bodies:?}"
+            );
         }
     }
 

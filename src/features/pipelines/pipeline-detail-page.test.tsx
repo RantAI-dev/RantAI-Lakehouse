@@ -126,6 +126,9 @@ type Stub = {
   triggerError?: string
   /** The detail read after a status POST (Mark ready). */
   readyPipeline?: PipelineDetail
+  /** Pipeline ids sent to the pause/resume routes (BLD-18). */
+  paused?: string[]
+  resumed?: string[]
 }
 
 /** Every `POST .../trigger` body, so a full refresh can be pinned. */
@@ -143,6 +146,16 @@ function stubApi(stub: Stub) {
     }
     if (path.endsWith("/api/pipelines/pl-connector-1/status") && method === "POST") {
       current = stub.readyPipeline ?? { ...current, status: "ready" }
+      return json(current)
+    }
+    if (path.endsWith("/api/pipelines/pl-connector-1/pause") && method === "POST") {
+      stub.paused?.push("pl-connector-1")
+      current = { ...current, status: "paused" }
+      return json(current)
+    }
+    if (path.endsWith("/api/pipelines/pl-connector-1/resume") && method === "POST") {
+      stub.resumed?.push("pl-connector-1")
+      current = { ...current, status: "ready" }
       return json(current)
     }
     if (path.endsWith("/api/pipelines/pl-connector-1")) {
@@ -252,9 +265,10 @@ describe("the pipeline page's run state (BLD-8)", () => {
 })
 
 // BLD-11 F2/D3: the target lag is the trigger when one is set, whatever the
-// stored `schedule` says. A stored cron with a target lag never fires, and
-// the page must say neither "Manual only" nor offer a Pause for it.
-describe("the pipeline page's trigger (BLD-11)", () => {
+// stored `schedule` says. BLD-18 adds the other half: a lag-driven pipeline
+// is pausable (and visibly paused), because the API now stops its freshness
+// sensor instead of only pausing a cron that never fires.
+describe("the pipeline page's trigger (BLD-11 / BLD-18)", () => {
   it("a pipeline with a target lag and no schedule never says 'Manual only'", async () => {
     const pipeline: PipelineDetail = {
       ...PIPELINE,
@@ -269,33 +283,43 @@ describe("the pipeline page's trigger (BLD-11)", () => {
     expect(screen.getByText("Runs when an input changes")).toBeTruthy()
   })
 
-  it("a pipeline with a target lag and a stored cron offers no Pause schedule button", async () => {
+  it("a ready target-lag pipeline offers Pause and clicking it calls the pause route", async () => {
+    const paused: string[] = []
     const pipeline: PipelineDetail = {
       ...PIPELINE,
       schedule: "cron: 0 * * * * (RUNNING)",
       targetLag: { kind: "lag", minutes: 120 },
     }
-    stubApi({ status: () => "completed", pipeline })
+    stubApi({ status: () => "completed", pipeline, paused })
     renderPage()
 
     expect(await screen.findByText("Within 2 h of its inputs")).toBeTruthy()
-    expect(screen.queryByRole("button", { name: /pause schedule/i })).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }))
+    const dialog = await screen.findByRole("dialog")
+    fireEvent.click(within(dialog).getByRole("button", { name: "Pause" }))
+
+    await waitFor(() => expect(paused).toEqual(["pl-connector-1"]))
+    // The page reflects the pause with the same `· paused` cue as a cron.
+    expect(await screen.findByRole("button", { name: "Resume" })).toBeTruthy()
+    expect(screen.getAllByText(/· paused/).length).toBeGreaterThan(0)
   })
 
-  // BLD-11 review R1: D3 must hide Pause for a target-lag pipeline, but a
-  // pipeline already paused still needs its Resume to get running again.
-  it("a paused target-lag pipeline still offers Resume", async () => {
+  it("a paused target-lag pipeline shows a paused chip and offers Resume", async () => {
+    const resumed: string[] = []
     const pipeline: PipelineDetail = {
       ...PIPELINE,
       schedule: "cron: 0 * * * * (PAUSED)",
       status: "paused",
       targetLag: { kind: "lag", minutes: 10 },
     }
-    stubApi({ status: () => "completed", pipeline })
+    stubApi({ status: () => "completed", pipeline, resumed })
     renderPage()
 
-    expect(await screen.findByRole("button", { name: /resume schedule/i })).toBeTruthy()
-    expect(screen.queryByRole("button", { name: /pause schedule/i })).toBeNull()
+    expect(await screen.findByText("Within 10 min of its inputs")).toBeTruthy()
+    expect(screen.getAllByText(/· paused/).length).toBeGreaterThan(0)
+    const button = await screen.findByRole("button", { name: "Resume" })
+    fireEvent.click(button)
+    await waitFor(() => expect(resumed).toEqual(["pl-connector-1"]))
   })
 
   it("a refused Run now shows the API's reason under the masthead", async () => {

@@ -268,6 +268,13 @@ pub async fn list(
     headers: HeaderMap,
     Query(params): Query<ListQuery>,
 ) -> Response {
+    // `BI-44` slice 2: a `bi-only` install has no lakehouse registry to
+    // list. The active engine's own catalog is the source of truth, so this
+    // branch must return before any Lakekeeper or `ClickHouse` registry
+    // dial. `full` mode never enters it and keeps its byte-shaped answer.
+    if state.config.is_bi_only() {
+        return in_place_list(&state, params.limit).await;
+    }
     match catalog_tenant_refusal(&state, &principal, &headers).await {
         Ok(Some(reason)) => {
             return (
@@ -368,6 +375,109 @@ pub async fn list(
         }
         Err(err) => list_unavailable(err),
     }
+}
+
+/// `GET /api/catalog` for a `bi-only` installation: the active engine's own
+/// external tables, in the same `assets`/`namespaces` shape the console
+/// already reads (`BI-44` slice 2).
+///
+/// Everything unmeasured is `null` rather than a guessed number: there are
+/// no parts to count rows or bytes from, no watermark to turn into
+/// `freshnessLagSeconds`, and no lineage to claim. Each asset is marked
+/// `zone: "external"` so the console can tell an in-place source from a
+/// loaded lakehouse table.
+async fn in_place_list(state: &AppState, requested: Option<u32>) -> Response {
+    // The limit is checked here because the `full` path validates it later;
+    // a `bi-only` answer must refuse the same bad values in the same words.
+    let limit = match requested_limit(requested) {
+        Ok(limit) => limit,
+        Err(err) => return ApiRejection(err).into_response(),
+    };
+    let engine = state.config.query_engine;
+    let cap = limit.unwrap_or(200).clamp(1, 200);
+    let outcome: Result<Vec<crate::in_place::InPlaceTable>, crate::in_place::IntrospectionError> =
+        match engine {
+            crate::config::QueryEngine::Trino => {
+                crate::in_place::introspect_trino_tables(&state.trino, cap).await
+            }
+            crate::config::QueryEngine::ClickHouse => {
+                crate::in_place::introspect_clickhouse_external_tables(&state.clickhouse, cap).await
+            }
+        };
+    let tables = match outcome {
+        Ok(tables) => tables,
+        Err(err) => return ApiRejection(err.into_api_error()).into_response(),
+    };
+    let assets: Vec<Value> = tables
+        .iter()
+        .map(|table| {
+            let namespace = match (&table.catalog, engine) {
+                (Some(catalog), crate::config::QueryEngine::Trino) => {
+                    format!("{catalog}.{}", table.schema)
+                }
+                _ => table.schema.clone(),
+            };
+            json!({
+                "id": table.full_name,
+                "name": table.name,
+                "namespace": namespace,
+                "type": "table",
+                "layer": "external",
+                "tier": "external",
+                "classification": "external",
+                "owner": "",
+                "domain": "",
+                "description": format!(
+                    "External table read in place through {}. No lakehouse copy exists.",
+                    engine.name()
+                ),
+                "format": format!("{} external table", engine.name()),
+                "engine": engine.name(),
+                "rows": Value::Null,
+                "sizeBytes": Value::Null,
+                "columnCount": Value::Null,
+                "freshnessLagSeconds": Value::Null,
+                "lastUpdated": Value::Null,
+                "health": "unknown",
+                "residency": "",
+                "zone": "external",
+            })
+        })
+        .collect();
+    let namespaces: Vec<Value> = {
+        let mut order: Vec<String> = Vec::new();
+        let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for asset in &assets {
+            let ns = asset["namespace"].as_str().unwrap_or_default().to_owned();
+            if !counts.contains_key(&ns) {
+                order.push(ns.clone());
+            }
+            *counts.entry(ns).or_insert(0) += 1;
+        }
+        order
+            .into_iter()
+            .map(|name| {
+                json!({
+                    "id": name,
+                    "name": name,
+                    "description": "External schema read in place, not copied into the lakehouse.",
+                    "assetCount": counts[&name],
+                    "owner": "",
+                    "residency": "",
+                    "sourceEngine": engine.name(),
+                })
+            })
+            .collect()
+    };
+    (
+        StatusCode::OK,
+        ApiJson(json!({
+            "assets": assets,
+            "namespaces": namespaces,
+            "supported": true,
+        })),
+    )
+        .into_response()
 }
 
 /// The catalog as `list` serves it: [`list_body`] and the four enrichment
@@ -2348,6 +2458,7 @@ async fn apply_badges(state: &AppState, body: &mut Value, bronze_pairs: &[(Strin
 async fn mark_governance(
     state: &AppState,
     principal: &Principal,
+    headers: &HeaderMap,
     body: &mut Value,
     tables: &[String],
     names: &[String],
@@ -2357,7 +2468,10 @@ async fn mark_governance(
     let checks = catalog_governance::QualityIndex::load(state, Some(names))
         .await
         .checks_for(names);
-    let dependents = catalog_governance::dependents(state, principal, tables).await;
+    // SEC-54 review fix: the detail route's real headers travel here so
+    // the "used by" list is scoped to the tenant `X-Tenant` selects,
+    // not always the caller's first tenant.
+    let dependents = catalog_governance::dependents(state, principal, headers, tables).await;
     let (usage, recent_queries) =
         catalog_governance::usage(state, principal, tables, columns).await;
     if let Some(o) = body.as_object_mut() {
@@ -2697,6 +2811,7 @@ async fn clickhouse_asset_detail(
     mark_governance(
         state,
         principal,
+        headers,
         &mut body,
         std::slice::from_ref(&key),
         &[key.clone(), table.clone()],
@@ -2935,6 +3050,7 @@ async fn bronze_asset_detail_body(
     mark_governance(
         state,
         principal,
+        headers,
         &mut body,
         &tables,
         &names,
@@ -3244,7 +3360,11 @@ pub(crate) async fn table_access_for(
     state: &AppState,
     principal: &Principal,
 ) -> Result<crate::table_access::TableAccess, ApiError> {
-    Ok(crate::table_access::for_roles(state.pg.as_deref(), &principal.role_names).await?)
+    // SEC-68: a role-less service identity is NOT a wildcard admin — only a
+    // real `*:*` grant reads every table. `for_principal` also leaves a
+    // platform admin (whose wildcard is a permission, not a role name) and
+    // Postgres-optional reads with non-empty roles unchanged.
+    Ok(crate::table_access::for_principal(state.pg.as_deref(), principal).await?)
 }
 
 /// The canonical `schema.table` key a catalog row or detail body names, or

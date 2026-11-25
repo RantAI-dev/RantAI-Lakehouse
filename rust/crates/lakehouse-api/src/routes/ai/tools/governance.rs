@@ -244,26 +244,75 @@ pub(super) async fn get_maintenance_metrics(
     .await
 }
 
+/// What `draft_policy` answers when `conditions` cannot be enforced (AI-27).
+/// It names the three parts of an enforceable condition so the model can
+/// correct the call, and it is fixed text: the route's own 400 message never
+/// reaches the model (SEC-11).
+const CONDITIONS_REFUSAL: &str =
+    "The conditions need roles, a table, and a mask or a row filter, so the draft was not saved.";
+
+/// What a saved draft with no `conditions` adds to its result (AI-27).
+const NO_CONDITIONS_NOTE: &str = "This draft enforces nothing until a person adds conditions in the console (Governance, then Policies).";
+
 /// Builds the `POST /api/governance/policies` body from the tool's args,
 /// forcing `activate: false` regardless of anything the model passed —
 /// `draft_policy` must NEVER be able to create an already-`"ready"`
 /// policy; only a human, in the console, activates one.
+///
+/// A drafted policy is enforceable or the result says it enforces nothing
+/// (AI-27). The route lets free-text `conditions` through on purpose, for an
+/// admin who writes prose, but a model that writes prose saves a policy that
+/// looks real and does nothing. So when `conditions` is present, the tool
+/// checks it with the engine's own [`PolicyCondition::parse`] before it
+/// saves, and refuses what the engine would not enforce. A `conditions`
+/// string (the old schema) is refused too, even a JSON one: the tool's
+/// schema is an object, so a string means the model did not follow it.
+///
+/// [`PolicyCondition::parse`]: crate::policy_engine::PolicyCondition::parse
 pub(super) async fn draft_policy(state: &AppState, args: &Map<String, Value>) -> Value {
     let mut body = args.clone();
     body.insert("activate".to_owned(), Value::Bool(false));
+    let has_conditions = match args.get("conditions") {
+        None | Some(Value::Null) => false,
+        Some(conditions @ Value::Object(_)) => {
+            // The store keeps `conditions` as the JSON string the engine
+            // parses at read time, and the route takes a string.
+            let Ok(raw) = serde_json::to_string(conditions) else {
+                return json!({ "error": CONDITIONS_REFUSAL });
+            };
+            if crate::policy_engine::PolicyCondition::parse(&raw).is_none() {
+                return json!({ "error": CONDITIONS_REFUSAL });
+            }
+            body.insert("conditions".to_owned(), Value::String(raw));
+            true
+        }
+        Some(_) => return json!({ "error": CONDITIONS_REFUSAL }),
+    };
     let bytes = match serde_json::to_vec(&Value::Object(body)) {
         Ok(bytes) => bytes,
         // Serialising our own `Value` (infallible in practice): not an upstream error.
         Err(err) => return json!({ "error": err.to_string() }),
     };
-    api_result_to_value(
+    let mut result = api_result_to_value(
         crate::routes::governance::create_policy(
             State(state.clone()),
             axum::body::Bytes::from(bytes),
         )
         .await,
     )
-    .await
+    .await;
+    // Only a saved draft gets the note: a failed save (no pool, a taken
+    // name) already carries an `error`, and a note would read as success.
+    if !has_conditions
+        && let Value::Object(map) = &mut result
+        && !map.contains_key("error")
+    {
+        map.insert(
+            "note".to_owned(),
+            Value::String(NO_CONDITIONS_NOTE.to_owned()),
+        );
+    }
+    result
 }
 
 pub(super) async fn draft_classification_rule(

@@ -197,6 +197,59 @@ export const NAV_GROUPS: NavGroup[] = [
 /** Flat list of every sidebar nav item, used for active-state and command search. */
 export const ALL_NAV_ITEMS: NavItem[] = NAV_GROUPS.flatMap((g) => g.items)
 
+/**
+ * Pages that move data INTO the warehouse (`BI-44`). A `bi-only`
+ * installation has no Dagster, object store, upload or Gold export service;
+ * a link to one of these pages would open a dead end. The extra names are
+ * pages other sections link to (`/lakehouse/tables`, `/gold-exports`): a
+ * child route is hidden with its parent. Home, History, Dashboards,
+ * Catalog, Query Studio, Sources, Governance and Settings stay visible:
+ * they read the customer's tables in place through the installed engine.
+ */
+export const BI_ONLY_HIDDEN_HREFS: ReadonlySet<string> = new Set([
+  "/pipelines",
+  "/storage",
+  "/lakehouse",
+  "/uploads",
+  "/gold",
+  "/gold-exports",
+])
+
+/**
+ * Whether a nav href belongs to a warehouse-only page in a `bi-only`
+ * installation. Child routes count as part of their parent, but a prefix
+ * must end at a path boundary so `/pipelines-extra` is not swallowed.
+ */
+export function isHiddenInBiOnly(href: string): boolean {
+  for (const hidden of BI_ONLY_HIDDEN_HREFS) {
+    if (href === hidden || href.startsWith(`${hidden}/`)) return true
+  }
+  return false
+}
+
+/**
+ * The sidebar sections a `bi-only` installation can actually open.
+ *
+ * Pure by design: the caller owns the deployment answer, so this never
+ * fetches anything and can be tested on its own. With `full`, an absent or
+ * a loading `installMode`, the SAME array is returned untouched — no
+ * refetch, no flash of a shorter menu, no guess from a health probe. Only
+ * an affirmative `"bi-only"` hides anything; empty groups drop out so the
+ * sidebar does not draw an empty section header.
+ */
+export function filterNavSectionsForInstallMode(
+  sections: NavGroup[],
+  installMode?: string
+): NavGroup[] {
+  if (installMode !== "bi-only") return sections
+  return sections
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((item) => !isHiddenInBiOnly(item.href)),
+    }))
+    .filter((group) => group.items.length > 0)
+}
+
 /** The group (section) that contains the active page — for bottom-nav & sub-navigation. */
 export function activeNavGroup(pathname: string): NavGroup | undefined {
   const href = activeNavHref(pathname)
@@ -320,8 +373,10 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
   // B). The sidebar entry and `/catalog` stay `catalog:read`.
   { pattern: "/data/assets/[assetId]", requires: ["catalog:read", "query:read"] },
   { pattern: "/lakehouse/tables/[namespace]/[table]", requires: ["catalog:read"] },
-  // ADM-13 review round 1, S4: gold-exports requires [] (any signed-in user, RequiresAuth on GET)
-  { pattern: "/gold-exports", requires: [] },
+  // SEC-66: GET /api/gold/* is no longer RequiresAuth — the same gold:read
+  // grant the API checks now opens the page. A Dashboard Viewer must not be
+  // able to open it by address.
+  { pattern: "/gold-exports", requires: ["gold:read"] },
 
   // Query Studio
   { pattern: "/query-studio", requires: ["query:read"] },
@@ -373,8 +428,9 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
   { pattern: "/alerts/rules/[id]/edit", requires: ["alert:write"] },
 
   // Intelligence / Agents
-  // ADM-13 review round 1, S4: agent runs requires [] (any signed-in user, RequiresAuth on GET)
-  { pattern: "/agents/runs/[runId]", requires: [] },
+  // SEC-66: GET /api/agents/runs* now requires agent:read, so the run detail
+  // page follows that grant instead of opening for any signed-in user.
+  { pattern: "/agents/runs/[runId]", requires: ["agent:read"] },
 
   // Administration
   { pattern: "/admin/users", requires: ["identity:read"] },

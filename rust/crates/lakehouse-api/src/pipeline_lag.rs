@@ -904,6 +904,25 @@ pub async fn run_lag_check(
     let (target_seconds, downstream) = target_of(pipeline);
     let job_name = crate::routes::authored_pipelines::job_name(&pipeline.id);
 
+    // BLD-18: fail closed on a paused pipeline. The Python factory drops a
+    // `paused` row's freshness sensor on the next code-location reload, but
+    // a tick that already started before `stopSensor` landed can still ask
+    // this route for a decision. This is the choke point the sensor asks,
+    // so a pause must be honoured here even if that race happens. No state
+    // row is written: a paused pipeline is not measured while paused.
+    if pipeline.status == "paused" {
+        return Ok(LagCheckOutcome {
+            decision: Decision::Wait,
+            run_key: None,
+            job_name,
+            status: LagStatus::NotMeasured,
+            lag_seconds: None,
+            target_seconds: None,
+            behind_streak: 0,
+            reason: Some("pipeline is paused".to_owned()),
+        });
+    }
+
     // BLD-2 review R1 SHOULD-FIX 6: A pipeline with no target lag must not decide run / behind:
     // answer wait with not_measured and touch nothing.
     if target_seconds.is_none() && !downstream {
@@ -1163,6 +1182,13 @@ async fn evaluate_upstream_chain(
     now: OffsetDateTime,
 ) -> Result<Option<LagCheckOutcome>, ApiError> {
     for u_pipe in chain {
+        // BLD-18: a paused downstream pipeline is not launched by a
+        // reading pipeline's check. It has no freshness sensor of its own
+        // (`targetLag.kind == "downstream"`), so stopping a sensor cannot
+        // silence this path; the chain walk has to skip it here.
+        if u_pipe.status == "paused" {
+            continue;
+        }
         // BLD-2 review R3 BLOCKER 2 / decision R12: U row was locked in one ordered statement with P
         let u_stored = locked_states.remove(&u_pipe.id).flatten();
         let mut u_state = CheckState::from_stored(u_stored.as_ref());
@@ -2158,6 +2184,34 @@ mod tests {
 
     fn source_input() -> InputTable {
         input_of("bronze", "orders")
+    }
+
+    /// BLD-18: a freshness-sensor tick that already started when Pause
+    /// landed can still reach this route before the code-location reload
+    /// removes the sensor. The row's paused status must win here — no run,
+    /// no measurement, no state write — rather than relying on the reload
+    /// having finished first.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_paused_pipeline_answers_wait_without_a_run_or_a_state_write(pool: PgPool) {
+        let (dagster, _server) = dagster_with(&job_name("pl-paused"), None, &[]).await;
+        let mut p = pipeline("pl-paused", 10);
+        p.status = "paused".to_owned();
+        let reader = FakeTokens::new().with("bronze.orders", "iceberg:1");
+
+        let outcome = run_lag_check(&pool, &dagster, &reader, &p, &[source_input()], at(1_000))
+            .await
+            .expect("checking a paused pipeline is not an error");
+
+        assert_eq!(outcome.decision, Decision::Wait);
+        assert_eq!(outcome.run_key, None);
+        assert_eq!(outcome.reason.as_deref(), Some("pipeline is paused"));
+        assert!(
+            pipelines::get_lag_state(&pool, &p.id)
+                .await
+                .expect("read the lag state")
+                .is_none(),
+            "a paused pipeline is not measured"
+        );
     }
 
     /// A `Dagster` stub whose answers both queries the check can make: the

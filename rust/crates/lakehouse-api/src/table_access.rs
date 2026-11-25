@@ -39,8 +39,19 @@
 
 use std::collections::HashSet;
 
-use lakehouse_auth::PermissionSet;
+use lakehouse_auth::{PermissionSet, Principal, PrincipalId};
 use lakehouse_store::{PgPool, StoreError};
+
+/// The sole role name a headless agent run carries when its explicit read
+/// grant is empty (`SEC-68`). [`for_roles`] resolves a name no row carries to
+/// an empty [`TableAccess::Listed`] — zero tables — so putting this in a
+/// principal's `role_names` makes EVERY existing `for_roles` call site (the
+/// policy rewrite, the data tools, the catalog lists) fail closed for that
+/// run without threading a new flag through the whole tool stack.
+///
+/// It is not a real role and must never be created. Even if it were,
+/// [`for_grant_roles`] refuses an empty grant before this constant is used.
+pub const NO_GRANT_ROLE: &str = "__sec68_agent_without_read_grant__";
 
 /// What one principal may read, from the roles it holds.
 ///
@@ -98,6 +109,15 @@ impl TableAccess {
             Some((schema, table)) => self.allows(schema, table),
             None => self.is_all(),
         }
+    }
+
+    /// The narrowest access: reads ZERO tables (`SEC-68`). An explicit empty
+    /// grant is this, never [`Self::All`]. `Listed` with two empty sets, not a
+    /// new enum variant, so every existing `allows`/`allows_key`/`is_all`
+    /// consumer narrows correctly with no match to update.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::Listed(HashSet::new(), HashSet::new())
     }
 }
 
@@ -170,6 +190,66 @@ pub async fn for_roles(pg: Option<&PgPool>, roles: &[String]) -> Result<TableAcc
     Ok(TableAccess::Listed(tables, schemas))
 }
 
+/// What an AGENT GRANT allows (`SEC-68`) — the fail-closed sibling of
+/// [`for_roles`].
+///
+/// `for_roles(&[])` is deliberately `All`: no roles means a service identity
+/// or a system run whose scopes govern it, and a platform admin's wildcard
+/// grant is not a role name. An agent's explicit grant is different — its
+/// whole meaning is "read ONLY these roles' tables" — so an EMPTY grant must
+/// read nothing. Returning `All` here is the escalation this task closes.
+///
+/// A non-empty grant resolves exactly like any other role set: unknown names
+/// contribute nothing (D4), and one `*:*`/`'all'` role makes the grant `All`.
+/// With no Postgres pool a non-empty grant degrades to `All` like every
+/// other optional read in this crate; the empty case never degrades.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the grants cannot be read. The caller must
+/// treat that as a refusal, never as "no restriction".
+pub async fn for_grant_roles(
+    pg: Option<&PgPool>,
+    roles: &[String],
+) -> Result<TableAccess, StoreError> {
+    if roles.is_empty() {
+        return Ok(TableAccess::none());
+    }
+    for_roles(pg, roles).await
+}
+
+/// What a principal may read, distinguishing a wildcard administrator from a
+/// role-less service identity (`SEC-68`).
+///
+/// A principal with role names resolves through [`for_roles`] as before, so
+/// platform admins whose wildcard is a named role and Postgres-optional
+/// deployments are untouched. With NO role names:
+///
+/// * a [`PrincipalId::Service`] identity (a headless agent run, a scheduler)
+///   whose scopes are not a `*:*` grant reads ZERO tables — it has no person
+///   whose roles could narrow it, so `for_roles(&[])`'s `All` would be a
+///   `GOV-7` bypass;
+/// * a genuine `*:*` admin, or a HUMAN with no roles, keeps the documented
+///   `GOV-7` default of `All`. A human's missing roles are a deployment
+///   choice, not a headless escape, and changing that here would silently
+///   hide tables for every role-less account in an existing deployment.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the roles cannot be read.
+pub async fn for_principal(
+    pg: Option<&PgPool>,
+    principal: &Principal,
+) -> Result<TableAccess, StoreError> {
+    if principal.role_names.is_empty()
+        && matches!(principal.id, PrincipalId::Service(_))
+        && !principal.permissions.grants_unrestricted()
+    {
+        return Ok(TableAccess::none());
+    }
+    for_roles(pg, &principal.role_names).await
+}
+
 /// A schema grant, normalized through the same [`canonicalize`] the table
 /// grants use, so a catalog-qualified grant (`iceberg` + `serving`) matches
 /// the schema a statement's table canonicalizes to.
@@ -184,6 +264,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use lakehouse_auth::PrincipalId;
     use lakehouse_test_support as _;
     use uuid::Uuid;
 
@@ -425,6 +506,98 @@ mod tests {
             .unwrap();
         assert!(!access.allows("", "mart_x"));
         assert!(!access.allows_key("mart_x"));
+        Ok(())
+    }
+
+    // ── SEC-68: explicit agent grants ───────────────────────────────────
+
+    /// SEC-68 D1: an EMPTY agent grant reads ZERO tables, even with a live
+    /// Postgres pool. `for_roles(&[])` would answer `All` — that is exactly
+    /// the leak this function exists to close.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_empty_agent_grant_reads_no_tables(pool: PgPool) -> sqlx::Result<()> {
+        let access = for_grant_roles(Some(&pool), &[]).await.unwrap();
+        assert_eq!(access, TableAccess::none());
+        assert!(!access.allows("serving", "revenue"));
+        assert!(!access.is_all());
+        // Also fail closed with no pool — the empty case never degrades.
+        assert_eq!(
+            for_grant_roles(None, &[]).await.unwrap(),
+            TableAccess::none()
+        );
+        Ok(())
+    }
+
+    /// SEC-68 D2: a grant resolves to exactly the granted role's tables:
+    /// `Finance` sees `serving.revenue`, not `serving.hr_salaries`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_grant_resolves_only_the_granted_role_tables(pool: PgPool) -> sqlx::Result<()> {
+        let finance = role(&pool, "Finance", "query:read", "listed").await;
+        grant(&pool, finance, "serving", "revenue").await;
+        let access = for_grant_roles(Some(&pool), &["Finance".to_owned()])
+            .await
+            .unwrap();
+        assert!(access.allows("serving", "revenue"));
+        assert!(!access.allows("serving", "hr_salaries"));
+        Ok(())
+    }
+
+    /// The sentinel a grant-less run carries into `role_names` resolves
+    /// through the ORDINARY `for_roles` path to zero tables — this is what
+    /// makes every existing `for_roles` call site fail closed for that run.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_no_grant_sentinel_role_resolves_to_no_tables(pool: PgPool) -> sqlx::Result<()> {
+        let access = for_roles(Some(&pool), &[NO_GRANT_ROLE.to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(access, TableAccess::none());
+        assert!(!access.allows("serving", "revenue"));
+        Ok(())
+    }
+
+    fn principal(roles: &[&str], permissions: &str) -> Principal {
+        Principal {
+            id: PrincipalId::Service(Uuid::nil()),
+            tenant_ids: Vec::new(),
+            display_name: "headless".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::parse(permissions),
+            provider: "service".to_owned(),
+            must_change_password: false,
+            role_names: roles.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
+    /// SEC-68 D3: a role-less service identity without `*:*` reads zero
+    /// tables instead of silently getting `All` from `for_roles(&[])`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_roleless_service_identity_reads_no_tables(pool: PgPool) -> sqlx::Result<()> {
+        let access = for_principal(Some(&pool), &principal(&[], "agent:manage"))
+            .await
+            .unwrap();
+        assert_eq!(access, TableAccess::none());
+        Ok(())
+    }
+
+    /// A genuine wildcard admin (whose `*:*` is a permission, not a role
+    /// name) keeps reading every table — no regression for platform admins.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_wildcard_admin_without_roles_reads_all(pool: PgPool) -> sqlx::Result<()> {
+        let access = for_principal(Some(&pool), &principal(&[], "*:*"))
+            .await
+            .unwrap();
+        assert!(access.is_all());
+        Ok(())
+    }
+
+    /// A human with no roles keeps the documented `GOV-7` default (`All`):
+    /// only a headless SERVICE identity is narrowed here. An existing
+    /// deployment's role-less accounts must not silently lose every table.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_roleless_human_keeps_the_documented_default(pool: PgPool) -> sqlx::Result<()> {
+        let mut human = principal(&[], "catalog:read");
+        human.id = PrincipalId::User(Uuid::nil());
+        let access = for_principal(Some(&pool), &human).await.unwrap();
+        assert!(access.is_all());
         Ok(())
     }
 }

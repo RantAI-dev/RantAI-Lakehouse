@@ -2667,13 +2667,21 @@ filtered per tenant, because nothing in the schema associates them with one:
 
 Rather than show every tenant the same shared list and call it scoped, both
 are **refused** for any principal without the unrestricted (`*:*`) grant once
-the deployment has more than one tenant.
+the deployment has more than one tenant. The same gate covers every statement
+against the Silver and Gold tables as well: a shared table belongs to no
+tenant, and only the tenant named here may read one. So with this setting
+unset, a principal without `*:*` also loses **every** Silver and Gold query —
+dashboards, Query Studio, the assistant, alerts and reports — to the fixed
+"Table not found or not available to your organisation" 404. It is not just
+two lists: the catalog, the job list and the shared warehouse all fail closed
+together.
 
 **What this means for an existing deployment.** `0002_seed_identity.sql` seeds
 four tenants, and its users belong to several of them — so on upgrade,
-Analysts, Data Engineers and Governance Admins lose the catalog and the job
-list until you say who owns them. `lakehousectl install` writes this setting
-as the group tenant on a fresh install, and `lakehousectl update` fills it
+Analysts, Data Engineers and Governance Admins lose the catalog, the job list
+and every Silver and Gold query until you say who owns them. `lakehousectl
+install` writes this setting as the group tenant on a fresh install, and
+`lakehousectl update` fills it
 when the line is empty — so a stack made or updated by the tool needs no hand
 edit (`REL-10`). Set it by hand only on a stack not made by `lakehousectl`,
 where a value is not already there:
@@ -2684,8 +2692,9 @@ CATALOG_TENANT_ID=<the id of the tenant that owns this deployment's shared catal
 
 For a stack that still runs the seeded identities, that is the group tenant in
 `0002_seed_identity.sql`. Members of that tenant then see both surfaces exactly
-as before; everyone else keeps getting `{"supported": false, "reason": …}`,
-which names this setting.
+as before and their Silver and Gold queries work again; everyone else keeps
+getting `{"supported": false, "reason": …}` for the two lists — which names
+this setting — and the fixed table-not-available 404 for Silver and Gold.
 
 A **single-tenant** deployment is unaffected — there is no other tenant's data
 to leak into a shared list, so nothing is refused whether or not the setting is
@@ -3080,3 +3089,117 @@ one the release published, and it is not unpacked.
 That is one way to join, and the whole of it (REL-7 D2). `lakehousectl` changes nothing:
 it still reads an UNPACKED bundle directory (`install --bundle <dir>`), so the join is
 the operator's step and the tool never sees the parts.
+
+## Air-gapped installation (no internet access)
+
+This is the supported path when the deployment host has no route to the internet. It is
+covered by backlog `OPS-2`; the end-to-end evidence is the two proofs in
+`.github/workflows/release.yml` — REL-12 (#693) blocks root's `OUTPUT` traffic and proves a
+`docker pull` of a bundle-less image fails, and REL-16 (#711) also blocks container egress
+with `DOCKER-USER` and proves the stack still reaches `/health/ready`. The permanent
+regression guards are `ops/release/test_ops2_airgap_completeness.py`: no starting service
+installs a package or downloads from an external host, every image the rendered Compose
+file runs is named by the signed manifest (and is therefore in the bundle), and the
+installer's pre-flight stays local.
+
+### On a connected staging machine: obtain the release
+
+1. Download **every** asset, not just the joined bundle. `SHA256SUMS` names each part and
+   the release's other files, so a missing asset is found before anything is joined.
+
+   ```bash
+   version=0.2.0
+   mkdir -p release-assets && cd release-assets
+   gh release download "v$version"     # gh must be signed in to the release repository
+   ```
+
+2. Check the parts and the other assets against `SHA256SUMS` before joining them. A part
+   that does not match is named here, and only that download needs repeating.
+
+   ```bash
+   sha256sum -c SHA256SUMS
+   ```
+
+3. Join the parts **in name order** — they are padded to two digits, so the shell's
+   lexical order is the byte order — and check the joined file against the release's own
+   `.sha256` asset. A set of parts from two different releases fails this check.
+
+   ```bash
+   bundle="rantai-lakehouse-$version-linux-x86_64.tar.zst"
+   cat "$bundle".part-* > "$bundle"
+   sha256sum -c "$bundle.sha256"
+   ```
+
+4. Transfer the joined archive and its `.sha256` file to the air-gapped host by approved
+   removable media. The parts are not needed there; the unpacked bundle is what the
+   installer reads.
+
+### Fresh install on the air-gapped host
+
+The host needs Linux `x86_64`, Docker 24 or newer, Compose 2.24 or newer, 4 CPUs, 16 GiB
+of memory, 50 GiB of free disk and free published ports. It also needs Docker's
+**containerd image store**: after `docker load` the classic store registers no repo
+digest, so the digest-pinned images the signed manifest names would not resolve. The
+installer refuses a bundle install on the classic store and says how to switch it on.
+
+```bash
+mkdir -p bundle
+tar --zstd -xf "rantai-lakehouse-$version-linux-x86_64.tar.zst" -C bundle
+cd bundle && sha256sum -c SHA256SUMS && cd ..       # the bytes the release published
+./bundle/lakehousectl verify --dir bundle            # signature, offline
+./bundle/lakehousectl install --bundle bundle        # one command, no network
+```
+
+`verify` checks the manifest through the release key compiled into the binary; the
+public half is in this repository at `ops/release/release.pub` for audit. No step above
+asks a registry, a package mirror or a key server. `install --bundle` reads the release
+from the directory, verifies the signature and the shipped files' checksums before
+writing anything, runs the local pre-flight, and loads every image from the bundle with
+`docker load` — the third-party images and the five this repository builds alike,
+including `rantai-lakehouse-init`. That last image is why a first start needs no
+package mirror: the init jobs no longer run `apk add` at start (REL-16, #711). The
+installer also writes `.env` with generated secrets, so there is no file to edit by hand.
+The copy of `lakehousectl` in the bundle is the tool to keep using: `lakehousectl self-update`
+needs the network and does not work here.
+
+### Updates and rollback, still offline
+
+Transfer a newer release the same way (assets, `SHA256SUMS`, join, `.sha256`, transfer),
+unpack it into a second directory, and point the tool at it:
+
+```bash
+./bundle/lakehousectl update --bundle /path/to/newer-bundle   # backup first, then switch
+./bundle/lakehousectl status                                  # which release is running
+./bundle/lakehousectl rollback                                # back to the previous release
+```
+
+`update --bundle` verifies and loads the new release entirely from that directory, takes
+a local backup before stopping the stack, and rolls itself back automatically if the
+stack is not ready within `--ready-timeout` seconds (600 by default). `rollback` reads
+the previous release and its backup from local state; neither command reaches the
+internet. The bundle carries the newer `lakehousectl` too, so an update does not need
+`self-update`.
+
+### Honest limits of an air-gapped deployment
+
+- **Optional integrations that need a remote endpoint must point to an internal/on-prem
+  service or stay off.** The console's assistant provider (`LLM_URL`/`LLM_KEY`), an
+  external OIDC provider (its issuer, discovery document and JWKS must be reachable over
+  HTTPS), external SMTP (`SMTP_HOST`), and cloud S3 backups (`BACKUP_S3_ENDPOINT`,
+  `BACKUP_WAREHOUSE_ENDPOINT`) are all optional; with no on-prem endpoint for one, leave
+  it unset and the stack starts without that feature. SAML is not supported at all. An
+  internal SMTP relay's CA file is still read from inside the API container.
+- **Profiles the release bundle does carry** (from `render_compose.py` over the real
+  template, so this is the rendered list, not a guess): `dagster` (the installer enables
+  it by default), `backups` (the `backup-job` service), `trino` (Trino and its maintenance
+  cron; the host-port proxy sits behind `TRINO_PUBLISH_HOST_PORT`), `seaweedfs` (SeaweedFS
+  and its bucket/IAM init jobs) and `cdc` (Kafka and Kafka Connect). Every image for all
+  of them is in the bundle, so they can be switched on offline, and none of them pulls
+  an image or installs a package at start.
+- **Profiles the release bundle does not carry:** the gate and test profiles that
+  `render_compose.py` drops (`test`, `g1`–`g10`, and the `g6-*` variants). Their harness
+  images are not in the bundle and cannot be run on an air-gapped deployment — the
+  acceptance gates belong to CI. The staging Keycloak SSO override
+  (`ops/sso/docker-compose.staging-keycloak.override.yml`, profile `sso`) is a repository
+  file, not a release asset; an internal identity provider must be deployed separately.
+- One host, Linux `x86_64` only. An update stops the stack while it switches releases.

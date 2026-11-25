@@ -44,6 +44,7 @@ from dispar_orchestrate.replication_metrics import (
     replication_slot_check_job,
     replication_slot_check_schedule,
 )
+from dispar_orchestrate.reupload_chain import reupload_chain_sensors
 from dispar_orchestrate.run_queue_sensor import run_queue_near_limit_sensor
 from dispar_orchestrate.storage_snapshot import (
     storage_snapshot_job,
@@ -159,6 +160,10 @@ defs = Definitions(
         # module doc for the ALL-semantics and run_key = upstream run id
         # design choices.
         *authored_dependency_sensors,
+        # BLD-14 D6: one polling chain sensor per pipeline the D3 graph
+        # can reach, named authored__<id>_chain (the Rust pause/resume
+        # toggle stops the same sensor). No token means the list is empty.
+        *reupload_chain_sensors,
         # BLD-2 D6: one lag sensor per authored pipeline with a time-based target lag
         # (named authored__<safe_id>_lag, running every 30 seconds).
         *authored_lag_sensors,

@@ -39,10 +39,17 @@ function ScheduleChip({
   // BLD-11 F2/D3: with a target lag the stored cron never fires, so naming
   // it (or saying "Manual only") would deny that the lag sensor runs this.
   if (isLagTrigger(trigger)) {
+    // BLD-18: the lag sensor is the trigger here, so a paused pipeline
+    // must say so on this chip — the same `· paused` cue the cron chip
+    // carries, never just the amber status badge elsewhere on the page.
     return (
-      <Pill tone="violet">
+      <Pill
+        tone={paused ? "warning" : "violet"}
+        className={paused ? "border border-dashed border-border" : undefined}
+      >
         <RadarIcon className="size-3" aria-hidden />
         {trigger.label}
+        {paused ? <span className="font-medium">· paused</span> : null}
       </Pill>
     )
   }

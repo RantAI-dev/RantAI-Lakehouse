@@ -66,22 +66,40 @@ RULES
 - Only state numbers that appear in a tool result in this conversation.
 - Be concise. Use Markdown: short paragraphs, bold for the key figure, tables for comparisons.";
 
+/// The extra rules a `bi-only` install needs, and the only prompt text this
+/// file adds for `BI-44`. They are built here, never in `SYSTEM_BASE`: the
+/// `full` mode prompt stays byte-identical for every `AI-32` pin, while a
+/// model in a one-engine install is told which dialect its `run_sql` calls
+/// run and which engine it must never name. External tables are read in
+/// place, so the Bronze/Silver/Gold story in [`SYSTEM_BASE`] does not apply
+/// to this deployment.
+pub(super) fn bi_only_engine_rules(engine: crate::config::QueryEngine) -> String {
+    let (active, inactive) = match engine {
+        crate::config::QueryEngine::Trino => ("Trino SQL", "ClickHouse SQL"),
+        crate::config::QueryEngine::ClickHouse => ("ClickHouse SQL", "Trino SQL"),
+    };
+    format!(
+        "\n\nBI-ONLY ENGINE RULES\n- This installation runs {active} only. {inactive} is not installed: never reference, target or suggest a {inactive} table, database, session setting or tool call.\n- External tables are read in place through {active}; no data is copied into a lakehouse. There are no Bronze/Silver/Gold layers, no `serving` marts and no primary/secondary datasets.\n- Call list_datasets and describe_dataset for the table names and columns, then run_sql on those names."
+    )
+}
+
 /// Appended after the mode text when the chat may ask the person a question
 /// (`AI_ASK_BACK` on and `ask_user` in the tool list). It is a separate block
 /// and not part of [`SYSTEM_BASE`], so a deployment with the switch off
 /// keeps the prompt it was measured with, byte for byte.
 ///
-/// The rules turn an unclear word into one of three answers: use the one
-/// reading there is and say which, ask once with options, or say the data
-/// does not cover it (the coverage rule in [`SYSTEM_BASE`] already says
-/// that last one).
+/// The rules cover using a reading the DATA MAP or the person's words settle,
+/// asking once with options when nothing settles it, and answering a question
+/// that is not about data as it is. A reply that uses a reading opens by
+/// naming it. The rules name no table, column or value (`AI-17`).
 pub(super) const ASK_BACK_RULES: &str = "
 
 UNCLEAR WORDS
-- If the DATA MAP or THIS USER'S WORDS settles what a word means, use that reading and say in your reply which reading you took.
-- If a word fits two or more tables, columns or values and nothing settles it, call ask_user once. Make the options names taken from the DATA MAP. Run no query in that turn.
-- Ask only once. If your previous message was a question, take the most likely reading, say which one you took, and answer.
-- If the question is not about data, answer it as it is. Do not ask.";
+- A reading the DATA MAP or THIS USER'S WORDS settles is the one to use.
+- A word fitting two or more tables, columns or values, with nothing settling it, gets one ask_user call with options from the DATA MAP and no query that turn.
+- Ask only once. After the person answers, use the reading they chose; without an answer, take the most likely one.
+- Open every reply that uses a reading with one short sentence naming it.
+- A question not about data is answered as it is, with no ask.";
 
 /// The two sentences the console sends with the SQL help. `prepare_chat`
 /// matches the Explain one to take the tool out of its turn (plan 17); the
@@ -1134,6 +1152,60 @@ pub(super) fn group_of(name: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `BI-44` slice 3: the in-place rules are a separate block, so the
+    /// measured `full` prompt is untouched. Each install names only the
+    /// engine it started.
+    #[test]
+    fn the_bi_only_rules_name_only_the_active_engine() {
+        use crate::config::QueryEngine;
+
+        let trino = bi_only_engine_rules(QueryEngine::Trino);
+        assert!(trino.contains("BI-ONLY ENGINE RULES"));
+        assert!(trino.contains("Trino SQL"), "{trino}");
+        assert!(
+            trino.contains("never reference, target or suggest a ClickHouse SQL"),
+            "{trino}"
+        );
+        assert!(trino.contains("read in place"), "{trino}");
+        assert!(!trino.contains("target a ClickHouse SQL table"), "{trino}");
+
+        let ch = bi_only_engine_rules(QueryEngine::ClickHouse);
+        assert!(ch.contains("ClickHouse SQL"), "{ch}");
+        assert!(
+            ch.contains("never reference, target or suggest a Trino SQL"),
+            "{ch}"
+        );
+    }
+
+    #[test]
+    fn the_ask_back_rules_pin_the_chosen_reading_and_the_opening_sentence_and_name_no_dataset() {
+        assert!(
+            ASK_BACK_RULES.contains("the reading they chose"),
+            "{ASK_BACK_RULES}"
+        );
+        assert!(
+            ASK_BACK_RULES
+                .contains("Open every reply that uses a reading with one short sentence naming it"),
+            "{ASK_BACK_RULES}"
+        );
+        // A word of one dataset would tie these rules to one deployment.
+        let lower = ASK_BACK_RULES.to_lowercase();
+        for word in ["wisman", "pariwisata", "mart_", "outlet", "distributor"] {
+            assert!(!lower.contains(word), "`{word}` in {ASK_BACK_RULES}");
+        }
+    }
+
+    /// The Build prompt has a character ceiling (`ai_prompt_size`), so a later
+    /// edit of these rules must not grow the block past what the owner saw.
+    #[test]
+    fn the_ask_back_rules_stay_within_570_characters() {
+        let chars = ASK_BACK_RULES.chars().count();
+        assert!(
+            chars <= 570,
+            "{chars} characters, the ceiling is 570: {ASK_BACK_RULES}"
+        );
+    }
 
     #[test]
     fn the_count_rules_are_five_lines_and_name_no_dataset() {

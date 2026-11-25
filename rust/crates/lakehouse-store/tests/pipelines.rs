@@ -26,9 +26,19 @@ use lakehouse_store::error::StoreError;
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::pipelines::{self, CreatePipelineInput, PipelineFilter, UpdatePipelineInput};
 use sqlx::PgPool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
+/// BLD-20: the store now refuses two live pipelines with the same output
+/// table, so every fixture that creates more than one pipeline in a test has
+/// to give each one a distinct target. A process-wide counter makes every
+/// call to [`input`] a fresh `(silver, orders_clean_<n>)` claim; tests that
+/// assert an exact target derive it from the input they created with instead
+/// of hard-coding `orders_clean`.
+static TARGET_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn input() -> CreatePipelineInput {
+    let seq = TARGET_SEQ.fetch_add(1, Ordering::Relaxed);
     CreatePipelineInput {
         incremental_strategy: "append".to_owned(),
         partition_granularity: "day".to_owned(),
@@ -46,7 +56,7 @@ fn input() -> CreatePipelineInput {
         ],
         fbic_enabled: true,
         target_zone: "silver".to_owned(),
-        target_table: "orders_clean".to_owned(),
+        target_table: format!("orders_clean_{seq}"),
         schedule: "manual".to_owned(),
         owner: None,
         description: None,
@@ -79,7 +89,8 @@ fn input() -> CreatePipelineInput {
 async fn create_pipeline_persists_incremental_column_fbic_enabled_and_transforms(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let created = pipelines::create_pipeline(&pool, &input(), None)
+    let fixture = input();
+    let created = pipelines::create_pipeline(&pool, &fixture, None)
         .await
         .expect("create_pipeline should succeed");
 
@@ -90,8 +101,8 @@ async fn create_pipeline_persists_incremental_column_fbic_enabled_and_transforms
 
     assert_eq!(definition.source_zone, "bronze");
     assert_eq!(definition.source_table, "orders");
-    assert_eq!(definition.target_zone, "silver");
-    assert_eq!(definition.target_table, "orders_clean");
+    assert_eq!(definition.target_zone, fixture.target_zone);
+    assert_eq!(definition.target_table, fixture.target_table);
     assert_eq!(definition.incremental_column, Some("updated_at".to_owned()));
     assert_eq!(
         definition.transforms,
@@ -2055,11 +2066,12 @@ async fn baseline_backfill_synthesises_version_one_for_a_legacy_row(
         .await
         .expect("get_definition_version")
         .expect("the backfilled version row exists");
+    let (expected_zone, expected_table) = created.target.split_once('.').unwrap();
     assert_eq!(snapshot.kind, "incremental");
     assert_eq!(snapshot.source_zone, "bronze");
     assert_eq!(snapshot.source_table, "orders");
-    assert_eq!(snapshot.target_zone, "silver");
-    assert_eq!(snapshot.target_table, "orders_clean");
+    assert_eq!(snapshot.target_zone, expected_zone);
+    assert_eq!(snapshot.target_table, expected_table);
     assert_eq!(snapshot.incremental_column.as_deref(), Some("updated_at"));
     assert_eq!(
         snapshot.transforms,
@@ -2982,17 +2994,12 @@ async fn the_batched_lag_reader_check_agrees_with_the_per_row_count(
     )
     .await;
     // A reader through `depends_on`: the pipeline it depends on has the
-    // candidate's target.
-    let depends_upstream = create_lag_reader_fixture(
-        &pool,
-        "lag_depends_upstream",
-        Some(tenant_a),
-        "bronze.raw_depends_upstream",
-        "silver.depends_candidate",
-        None,
-        vec![],
-    )
-    .await;
+    // candidate's target. That is the candidate itself — BLD-20 forbids a
+    // second pipeline from writing the same output table, so the old
+    // `lag_depends_upstream` fixture (which did exactly that) is gone and the
+    // reader depends on `candidate_depends` directly. The predicate excludes
+    // the reader's own id, not the depended-on pipeline's, so this still
+    // exercises the `EXISTS` clause.
     create_lag_reader_fixture(
         &pool,
         "lag_reader_depends",
@@ -3000,7 +3007,7 @@ async fn the_batched_lag_reader_check_agrees_with_the_per_row_count(
         "bronze.raw_depends_reader",
         "gold.depends_reader",
         Some(pipelines::TargetLag::Lag { minutes: 5 }),
-        vec![depends_upstream.id.clone()],
+        vec![candidate_depends.id.clone()],
     )
     .await;
     // A reader in another tenant: it does not count for the candidate.
@@ -4418,5 +4425,308 @@ async fn update_can_clear_the_author(pool: PgPool) -> sqlx::Result<()> {
             .run_as,
         None,
     );
+    Ok(())
+}
+
+// ── BLD-20: one pipeline per output table ────────────────────────────────
+//
+// The guard lives in `create_pipeline` and `update_pipeline_with_event` (the
+// shared body behind both `update_pipeline` and `restore_pipeline`), so every
+// save path is covered. These tests exercise the store seam directly: the
+// advisory lock + SELECT run against a real Postgres from the testcontainer.
+
+/// A create fixture with an explicit name and output table.
+fn claimed_input(name: &str, zone: &str, table: &str) -> CreatePipelineInput {
+    CreatePipelineInput {
+        name: name.to_owned(),
+        target_zone: zone.to_owned(),
+        target_table: table.to_owned(),
+        ..named_input(name)
+    }
+}
+
+/// An update input that writes the given output table.
+fn update_target(p: &pipelines::Pipeline, zone: &str, table: &str) -> UpdatePipelineInput {
+    UpdatePipelineInput {
+        target_zone: zone.to_owned(),
+        target_table: table.to_owned(),
+        ..update_input_for(p)
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_second_pipeline_cannot_claim_the_same_output_table(pool: PgPool) -> sqlx::Result<()> {
+    pipelines::create_pipeline(
+        &pool,
+        &claimed_input("pl-a", "silver", "orders_clean"),
+        None,
+    )
+    .await
+    .unwrap();
+    let err = pipelines::create_pipeline(
+        &pool,
+        &claimed_input("pl-b", "silver", "orders_clean"),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, StoreError::FieldConflict(_)),
+        "the second writer must get a 409 FieldConflict, got {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .contains("another pipeline already writes the output table"),
+        "the refusal must say what happened in plain English, got {err}"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM pipeline_definition")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 1, "the refused create must not leave a second row");
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn output_table_conflict_ignores_case_and_padding(pool: PgPool) -> sqlx::Result<()> {
+    pipelines::create_pipeline(
+        &pool,
+        &claimed_input("pl-a", "silver", "orders_clean"),
+        None,
+    )
+    .await
+    .unwrap();
+    let err = pipelines::create_pipeline(
+        &pool,
+        &claimed_input("pl-b", "Silver", " Orders_Clean "),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, StoreError::FieldConflict(_)),
+        "same table with different casing/padding must still conflict, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("silver.orders_clean"),
+        "the 409 must name the normalized output table, got {err}"
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn legacy_gold_and_serving_targets_claim_the_same_output_table(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    // BLD-19 (04e6ff031) maps `gold` to `serving` at the API write boundary:
+    // a legacy `gold.foo` row and a new `serving.foo` save name one physical
+    // ClickHouse table. The store guard must reject both orderings (PR #703).
+    let gold = pipelines::create_pipeline(&pool, &claimed_input("pl-gold", "gold", "foo"), None)
+        .await
+        .unwrap();
+    let err =
+        pipelines::create_pipeline(&pool, &claimed_input("pl-serving", "serving", "foo"), None)
+            .await
+            .unwrap_err();
+    assert!(
+        matches!(err, StoreError::FieldConflict(_)),
+        "a legacy gold row must conflict with a serving save, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("serving.foo"),
+        "the 409 must name the canonical serving table, got {err}"
+    );
+
+    // The other ordering: a serving row blocks a case/padded legacy gold save.
+    pipelines::delete_pipeline(&pool, &gold.id, None)
+        .await
+        .unwrap();
+    pipelines::create_pipeline(&pool, &claimed_input("pl-serving", "serving", "foo"), None)
+        .await
+        .unwrap();
+    let err = pipelines::create_pipeline(
+        &pool,
+        &claimed_input("pl-gold-again", " GOLD ", " Foo "),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, StoreError::FieldConflict(_)),
+        "a serving row must conflict with a legacy gold save, got {err:?}"
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_same_table_in_a_different_zone_is_allowed(pool: PgPool) -> sqlx::Result<()> {
+    pipelines::create_pipeline(
+        &pool,
+        &claimed_input("pl-a", "silver", "orders_clean"),
+        None,
+    )
+    .await
+    .unwrap();
+    let created =
+        pipelines::create_pipeline(&pool, &claimed_input("pl-b", "gold", "orders_clean"), None)
+            .await
+            .expect("a different zone is a different output table and must be allowed");
+    assert_eq!(created.target, "gold.orders_clean");
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn updating_a_pipeline_with_its_own_output_table_succeeds(pool: PgPool) -> sqlx::Result<()> {
+    let a = pipelines::create_pipeline(
+        &pool,
+        &claimed_input("pl-a", "silver", "orders_clean"),
+        None,
+    )
+    .await
+    .unwrap();
+    let updated = pipelines::update_pipeline(
+        &pool,
+        &a.id,
+        &update_target(&a, "silver", "orders_clean"),
+        None,
+    )
+    .await
+    .expect("keeping one's own output table is not a conflict")
+    .expect("the row exists");
+    assert_eq!(updated.target, "silver.orders_clean");
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn updating_a_pipeline_to_steal_another_output_table_is_refused(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let a = pipelines::create_pipeline(
+        &pool,
+        &claimed_input("pl-a", "silver", "orders_clean"),
+        None,
+    )
+    .await
+    .unwrap();
+    let b = pipelines::create_pipeline(&pool, &claimed_input("pl-b", "gold", "events_clean"), None)
+        .await
+        .unwrap();
+    let err = pipelines::update_pipeline(
+        &pool,
+        &b.id,
+        &update_target(&b, "SILVER", "Orders_Clean"),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, StoreError::FieldConflict(_)),
+        "stealing A's table (even with different casing) must conflict, got {err:?}"
+    );
+    let still_b = pipelines::get_pipeline(&pool, &b.id)
+        .await
+        .expect("get_pipeline")
+        .expect("B still exists");
+    assert_eq!(
+        still_b.target, "gold.events_clean",
+        "the refused write changed nothing"
+    );
+    let _ = a;
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn restoring_a_snapshot_that_claims_a_taken_output_table_is_refused(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let a = pipelines::create_pipeline(
+        &pool,
+        &claimed_input("pl-a", "silver", "orders_clean"),
+        None,
+    )
+    .await
+    .unwrap();
+    // Move A off `silver.orders_clean`, freeing it, then let B claim it.
+    pipelines::update_pipeline(&pool, &a.id, &update_target(&a, "gold", "a_only"), None)
+        .await
+        .unwrap();
+    pipelines::create_pipeline(
+        &pool,
+        &claimed_input("pl-b", "silver", "orders_clean"),
+        None,
+    )
+    .await
+    .unwrap();
+    // A's version 1 snapshot still names `silver.orders_clean`. Restoring it
+    // now must be refused instead of overwriting B's table.
+    let snapshot = pipelines::get_definition_version(&pool, &a.id, 1)
+        .await
+        .expect("get_definition_version")
+        .expect("A's version 1 exists");
+    let restore = UpdatePipelineInput {
+        target_zone: snapshot.target_zone,
+        target_table: snapshot.target_table,
+        ..update_input_for(&a)
+    };
+    let err = pipelines::restore_pipeline(&pool, &a.id, &restore, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::FieldConflict(_)),
+        "a restore that would steal B's table must conflict, got {err:?}"
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn deleting_a_pipeline_frees_its_output_table(pool: PgPool) -> sqlx::Result<()> {
+    let a = pipelines::create_pipeline(
+        &pool,
+        &claimed_input("pl-a", "silver", "orders_clean"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        pipelines::delete_pipeline(&pool, &a.id, None)
+            .await
+            .unwrap()
+    );
+    let b = pipelines::create_pipeline(
+        &pool,
+        &claimed_input("pl-b", "silver", "orders_clean"),
+        None,
+    )
+    .await
+    .expect("a hard-deleted pipeline's output table is free again");
+    assert_eq!(b.target, "silver.orders_clean");
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_claims_of_one_output_table_admit_exactly_one_writer(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let input_a = claimed_input("pl-a", "silver", "orders_clean");
+    let input_b = claimed_input("pl-b", "silver", "orders_clean");
+    let (a, b) = tokio::join!(
+        pipelines::create_pipeline(&pool, &input_a, None),
+        pipelines::create_pipeline(&pool, &input_b, None),
+    );
+    let winners = usize::from(a.is_ok()) + usize::from(b.is_ok());
+    assert_eq!(
+        winners, 1,
+        "exactly one concurrent claim may win, got {a:?} / {b:?}"
+    );
+    let ((Err(err), _) | (_, Err(err))) = (a, b) else {
+        unreachable!("one of the two must have lost")
+    };
+    assert!(
+        matches!(err, StoreError::FieldConflict(_)),
+        "the loser must get a 409 FieldConflict, got {err:?}"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM pipeline_definition")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 1, "the advisory lock must serialize to one row");
     Ok(())
 }
