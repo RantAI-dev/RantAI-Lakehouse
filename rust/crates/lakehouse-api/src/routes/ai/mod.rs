@@ -624,6 +624,13 @@ async fn system_prompt(
     sql_help: bool,
 ) -> String {
     let latest_user = user_messages.last().copied().unwrap_or_default();
+    // `BI-44` slice 3: a `bi-only` install has no lakehouse DATA MAP, and
+    // the map builder below reads `ClickHouse` and Lakekeeper, which that
+    // deployment never started. `full` mode never enters this helper, so
+    // its prompt stays byte for byte what `AI-32` pinned.
+    if state.config.is_bi_only() {
+        return bi_only_system_prompt(state, is_build, asking, sql_help, context, latest_user);
+    }
     let withheld = withheld_by_policy(state).await;
     let terms = users_terms(state, principal).await;
     // The DATA MAP describes the shared, one-per-deployment catalog and
@@ -666,17 +673,16 @@ async fn system_prompt(
             // which roles may read what hides every table (fail closed) —
             // the map still renders, with none of its tables in it.
             let access = match principal {
+                // SEC-68: a role-less service identity is not a wildcard
+                // admin. `for_principal` answers zero tables for it, keeps a
+                // genuine `*:*` admin at `All`, and degrades to `All` only
+                // for a non-empty role set with no Postgres pool.
                 Some(principal) => {
-                    crate::table_access::for_roles(state.pg.as_deref(), &principal.role_names)
+                    crate::table_access::for_principal(state.pg.as_deref(), principal)
                         .await
-                        .unwrap_or_else(|_| {
-                            crate::table_access::TableAccess::Listed(
-                                std::collections::HashSet::new(),
-                                std::collections::HashSet::new(),
-                            )
-                        })
+                        .unwrap_or_else(|_| crate::table_access::TableAccess::none())
                 }
-                None => crate::table_access::TableAccess::All,
+                None => crate::table_access::TableAccess::none(),
             };
             // `SEC-20`, plan 97: the closing line of the map names registry
             // datasets, which another tenant's upload is one of. The reach is
@@ -731,6 +737,41 @@ async fn system_prompt(
     } + &words
         + &ctx_line
         + &prompt::closing(latest_user, state.config.ai_default_reply_language))
+}
+
+/// The `bi-only` prompt: the measured base and the same switch-controlled
+/// rules, plus [`prompt::bi_only_engine_rules`] and an honest "no DATA MAP"
+/// line instead of the lakehouse catalog (which this install does not have).
+/// The reply-language line stays last, as in `full` mode.
+fn bi_only_system_prompt(
+    state: &AppState,
+    is_build: bool,
+    asking: bool,
+    sql_help: bool,
+    context: &str,
+    latest_user: &str,
+) -> String {
+    let base = if is_build {
+        format!("{}{}", prompt::SYSTEM_BASE, prompt::SYSTEM_BUILD_SUFFIX)
+    } else {
+        format!("{}{}", prompt::SYSTEM_BASE, prompt::SYSTEM_ASK_SUFFIX)
+    };
+    let mut rules = String::new();
+    if state.config.ai_ask_back && asking {
+        rules.push_str(prompt::ASK_BACK_RULES);
+    }
+    if state.config.ai_sql_help && sql_help {
+        rules.push_str(prompt::SQL_HELP_RULES);
+    }
+    if state.config.ai_semantic_layer {
+        rules.push_str(prompt::DISTINCT_COUNT_RULES);
+    }
+    format!(
+        "{base}{rules}{}\n\nDATA MAP: unavailable in a bi-only installation. Call list_datasets and describe_dataset to explore the external tables.{}{}",
+        prompt::bi_only_engine_rules(state.config.query_engine),
+        page_context_line(context),
+        prompt::closing(latest_user, state.config.ai_default_reply_language)
+    )
 }
 
 /// Plan 17: an Explain turn offers no tool. The console's Explain sends the
@@ -3235,6 +3276,110 @@ mod tests {
         assert_eq!(
             (prompt::SYSTEM_BASE.len(), fnv1a(prompt::SYSTEM_BASE)),
             (BASE_LEN_BEFORE_ASK_BACK, BASE_FNV_BEFORE_ASK_BACK)
+        );
+    }
+
+    /// `BI-44` slice 3 (`AI-32`): the separate in-place branch must not move a
+    /// byte of the measured `full` prompt. The same fixed input is asked of
+    /// all three states; only the `bi-only` ones gain the engine rules.
+    #[tokio::test]
+    async fn a_bi_only_prompt_names_only_the_active_engine_and_full_stays_pinned() {
+        let headers = axum::http::HeaderMap::new();
+        let full = state_with_ask_back_and_layer("false", "false");
+        let full_prompt = system_prompt(
+            &full,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(
+            full_prompt,
+            format!(
+                "{}{}{PROMPT_TAIL_BEFORE_ASK_BACK}",
+                prompt::SYSTEM_BASE,
+                prompt::SYSTEM_ASK_SUFFIX
+            )
+        );
+
+        let common = [
+            ("DATABASE_URL", "not a postgres url"),
+            ("AI_ASK_BACK", "false"),
+            ("AI_SEMANTIC_LAYER", "false"),
+            ("CH_URL", ""),
+        ];
+        let trino_env = [
+            &common[..],
+            &[
+                ("LAKEHOUSE_INSTALL_MODE", "bi-only"),
+                ("LAKEHOUSE_QUERY_ENGINE", "trino"),
+                ("TRINO_URL", "http://127.0.0.1:1"),
+            ][..],
+        ]
+        .concat();
+        let trino = state_with_env(&trino_env);
+        let trino_prompt = system_prompt(
+            &trino,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            false,
+            false,
+        )
+        .await;
+        assert!(
+            trino_prompt.contains("BI-ONLY ENGINE RULES"),
+            "{trino_prompt}"
+        );
+        assert!(
+            trino_prompt.contains("This installation runs Trino SQL only."),
+            "{trino_prompt}"
+        );
+        assert!(
+            !trino_prompt.contains("This installation runs ClickHouse SQL"),
+            "the inactive engine is named only as not installed: {trino_prompt}"
+        );
+        assert!(
+            trino_prompt
+                .find("BI-ONLY ENGINE RULES")
+                .unwrap_or_default()
+                < trino_prompt.find("LANGUAGE:").unwrap_or_default(),
+            "the reply-language line stays last"
+        );
+
+        let ch_env = [
+            &common[..],
+            &[
+                ("LAKEHOUSE_INSTALL_MODE", "bi-only"),
+                ("LAKEHOUSE_QUERY_ENGINE", "clickhouse"),
+            ][..],
+        ]
+        .concat();
+        let clickhouse = state_with_env(&ch_env);
+        let ch_prompt = system_prompt(
+            &clickhouse,
+            None,
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            false,
+            false,
+        )
+        .await;
+        assert!(
+            ch_prompt.contains("This installation runs ClickHouse SQL only."),
+            "{ch_prompt}"
+        );
+        assert!(
+            !ch_prompt.contains("This installation runs Trino SQL"),
+            "{ch_prompt}"
         );
     }
 

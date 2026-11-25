@@ -55,6 +55,7 @@ once a first release is tagged.
 
 ### Fixed
 
+- Snapshot expiry no longer needs Trino (backlog `OPS-20`). The Bronze maintenance job expired Iceberg snapshots only through Trino, so a deployment without the `trino` profile — the normal case — recorded the verb as `skipped` with the reason "trino unreachable" and its snapshots grew without limit. The job now falls back to `pyiceberg` when Trino is unreachable, expiring the same snapshots against the same Lakekeeper catalog the ingest job writes through and keeping the per-table policy unchanged (`snapshotsToKeep`, 7 days by default); the recorded verb run names the engine (`pyiceberg`), and when Trino answers nothing changes. The expiry removes snapshot metadata only and deletes no file, so the files the expired snapshots referenced are reclaimed by the `remove_orphan_files` verb that runs after it — and that verb protects files younger than ClickHouse's `iceberg_orphan_files_older_than_seconds` default (259200 s, 3 days), so the freed space comes back about three days later, not in the same run.
 - Alerts (backlog `BI-65`, owner QA): the page keeps its tab in the address (`/alerts?tab=rules`), so saving or leaving a rule returns to Rules & Digests instead of Active Incidents; a digest's Dashboard field shows the dashboard's name, not its id; the rule page has one way back (the arrow), which asks "Discard your changes?" when something changed, and no Cancel button.
 
 - Query Studio's Execution transparency panel no longer shows the catalog's sources, their certification marks or freshness to a person without `catalog:read`: it says catalog access is needed instead, and runs SQL all the same. An estimate whose plan names no table no longer invents a source. Runs and estimates now report which masking and row-filter obligations actually applied to the statement ("Column masks", "Row filters"), instead of saying they were not evaluated, and the asset page's Sensitive columns card no longer implies that a classification by itself masks a column (backlog `QS-10`).
@@ -65,6 +66,8 @@ once a first release is tagged.
 - A join that sent a chart dimension as `{"param": …}` was checked against the route, which already refuses that shape, so no code change was needed and the finding is recorded here (`AI-36`).
 - A grain change made through `update_chart` now keeps the chart's title and edits only the old words (a "Daily visitors" title becomes "Monthly visitors") rather than replacing the title; a title that names no grain and the subtitle stay (`AI-36`).
 - A binned chart drafted with no `limit` now says in its result that it shows at most 20 values by default and that a `limit` shows more, so the assistant can warn the person instead of showing a cut without saying so (`AI-36`).
+- A policy the assistant drafts now has conditions the engine can enforce, or the assistant says it enforces nothing (`AI-27`).
+- After a person answers the chat's question, the reply now opens by naming the reading it used (`AI-17`).
 
 ### Security
 

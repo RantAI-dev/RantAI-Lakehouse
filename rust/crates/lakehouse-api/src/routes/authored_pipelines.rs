@@ -127,6 +127,17 @@ pub fn sensor_name(id: &str) -> String {
     format!("{}_after", job_name(id))
 }
 
+/// The re-upload chain sensor `reupload_chain.py` builds for pipeline `id`
+/// (`BLD-14`, D6): `authored__<safe_id>_chain`. The Python twin is
+/// `chain_sensor_name` in `dagster/dispar_orchestrate/reupload_chain.py`,
+/// which imports the same `_dagster_safe_name` rule this name uses. The
+/// stored RUNNING/STOPPED state outlives a code-location reload, so pausing
+/// the pipeline must switch this sensor too, like `sensor_name` above.
+#[must_use]
+pub fn chain_sensor_name(id: &str) -> String {
+    format!("{}_chain", job_name(id))
+}
+
 /// The target-lag (freshness) sensor name `authored_factory.py` gives a
 /// pipeline whose `targetLag.kind == "lag"` (`lag_sensor_name` there).
 ///
