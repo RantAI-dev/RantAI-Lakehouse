@@ -56,14 +56,14 @@ export function HeroSection({
             {/* WEB-1 review round 1 SHOULD-FIX 4: on a phone the eyebrow sits on the moon's
                 reflection, so it is lighter and carries a dark halo there. */}
             {/* O50 (audit #7): who it is for, not the product name the top bar already shows. */}
-            <Eyebrow className="text-balance max-md:text-[#a9d6ff] max-md:[text-shadow:0_0_10px_rgba(2,5,20,0.95),0_1px_2px_rgba(2,5,20,0.9)]">
+            <Eyebrow className="lk-ii text-balance max-md:text-[#a9d6ff] max-md:[text-shadow:0_0_10px_rgba(2,5,20,0.95),0_1px_2px_rgba(2,5,20,0.9)]">
               {copy.eyebrow}
             </Eyebrow>
-            <DisplayHeading as="h1" size="xl" className="mt-5 short:mt-3 short:text-[2.75rem]">
+            <DisplayHeading as="h1" size="xl" className="lk-ii mt-5 short:mt-3 short:text-[2.75rem]">
               {copy.headline}
             </DisplayHeading>
-            <LeadText className="mx-auto mt-6 max-w-[34rem] short:mt-4 short:text-[15px] short:leading-[1.5] md:mx-0">{copy.sub}</LeadText>
-            <div className="mt-9 short:mt-6 flex flex-wrap items-center justify-center gap-3 md:justify-start">
+            <LeadText className="lk-ii mx-auto mt-6 max-w-[34rem] short:mt-4 short:text-[15px] short:leading-[1.5] md:mx-0">{copy.sub}</LeadText>
+            <div className="lk-ii mt-9 short:mt-6 flex flex-wrap items-center justify-center gap-3 md:justify-start">
               {/* WEB-5 D20: the install path is on the page now; it links on to the README. */}
               <CtaLink href="#get-started">{cta.install}</CtaLink>
               <CtaLink href={contactHref} variant="ghost">
@@ -73,7 +73,7 @@ export function HeroSection({
             {/* WEB-5 D21 + O50 (audit #7): the doubts answered where people decide, in one quiet line
                 with a dot between the two parts; each part is a claim. On a phone each part has its own
                 line, so no part is ever left alone. */}
-            <ul className="mt-3 flex flex-wrap items-center justify-center gap-y-0.5 text-[12px] leading-5 text-[#E8F4FF]/65 md:justify-start">
+            <ul className="lk-ii mt-3 flex flex-wrap items-center justify-center gap-y-0.5 text-[12px] leading-5 text-[#E8F4FF]/65 md:justify-start">
               {copy.reassurance.map((part, i) => (
                 <li
                   key={part}
@@ -108,19 +108,19 @@ function HeroBackdrop() {
       <div className="absolute inset-0 bg-[linear-gradient(180deg,#020514_0%,#050A30_38%,#0A1F55_61%,#0B2A66_61.4%,#061440_74%,#030B2A_100%)]" />
       {/* Day (html[data-tod="day"]): the same stage as a calm daytime lake; it fades in over the night
           picture, and the sun and the glitter take the moon's place. */}
-      <div className="lk-td absolute inset-0 bg-[linear-gradient(180deg,#5d99dc_0%,#86b6e8_34%,#bcd9f1_54%,#e3eef8_61%,#a9cdea_61.4%,#6fa6d6_74%,#3d82c0_88%,#2a6aa8_100%)]" />
+      <div className="lk-td lk-ib2 absolute inset-0 bg-[linear-gradient(180deg,#5d99dc_0%,#86b6e8_34%,#bcd9f1_54%,#e3eef8_61%,#a9cdea_61.4%,#6fa6d6_74%,#3d82c0_88%,#2a6aa8_100%)]" />
       {/* Moon glow and its reflection streak on the water. */}
-      <div className="lk-tn absolute top-[8%] left-[62%] size-[46vmin] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,rgba(232,244,255,0.22)_0%,rgba(68,166,250,0.10)_38%,transparent_70%)]" />
-      <div className="lk-tn absolute top-[62%] left-[62%] h-[34vh] w-[14vw] -translate-x-1/2 bg-[radial-gradient(ellipse_at_top,rgba(68,166,250,0.35)_0%,transparent_70%)] blur-xl" />
-      <div className="lk-td absolute top-[calc(8%+23vmin-35vmin)] left-[62%] size-[70vmin] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,rgba(255,249,230,0.9)_0%,rgba(255,241,204,0.5)_9%,rgba(255,234,186,0.18)_30%,transparent_66%)]" />
-      <div className="lk-td absolute top-[calc(8%+23vmin-4vmin)] left-[62%] size-[8vmin] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,#fffefa_0%,#fff9e8_58%,rgba(255,246,216,0)_100%)] blur-[1.5px]" />
-      <div className="lk-td lk-glitter absolute top-[62%] left-[62%] h-[34vh] w-[16vw] -translate-x-1/2" />
+      <div className="lk-tn lk-ib3 lk-hold absolute top-[8%] left-[62%] size-[46vmin] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,rgba(232,244,255,0.22)_0%,rgba(68,166,250,0.10)_38%,transparent_70%)]" />
+      <div className="lk-tn lk-hold absolute top-[62%] left-[62%] h-[34vh] w-[14vw] -translate-x-1/2 bg-[radial-gradient(ellipse_at_top,rgba(68,166,250,0.35)_0%,transparent_70%)] blur-xl" />
+      <div className="lk-td lk-hold absolute top-[calc(8%+23vmin-35vmin)] left-[62%] size-[70vmin] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,rgba(255,249,230,0.9)_0%,rgba(255,241,204,0.5)_9%,rgba(255,234,186,0.18)_30%,transparent_66%)]" />
+      <div className="lk-td lk-hold absolute top-[calc(8%+23vmin-4vmin)] left-[62%] size-[8vmin] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,#fffefa_0%,#fff9e8_58%,rgba(255,246,216,0)_100%)] blur-[1.5px]" />
+      <div className="lk-td lk-hold lk-glitter absolute top-[62%] left-[62%] h-[34vh] w-[16vw] -translate-x-1/2" />
       {/* WEB-5 audit #11: the waterline is wavy and feathered, and kept out of the text column
           (only under the creature on the right; none on phones, where the copy spans the width). */}
       <svg
         viewBox="0 0 1200 12"
         preserveAspectRatio="none"
-        className="lk-waterline absolute inset-x-0 top-[calc(61.2%-6px)] h-3 w-full max-md:hidden [mask-image:linear-gradient(90deg,transparent_0%,transparent_50%,#000_64%,#000_90%,transparent_100%)]"
+        className="lk-waterline lk-hold absolute inset-x-0 top-[calc(61.2%-6px)] h-3 w-full max-md:hidden [mask-image:linear-gradient(90deg,transparent_0%,transparent_50%,#000_64%,#000_90%,transparent_100%)]"
         aria-hidden="true"
       >
         <path

@@ -11,6 +11,10 @@ import * as React from "react";
  *    to right, the lead, the buttons and the reassurance line; the top bar
  *    and the depth gauge come in last.
  *
+ * The copy's five children carry `lk-ii` so the rules above end in a class: a rule that
+ * ends in `*` or `:not(h1)` makes the browser restyle all 3,500 elements (about 60 ms) when the
+ * intro's classes leave <html>; ending in a class restyles only these five.
+ *
  * Two paths, chosen by a tiny inline script that only puts classes on <html>.
  * WEB-5 T3: the page starts on the 3D hold, and the WebGL test runs one task
  * after the first paint (creating a context on a cold browser can take
@@ -109,7 +113,7 @@ const CSS = `
   html.lk-intro:not(.lk-intro-go) [data-intro-backdrop],
   html.lk-intro:not(.lk-intro-go) [data-hero-room],
   html.lk-intro:not(.lk-intro-go) .lk-water,
-  html.lk-intro:not(.lk-intro-go) [data-intro-copy] > :not(h1),
+  html.lk-intro:not(.lk-intro-go) [data-intro-copy] > .lk-ii:not(h1),
   html.lk-intro:not(.lk-intro-go) [data-intro-scroll-cue],
   html.lk-intro:not(.lk-intro-go) .lk-gauge { opacity: 0 !important; }
   html.lk-intro:not(.lk-intro-go) .lk-root > header { transform: translateY(-100%) !important; }
@@ -119,13 +123,13 @@ const CSS = `
   /* Owner QA 2026-11-25: with the lake about to appear, the DOM creature, sun, moon and reflection wait
      (the sky, the sea and the text are not touched). Their own opacity transitions fade them in if the lake does not come. */
   html.lk-gl-wait [data-hero-room],
-  html.lk-gl-wait [data-intro-backdrop] > :nth-child(n + 3):nth-child(-n + 8) { opacity: 0 !important; }
+  html.lk-gl-wait [data-intro-backdrop] > .lk-hold { opacity: 0 !important; }
   [data-intro-backdrop] > .lk-waterline { transition: opacity 0.4s ease; }
 
   /* Beat 1, the open sea. */
   html.lk-intro-go [data-intro-backdrop], html.lk-intro-go .lk-water { animation: lk-i-sky 0.6s ease-out backwards; }
-  html.lk-intro-go [data-intro-backdrop] > :nth-child(2) { animation: lk-i-moon 0.7s 0.1s cubic-bezier(0.2, 0.7, 0.3, 1) backwards; }
-  html.lk-intro-go [data-intro-backdrop] > :nth-child(3) { transform-origin: 50% 0; animation: lk-i-glitter 0.6s 0.3s cubic-bezier(0.2, 0.7, 0.3, 1) backwards; }
+  html.lk-intro-go [data-intro-backdrop] > .lk-ib2 { animation: lk-i-moon 0.7s 0.1s cubic-bezier(0.2, 0.7, 0.3, 1) backwards; }
+  html.lk-intro-go [data-intro-backdrop] > .lk-ib3 { transform-origin: 50% 0; animation: lk-i-glitter 0.6s 0.3s cubic-bezier(0.2, 0.7, 0.3, 1) backwards; }
   /* Beat 2, the whale (DOM path; the 3D whale rises in the scene). */
   html.lk-intro-go [data-hero-creature] { animation: lk-i-rise 0.7s 0.9s cubic-bezier(0.2, 0.75, 0.3, 1) backwards; }
   html.lk-intro-go [data-hero-creature]::before {
@@ -141,11 +145,11 @@ const CSS = `
   }
   @media (max-width: 767.98px) { html.lk-intro-go [data-hero-creature]::after { top: 8%; } }
   /* Beat 3, the text, then the top bar and the gauge. */
-  html.lk-intro-go [data-intro-copy] > * { animation: lk-i-up 0.45s cubic-bezier(0.2, 0.7, 0.3, 1) backwards; }
-  html.lk-intro-go [data-intro-copy] > :nth-child(1) { animation-delay: 1.6s; }
-  html.lk-intro-go [data-intro-copy] > :nth-child(3) { animation-delay: 1.95s; }
-  html.lk-intro-go [data-intro-copy] > :nth-child(4) { animation-delay: 2.05s; }
-  html.lk-intro-go [data-intro-copy] > :nth-child(5) { animation-delay: 2.15s; }
+  html.lk-intro-go [data-intro-copy] > .lk-ii:not(h1) { animation: lk-i-up 0.45s cubic-bezier(0.2, 0.7, 0.3, 1) backwards; }
+  html.lk-intro-go [data-intro-copy] > .lk-ii:nth-child(1) { animation-delay: 1.6s; }
+  html.lk-intro-go [data-intro-copy] > .lk-ii:nth-child(3) { animation-delay: 1.95s; }
+  html.lk-intro-go [data-intro-copy] > .lk-ii:nth-child(4) { animation-delay: 2.05s; }
+  html.lk-intro-go [data-intro-copy] > .lk-ii:nth-child(5) { animation-delay: 2.15s; }
   html.lk-intro [data-intro-copy] > h1,
   html.lk-intro-lite [data-intro-copy] > h1,
   html.lk-intro-lite #contact-heading {
