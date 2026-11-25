@@ -193,6 +193,16 @@ pub(super) async fn run_saved_query(
         Ok(filled) => filled,
         Err(refusal) => return json!({ "error": refusal.to_string() }),
     };
+    // `BI-44` slice 3: a `bi-only` install has one engine, so a saved query
+    // runs on it. The saved-query store has no engine column (and adding one
+    // would need a migration reserved by other PRs), so `full` mode keeps
+    // its historical ClickHouse run; `run_statement` still checks
+    // `Config::engine_allowed` before any dial.
+    let engine = if state.config.is_bi_only() {
+        state.config.default_query_engine_name()
+    } else {
+        "clickhouse"
+    };
     // This internal call never goes through axum's auth middleware, so it
     // forwards the caller's own `Principal` itself: the copilot dispatcher
     // (`routes::ai::tools::run_tool`) is handed the SAME principal axum
@@ -217,7 +227,7 @@ pub(super) async fn run_saved_query(
         Some(principal),
         &axum::http::HeaderMap::new(),
         &statement,
-        "clickhouse",
+        engine,
     )
     .await
     {

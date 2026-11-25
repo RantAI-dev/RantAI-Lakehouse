@@ -28,6 +28,35 @@ describe("the PDF print view's headers (BI-1, plan D4)", () => {
     expect(response.headers.get("x-robots-tag")).toBe("noindex")
   })
 
+  // PR #648 review 1: the frame must be transparent from the first paint, so
+  // the layout is told on the request, not after hydration.
+  it("marks a transparent embed on the request the root layout renders <html> from", async () => {
+    const originalFetch = global.fetch
+    global.fetch = (async () =>
+      new Response(JSON.stringify({ origins: [], contentSites: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })) as unknown as typeof fetch
+    try {
+      const transparent = await proxy(
+        new NextRequest("http://console.test:3000/embed/dashboard/t?background=transparent"),
+      )
+      // Next carries request-header overrides to the page render as
+      // `x-middleware-request-<name>`; that is the header `layout.tsx` reads.
+      expect(transparent.headers.get("x-middleware-request-x-embed-transparent")).toBe("1")
+
+      const opaque = await proxy(new NextRequest("http://console.test:3000/embed/signed/a.b.c"))
+      expect(opaque.headers.get("x-middleware-request-x-embed-transparent")).toBeNull()
+
+      const consolePage = await proxy(
+        new NextRequest("http://console.test:3000/dashboards?background=transparent"),
+      )
+      expect(consolePage.headers.get("x-middleware-request-x-embed-transparent")).toBeNull()
+    } finally {
+      global.fetch = originalFetch
+    }
+  })
+
   // BI-19 part D (plan D13): the chart image's view runs under the same
   // policy as the PDF view; the PNG path loosens nothing.
   it("gives /render/chart/<token> the same policy and headers as the PDF view", async () => {

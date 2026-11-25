@@ -134,6 +134,163 @@ async fn draft_policy_always_creates_a_draft_status_row() {
     assert_eq!(status, "draft");
 }
 
+/// Calls `draft_policy` the way [`run_write_low_tool`] does, for a call the
+/// tool must refuse: asserts the tool route reports it as `failed` (a result
+/// with an `error` key) and returns that error sentence (AI-27).
+async fn run_refused_draft_policy(
+    router: &axum::Router,
+    pool: &sqlx::PgPool,
+    mut args: Value,
+) -> String {
+    let cookie = session_cookie_for_seeded_user(pool, "fajar@meridian.example").await;
+    args["confirmed"] = json!(true);
+    let resp = post(
+        router,
+        "/api/ai/tool",
+        &cookie,
+        json!({ "tool": "draft_policy", "args": args, "mode": "build" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["outcome"], "failed", "{body}");
+    body["result"]["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a refusal carries an error sentence: {body}"))
+        .to_owned()
+}
+
+/// The fixed sentence a refused draft answers with (AI-27): it names what an
+/// enforceable condition needs, so the model can act on it.
+const CONDITIONS_REFUSAL: &str =
+    "The conditions need roles, a table, and a mask or a row filter, so the draft was not saved.";
+
+/// The args of a policy draft, with `conditions` left for the test to set.
+fn policy_args(name: &str) -> Value {
+    json!({
+        "name": name,
+        "kind": "Row filter",
+        "subjects": "Analysts",
+        "resources": "serving.mart_customer_segment",
+        "effect": "Permit with obligation",
+    })
+}
+
+async fn policy_rows(pool: &sqlx::PgPool, name: &str) -> i64 {
+    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM policy WHERE name = $1")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .expect("count policies");
+    n
+}
+
+/// AI-27 (a): structured conditions with a mask are saved as a draft that the
+/// engine can enforce, and the result says so.
+#[tokio::test]
+async fn draft_policy_with_structured_conditions_is_an_enforceable_draft() {
+    let (router, pool, _ch) = app().await;
+    let mut args = policy_args("copilot_drafted_masked_policy");
+    args["conditions"] = json!({
+        "roles": ["analyst"],
+        "table": "serving.mart_customer_segment",
+        "mask": ["email"],
+    });
+    let result = run_write_low_tool(&router, &pool, "draft_policy", args).await;
+    assert_eq!(result["status"], "draft", "{result}");
+    assert_eq!(result["enforceable"], true, "{result}");
+
+    let (status, conditions): (String, Option<String>) = sqlx::query_as(
+        "SELECT status, conditions FROM policy WHERE name = 'copilot_drafted_masked_policy'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("row must exist");
+    assert_eq!(status, "draft");
+    let stored = conditions.expect("conditions are stored");
+    assert!(
+        lakehouse_api::policy_engine::PolicyCondition::parse(&stored).is_some(),
+        "the stored conditions must be enforceable: {stored}"
+    );
+}
+
+/// AI-27 (b): roles and a table with neither a mask nor a row filter enforce
+/// nothing, so the tool refuses and saves no row.
+#[tokio::test]
+async fn draft_policy_conditions_without_an_obligation_are_refused() {
+    let (router, pool, _ch) = app().await;
+    let mut args = policy_args("copilot_drafted_no_obligation");
+    args["conditions"] = json!({
+        "roles": ["analyst"],
+        "table": "serving.mart_customer_segment",
+    });
+    let error = run_refused_draft_policy(&router, &pool, args).await;
+    assert_eq!(error, CONDITIONS_REFUSAL);
+    assert_eq!(policy_rows(&pool, "copilot_drafted_no_obligation").await, 0);
+}
+
+/// AI-27 (c): `conditions` as prose is what a model following the old schema
+/// sends. The tool refuses it with the same sentence and saves no row.
+#[tokio::test]
+async fn draft_policy_prose_conditions_are_refused() {
+    let (router, pool, _ch) = app().await;
+    let mut args = policy_args("copilot_drafted_prose_conditions");
+    args["conditions"] = json!("Analysts may not see the email column");
+    let error = run_refused_draft_policy(&router, &pool, args).await;
+    assert_eq!(error, CONDITIONS_REFUSAL);
+    assert_eq!(
+        policy_rows(&pool, "copilot_drafted_prose_conditions").await,
+        0
+    );
+}
+
+/// AI-27 (d): a draft with no `conditions` is still saved, and the result says
+/// it enforces nothing, next to `enforceable: false`.
+#[tokio::test]
+async fn draft_policy_without_conditions_says_it_enforces_nothing() {
+    let (router, pool, _ch) = app().await;
+    let result = run_write_low_tool(
+        &router,
+        &pool,
+        "draft_policy",
+        policy_args("copilot_drafted_without_conditions"),
+    )
+    .await;
+    assert_eq!(result["status"], "draft", "{result}");
+    assert_eq!(result["enforceable"], false, "{result}");
+    assert_eq!(
+        result["note"],
+        "This draft enforces nothing until a person adds conditions in the console (Governance, then Policies).",
+        "{result}"
+    );
+    assert_eq!(
+        policy_rows(&pool, "copilot_drafted_without_conditions").await,
+        1
+    );
+}
+
+/// AI-27 (e): `activate: true` still saves a draft when the conditions are
+/// structured, so the new check does not open a way around the draft-only rule.
+#[tokio::test]
+async fn draft_policy_with_structured_conditions_ignores_activate() {
+    let (router, pool, _ch) = app().await;
+    let mut args = policy_args("copilot_drafted_activate_true");
+    args["activate"] = json!(true);
+    args["conditions"] = json!({
+        "roles": ["analyst"],
+        "table": "serving.mart_customer_segment",
+        "rowFilter": "region = 'ID'",
+    });
+    let result = run_write_low_tool(&router, &pool, "draft_policy", args).await;
+    assert_eq!(result["status"], "draft", "{result}");
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status FROM policy WHERE name = 'copilot_drafted_activate_true'")
+            .fetch_one(&pool)
+            .await
+            .expect("row must exist");
+    assert_eq!(status, "draft");
+}
+
 /// `draft_classification_rule` always lands `review_status = "needs-review"`
 /// — the only value `create_classification_rule` ever inserts.
 #[tokio::test]

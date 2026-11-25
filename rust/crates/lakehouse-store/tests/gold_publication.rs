@@ -94,3 +94,110 @@ async fn list_enabled_returns_only_enabled_rows(pool: PgPool) -> sqlx::Result<()
     );
     Ok(())
 }
+
+/// DATA-65: a Gold publication writes the `gold` zone by default, so a
+/// pre-DATA-65 caller reading it through `get` still sees its own row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_gold_helpers_still_address_the_gold_zone(pool: PgPool) -> sqlx::Result<()> {
+    let actor = Uuid::new_v4();
+    let stored = gold_publication::upsert(&pool, "orders", true, actor)
+        .await
+        .expect("the Gold upsert succeeds");
+    assert_eq!(stored.zone, "gold");
+    assert_eq!(stored.mart, "orders");
+
+    let got = gold_publication::get(&pool, "orders")
+        .await
+        .expect("the Gold read succeeds")
+        .expect("the row exists");
+    assert_eq!(got.zone, "gold");
+    assert!(got.enabled);
+    Ok(())
+}
+
+/// DATA-65: `silver.orders` and `serving.orders` are two independent
+/// switches. Enabling Silver does not touch the Gold row, and each
+/// zone-aware read sees only its own zone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn silver_and_gold_publications_of_the_same_mart_are_independent(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let actor = Uuid::new_v4();
+    let gold = gold_publication::upsert_in_zone(&pool, "gold", "orders", true, actor)
+        .await
+        .expect("the Gold upsert succeeds");
+    let silver = gold_publication::upsert_in_zone(&pool, "silver", "orders", true, actor)
+        .await
+        .expect("the Silver upsert succeeds");
+
+    assert_eq!(gold.zone, "gold");
+    assert_eq!(silver.zone, "silver");
+    assert_eq!(gold.mart, "orders");
+    assert_eq!(silver.mart, "orders");
+
+    let silver_only = gold_publication::get_in_zone(&pool, "silver", "not_enabled")
+        .await
+        .expect("read succeeds");
+    assert!(silver_only.is_none());
+
+    // Flipping Silver off leaves Gold on.
+    gold_publication::upsert_in_zone(&pool, "silver", "orders", false, actor)
+        .await
+        .expect("the Silver flip succeeds");
+    let gold_after = gold_publication::get_in_zone(&pool, "gold", "orders")
+        .await
+        .expect("read succeeds")
+        .expect("the Gold row is still there");
+    assert!(gold_after.enabled, "the Gold switch was not touched");
+    let silver_after = gold_publication::get_in_zone(&pool, "silver", "orders")
+        .await
+        .expect("read succeeds")
+        .expect("the Silver row is still there");
+    assert!(!silver_after.enabled);
+    Ok(())
+}
+
+/// DATA-65: `list_enabled_in_zone` filters by zone; `list_enabled` returns
+/// both zones ordered by `(zone, mart)` so the scheduler can schedule each
+/// with its own zone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_enabled_returns_both_zones_and_zone_queries_filter(pool: PgPool) -> sqlx::Result<()> {
+    let actor = Uuid::new_v4();
+    gold_publication::upsert_in_zone(&pool, "gold", "zeta", true, actor)
+        .await
+        .expect("insert succeeds");
+    gold_publication::upsert_in_zone(&pool, "silver", "alpha", true, actor)
+        .await
+        .expect("insert succeeds");
+    gold_publication::upsert_in_zone(&pool, "gold", "alpha", true, actor)
+        .await
+        .expect("insert succeeds");
+    gold_publication::upsert_in_zone(&pool, "silver", "off", false, actor)
+        .await
+        .expect("insert succeeds");
+
+    let silver: Vec<(String, String)> = gold_publication::list_enabled_in_zone(&pool, "silver")
+        .await
+        .expect("list succeeds")
+        .into_iter()
+        .map(|p| (p.zone, p.mart))
+        .collect();
+    assert_eq!(silver, vec![("silver".to_owned(), "alpha".to_owned())]);
+
+    let all: Vec<(String, String)> = gold_publication::list_enabled(&pool)
+        .await
+        .expect("list succeeds")
+        .into_iter()
+        .map(|p| (p.zone, p.mart))
+        .collect();
+    assert_eq!(
+        all,
+        vec![
+            ("gold".to_owned(), "alpha".to_owned()),
+            ("gold".to_owned(), "zeta".to_owned()),
+            ("silver".to_owned(), "alpha".to_owned()),
+        ],
+        "ordered by zone then mart"
+    );
+    Ok(())
+}

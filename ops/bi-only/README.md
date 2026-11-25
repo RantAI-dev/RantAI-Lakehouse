@@ -22,6 +22,34 @@ is attempted.
 | `docker-compose.bi-only-clickhouse.yml` | ClickHouse external engines | PostgreSQL, MySQL, remote ClickHouse |
 | `docker-compose.bi-only-trino.yml` | Trino federated catalogs | PostgreSQL, MySQL, MariaDB, SQL Server, Oracle, ClickHouse, Snowflake, BigQuery, Redshift |
 
+## Install with `lakehousectl`
+
+The installer takes the same choice as the two files above:
+
+```bash
+lakehousectl install --mode bi-only --engine clickhouse
+lakehousectl install --mode bi-only --engine trino
+```
+
+`--mode` defaults to `full` and `--engine` to `clickhouse`, so an install
+with no flags is byte-for-byte the earlier full install. In `bi-only` the
+installer writes `LAKEHOUSE_INSTALL_MODE=bi-only`,
+`LAKEHOUSE_QUERY_ENGINE=<clickhouse|trino>` and exactly one engine URL into
+the install's `.env` (still mode 0600, never overwriting an operator's
+other values): a federated install sets `TRINO_URL=http://trino:8080` and
+comments out `CH_URL` / `CLICKHOUSE_URL`; a `ClickHouse` install comments
+out `TRINO_URL`. An unknown mode or engine is refused by the parser, and
+`--mode full --engine trino` is refused before any file is written —
+`--engine` names the single engine of a `bi-only` installation, not an
+optional profile of the full stack.
+
+The installer writes the mode variables; it does not swap the release's
+root Compose file. Start the matching standalone file below to deploy only
+the seven named services. Once the API is up, the console's Admin >
+Settings > Deployment page shows the mode and engine, hides the
+warehouse-only sidebar pages and offers only that engine in Query Studio
+(for a principal allowed to read the deployment route).
+
 ## Start
 
 1. Build the two images this repository owns, from the repository root:

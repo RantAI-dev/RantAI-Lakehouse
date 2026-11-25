@@ -1,5 +1,6 @@
-"""P4 Dagster maintenance job: the in-engine ClickHouse Iceberg maintenance
-chain, run per Bronze table, on a schedule.
+"""P4 Dagster maintenance job: the ClickHouse Iceberg maintenance chain —
+the in-engine verbs plus a catalog-side snapshot expiry — run per Bronze
+table, on a schedule.
 
 # ClickHouse 26.8 rework — this module was rebuilt after the 26.3 -> 26.8
 # bump changed which verbs work
@@ -18,16 +19,30 @@ working verb set had changed underneath this job:
 | `OPTIMIZE` | `Code: 499` HTTP 403 at runtime | **returns OK** — but measured directly against a 7-small-file partition: seven files go in, seven files come out. It does **not** bin-pack. Not a compaction remedy at any version tested. |
 
 **This job now runs `remove_orphan_files` (dry-run, then applied) as its
-one active in-engine verb**, replacing `expire_snapshots`. `expire_snapshots`
-is attempted once per table anyway — specifically so the skip is a REAL,
-freshly-observed error every run (`probe_expire_snapshots_skip`), not a
-hardcoded string that could silently go stale if some future ClickHouse
-version changes the behavior again — and its failure is logged loudly and
-recorded in `skipped_verbs`, never silently dropped. `OPTIMIZE` is
-deliberately NOT invoked (calling it would succeed and do nothing useful —
-see the table above): that is a logged design skip, not a caught runtime
-error, and the log message says so explicitly rather than pretending it is
-the same kind of skip as `expire_snapshots`'s.
+one active in-engine verb**, replacing ClickHouse's own `expire_snapshots`.
+ClickHouse's `expire_snapshots` is still ATTEMPTED once per table
+(`probe_expire_snapshots_skip`), but only to OBSERVE it: on 26.8 the
+server refuses its own verb against a catalog-backed table, and the point
+of the probe is that this refusal is a REAL, freshly-observed error every
+run rather than a hardcoded string that could silently go stale if some
+future ClickHouse version changes the behavior again. The observation goes
+to the Dagster run log, per table, per run — and NOWHERE else: it is
+ClickHouse's own error body, so it does NOT go into `skipped_verbs`, into
+a `maintenance_verb_run` / `maintenance_run` row, or into any API
+response (`GET /api/governance/maintenance`,
+`GET /api/lakehouse/tables/{ns}/{table}/maintenance`) — upstream error
+text never reaches a response.
+The expiry this job performs is not ClickHouse's: it runs through
+Trino's Iceberg connector when Trino answers and, when Trino is unreachable,
+through the REST catalog (`pyiceberg`, against the same Lakekeeper catalog
+the ingest job writes through — the `dlt` principal), so "trino unreachable"
+is no longer the outcome of this verb, and the expiry's own recorded skip
+reason comes from the engine that ran it (Trino or the catalog), never
+from this probe. `OPTIMIZE` is deliberately NOT invoked (calling it would
+succeed and do nothing useful — see the table above): that is a design
+skip of this job's OWN work, recorded in `skipped_verbs` like every other
+skip this job records — not an observation of another engine's refusal
+like the probe above is.
 
 # Lakekeeper-side snapshot expiry — investigated, NOT wired in, and why
 
@@ -62,10 +77,15 @@ taking `enable-expire-snapshots` / `max-snapshot-age-ms` /
    `GET /management/v1/warehouse`, an ADMIN-scoped list call — see
    `lakekeeper-authz-init` in `docker-compose.yml`, which is the ONLY
    place `admin.jwt` is mounted) plus, almost certainly, an `admin`-level
-   grant on the warehouse to change its task-queue config. This job's only
-   identity is `clickhouse-reader` (`select`+`modify` — granted for
-   ClickHouse's OWN `expire_snapshots` attempt above, now failing), and
-   `dagster-code-location` (where this op runs) mounts no admin token.
+   grant on the warehouse to change its task-queue config. This job holds
+   two identities, and NEITHER is admin-level: `clickhouse-reader`
+   (`select`+`modify` — granted for ClickHouse's OWN `expire_snapshots`
+   attempt above, now failing) and the `dlt` principal
+   (warehouse-scoped `create modify select`, ADR 0011 — the identity the
+   catalog-side expiry above writes through, its token pre-minted and
+   mounted read-only at `/tokens/dlt.jwt`). `dagster-code-location` (where
+   this op runs) mounts no admin token, so Lakekeeper's task-queue API
+   stays out of reach for this job.
    Minting one for a recurring, unattended scheduled job — rather than the
    one-shot bootstrap job that currently holds it — is a real
    authorization-surface change this fix does not make unreviewed, and
@@ -85,12 +105,15 @@ tables/{table}` — the SAME endpoint `ops/g3a/g3a_test.py`'s
 `step_verify_format_version_2` already uses and has proven works against
 this stack) and records `len(metadata["snapshots"])` and
 `len(metadata["metadata-log"])` through `record_maintenance_run`, so the
-unbounded growth this section describes is VISIBLE and trending in
+snapshot growth this section describes is VISIBLE and trending in
 `GET /api/governance/maintenance` history — not silent — even though
-nothing in this stack reclaims it yet. Orphan *files* are still reclaimed
-by `remove_orphan_files` above; orphan *snapshots* are not reclaimed by
-anything in this stack, and this module now says so with numbers attached,
-every run.
+Lakekeeper's own background expiry task (the `enable-expire-snapshots`
+toggle above) stays off. Snapshot METADATA is reclaimed in this stack, but
+by this job's own per-run, policy-driven expiry through the REST catalog,
+not by Lakekeeper's task queue. Orphan *files* are still reclaimed by
+`remove_orphan_files` above — the files an expired snapshot referenced are
+among them, and that verb deletes them about three days later, under its
+3-day age floor.
 
 # G3's consequence for this job is unchanged
 
@@ -103,7 +126,11 @@ on 26.3, this job provides ZERO small-file mitigation;
 gap, and the Trino escape hatch (`docker-compose.yml`'s
 `trino-maintenance-cron` service, ADR 0009) is what actually keeps Bronze
 query-planning healthy. This job's job stays narrower: orphan-file and
-(once expire_snapshots moves to the catalog) snapshot hygiene only.
+snapshot hygiene only. `expire_snapshots` HAS moved to the catalog — the
+expiry runs through Trino when Trino answers and through `pyiceberg` when
+it does not — so snapshot hygiene is covered here too; compaction (small
+files) is still Trino-only (`trino-maintenance-cron`, ADR 0009), which is
+what OPS-21 is about.
 
 # Bronze-only scoping
 
@@ -118,10 +145,13 @@ proving a `gold.*` table is excluded.
 
 # The pause: `MAINTENANCE_PAUSED`
 
-The two verbs here that DELETE files — the snapshot expiry and the
-orphan-file removal — do not run while `MAINTENANCE_PAUSED=true` is
-set: they skip, the reason is recorded in `skipped_verbs`, and the run
-does not fail (REL-2 S4 decision D16).
+The two verbs here that DELETE files, or make them reclaimable — the
+snapshot expiry and the orphan-file removal — do not run while
+`MAINTENANCE_PAUSED=true` is set: they skip, the reason is recorded in
+`skipped_verbs`, and the run does not fail (REL-2 S4 decision D16). The
+catalog-side expiry deletes no file by itself — it removes snapshot
+metadata, and the files it frees are the orphan verb's to delete — so
+both verbs stay under the pause.
 
 Why: the local backup does NOT hold the warehouse files. A restore
 brings the catalogs, Postgres and ClickHouse back to the moment of the
@@ -132,21 +162,25 @@ update and clears it after the update succeeds or is rolled back. The
 Gold export's trim deletes files too, so it reads the same variable
 (`gold_export.py`).
 
-# Per-table policy + Trino verbs
+# Per-table policy + maintenance verbs
 
 The verbs above are the job's fixed, unconditional behavior. Operators
 who want to bin-pack small files need `table_maintenance_policy`
 (`rust/migrations/0030`), read once per run from
-`GET /api/lakehouse/maintenance-policies` and routed through Trino's
-Iceberg connector — which does not carry ClickHouse's "transactional catalog"
-restriction on `expire_snapshots`, and whose `optimize` genuinely
-bin-packs (ClickHouse's does not — see the table above).
+`GET /api/lakehouse/maintenance-policies`. Its `optimize` is Trino-only —
+Trino's Iceberg connector is the only engine here that genuinely bin-packs
+(ClickHouse's does not — see the table above) — while its
+`expire_snapshots` runs through that connector when Trino answers and
+through the REST catalog (`pyiceberg`) when Trino does not. Trino's
+connector does not carry ClickHouse's "transactional catalog" restriction
+on `expire_snapshots`.
 
 Snapshot expiry (`expire_snapshots`) runs by default for every Bronze
 table with a 7-day retention threshold (Trino's own floor, OPS-1 Decision
-D1). Operators who want to retain fewer or more snapshots configure
-`snapshotsToKeep` in `table_maintenance_policy`, which overrides the
-default (D2).
+D1) — the same number whichever engine runs it: Trino's connector when
+Trino answers, the REST catalog when it does not. Operators who want to
+retain fewer or more snapshots configure `snapshotsToKeep` in
+`table_maintenance_policy`, which overrides the default (D2).
 
 * **`snapshotsToKeep`.** Trino 483's `expire_snapshots` procedure takes
   only a `retention_threshold` age, not a keep-count, so keeping the N
@@ -154,27 +188,35 @@ default (D2).
   `committed_at` (newest first) from Trino's `"<table>$snapshots"`
   metadata table, and if there are more than N, the threshold is the AGE
   of the Nth-newest snapshot, in whole seconds rounded up. Exactly N
-  survive. A table with N or fewer snapshots has nothing to expire and
-  the verb is skipped, not run with a threshold of zero — a `'0d'`
-  threshold (the naive reading of "expire snapshots older than
-  everything") would expire every snapshot but the current one,
-  regardless of how many the operator asked to keep, which is real data
-  loss for anyone who configured a keep-count greater than one. Trino's
-  `iceberg.expire-snapshots.min-retention` (a 7-day default, unset in
-  this stack's compose) can also refuse a threshold shorter than that
-  floor; the refusal is recorded honestly and never retried with a
-  larger value — lowering the floor is a deployment/product decision,
-  not something this job decides for an operator.
-* **`orphanAgeHours`.** Nothing in this repo proves
-  `remove_orphan_files` accepts an age argument on this ClickHouse
-  version, and it is called above with only `dry_run=1/0`. Setting this
-  field is recorded, honestly, as "stored; not applied by this build" —
-  never silently ignored, and never applied on a guess.
-* **`schedule`.** A per-table cadence for the Trino verbs only (the
-  ClickHouse-side steps above stay unconditional, every run): `weekly`
-  requires the table's last recorded verb run to be at least 7 days old,
-  `daily` at least 20 hours (tolerating this job's own start jitter — see
-  `bronze_maintenance_schedule` below), `null` runs every time.
+  survive — the catalog path computes the SAME age and then keeps the
+  newest N by id, and it additionally protects every branch and tag head
+  (`pyiceberg`'s `ExpireSnapshots.by_id` refuses to expire one). A table
+  with N or fewer snapshots has nothing to expire and the verb is skipped,
+  not run with a threshold of zero — a `'0d'` threshold (the naive reading
+  of "expire snapshots older than everything") would expire every snapshot
+  but the current one, regardless of how many the operator asked to keep,
+  which is real data loss for anyone who configured a keep-count greater
+  than one. Trino's `iceberg.expire-snapshots.min-retention` (a 7-day
+  default, unset in this stack's compose) can also refuse a threshold
+  shorter than that floor; the refusal is recorded honestly and never
+  retried with a larger value — lowering the floor is a
+  deployment/product decision, not something this job decides for an
+  operator.
+* **`orphanAgeHours`.** `remove_orphan_files` DOES take an age: the
+  `iceberg_orphan_files_older_than_seconds` setting, which
+  `run_remove_orphan_files` above can set. Its ClickHouse default is
+  3 days — 259200 s, measured in this repo at
+  `docs/superpowers/plans/2026-10-14-data-2-gold-keep-copies.md:245-246`
+  — and this job calls the verb without overriding that setting, so
+  files younger than 3 days are protected and the reclaim lands about
+  three days later. Setting this field is recorded, honestly, as
+  "stored; not applied by this build" — never silently ignored, and
+  never applied on a guess.
+* **`schedule`.** A per-table cadence for the expiry and compaction verbs
+  only (the ClickHouse-side steps above stay unconditional, every run):
+  `weekly` requires the table's last recorded verb run to be at least 7 days
+  old, `daily` at least 20 hours (tolerating this job's own start jitter —
+  see `bronze_maintenance_schedule` below), `null` runs every time.
 * **`compactSmallFiles`.** Runs Trino's `ALTER TABLE ... EXECUTE
   optimize` — the same call `ops/trino/optimize_bronze.sh` already
   proves works against this stack's Iceberg tables.
@@ -273,6 +315,19 @@ def _env(name: str, default: str) -> str:
     return value if value else default
 
 
+def _read_token_file(path: str) -> str:
+    """The bearer token in `path`, or `""` when there is no such file.
+
+    A missing file is a stack without that identity, not an error: the
+    caller records an honest skip. The file is read rather than an env
+    var because this container's `command:` is a fixed exec array, not
+    a shell script (see `MaintenanceConfig`'s comment)."""
+    if not path or not os.path.exists(path):
+        return ""
+    with open(path, encoding="utf-8") as handle:
+        return handle.read().strip()
+
+
 @dataclass(frozen=True)
 class MaintenanceConfig:
     ch: ClickHouseTarget
@@ -286,16 +341,34 @@ class MaintenanceConfig:
     # or authz-disabled stack.
     ch_oauth_client_id: str
     ch_oauth_server_uri: str
-    # Per-table policy + Trino verbs (module doc, "Per-table policy +
-    # Trino verbs"). Defaulted so every existing positional/keyword
-    # construction of this dataclass elsewhere (this module's own test
-    # module included) keeps working unchanged.
+    # Per-table policy + maintenance verbs (module doc, "Per-table
+    # policy + maintenance verbs"). Defaulted so every existing
+    # positional/keyword construction of this dataclass elsewhere (this
+    # module's own test module included) keeps working unchanged.
     api_url: str = "http://lakehouse-api:8080"
     maintenance_token: str = ""
     trino_url: str = "http://trino:8080"
+    # The `dlt` principal's pre-minted Lakekeeper token (ADR 0011) —
+    # the identity the ingest job already writes through, and the one
+    # the pyiceberg expiry fallback uses. It is read from a FILE, not
+    # from an env var, for the same reason `dlt_pipeline.py` reads it
+    # from one: this container's `command:` is a fixed exec array, not
+    # a shell script, so there is no step between container start and
+    # this code to interpolate a file's contents into an env var. Both
+    # fields default to empty so a stack that mounts no token file
+    # (pre-R1 or authz-disabled) keeps working: the fallback then
+    # records an honest skip, never a crash.
+    lakekeeper_token_file: str = ""
+    lakekeeper_token: str = ""
+    # The object-store credentials the catalog needs to read a table's
+    # metadata and to commit an expiry — the same connector-scoped
+    # `CONNECTOR_S3_*` pair the ingest job already uses.
+    rustfs_access_key: str = ""
+    rustfs_secret_key: str = ""
 
     @classmethod
     def from_env(cls) -> "MaintenanceConfig":
+        token_file = _env("LAKEKEEPER_TOKEN_FILE", "")
         return cls(
             ch=ClickHouseTarget.from_env(),
             lakekeeper_catalog_uri=_env(
@@ -308,6 +381,10 @@ class MaintenanceConfig:
             api_url=_env("LAKEHOUSE_API_URL", "http://lakehouse-api:8080"),
             maintenance_token=_env("LAKEHOUSE_MAINTENANCE_TOKEN", ""),
             trino_url=_env("TRINO_URL", "http://trino:8080"),
+            lakekeeper_token_file=token_file,
+            lakekeeper_token=_read_token_file(token_file),
+            rustfs_access_key=_env("CONNECTOR_S3_ACCESS_KEY", ""),
+            rustfs_secret_key=_env("CONNECTOR_S3_SECRET_KEY", ""),
         )
 
     def ch_auth_settings(self) -> str:
@@ -474,9 +551,13 @@ def probe_expire_snapshots_skip(cfg: MaintenanceConfig, table_name: str) -> str:
     backed by a transactional catalog` — a deliberate restriction (a REST
     catalog owns snapshot expiry, not the query engine), not a bug; see
     `docs/plans/CLICKHOUSE-26.8-REMEASUREMENT.md`. If some future
-    ClickHouse version makes this succeed again, that is reported loudly
-    too (the caller logs whatever this returns either way — this function
-    never swallows the outcome, it just describes it)."""
+    ClickHouse version makes this succeed again, that is reported too (the
+    caller logs whatever this returns either way — this function never
+    swallows the outcome, it just describes it). What it returns is
+    ClickHouse's own text (its error body, or the result of an unexpected
+    success), so it lands in the Dagster run log and NOWHERE else: not in
+    `skipped_verbs`, not in a recorded row, and so not in an API
+    response."""
     sql = (
         f"ALTER TABLE {CATALOG_DB}.`{table_name}` "
         f"EXECUTE expire_snapshots(dry_run=1) "
@@ -544,25 +625,33 @@ def resolve_catalog_prefix(cfg: MaintenanceConfig, token: str) -> str:
 
 
 def measure_snapshot_growth(cfg: MaintenanceConfig, table_name: str) -> dict[str, Any]:
-    """Measure the unbounded-growth gap the module doc describes:
+    """Measure the snapshot growth the module doc describes:
     `snapshot_count` (from the table's own `metadata.snapshots`) and
     `metadata_log_count` (from `metadata.metadata-log`, the retained-old-
     metadata-file trail) — both read straight from the Iceberg REST
     catalog's table-metadata document (`GET /v1/{prefix}/namespaces/{ns}/
-    tables/{table}`), never guessed or derived from ClickHouse. Neither
-    `expire_snapshots` (unsupported on 26.8 for catalog-backed tables) nor
-    `remove_orphan_files` (files, not snapshots) reduces these numbers —
-    this function exists to make sure that fact is VISIBLE and trending
-    rather than silent, per the module doc's "Lakekeeper-side snapshot
-    expiry" section. `table_name` is the catalog's own two-part name (e.g.
+    tables/{table}`), never guessed or derived from ClickHouse. The
+    snapshot expiry DOES reduce `snapshot_count`: it runs through the
+    catalog (Trino's connector when Trino answers, `pyiceberg` when it
+    does not) and removes the snapshot entries the policy expires.
+    `remove_orphan_files` reduces NEITHER number — it deletes files, not
+    snapshot metadata — and because this function runs AFTER the expiry
+    (OPS-20 decision 4) the count it records is the count the policy
+    LEAVES BEHIND, not the count the run started with.
+    `table_name` is the catalog's own two-part name (e.g.
     `bronze.g3a_orders`, same shape `discover_bronze_tables` returns).
 
     Returns `{"measured": False, ...}` (zeros) rather than raising when
-    `CH_OAUTH_CLIENT_ID` is unset (pre-R1/authz-disabled stack, no way to
-    mint a catalog token) — a stack with no per-principal auth wired up
-    yet has no `expire_snapshots` write path to measure a gap in either,
-    so a skip here is consistent with the rest of this module's degrade-
-    gracefully posture on that same condition."""
+    `CH_OAUTH_CLIENT_ID` is unset (pre-R1/authz-disabled stack): the
+    token this measurement mints for itself cannot be minted then, and
+    that token is the only credential its read path has. The expiry is
+    not this measurement — it runs through Trino when Trino answers and
+    through the catalog (`pyiceberg`, the `dlt` principal) when it does
+    not, so a stack with no `CH_OAUTH_CLIENT_ID` can still expire
+    snapshots: this measurement is skipped because ITS read path has no
+    token, not because nothing can write. A skip here stays consistent
+    with the rest of this module's degrade-gracefully posture on that
+    same condition."""
     token = mint_lakekeeper_read_token(cfg)
     if token is None:
         return {"measured": False, "snapshot_count": 0, "metadata_log_count": 0}
@@ -627,14 +716,21 @@ def _run_maintenance_for_table(
     table_name: str,
     policy: dict[str, Any] | None,
     policy_fetch_error: str | None,
+    context: Any = None,
 ) -> dict[str, Any]:
     """The per-table body of the maintenance chain, extracted from
     `run_bronze_maintenance` so PART C's `maintain_bronze_table` mapped
     op and the existing `test_maintenance.py` Trino-integration tests
-    can both drive it. Behaviour is unchanged from the previous
-    in-line loop body: probe, dry-run + applied orphan removal,
-    growth measurement, policy-driven `expire_snapshots`/`optimize`,
-    `record_maintenance_run` + `record_maintenance_verb_run`."""
+    can both drive it. The order is: probe, the policy-driven
+    `expire_snapshots`, dry-run + applied orphan removal, growth
+    measurement, `optimize`, then `record_maintenance_run` +
+    `record_maintenance_verb_run`. The expiry moved ahead of the orphan
+    removal (OPS-20 decision 4) so the files the expired snapshots
+    referenced are orphans by the time `remove_orphan_files` runs.
+
+    `context` is the op's own context, so the ClickHouse probe's outcome
+    can be logged (see below). It is optional because this helper is
+    driven directly by the tests, which have no op context to hand."""
     skipped_verbs: list[str] = []
 
     if maintenance_paused():
@@ -665,10 +761,24 @@ def _run_maintenance_for_table(
             "snapshot_growth": {},
         }
 
-    expire_skip_reason = probe_expire_snapshots_skip(cfg, table_name)
-    dry = run_remove_orphan_files(cfg, table_name, dry_run=True)
-    real = run_remove_orphan_files(cfg, table_name, dry_run=False)
-    growth = measure_snapshot_growth(cfg, table_name)
+    # The probe OBSERVES ClickHouse's own `expire_snapshots` refusal; it
+    # expires nothing (this job's expiry runs through Trino or the REST
+    # catalog — see the module doc). Its outcome is ClickHouse's own error
+    # body, so it is logged in the Dagster run log and NEVER recorded:
+    # `skipped_verbs` and the `maintenance_run` / `maintenance_verb_run`
+    # rows are served by the API, and upstream error text never reaches a
+    # response. INFO, not WARNING: the refusal is ClickHouse's deliberate
+    # behaviour on 26.8, not a fault of this job, and the probe's own text
+    # says which case it is.
+    expire_probe_outcome = probe_expire_snapshots_skip(cfg, table_name)
+    log = context.log if context else None
+    if log is not None:
+        log.info(
+            f"ClickHouse's own expire_snapshots probe for {table_name}: "
+            f"{expire_probe_outcome} — this job's snapshot expiry runs "
+            "through Trino (or the REST catalog when Trino is unreachable), "
+            "not through ClickHouse"
+        )
     namespace, name = _table_namespace_and_name(table_name)
     now = datetime.now(timezone.utc)
 
@@ -681,8 +791,9 @@ def _run_maintenance_for_table(
     if policy is not None:
         if policy.get("orphanAgeHours") is not None:
             detail = (
-                "orphan_age_hours not applied: remove_orphan_files is "
-                "called without an age argument on this ClickHouse"
+                "orphan_age_hours not applied: remove_orphan_files runs with "
+                f"ClickHouse's default age floor ({ORPHAN_FILE_AGE_FLOOR_SECONDS}s "
+                "= 3 days), not with this policy's value"
             )
             skipped_verbs.append(detail)
             verb_runs.append(
@@ -695,17 +806,29 @@ def _run_maintenance_for_table(
             )
         last_run_at = _parse_run_at(latest_maintenance_run_at(cfg.ch, table_name))
 
+    # The expiry runs BEFORE the orphan-file removal (OPS-20 decision 4):
+    # the files the expired snapshots referenced are orphans by the time
+    # `remove_orphan_files` runs — but the reclaim lands about three days
+    # later, not in this run: `remove_orphan_files` runs with ClickHouse's
+    # default `iceberg_orphan_files_older_than_seconds`
+    # (`ORPHAN_FILE_AGE_FLOOR_SECONDS`, 259200 s = 3 days), which protects
+    # files younger than that, and the measured proof run deleted 0 files
+    # for that reason. The orphan verb itself is unchanged.
     if policy_fetch_error is not None:
         expire_skip = f"expire_snapshots (policy fetch failed: {policy_fetch_error})"
         expire_verb_run = None
     else:
         expire_skip, expire_verb_run = _expire_snapshots_result(
-            cfg, namespace, name, policy, expire_skip_reason, now, last_run_at
+            cfg, namespace, name, policy, now, last_run_at
         )
     if expire_skip is not None and expire_skip not in skipped_verbs:
         skipped_verbs.append(expire_skip)
     if expire_verb_run is not None:
         verb_runs.append(expire_verb_run)
+
+    dry = run_remove_orphan_files(cfg, table_name, dry_run=True)
+    real = run_remove_orphan_files(cfg, table_name, dry_run=False)
+    growth = measure_snapshot_growth(cfg, table_name)
 
     optimize_skip, optimize_verb_run = _optimize_result(
         cfg, namespace, name, policy, now, last_run_at
@@ -908,18 +1031,18 @@ def _parse_run_at(value: str | None) -> datetime | None:
 def _cadence_allows(
     schedule: str | None, now: datetime, last_run_at: datetime | None
 ) -> tuple[bool, str | None]:
-    """Per-table schedule cadence for the Trino verbs only (module doc).
-    `schedule=None` or no prior recorded run always allows a run. Returns
-    `(True, None)` when the run is allowed, `(False, <reason>)`
+    """Per-table schedule cadence for the expiry and compaction verbs
+    (module doc). `schedule=None` or no prior recorded run always allows a
+    run. Returns `(True, None)` when the run is allowed, `(False, <reason>)`
     otherwise. Pure — takes `now` and `last_run_at` explicitly so this is
     testable on fixed times, with no wall-clock or network dependency."""
     if schedule is None or last_run_at is None:
         return True, None
     elapsed = now - last_run_at
     if schedule == "weekly" and elapsed < timedelta(days=7):
-        return False, f"schedule=weekly: last Trino verb run {elapsed} ago, needs >= 7 days"
+        return False, f"schedule=weekly: last verb run {elapsed} ago, needs >= 7 days"
     if schedule == "daily" and elapsed < timedelta(hours=20):
-        return False, f"schedule=daily: last Trino verb run {elapsed} ago, needs >= 20 hours"
+        return False, f"schedule=daily: last verb run {elapsed} ago, needs >= 20 hours"
     return True, None
 
 
@@ -950,7 +1073,12 @@ def _compute_retention_threshold(
     return f"{age_seconds}s", None
 
 
-_TRINO_UNREACHABLE_SKIP = "expire_snapshots/optimize skipped: trino unreachable"
+# The OPTIMIZE verb's skip when Trino is not there. Only the optimize
+# verb is skipped: the snapshot expiry falls back to the catalog
+# (`pyiceberg`) when Trino is unreachable, so a text that also claimed
+# the expiry was skipped would put a false statement in the recorded
+# run.
+_TRINO_UNREACHABLE_SKIP = "optimize skipped: trino unreachable"
 
 # OPS-1 (Decision D1): Tables without a policy, or a policy with no
 # `snapshotsToKeep`, keep 7 days of snapshots. Trino 483's Iceberg
@@ -958,26 +1086,316 @@ _TRINO_UNREACHABLE_SKIP = "expire_snapshots/optimize skipped: trino unreachable"
 # default), so 7d is both the product floor and Trino's system floor.
 DEFAULT_SNAPSHOT_RETENTION = "7d"
 
+# ClickHouse's `iceberg_orphan_files_older_than_seconds` default, measured
+# in this repo at
+# `docs/superpowers/plans/2026-10-14-data-2-gold-keep-copies.md:245-246`
+# (3 days). `run_remove_orphan_files` calls the verb WITHOUT overriding
+# that setting, so files younger than this age are protected and the
+# space an expiry frees is reclaimed about three days later, not in the
+# same run. The expiry's recorded detail says so, because "where did my
+# space go" is otherwise unanswerable from the recorded run.
+ORPHAN_FILE_AGE_FLOOR_SECONDS = 259_200
 
-def _expire_snapshots_result(
+# The units a retention threshold string may carry: `7d` is this module's
+# default retention, `<n>s` is what `_compute_retention_threshold`
+# emits.
+_RETENTION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86_400}
+
+
+def _retention_seconds(threshold: str) -> int:
+    """The number of seconds a retention threshold string denotes
+    (`'86400s'`, `'7d'`).
+
+    No duration parser existed in this repo before this change (the two
+    parsers that do exist, `gold_export.parse_gold_keep_copies` and
+    `parse_gold_orphan_min_age_seconds`, read plain integers), so this
+    is a small local one. It is needed because
+    `_compute_retention_threshold` returns an AGE and the pyiceberg path
+    needs the CUTOFF INSTANT that age describes."""
+    text = threshold.strip()
+    unit = text[-1:]
+    if unit not in _RETENTION_UNITS:
+        raise ValueError(f"unsupported retention threshold: {threshold!r}")
+    return int(text[:-1]) * _RETENTION_UNITS[unit]
+
+
+def _snapshot_datetime(timestamp_ms: int) -> datetime:
+    """A snapshot's commit time as an aware UTC `datetime`, exact to the
+    millisecond (Iceberg stores milliseconds, not microseconds)."""
+    return datetime.fromtimestamp(timestamp_ms // 1000, tz=timezone.utc) + timedelta(
+        milliseconds=timestamp_ms % 1000
+    )
+
+
+def _snapshot_ids_to_expire(
+    table: Any, keep: int | None, now: datetime
+) -> tuple[list[int], str | None, str | None]:
+    """The snapshot ids the pyiceberg expiry must remove, the threshold
+    that decided them, and a skip reason (`None` when there is nothing to
+    skip).
+
+    Pure over the loaded table — no I/O — so it is testable with a fake
+    table.
+
+    * The snapshots are ordered newest first, exactly the order
+      `_compute_retention_threshold` expects.
+    * The threshold is the AGE of the Nth-newest snapshot when the
+      policy has a `snapshotsToKeep`, and this module's default
+      retention (`7d`) when it does not — the same number the Trino path
+      hands to `expire_snapshots(retention_threshold => ...)`.
+    * The ids to KEEP are the newest N, every branch and tag head, and
+      the table's CURRENT snapshot.
+      - A branch or tag head is PROTECTED: `pyiceberg`'s
+        `ExpireSnapshots.by_id` RAISES `ValueError` on a protected id,
+        so they must be filtered out here, before the call, not left to
+        the library.
+      - The current snapshot is protected for another reason:
+        `pyiceberg` 0.12.0's `RemoveSnapshotRefUpdate` — the update it
+        applies for a ref whose head is the removed snapshot — sets
+        `current_snapshot_id = None` when the removed ref is the main
+        branch (`pyiceberg/table/update/__init__.py:558-568`), so expiring
+        the current snapshot would leave the table with NO current snapshot
+        at all. A format-version-1 table has no refs at all, so the
+        branch-head protection does not cover it.
+    * A snapshot is expired when it is STRICTLY older than the threshold
+      (`committed < cutoff`): the cutoff is EXCLUSIVE. Iceberg's own
+      expiry is strict on that boundary — `pyiceberg` 0.12.0's
+      `ExpireSnapshots.older_than` expires a snapshot only when
+      `snapshot.timestamp_ms < expire_from`
+      (`pyiceberg/table/update/snapshot.py:1335`), and Iceberg's Java
+      `RemoveSnapshots` — what Trino's `expire_snapshots` calls through
+      `expireOlderThan` — keeps a snapshot while
+      `snapshot.timestampMillis() >= expireOlderThan`
+      (`RemoveSnapshots.unreferencedSnapshotsToRetain` and
+      `RemoveSnapshots.computeBranchSnapshotsToRetain`). The plan's
+      decision 1 is "fallback, not replacement": the fallback has to
+      behave like the engine it replaces, so the two engines must agree
+      on the boundary.
+    * Strict is also what makes the newest N safe BY the threshold
+      alone: `_compute_retention_threshold` returns the Nth-newest
+      snapshot's age rounded UP, so the cutoff instant is at or BEFORE
+      the Nth-newest's commit instant, and the newest N are therefore
+      never strictly older than it. The keep filter above is then a
+      second, independent guard rather than the only one — a bug in it
+      could at worst expire FEWER snapshots, never one the policy
+      keeps. With an inclusive comparison the keep filter was the only
+      guard for the newest N, which is the plan's stop condition ("the
+      proof shows a snapshot that the policy keeps being removed")
+      resting on hand-computed code.
+    * The honest consequence of the strict comparison: the cutoff is
+      `now` minus the Nth-newest's AGE rounded UP to whole seconds (the
+      `'<secs>s'` threshold Trino takes), so the cutoff instant lands
+      at or BEFORE the Nth-newest's commit instant, by up to one
+      second. Every snapshot committed inside that one-second window
+      (up to one second before the Nth-newest) is not strictly older
+      than the cutoff, so it survives too — the 2026-11-21 proof run
+      kept 3 snapshots for a policy that keeps 2, the 3rd-newest
+      committed 789 ms before the 2nd-newest. So "the newest N survive"
+      is "AT LEAST N survive". Trino's own `expire_snapshots` does the
+      same with the same threshold (Iceberg expires a snapshot only
+      when `timestamp_ms < now - retention`), and that is why the
+      comparison is strict: with a strict cutoff the newest N can never
+      be removed.
+    * A table with N or fewer snapshots is skipped — never a zero
+      threshold, which would expire every snapshot but the current one
+      regardless of `keep`."""
+    from pyiceberg.table.refs import SnapshotRefType
+
+    snapshots = sorted(table.snapshots(), key=lambda s: s.timestamp_ms, reverse=True)
+    committed_at = [_snapshot_datetime(s.timestamp_ms) for s in snapshots]
+
+    if keep is None:
+        threshold = DEFAULT_SNAPSHOT_RETENTION
+    else:
+        threshold, skip_reason = _compute_retention_threshold(committed_at, keep, now)
+        if skip_reason is not None:
+            return [], threshold, skip_reason
+
+    keep_ids = {
+        ref.snapshot_id
+        for ref in table.refs().values()
+        if ref.snapshot_ref_type in (SnapshotRefType.BRANCH, SnapshotRefType.TAG)
+    }
+    if keep is not None:
+        keep_ids.update(snapshot.snapshot_id for snapshot in snapshots[:keep])
+    current = table.current_snapshot()
+    if current is not None:
+        keep_ids.add(current.snapshot_id)
+
+    cutoff = now - timedelta(seconds=_retention_seconds(threshold))
+    ids = [
+        snapshot.snapshot_id
+        for snapshot, committed in zip(snapshots, committed_at)
+        if snapshot.snapshot_id not in keep_ids and committed < cutoff
+    ]
+    return ids, threshold, None
+
+
+def _pyiceberg_catalog(cfg: MaintenanceConfig) -> Any:
+    """The `pyiceberg` `RestCatalog` this job expires snapshots through.
+
+    The identity is the `dlt` principal — the one the ingest job already
+    writes through. ADR 0011 grants it `create modify select` on the
+    warehouse, and `modify` covers `expire_snapshots`, so this change
+    adds no principal, no grant and no compose entry: the token file
+    the ingest job reads is already mounted read-only into this
+    container.
+
+    `s3.path-style-access=true` and `s3.force-virtual-addressing=false`
+    are what RustFS/SeaweedFS need — see `adapters/sink.py`'s
+    `_install_catalog_env` for the measured reason: without them
+    pyiceberg tries virtual-hosted addressing and fails DNS.
+
+    The `RestCatalog` constructor fetches the catalog's own config, so
+    THIS is the seam the tests patch: no test reaches the network."""
+    from pyiceberg.catalog.rest import RestCatalog
+
+    return RestCatalog(
+        name="lakekeeper",
+        warehouse=cfg.lakekeeper_warehouse,
+        uri=cfg.lakekeeper_catalog_uri,
+        token=cfg.lakekeeper_token,
+        **{
+            "s3.endpoint": cfg.rustfs_endpoint,
+            "s3.access-key-id": cfg.rustfs_access_key,
+            "s3.secret-access-key": cfg.rustfs_secret_key,
+            "s3.region": "us-east-1",
+            "s3.path-style-access": "true",
+            "s3.force-virtual-addressing": "false",
+        },
+    )
+
+
+def _expire_snapshots_pyiceberg(
     cfg: MaintenanceConfig,
     namespace: str,
     name: str,
     policy: dict[str, Any] | None,
-    expire_skip_reason: str,
     now: datetime,
-    last_run_at: datetime | None,
 ) -> tuple[str | None, dict[str, str] | None]:
-    """Decides and executes this table's `expire_snapshots` verb via
-    Trino. Returns `(skipped_verbs_entry, verb_run_record)`:
-    `skipped_verbs_entry` is `None` exactly when the verb genuinely ran
-    (it must not also be recorded as skipped); `verb_run_record` is
-    `None` only when no verb ran or was skipped with a recorded run.
+    """Expires this table's snapshots through `pyiceberg` — the fallback
+    for a stack where Trino is not running. Returns the same
+    `(skipped_verbs_entry, verb_run_record)` shape as the Trino path.
 
-    When `snapshotsToKeep` is specified in `policy`, computes the retention
-    threshold to preserve that many snapshots. When no policy is set or
-    `snapshotsToKeep` is None, applies `DEFAULT_SNAPSHOT_RETENTION` ('7d')
-    unconditionally on the daily schedule (OPS-1 Decision D1)."""
+    `pyiceberg`'s expiry removes snapshot METADATA only: the files the
+    expired snapshots referenced become orphans, and the
+    `remove_orphan_files` verb — which runs after this one — is what
+    deletes them, under ClickHouse's 3-day age floor."""
+    keep = None if policy is None else policy.get("snapshotsToKeep")
+
+    if not cfg.lakekeeper_token:
+        reason = "no Lakekeeper catalog identity on this stack (no dlt token)"
+        return (
+            f"expire_snapshots ({reason})",
+            {
+                "verb": "expire_snapshots",
+                "engine": "pyiceberg",
+                "outcome": "skipped",
+                "detail": reason,
+            },
+        )
+
+    try:
+        catalog = _pyiceberg_catalog(cfg)
+        table = catalog.load_table((namespace, name))
+        # The id computation is inside this try on purpose: one table's
+        # unreadable metadata is one degraded table, never a run that
+        # takes the whole maintenance down with it.
+        ids, threshold, skip_reason = _snapshot_ids_to_expire(table, keep, now)
+    except Exception as exc:  # noqa: BLE001 -- any catalog failure is one degraded table, not a broken run
+        # The TYPE only: this detail is recorded in
+        # `lake.bronze_meta.maintenance_verb_run` and served by the API,
+        # so upstream (Lakekeeper/pyiceberg) text must never reach it
+        # (the same rule `_fetch_policy_index` follows).
+        detail = f"{type(exc).__name__}"
+        return (
+            f"expire_snapshots (the pyiceberg fallback could not read the table: "
+            f"{type(exc).__name__})",
+            {
+                "verb": "expire_snapshots",
+                "engine": "pyiceberg",
+                "outcome": "failed",
+                "detail": detail,
+            },
+        )
+    if skip_reason is not None:
+        # The reason states WHY the verb was skipped — the `engine` column
+        # already says `pyiceberg`, which is itself the signal that Trino
+        # was unreachable.
+        reason = skip_reason
+        return (
+            f"expire_snapshots ({reason})",
+            {
+                "verb": "expire_snapshots",
+                "engine": "pyiceberg",
+                "outcome": "skipped",
+                "detail": reason,
+            },
+        )
+    if not ids:
+        reason = f"no snapshot older than {threshold}"
+        return (
+            f"expire_snapshots ({reason})",
+            {
+                "verb": "expire_snapshots",
+                "engine": "pyiceberg",
+                "outcome": "skipped",
+                "detail": reason,
+            },
+        )
+
+    try:
+        table.maintenance.expire_snapshots().by_ids(ids).commit()
+    except Exception as exc:  # noqa: BLE001 -- the expiry failed; the table's other maintenance still runs
+        # The TYPE only, for the same reason as the load failure above:
+        # the recorded detail is served by the API.
+        detail = f"{type(exc).__name__}"
+        return (
+            f"expire_snapshots (the pyiceberg fallback failed: {type(exc).__name__})",
+            {
+                "verb": "expire_snapshots",
+                "engine": "pyiceberg",
+                "outcome": "failed",
+                "detail": detail,
+            },
+        )
+
+    detail = (
+        f"expired {len(ids)} snapshot(s) older than {threshold}; their files are "
+        f"reclaimed by remove_orphan_files, which protects files younger than "
+        f"{ORPHAN_FILE_AGE_FLOOR_SECONDS}s (3 days), so the space comes back "
+        "about 3 days later"
+    )
+    return (
+        None,
+        {
+            "verb": "expire_snapshots",
+            "engine": "pyiceberg",
+            "outcome": "applied",
+            "detail": detail,
+        },
+    )
+
+
+def _expire_snapshots_trino(
+    cfg: MaintenanceConfig,
+    namespace: str,
+    name: str,
+    policy: dict[str, Any] | None,
+    now: datetime,
+) -> tuple[str | None, dict[str, str] | None]:
+    """This table's `expire_snapshots` verb through Trino — the path that
+    runs whenever Trino answers. Returns the same
+    `(skipped_verbs_entry, verb_run_record)` shape as
+    `_expire_snapshots_result`.
+
+    A Trino that is NOT there raises `TrinoUnavailableError` out of here,
+    and the caller falls back to `pyiceberg`: an unreachable Trino is a
+    degraded state (Trino runs only under this stack's `trino` compose
+    profile), never a refusal. A Trino that ANSWERS and refuses (e.g.
+    its `iceberg.expire-snapshots.min-retention` floor) raises
+    `TrinoQueryError` and keeps today's behaviour exactly: `refused` or
+    `failed`, never a fallback."""
     keep = None if policy is None else policy.get("snapshotsToKeep")
     if keep is None:
         sql = (
@@ -986,16 +1404,6 @@ def _expire_snapshots_result(
         )
         try:
             _trino_execute(cfg, sql)
-        except TrinoUnavailableError:
-            return (
-                _TRINO_UNREACHABLE_SKIP,
-                {
-                    "verb": "expire_snapshots",
-                    "engine": "trino",
-                    "outcome": "skipped",
-                    "detail": "trino unreachable",
-                },
-            )
         except TrinoQueryError as exc:
             detail = str(exc)
             return (
@@ -1017,23 +1425,11 @@ def _expire_snapshots_result(
             },
         )
 
-    cadence_ok, cadence_reason = _cadence_allows(policy.get("schedule"), now, last_run_at)
-    if not cadence_ok:
-        return (
-            f"expire_snapshots ({cadence_reason})",
-            {"verb": "expire_snapshots", "engine": "trino", "outcome": "skipped", "detail": cadence_reason or ""},
-        )
-
     try:
         rows = _trino_execute(
             cfg,
             f'SELECT committed_at FROM iceberg.{namespace}."{name}$snapshots" '
             "ORDER BY committed_at DESC",
-        )
-    except TrinoUnavailableError:
-        return (
-            _TRINO_UNREACHABLE_SKIP,
-            {"verb": "expire_snapshots", "engine": "trino", "outcome": "skipped", "detail": "trino unreachable"},
         )
     except TrinoQueryError as exc:
         detail = str(exc)
@@ -1056,11 +1452,6 @@ def _expire_snapshots_result(
     )
     try:
         _trino_execute(cfg, sql)
-    except TrinoUnavailableError:
-        return (
-            _TRINO_UNREACHABLE_SKIP,
-            {"verb": "expire_snapshots", "engine": "trino", "outcome": "skipped", "detail": "trino unreachable"},
-        )
     except TrinoQueryError as exc:
         # Most likely Trino's `iceberg.expire-snapshots.min-retention`
         # floor (7 days by default, unset in this stack) refusing a
@@ -1080,6 +1471,54 @@ def _expire_snapshots_result(
             "detail": f"retention_threshold={threshold}",
         },
     )
+
+
+def _expire_snapshots_result(
+    cfg: MaintenanceConfig,
+    namespace: str,
+    name: str,
+    policy: dict[str, Any] | None,
+    now: datetime,
+    last_run_at: datetime | None,
+) -> tuple[str | None, dict[str, str] | None]:
+    """Decides and executes this table's `expire_snapshots` verb. Returns
+    `(skipped_verbs_entry, verb_run_record)`: `skipped_verbs_entry` is
+    `None` exactly when the verb genuinely ran (it must not also be
+    recorded as skipped); `verb_run_record` is `None` only when no verb
+    ran or was skipped with a recorded run.
+
+    Trino first, exactly as before: when Trino answers, its path is the
+    one that runs. Only an UNREACHABLE Trino (this stack's `trino`
+    compose profile is off) switches to the `pyiceberg` fallback, which
+    expires the same snapshots through the same catalog the ingest job
+    writes through — "trino unreachable" is no longer the outcome of
+    this verb.
+
+    The schedule cadence is checked BEFORE any engine is tried: a
+    cadence refusal is a policy decision, not an engine problem, so it
+    never triggers the fallback.
+
+    When `snapshotsToKeep` is specified in `policy`, the retention
+    threshold preserves that many snapshots. When no policy is set or
+    `snapshotsToKeep` is None, applies `DEFAULT_SNAPSHOT_RETENTION`
+    ('7d') unconditionally (OPS-1 Decision D1)."""
+    keep = None if policy is None else policy.get("snapshotsToKeep")
+
+    if keep is not None:
+        cadence_ok, cadence_reason = _cadence_allows(policy.get("schedule"), now, last_run_at)
+        if not cadence_ok:
+            # The cadence gate refuses BEFORE an engine is chosen, so no
+            # engine ran: `none`, not a guess at the one that would have
+            # (the verb may run through Trino or through the catalog).
+            return (
+                f"expire_snapshots ({cadence_reason})",
+                {"verb": "expire_snapshots", "engine": "none", "outcome": "skipped", "detail": cadence_reason or ""},
+            )
+
+    try:
+        return _expire_snapshots_trino(cfg, namespace, name, policy, now)
+    except TrinoUnavailableError:
+        return _expire_snapshots_pyiceberg(cfg, namespace, name, policy, now)
 
 
 def _optimize_result(
@@ -1226,6 +1665,7 @@ def maintain_bronze_table(context, payload: dict[str, Any]) -> dict[str, Any]:
         payload["table_name"],
         payload["policy"],
         payload["policy_fetch_error"],
+        context=context,
     )
 
 
