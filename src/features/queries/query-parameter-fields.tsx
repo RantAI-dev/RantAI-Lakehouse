@@ -6,6 +6,7 @@ import { Label } from "@/components/ui/label"
 import type { QueryParamDef, QueryParamValue } from "@/services/contracts/queries"
 import { ParameterControl } from "./query-parameter-control"
 import { ParameterMenu } from "./query-parameter-menu"
+import { cn } from "@/lib/utils"
 
 /**
  * One field for each `{{name}}` in the open tab's SQL (`QS-5`), in the order
@@ -22,6 +23,7 @@ export function QueryParameterFields({
   invalid,
   onValueChange,
   onDefinitionChange,
+  className,
 }: {
   /** The definitions of the names the SQL uses, in order. */
   readonly definitions: readonly QueryParamDef[]
@@ -35,10 +37,16 @@ export function QueryParameterFields({
   /** `undefined` means the field holds no value now. */
   readonly onValueChange: (name: string, value: QueryParamValue | undefined) => void
   readonly onDefinitionChange: (def: QueryParamDef) => void
+  /** Where the fields sit in the editor's box (`UX-9`). */
+  readonly className?: string
 }) {
   if (definitions.length === 0) return null
   return (
-    <div role="group" aria-label="Query parameters" className="flex flex-wrap items-start gap-x-4 gap-y-2">
+    <div
+      role="group"
+      aria-label="Query parameters"
+      className={cn("flex flex-wrap items-start gap-x-4 gap-y-2", className)}
+    >
       {definitions.map((def) => (
         // The type is part of the key: a field whose type changed starts
         // over, with none of the old control's half-typed text.

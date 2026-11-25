@@ -51,6 +51,16 @@
     from { opacity: 0; transform: translateY(4px); }
     to { opacity: 1; transform: translateY(0); }
   }
+  /*
+   * UX-9: Query Studio's running bar, a short segment crossing the top of
+   * the result area while a statement runs, so a wait reads as work going
+   * on. Transform only; the reduced-motion rule below stops it.
+   */
+  --animate-studio-running: studio-running 1.2s var(--ease-move) infinite;
+  @keyframes studio-running {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(400%); }
+  }
 }
 
 /*
@@ -365,4 +375,23 @@ html.embed-transparent body {
   to {
     stroke-dashoffset: -12;
   }
+}
+
+/*
+ * UX-9 browser review: the SQL editor's completion list. Its rows are `li`,
+ * which the base scale above sets to 16 px; the list reads at the editor's
+ * own size instead. Query Studio's completion turns CodeMirror's emoji icons
+ * off (they drew as empty boxes in the console's fonts) and ends each row
+ * with a small word for what it is (`sql-completion-source.ts`).
+ */
+.cm-tooltip-autocomplete > ul > li {
+  font-size: 13px;
+  line-height: 20px;
+}
+.cm-tooltip-autocomplete .cm-completionKind {
+  float: right;
+  padding-left: 1.5em;
+  font-family: var(--font-sans);
+  font-size: 11px;
+  color: var(--muted-foreground);
 }

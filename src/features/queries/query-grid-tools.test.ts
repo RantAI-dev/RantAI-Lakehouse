@@ -6,7 +6,9 @@ import { describe, expect, it } from "bun:test"
 import {
   cellText,
   columnStatistics,
+  compareNumericCells,
   filterRows,
+  formatDecimalText,
   histogram,
 } from "./query-grid-tools"
 
@@ -226,5 +228,37 @@ describe("histogram", () => {
     expect(shape.bins[shape.bins.length - 1]?.upper).toBe(3.75)
     const counted = shape.bins.reduce((sum, bin) => sum + bin.count, 0)
     expect(counted).toBe(4)
+  })
+})
+
+// UX-9 browser review: ClickHouse sends a 64-bit integer as text, so the grid
+// gives numeric text its separators itself, without changing a digit.
+describe("formatDecimalText", () => {
+  it("groups the thousands of an integer in the locale's way", () => {
+    expect(formatDecimalText("3010348", "en-US")).toBe("3,010,348")
+    expect(formatDecimalText("3010348", "id-ID")).toBe("3.010.348")
+    expect(formatDecimalText("-1500", "en-US")).toBe("-1,500")
+  })
+
+  it("keeps every digit of an integer past 2^53", () => {
+    expect(formatDecimalText("18446744073709551615", "en-US")).toBe("18,446,744,073,709,551,615")
+  })
+
+  it("keeps the fraction as sent, with the locale's decimal mark", () => {
+    expect(formatDecimalText("1234.50", "en-US")).toBe("1,234.50")
+    expect(formatDecimalText("1234.5", "id-ID")).toBe("1.234,5")
+  })
+
+  it("leaves text that is not a canonical decimal as it is", () => {
+    expect(formatDecimalText("007", "en-US")).toBe("007")
+    expect(formatDecimalText("1e5", "en-US")).toBe("1e5")
+    expect(formatDecimalText("+5", "en-US")).toBe("+5")
+  })
+})
+
+describe("compareNumericCells", () => {
+  it("orders numbers and numeric text by value, with nulls last", () => {
+    const cells = ["10", 9, null, "100", "2"]
+    expect([...cells].sort(compareNumericCells)).toEqual(["2", 9, "10", "100", null])
   })
 })

@@ -152,5 +152,34 @@ const keywords: CompletionSource = (context) => {
  * inside a comment or a quoted run.
  */
 export function sqlCompletionExtension(source: CompletionSource): Extension {
-  return autocompletion({ override: [source, keywords] })
+  return autocompletion({
+    override: [source, keywords],
+    // UX-9 browser review, SHOULD-FIX 3: CodeMirror's icons are emoji
+    // glyphs (`🔑︎` for a keyword) that the console's fonts do not have, so
+    // they drew as empty boxes. The icons are off (`icons` combines with
+    // AND, so this wins over the editor's basic setup) and each option says
+    // what it is in a small word at its end instead.
+    icons: false,
+    addToOptions: [{ render: renderKindLabel, position: 90 }],
+  })
+}
+
+/** The word an option's `type` (set in `toCompletion`, or the keywords' own) is shown as. */
+const KIND_LABEL: Record<string, string> = {
+  property: "column",
+  class: "table",
+  variable: "parameter",
+  keyword: "keyword",
+  type: "type",
+}
+
+/** The small, muted kind word at the end of a completion option; nothing for a message. */
+export function renderKindLabel(completion: { type?: string }): Node | null {
+  const word = completion.type ? KIND_LABEL[completion.type.split(/\s+/)[0] ?? ""] : undefined
+  if (!word) return null
+  const label = document.createElement("span")
+  label.className = "cm-completionKind"
+  label.textContent = word
+  label.setAttribute("aria-hidden", "true")
+  return label
 }

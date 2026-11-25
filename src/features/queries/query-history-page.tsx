@@ -3,10 +3,17 @@
 import * as React from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
+import { EllipsisIcon, ExternalLinkIcon, ScrollTextIcon } from "lucide-react"
 import { PageHeader } from "@/components/patterns/page-header"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { StatusBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { Input } from "@/components/ui/input"
 import { useService } from "@/hooks/use-service"
 import { formatDateTime, formatDuration } from "@/lib/format"
@@ -102,6 +109,38 @@ function Pill({
   )
 }
 
+/** The row menu of one run: open it in the Studio, and its audit event when it has one. */
+function RunActions({ run }: { run: QueryHistoryItem }) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-7"
+            aria-label={`Actions for the run at ${formatDateTime(run.at)}`}
+          />
+        }
+      >
+        <EllipsisIcon className="size-4" aria-hidden />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuItem render={<Link href={studioHref(run)} />}>
+          <ExternalLinkIcon className="size-3.5" data-icon="inline-start" />
+          Open in Studio
+        </DropdownMenuItem>
+        {run.auditEventId ? (
+          <DropdownMenuItem render={<Link href={`/audit?event=${run.auditEventId}`} />}>
+            <ScrollTextIcon className="size-3.5" data-icon="inline-start" />
+            View in Audit
+          </DropdownMenuItem>
+        ) : null}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
 /**
  * Every run this caller made in the last 14 days, filtered, newest first
  * (`QS-4`, D1/D2/D5/D6). The server owns the window and the page size;
@@ -191,8 +230,9 @@ export function QueryHistoryPage() {
       <PageHeader
         title="Query History"
         description="Every run of yours that reached an answer, in the last 14 days."
+        // UX-9: the sections are the header's own control now.
+        actions={<QueryStudioTabs />}
       />
-      <QueryStudioTabs />
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-md border bg-card px-3 py-2">
         <div className="flex items-center gap-1" role="group" aria-label="Filter by status">
           <Pill pressed={status === "all"} onClick={() => setStatus("all")}>
@@ -298,6 +338,9 @@ export function QueryHistoryPage() {
                   <th className="px-3 py-2 font-medium">Duration</th>
                   <th className="px-3 py-2 font-medium">Tables</th>
                   <th className="px-3 py-2 font-medium">SQL</th>
+                  <th className="w-10 px-1 py-2">
+                    <span className="sr-only">Actions</span>
+                  </th>
                 </tr>
               </thead>
               <tbody className="divide-y">
@@ -317,6 +360,11 @@ export function QueryHistoryPage() {
                       if (event.button !== 0) return
                       if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
                       if ((event.target as HTMLElement).closest("a")) return
+                      // UX-9: the row menu renders in a portal, and React
+                      // bubbles its clicks here; a click that did not land
+                      // in the row's own cells is not the row's.
+                      if (!event.currentTarget.contains(event.target as Node)) return
+                      if ((event.target as HTMLElement).closest("button")) return
                       router.push(studioHref(run))
                     }}
                   >
@@ -352,6 +400,12 @@ export function QueryHistoryPage() {
                       {run.message ? (
                         <p className="mt-1 text-xs text-destructive">{run.message}</p>
                       ) : null}
+                    </td>
+                    {/* UX-9: the Studio's History card is gone; its per-run
+                        "Audit" link lives in this row menu, beside the way
+                        back into the Studio the row click already is. */}
+                    <td className="px-1 py-1.5 text-right">
+                      <RunActions run={run} />
                     </td>
                   </tr>
                 ))}

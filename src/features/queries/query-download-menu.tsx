@@ -1,12 +1,14 @@
 "use client"
 
 import * as React from "react"
-import { Download } from "lucide-react"
+import { Download, LoaderCircle } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuGroupLabel,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
@@ -74,15 +76,29 @@ export function QueryDownloadMenu({
       : "Downloads run on ClickHouse only."
   return (
     <DropdownMenu>
+      {/* UX-9: an icon in the result's header row; its name says the same
+          as the words did, and the reason it is off is its title. */}
       <DropdownMenuTrigger
         render={
-          <Button size="sm" variant="outline" disabled={disabled} title={reason} />
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            disabled={disabled}
+            title={reason ?? (busy !== null ? "Downloading…" : "Download")}
+            className="aria-expanded:bg-muted"
+          />
         }
       >
-        <Download className="size-4" aria-hidden />
-        {busy !== null ? "Downloading…" : "Download"}
+        {busy !== null ? (
+          <LoaderCircle className="size-4 animate-spin motion-reduce:animate-none" aria-hidden />
+        ) : (
+          <Download className="size-4" aria-hidden />
+        )}
+        <span className="sr-only">{busy !== null ? "Downloading…" : "Download"}</span>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
+      <DropdownMenuContent align="end" className="w-44">
+        <DropdownMenuGroup>
+          <DropdownMenuGroupLabel>Download as</DropdownMenuGroupLabel>
         {FORMATS.map((choice) => (
           <DropdownMenuItem
             key={choice.format}
@@ -91,6 +107,7 @@ export function QueryDownloadMenu({
             {choice.label}
           </DropdownMenuItem>
         ))}
+        </DropdownMenuGroup>
       </DropdownMenuContent>
     </DropdownMenu>
   )

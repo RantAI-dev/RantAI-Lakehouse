@@ -43,7 +43,15 @@ export type SaveQueryDraft = {
 }
 
 /** What the Save as SQL source page needs from the editor. */
-export type SaveSourceDraft = { sql: string }
+export type SaveSourceDraft = {
+  sql: string
+  /**
+   * `UX-9` Make a chart: where the page goes once the source is saved.
+   * `"chart"` opens the chart builder on the new source; absent goes back
+   * to Query Studio, as Save as SQL source always did.
+   */
+  next?: "chart"
+}
 
 function readJson(key: string): unknown {
   try {
@@ -112,7 +120,7 @@ export function readSaveSourceDraft(): SaveSourceDraft | null {
   if (typeof raw !== "object" || raw === null) return null
   const draft = raw as Partial<SaveSourceDraft>
   if (typeof draft.sql !== "string" || !draft.sql.trim()) return null
-  return { sql: draft.sql }
+  return draft.next === "chart" ? { sql: draft.sql, next: "chart" } : { sql: draft.sql }
 }
 
 export function writeSaveSourceDraft(draft: SaveSourceDraft): void {

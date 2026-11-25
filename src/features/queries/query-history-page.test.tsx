@@ -417,3 +417,32 @@ describe("QueryHistoryPage", () => {
     expect(screen.getByText("Clear a filter and try again.")).toBeTruthy()
   })
 })
+
+// UX-9: the Studio's History card is gone; its per-run "Audit" link lives in
+// each row's menu here, beside "Open in Studio".
+describe("QueryHistoryPage row menu", () => {
+  it("opens the run in the Studio and its audit event from the row's menu, without the row navigating", async () => {
+    spyOn(queryService, "listHistoryPage").mockResolvedValue(
+      pageOf([row({ id: "q-42", auditEventId: "ev-7" })], 1),
+    )
+    render(<QueryHistoryPage />)
+    const trigger = await screen.findByRole("button", { name: /^Actions for the run at / })
+    fireEvent.click(trigger)
+
+    const open = await screen.findByRole("menuitem", { name: "Open in Studio" })
+    expect(open.getAttribute("href")).toBe("/query-studio?run=q-42")
+    const audit = screen.getByRole("menuitem", { name: "View in Audit" })
+    expect(audit.getAttribute("href")).toBe("/audit?event=ev-7")
+    // Opening the menu is not a click on the row.
+    expect(pushed).toEqual([])
+  })
+
+  it("offers no audit item for a run without an audit event", async () => {
+    spyOn(queryService, "listHistoryPage").mockResolvedValue(pageOf([row({ id: "q-43" })], 1))
+    render(<QueryHistoryPage />)
+    fireEvent.click(await screen.findByRole("button", { name: /^Actions for the run at / }))
+
+    await screen.findByRole("menuitem", { name: "Open in Studio" })
+    expect(screen.queryAllByRole("menuitem", { name: "View in Audit" })).toHaveLength(0)
+  })
+})
