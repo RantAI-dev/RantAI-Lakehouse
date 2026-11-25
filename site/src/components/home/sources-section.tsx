@@ -4,7 +4,7 @@ import { Container, DisplayHeading, LeadText } from "@/components/shared/primiti
 import { ProgressSection } from "@/components/shared/progress-section";
 import { Reveal } from "@/components/shared/reveal";
 import { hoverColour, SourceIcon } from "@/components/shared/brand-icons";
-import { SOURCE_ICONS } from "@/lib/home-content";
+import { SOURCE_ICONS, SOURCES_PHONE } from "@/lib/home-content";
 import { SourcePills, SourcesHeadingFade } from "./sources-motion";
 
 /**
@@ -54,6 +54,8 @@ export function SourcesSection({ copy }: { copy: HomeCopy["sources"] }) {
               items={copy.items}
               marks={SOURCE_ICONS.map((id, i) => <SourceIcon key={i} id={id} className={PILL_MARK_CLASS} />)}
               colours={SOURCE_ICONS.map(hoverColour)}
+              phone={SOURCES_PHONE}
+              more={copy.more.replace("{count}", String(copy.items.length - SOURCES_PHONE.length))}
             />
           </ul>
           {/* Audit #26: the footnote is readable (14 px, ~8:1 on the water) and wraps without a widow. */}

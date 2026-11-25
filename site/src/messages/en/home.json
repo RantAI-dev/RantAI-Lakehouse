@@ -35,7 +35,8 @@
       "JSON, JSON Lines and Avro",
       "gzip and zip archives"
     ],
-    "caption": "Live change capture for PostgreSQL. Dedupe or keep history on load."
+    "caption": "Live change capture for PostgreSQL. Dedupe or keep history on load.",
+    "more": "+{count} more"
   },
   "depths": {
     "eyebrow": "Three depths",

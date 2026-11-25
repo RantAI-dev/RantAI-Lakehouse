@@ -35,7 +35,8 @@
       "JSON, JSON Lines, Avro",
       "Arsip gzip dan zip"
     ],
-    "caption": "Change capture langsung untuk PostgreSQL. Dedupe atau simpan riwayat."
+    "caption": "Change capture langsung untuk PostgreSQL. Dedupe atau simpan riwayat.",
+    "more": "+{count} lainnya"
   },
   "depths": {
     "eyebrow": "Tiga kedalaman",

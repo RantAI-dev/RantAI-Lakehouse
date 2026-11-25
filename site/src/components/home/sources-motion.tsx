@@ -46,27 +46,35 @@ export function SourcesHeadingFade({ children }: { children: React.ReactNode }) 
  * layout (`offsetTop`, which transforms do not change), again whenever the
  * list rewraps; until then, list order.
  */
-function useLandingOrder(listRef: React.RefObject<HTMLLIElement | null>, count: number): number[] {
-  const [order, setOrder] = React.useState<number[]>(() => Array.from({ length: count }, (_, i) => i));
+function useLandingOrder(listRef: React.RefObject<HTMLLIElement | null>, count: number): { order: number[]; shown: number } {
+  const [state, setState] = React.useState(() => ({ order: Array.from({ length: count }, (_, i) => i), shown: count }));
   React.useEffect(() => {
     const list = listRef.current?.parentElement;
     if (!list) return;
     const measure = () => {
-      const pills = [...list.querySelectorAll<HTMLLIElement>(":scope > li:not([hidden])")];
-      const rows = [...new Set(pills.map((p) => p.offsetTop))].sort((a, b) => b - a);
+      const pills = [...list.querySelectorAll<HTMLLIElement>(":scope > li[data-pill]")];
+      // Owner QA 2026-11-25: on a phone only some pills are on show (the others are visually
+      // hidden, 1 px wide); only those are ranked, and the rest land last, unseen.
+      const onShow = pills.map((p) => p.offsetWidth > 1);
+      const seen = pills.filter((_, i) => onShow[i]);
+      const rows = [...new Set(seen.map((p) => p.offsetTop))].sort((a, b) => b - a);
       const ranked = pills
-        .map((p, i) => ({ i, row: rows.indexOf(p.offsetTop), left: p.offsetLeft }))
+        .map((p, i) => ({ i, row: onShow[i] ? rows.indexOf(p.offsetTop) : rows.length, left: p.offsetLeft }))
         .sort((a, b) => a.row - b.row || a.left - b.left);
       const next = Array.from({ length: pills.length }, () => 0);
       ranked.forEach((r, k) => (next[r.i] = k));
-      setOrder((prev) => (prev.length === next.length && prev.every((v, i) => v === next[i]) ? prev : next));
+      setState((prev) =>
+        prev.shown === seen.length && prev.order.length === next.length && prev.order.every((v, i) => v === next[i])
+          ? prev
+          : { order: next, shown: seen.length },
+      );
     };
     measure();
     const ro = new ResizeObserver(measure);
     ro.observe(list);
     return () => ro.disconnect();
   }, [listRef, count]);
-  return order;
+  return state;
 }
 
 /**
@@ -79,17 +87,23 @@ export function SourcePills({
   items,
   marks,
   colours,
+  phone,
+  more,
 }: {
   items: readonly string[];
   marks: readonly React.ReactNode[];
   colours: readonly string[];
+  /** Owner QA 2026-11-25: the pills on show below 1024 px; the others are visually hidden there. */
+  phone: readonly number[];
+  /** The line after them on a phone, "+11 more". */
+  more: string;
 }) {
   const reduced = useReducedMotionSafe();
   const progress = useProgress();
   // A hidden, empty item, so the order can find the list it sits in (hidden
   // items are not announced and take no place in the wrap).
   const markerRef = React.useRef<HTMLLIElement>(null);
-  const order = useLandingOrder(markerRef, items.length);
+  const { order, shown } = useLandingOrder(markerRef, items.length);
   return (
     <>
       <li ref={markerRef} hidden />
@@ -100,12 +114,34 @@ export function SourcePills({
           mark={marks[i]}
           colour={colours[i] ?? "#8fcbff"}
           index={order[i] ?? i}
-          count={items.length}
+          count={shown}
           progress={progress}
           animate={!reduced}
+          className={phone.includes(i) ? undefined : "max-lg:sr-only"}
         />
       ))}
+      {/* Plain text, not a pill: it is not a control. The list above already names every source. */}
+      <MoreLine label={more} progress={progress} animate={!reduced} />
     </>
+  );
+}
+
+const MORE_CLASS = "inline-flex items-center px-2 py-1 text-[12px] text-[#E8F4FF]/60 lg:hidden";
+
+/** Owner QA 2026-11-25: "+11 more" on a phone, fading in once the last pill has landed. */
+function MoreLine({ label, progress, animate }: { label: string; progress: MotionValue<number>; animate: boolean }) {
+  const opacity = useTransform(progress, [0.66, 0.76], [0, 1]);
+  if (!animate) {
+    return (
+      <li aria-hidden="true" className={MORE_CLASS}>
+        {label}
+      </li>
+    );
+  }
+  return (
+    <m.li aria-hidden="true" data-reveal className={MORE_CLASS} style={{ opacity }}>
+      {label}
+    </m.li>
   );
 }
 
@@ -148,6 +184,7 @@ function SourcePill({
   count,
   progress,
   animate,
+  className,
 }: {
   label: string;
   mark: React.ReactNode;
@@ -156,15 +193,16 @@ function SourcePill({
   count: number;
   progress: MotionValue<number>;
   animate: boolean;
+  className?: string;
 }) {
   if (!animate) {
     return (
-      <li className={`${PILL_CLASS} border-[#44A6FA]/30 bg-[#44A6FA]/10`} style={{ "--lk-brand": colour } as React.CSSProperties}>
+      <li data-pill className={`${PILL_CLASS} border-[#44A6FA]/30 bg-[#44A6FA]/10 ${className ?? ""}`} style={{ "--lk-brand": colour } as React.CSSProperties}>
         <PillContent label={label} mark={mark} />
       </li>
     );
   }
-  return <FallingPill label={label} mark={mark} colour={colour} index={index} count={count} progress={progress} />;
+  return <FallingPill label={label} mark={mark} colour={colour} index={index} count={count} progress={progress} className={className} />;
 }
 
 function FallingPill({
@@ -174,6 +212,7 @@ function FallingPill({
   index,
   count,
   progress,
+  className,
 }: {
   label: string;
   mark: React.ReactNode;
@@ -181,6 +220,7 @@ function FallingPill({
   index: number;
   count: number;
   progress: MotionValue<number>;
+  className?: string;
 }) {
   // Staggered: the first droplet leaves at 0.10, the last arrives by 0.80.
   // WEB-5 T6: the step shrinks when the list grows (19 sources now), so the
@@ -218,7 +258,8 @@ function FallingPill({
   return (
     <m.li
       data-reveal
-      className={PILL_CLASS}
+      data-pill
+      className={`${PILL_CLASS} ${className ?? ""}`}
       style={{
         y,
         x,

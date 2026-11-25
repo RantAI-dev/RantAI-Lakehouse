@@ -141,6 +141,13 @@ export const SOURCE_ICONS = [
   "archive", // gzip and zip archives
 ] as const;
 
+/**
+ * WEB-5 owner QA 2026-11-25 ("list listnya keknya banyak banget di mobile"): below 1024 px the
+ * sources section shows these eight best-known sources (indexes into `SOURCE_ICONS` and the copy's
+ * `sources.items`) and a "+11 more" line; the others stay in the list for screen readers.
+ */
+export const SOURCES_PHONE: readonly number[] = [0, 1, 2, 3, 5, 7, 11, 12];
+
 export type DepthId = "bronze" | "silver" | "gold";
 
 export type DepthLayer = {
