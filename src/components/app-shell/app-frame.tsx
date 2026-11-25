@@ -9,6 +9,7 @@ import { CopilotDock } from "@/features/copilot/copilot-dock";
 import { cn } from "@/lib/utils";
 import { CopilotSidebar } from "@/features/copilot/copilot-sidebar";
 import { CopilotProvider } from "@/features/copilot/use-copilot";
+import { SidePanelProvider } from "@/components/app-shell/side-panel";
 import { CommandPalette } from "@/components/command-palette";
 import { isPublicPath, useAuth } from "@/features/auth/auth-provider";
 import { SsoNotice } from "@/features/auth/sso-notice";
@@ -37,7 +38,10 @@ export function AppFrame({ children }: Readonly<{ children: React.ReactNode }>) 
   if (isPublicPath(pathname)) return <>{children}</>;
 
   return (
-    <SidebarProvider>
+    // `--app-navbar-h`: the navbar's height, set once here for the whole shell. The navbar, the
+    // sidebar's logo row and every offset under the navbar (page frames, sticky strips, side panels)
+    // read it, so a change of height is one edit (owner 2026-11-14: 48 px, was 64).
+    <SidebarProvider className="[--app-navbar-h:3rem]">
       {/* The workspace's name and pictures are read once for the whole
           shell (`adm-121`); the branding route is public, so the request
           needs no session and starts beside the session check. */}
@@ -80,7 +84,8 @@ function AuthenticatedFrame({
   hasAssistant,
 }: Readonly<{ children: React.ReactNode; hasAssistant: boolean }>) {
   return (
-    <>
+    // BI-61 T6: the one right side panel the Copilot and a page's own panels share.
+    <SidePanelProvider>
       <AppSidebar />
       {/*
         Owner QA 2026-11-14, composer (DESIGN.md §3, "Elemen melayang diletakkan di tengah area
@@ -127,11 +132,12 @@ function AuthenticatedFrame({
             <VersionBanner />
             <RouteGuard>{children}</RouteGuard>
           </main>
-          {hasAssistant && <CopilotSidebar />}
+          {/* Mounted for everyone: without the assistant it opens only for a page's tabs (BI-61 T6). */}
+          <CopilotSidebar hasAssistant={hasAssistant} />
         </div>
         {hasAssistant && <CopilotDock />}
       </SidebarInset>
       <CommandPalette />
-    </>
+    </SidePanelProvider>
   );
 }

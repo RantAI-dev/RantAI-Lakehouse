@@ -3,6 +3,7 @@
 import * as React from "react";
 import { cn } from "@/lib/utils";
 import { settleLayout } from "@/lib/grid-layout";
+import { reflowNarrow } from "@/lib/grid-reflow";
 import {
   PHONE_MAX_WIDTH, collapseLayout, foldedTiles, phoneOrder, placeUnboxed, tabOf,
 } from "@/lib/dashboard-tabs";
@@ -14,11 +15,21 @@ import { useFolded } from "./use-folded";
 export type TileMenuItem = {
   label: string;
   icon: React.ReactNode;
+  /** Ignored when `sub` is given: the item opens its submenu instead. */
   onSelect: () => void;
   destructive?: boolean;
   /** Start a new group: a separator is drawn above this item. */
   separatorBefore?: boolean;
+  /** The item is a submenu of these (`BI-61` T4: "Download ›"). */
+  sub?: TileMenuItem[];
 };
+
+/**
+ * How a tile is drawn: `card`, the bordered card of the embed and the public
+ * link; `soft`, the dashboard page's own (`BI-61` T4, layout A): a soft fill
+ * with no border and no badge, whose ⋯ and "Data from" line show on hover.
+ */
+export type TileLook = "card" | "soft";
 
 export type GridItem = {
   id: string;
@@ -34,6 +45,14 @@ export type GridItem = {
   body: React.ReactNode;
   /** Heading of the ⋯ menu (e.g. where the data comes from). */
   menuLabel?: string;
+  /**
+   * One quiet line at the top of the ⋯ menu (`soft` look): when the data is from
+   * and what the tile reads ("12:47 · mart_wisman"), with the full sentence as
+   * `detail` for the tooltip and screen readers (BI-61 review round 1, SHOULD-FIX 3).
+   */
+  menuNote?: { label: string; detail: string };
+  /** "Data from 12:47", shown on hover in the `soft` look's header. */
+  dataFrom?: string | null;
   menu?: TileMenuItem[];
 };
 
@@ -65,10 +84,18 @@ type Drag = { id: string; mode: "move" | "resize"; px: number; py: number; box: 
  * the tiles below it (the viewer's own state, `foldKey`); and a canvas narrower
  * than 640 px, or one in `phoneEdit`, is drawn as one full-width column
  * (`PhoneStack`) in the order of the phone layout, else the reading order.
+ *
+ * Between the two, a reading viewer whose canvas squeezes a tile under 240 px
+ * (one that is wide enough on a 1200 px canvas) sees that row laid out again
+ * in balanced rows that never narrow a tile (`reflowNarrow`, owner QA
+ * 2026-11-15; BI-61 review, reflow SHOULD-FIX 1 and 2); the saved layout is
+ * untouched and edit mode shows it as saved.
  */
 export function DashboardGrid({
-  items, layout, editable, onLayoutChange, tabs, tab, phone, phoneEdit, onPhoneChange, foldKey,
+  items, layout, editable, onLayoutChange, tabs, tab, phone, phoneEdit, onPhoneChange, foldKey, look = "card",
 }: {
+  /** How the tiles are drawn; the dashboard page passes `soft` (`BI-61` T4). */
+  look?: TileLook;
   items: GridItem[];
   layout: LayoutMap;
   editable: boolean;
@@ -122,6 +149,28 @@ export function DashboardGrid({
   // Edit mode shows everything; folding is for reading.
   const folding = !editable && !phoneEdit;
 
+  const hiddenIds = folding && !stacked ? foldedTiles(kinds, view, folded) : new Set<string>();
+  const drawn = hiddenIds.size ? collapseLayout(view, kinds, hiddenIds) : view;
+  // Owner QA 2026-11-15: reading, a row with a tile the space squeezes under 240 px is laid out again
+  // (`reflowNarrow`, BI-61 review, reflow SHOULD-FIX 1 and 2); edit mode draws the saved grid, so its
+  // author edits what is saved.
+  const laid = editable || stacked ? drawn : reflowNarrow(drawn, width, { cols: COLS, margin: MARGIN });
+  const reflowKey = laid === drawn ? "" : Object.keys(laid).filter((id) => laid[id].w !== drawn[id]?.w || laid[id].x !== drawn[id]?.x).sort().join(" ");
+  // A tile that changes row because of the reflow moves there at once: when a side panel opens,
+  // the tiles do not all glide across the canvas. Their 200 ms glide is back a frame later.
+  const [seenKey, setSeenKey] = React.useState(reflowKey);
+  const [instant, setInstant] = React.useState(false);
+  if (seenKey !== reflowKey) {
+    setSeenKey(reflowKey);
+    setInstant(true);
+  }
+  React.useEffect(() => {
+    if (!instant) return;
+    let inner = 0;
+    const outer = requestAnimationFrame(() => { inner = requestAnimationFrame(() => setInstant(false)); });
+    return () => { cancelAnimationFrame(outer); cancelAnimationFrame(inner); };
+  }, [instant]);
+
   // Margin hanya menjadi gap ANTAR kolom/baris. Kanvas tidak menambahkan
   // inset luar agar tepi tile sejajar dengan KPI dan konten dashboard lain.
   const colW = width > 0 ? (width - MARGIN * (COLS - 1)) / COLS : 0;
@@ -147,6 +196,7 @@ export function DashboardGrid({
           items={shown}
           order={ordered.filter((p) => !hidden.has(p.id))}
           editing={Boolean(phoneEdit)}
+          look={look}
           folded={folded}
           onToggleFold={toggleFold}
           onChange={onPhoneChange}
@@ -155,10 +205,7 @@ export function DashboardGrid({
     );
   }
 
-  const hiddenIds = folding ? foldedTiles(kinds, view, folded) : new Set<string>();
-  const drawn = hiddenIds.size ? collapseLayout(view, kinds, hiddenIds) : view;
-
-  const maxY = Math.max(0, ...Object.values(drawn).map((b) => b.y + b.h));
+  const maxY = Math.max(0, ...Object.values(laid).map((b) => b.y + b.h));
   const canvasH = maxY > 0
     ? maxY * ROW_H + (maxY - 1) * MARGIN + (editable ? unitY : 0)
     : 0;
@@ -200,32 +247,45 @@ export function DashboardGrid({
     <div ref={ref} className="dash-canvas relative w-full" style={{ height: canvasH, minHeight: 200 }}>
       {editable ? (
         <div
-          className="pointer-events-none absolute inset-0 rounded-lg"
+          // Micro-interaction audit 2026-11-14: the column lines fade in with edit mode.
+          className="pointer-events-none absolute inset-0 rounded-lg opacity-25 transition-opacity duration-200 ease-ui starting:opacity-0"
           style={{
             backgroundImage: `linear-gradient(90deg, var(--border) 1px, transparent 1px)`,
             backgroundSize: `${unitX}px 100%`,
             backgroundPosition: "0 0",
-            opacity: 0.25,
           }}
         />
       ) : null}
       {shown.map((it) => {
-        const b = drawn[it.id];
+        const b = laid[it.id];
         if (!b) return null;
         const dragging = drag?.id === it.id;
         const onMove = editable ? (e: React.PointerEvent) => startDrag(e, it.id, "move") : undefined;
         return (
-          <div key={it.id} style={boxStyle(b)} className={cn("dash-tile transition-[left,top,width,height]", dragging && "z-20 transition-none")}>
+          <div key={it.id} style={boxStyle(b)} className={cn(
+            // Micro-interaction audit 2026-11-14: the tiles a drag pushes aside glide on the console's
+            // ease-out (was Tailwind's 150 ms default curve); the one under the pointer follows it at once.
+            "dash-tile transition-[left,top,width,height] duration-200 ease-ui in-data-[sidebar-moving]:transition-none",
+            dragging && "z-20 transition-none",
+            instant && "transition-none",
+          )}>
             {isSectionKind(it.kind) ? (
               <SectionTile item={it} editable={editable} folded={folded.has(it.id)} onToggle={() => toggleFold(it.id)} onHeaderPointerDown={onMove} />
             ) : (
-              <TileCard item={it} editable={editable} dragging={dragging} onHeaderPointerDown={onMove} />
+              <TileCard item={it} editable={editable} dragging={dragging} onHeaderPointerDown={onMove} look={look} />
             )}
-            {/* Resize handle (bottom-right corner, visible) */}
+            {/* Resize handle (bottom-right corner, visible). Inside the tile box: a handle that sticks out
+                (it was -bottom-1 -right-1) widens the scroll region by 4 px on the rightmost column, which is
+                what gave edit mode a horizontal scrollbar (owner QA 2026-11-15). */}
             {editable ? (
               <div
                 onPointerDown={(e) => startDrag(e, it.id, "resize")}
-                className="absolute -bottom-1 -right-1 z-10 grid size-6 cursor-se-resize place-items-center rounded-md border border-border bg-card text-muted-foreground shadow-sm hover:bg-muted hover:text-foreground"
+                className={cn(
+                  // Micro-interaction audit 2026-11-14: the corner grows in with edit mode and answers hover and press.
+                  "absolute bottom-1 right-1 z-10 grid size-6 cursor-se-resize place-items-center rounded-md text-muted-foreground shadow-sm hover:bg-muted hover:text-foreground",
+                  "transition-[opacity,scale,background-color,color] duration-200 ease-ui starting:scale-90 starting:opacity-0 active:scale-110",
+                  look === "soft" ? "bg-background ring-1 ring-foreground/10" : "border border-border bg-card",
+                )}
                 style={{ touchAction: "none" }}
                 title="Drag to resize"
               >

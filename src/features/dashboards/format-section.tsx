@@ -1,5 +1,6 @@
 "use client";
 
+import { SuggestInput } from "@/components/patterns/suggest-input"
 import * as React from "react";
 import { Plus, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -532,8 +533,7 @@ function SeriesAdder({ names, taken, onAdd }: { readonly names: readonly string[
   };
   return (
     <div className="flex min-w-0 items-center gap-1.5">
-      <Input className="min-w-0 flex-1" value={text} list="series-names" placeholder="Pick or type a series" aria-label="Series name" onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }} />
-      <datalist id="series-names">{names.map((n) => <option key={n} value={n} />)}</datalist>
+      <SuggestInput className="min-w-0 flex-1" value={text} suggestions={names.map((n) => ({ value: n }))} placeholder="Pick or type a series" aria-label="Series name" onValueChange={setText} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }} />
       <Button type="button" size="sm" variant="outline" className="shrink-0" onClick={add}><Plus className="size-3" aria-hidden /> Add</Button>
     </div>
   );

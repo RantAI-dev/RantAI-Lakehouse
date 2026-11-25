@@ -247,7 +247,10 @@ describe("reference lines", () => {
   test("a band is a shaded area between two values and widens the axis", () => {
     const o = withReferenceLines(base(), [{ kind: "band", value: 500, to: 9000, label: "Normal", color: "#00aa00" }], false, false, ctx()) as unknown as Marks & { yAxis: { max: (r: { max: number }) => number } }
     expect(o.series[0]!.markArea?.data).toHaveLength(1)
-    expect(o.yAxis.max({ max: 100 })).toBe(9000)
+    // BI-72 decision 2: a widened axis ends on a round step, not on the line itself.
+    // niceCeil(9000, 0): five intervals is 1800, the next step is 2000, and the
+    // first multiple of 2000 at or above 9000 is 10000.
+    expect(o.yAxis.max({ max: 100 })).toBe(10000)
   })
 
   test("a computed line with nothing on screen to compute from is left out", () => {

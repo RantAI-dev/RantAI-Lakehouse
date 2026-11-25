@@ -1711,6 +1711,46 @@ pub(crate) fn parse_endpoint_host_port(endpoint: &str) -> Option<(&str, u16)> {
     }
 }
 
+/// Why [`pinned_https_client`] gave no client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinRefusal {
+    /// The address is not an `https` address with a host.
+    NotHttps,
+    /// The host did not resolve, or resolves inside the deployment's network.
+    Refused,
+    /// The client could not be built.
+    Build,
+}
+
+/// A client for one `https` address, pinned to the addresses
+/// [`resolve_checked`] approved for its host (so a name that resolves inside
+/// the deployment's network is refused and a second lookup cannot change the
+/// answer), with `timeout` and no redirect followed. The one copy for the
+/// print view's image fetch and the frame check (`BI-72`, rule 4).
+///
+/// # Errors
+///
+/// [`PinRefusal`] naming which step refused; never the resolver's own text.
+pub(crate) async fn pinned_https_client(
+    url: &str,
+    internal_hosts: &InternalHosts,
+    timeout: Duration,
+) -> Result<reqwest::Client, PinRefusal> {
+    let Some((host, port)) = parse_endpoint_host_port(url).filter(|_| url.starts_with("https://"))
+    else {
+        return Err(PinRefusal::NotHttps);
+    };
+    let Ok(checked) = resolve_checked(host, port, internal_hosts).await else {
+        return Err(PinRefusal::Refused);
+    };
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, checked.all())
+        .build()
+        .map_err(|_| PinRefusal::Build)
+}
+
 /// Classify an `object_store` request error into one of a small set of
 /// generic failure classes — see the module doc comment's "Error messages
 /// never echo upstream data" section. Deliberately never formats `err`

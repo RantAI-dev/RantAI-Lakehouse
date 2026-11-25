@@ -3,7 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
-import { PlusIcon, RefreshCw, SparklesIcon } from "lucide-react"
+import { BotIcon, PlusIcon, RefreshCw } from "lucide-react"
 
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
@@ -164,7 +164,7 @@ export function PipelinesPage() {
               Refresh
             </Button>
             <Button variant="outline" size="sm" onClick={() => setAgenticOpen(true)}>
-              <SparklesIcon data-icon="inline-start" />
+              <BotIcon data-icon="inline-start" />
               Agentic Builder
             </Button>
             <Button size="sm" render={<Link href="/pipelines/create" />}>
