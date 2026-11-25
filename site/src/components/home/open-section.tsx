@@ -7,7 +7,7 @@ import { SplitWords } from "@/components/shared/reveal";
 import { CodePanel, ConsoleHome } from "./open-visuals";
 import { ConsolePlay } from "./console-play";
 import { HostingStack } from "./hosting-stack";
-import { OneTableManyReaders } from "./open-tables-readers";
+import { OneTableManyReaders } from "./open-tables";
 import { OpenShowcase } from "./open-showcase";
 
 /**

@@ -2,7 +2,7 @@ import * as React from "react";
 import { BadgeCheck, Check, Folder, LayoutDashboard, Lock, LockOpen, Search } from "lucide-react";
 import type { HomeCopy } from "@/lib/copy";
 import { BentoFxHost } from "./bento-fx-host";
-import { ColumnLineage } from "./lineage-trace";
+import { ColumnLineage } from "./column-lineage";
 import { LiveTile } from "./live-tile";
 
 /**
