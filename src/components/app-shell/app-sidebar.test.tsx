@@ -243,6 +243,9 @@ function stubApi(
 }
 
 function renderBranded() {
+  // On main this no-arg helper is `renderSidebar`; #541 took that name for
+  // the sidebar's own three-argument helper above, so the branding one is
+  // `renderBranded` here (PR #545 merge of main, AGENTS.md rule 9).
   return render(
     <TooltipProvider>
       <SidebarProvider>
@@ -376,6 +379,8 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
       },
       { hold: true },
     )
+    // PR #545 merge of main: main's new test calls its no-arg `renderSidebar`,
+    // which is this branch's `renderBranded` (see the comment there).
     const { container } = renderBranded()
     // The sidebar is drawn (the session answered); the branding has not.
     await screen.findByText("Dashboards")

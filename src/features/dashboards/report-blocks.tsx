@@ -14,10 +14,11 @@ import "./report-document.css"
 
 /**
  * A report's blocks, in reading order (`BI-18` part D, R1; `BI-62`, D7): the
- * one renderer the reader page, the editor's Preview and the PDF's print view
- * all draw a report with, so the PDF shows what the page shows. The editor's
- * own document uses the same stylesheet (`report-document.css`), so writing
- * looks like reading.
+ * one renderer the reader page and the PDF's print view draw a report with.
+ * There is no separate Preview of the editor: the editor already shows the
+ * reader's view (owner QA 2026-11-16, `e6b603230`), and its own document
+ * uses the same stylesheet (`report-document.css`), so writing looks like
+ * reading.
  *
  * Every string is rendered as text. The inline marks of `BI-62` (`**bold**`,
  * `*italic*`, `[words](address)`) are parsed by `parseInline` into runs and
@@ -46,7 +47,7 @@ export function ReportBlocks({
   readonly dark: boolean
   /** The PDF's print view: no links out of the page, charts drawn without animation by `RenderMode`. */
   readonly print?: boolean
-  /** The report's title as the document's first line (the reader page, Preview). */
+  /** The report's title as the document's first line (the reader page and the editor's own document). */
   readonly title?: string
   readonly className?: string
   /** Map boundary loader for headless print views with no session (`PR #528 review BLOCKER`). */
