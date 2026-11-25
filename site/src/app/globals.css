@@ -3607,10 +3607,6 @@ html[data-tod="day"] footer .lk-wm [class*="text-[#E8F4FF]/[0.12]"] {
     max-width: none;
     margin: 0;
   }
-  html[data-scene] .lk-show-visual:not([data-on]) *,
-  html[data-scene] .lk-show-visual:not([data-on]) *::after {
-    animation-play-state: paused !important;
-  }
   /* The dots sit with the words, between the promise and its picture, and the pictures hang from
      the top of the stage, so what is left of the screen is under the picture, not between parts. */
   html[data-scene] .lk-show-dots {
