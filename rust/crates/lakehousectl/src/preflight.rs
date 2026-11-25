@@ -946,4 +946,36 @@ services:
             "the name is a check's name"
         );
     }
+
+    #[test]
+    fn a_bundle_install_runs_no_internet_dependent_preflight_check() {
+        // REL-12 (#693) and REL-16 (#711) proved the install air-gapped in
+        // fact. OPS-2: an air-gapped host has no internet to consult, so
+        // every check stays a pure function of locally gathered `Facts`
+        // (see `Check`'s signature). `--bundle` ADDS the local containerd
+        // store check and never adds a check that reaches out. This names
+        // that property: a connectivity check added to `CHECKS` fails here
+        // until it is gated out for a bundle install.
+        let network_checks = [
+            "internet",
+            "connectivity",
+            "online",
+            "network",
+            "registry",
+            "mirror",
+        ];
+        for name in CHECKS {
+            assert!(
+                !network_checks.contains(&name),
+                "pre-flight check {name:?} would need internet access on an air-gapped install"
+            );
+        }
+        // With a healthy host and a containerd store, the flag changes
+        // nothing: there is no hidden online check behind `--bundle`.
+        assert_eq!(
+            run(&facts(), &[], true),
+            run(&facts(), &[], false),
+            "bundle mode must not add a check a connected host passes"
+        );
+    }
 }

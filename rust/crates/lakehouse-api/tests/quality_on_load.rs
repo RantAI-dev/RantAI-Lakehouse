@@ -225,6 +225,9 @@ async fn seed_pipeline(pool: &PgPool, target_zone: &str, target_table: &str) -> 
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             name: "quality-on-load".to_owned(),

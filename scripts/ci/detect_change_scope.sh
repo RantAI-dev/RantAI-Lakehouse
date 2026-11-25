@@ -39,6 +39,15 @@
 # commas in the order of GATE_GROUPS below (`,cdc,`). `ci-required` reads
 # `gate_groups` to decide whether a skipped gate job was allowed to be skipped.
 #
+# It also answers one narrower question, `images_needed`, which the two shared
+# images (`images`, `image-smoke`) read (OPS-CI-FAST): it is `false` only when
+# every changed file is on the closed list in `is_image_neutral` -- paths
+# proved not to be compiled into `lakehouse-api` or `lakehouse-dagster` and not
+# to be mounted by either image. Anything else leaves it `true` (fail closed):
+# an unknown path, an unreadable map, `all=true`, a selected gate group or the
+# `ci:all-gates` label. A skipped image build costs minutes; a missing one
+# costs a red gate.
+#
 # Usage:
 #   detect_change_scope.sh                 classify the diff and write outputs
 #   detect_change_scope.sh --classify <path>…
@@ -72,6 +81,10 @@ docs_only=true
 all=false
 push_full=false
 draft=false
+# OPS-CI-FAST: starts `false` and is raised by every file that is not on the
+# closed neutral list below; the end of the run raises it again whenever any
+# gate group is selected (every gate job `needs: images`).
+images_needed=false
 
 gate_paths_error() {
   echo "::error::$1"
@@ -217,7 +230,8 @@ emit_scope() {
   echo "Scope detection result:"
   for line in "rust=${rust}" "frontend=${frontend}" "dagster=${dagster}" \
               "stack=${stack}" "docs_only=${docs_only}" "all=${all}" \
-              "push_full=${push_full}" "draft=${draft}"; do
+              "push_full=${push_full}" "draft=${draft}" \
+              "images_needed=${images_needed}"; do
     echo "  ${line}"
   done
   echo "  gate_groups=${gate_groups}"
@@ -232,6 +246,7 @@ emit_scope() {
     echo "all=${all}"
     echo "push_full=${push_full}"
     echo "draft=${draft}"
+    echo "images_needed=${images_needed}"
     for group in "${GATE_GROUPS[@]}"; do
       if [ -n "${SELECTED_GROUPS[$group]:-}" ]; then
         echo "gates_${group}=true"
@@ -254,6 +269,8 @@ emit_all_outputs() {
   stack=true
   docs_only=false
   all=true
+  # OPS-CI-FAST: everything runs, the images included.
+  images_needed=true
   select_every_group
   emit_scope
 }
@@ -264,6 +281,56 @@ is_docs_only() {
   local file="$1"
   [[ "$file" == docs/* ]] || [[ "$file" == GTM/* ]] || \
     [[ "$file" =~ ^[^/]+\.md$ ]] || [[ "$file" == "LICENSE" ]] || [[ "$file" == "NOTICE" ]]
+}
+
+# OPS-CI-FAST: the closed list of paths that cannot change either shared image
+# (`lakehouse-api`, `lakehouse-dagster`), and only those. It is a separate
+# question from `gates_*`: a file can select no gate group and still be
+# compiled into the API binary (`rust/crates/lakehouse-api/src/routes/ai/*` is
+# mapped `none` and is linked into it), so "no gate" is never "no image". The
+# reverse backstop exists too: selecting any gate group raises this to `true`
+# at the end of the loop, because every gate job `needs: images`.
+#
+# The two images are built from two contexts only (`.github/workflows/ci.yml`,
+# `images`: `context: rust` for the API and `context: dagster` for Dagster,
+# plus `pipeline_src=dagster/dispar_orchestrate`), so nothing outside them can
+# enter either image -- the console (`src/*`, `public/*`) included.
+#
+# Evidence for the Rust entries: `rust/Dockerfile` builds the image with
+# `cargo build --release --locked -p lakehouse-api`, and copies `crates/` only
+# to compile that package. `lakehousectl` (not in any image, `gate_paths.txt`)
+# and `lakehouse-test-support` (a dev-dependency of the crates that test
+# against it) are never built there; `crates/*/tests/*` and `crates/*/benches/*`
+# are test and bench targets, which a `-p lakehouse-api` release build does not
+# build; `rust/tests/*` (the parity corpus and its checker) is not in the
+# `rust/Dockerfile` build context at all.
+#
+# Evidence for the `ops/` entries: grepping `ops/`, `dagster/`,
+# `.github/workflows/ci.yml` and `rust/` for `ops/bi-only/*` and
+# `ops/landing-pages/*` finds no reference outside those directories
+# themselves (the landing site is built by `.github/workflows/deploy-landing.yml`);
+# no compose file mounts either, and no `include_str!`/`include_bytes!` in
+# `rust/` names anything under them.
+#
+# `src/lib/dashboard-specs.ts` and `public/geo/*` look like exceptions and are
+# not: their gate groups (`governance,alerts`) raise `images_needed` through
+# the backstop, so they keep the image build.
+is_image_neutral() {
+  local file="$1"
+  # `gate_paths.txt` maps this one to `storage`, and `g1-rustfs` starts the
+  # images it builds; a test path that a gate runs is not neutral.
+  if [[ "$file" == "rust/crates/lakehouse-iceberg/tests/g1_"* ]]; then
+    return 1
+  fi
+  [[ "$file" == rust/crates/lakehousectl/* ]] || \
+    [[ "$file" == rust/crates/lakehouse-test-support/* ]] || \
+    [[ "$file" == rust/crates/*/tests/* ]] || \
+    [[ "$file" == rust/crates/*/benches/* ]] || \
+    [[ "$file" == rust/tests/* ]] || \
+    [[ "$file" == ops/bi-only/* ]] || \
+    [[ "$file" == ops/landing-pages/* ]] || \
+    [[ "$file" == src/* ]] || \
+    [[ "$file" == public/* ]]
 }
 
 # OPS-25 T1: classify mode, before any git call. It prints the map's answer for
@@ -394,6 +461,13 @@ while IFS= read -r file; do
   # Any file outside the docs-only set means docs_only is false
   docs_only=false
 
+  # OPS-CI-FAST: the one place a path can ask for the two shared images to be
+  # skipped. Not being on the neutral list is the default answer, so an
+  # unclassified path keeps them (fail closed).
+  if ! is_image_neutral "$file"; then
+    images_needed=true
+  fi
+
   # Rust: rust/**, src/lib/dashboard-specs.ts, docker-compose.yml, .env.example,
   # ops/release/release.pub, ops/release/fixtures/**, public/geo/**
   # Note: docker-compose.yml is embedded via include_str! in
@@ -494,6 +568,16 @@ if [ "$all_gates_label" = true ]; then
   echo "Label ci:all-gates: selecting every gate group"
   select_every_group
   stack=true
+fi
+
+# OPS-CI-FAST, fail closed: every gate job `needs: images`, so a selected gate
+# group always means the images are needed. This is what keeps G1's
+# `rust/crates/lakehouse-iceberg/tests/g1_*` (mapped to `storage`) from being
+# read as a test-only path. `all=true`, the label and an unreadable map each
+# select every group, so they raise this too, with no second rule to keep in
+# step.
+if [ "$(gate_groups_value)" != "none" ]; then
+  images_needed=true
 fi
 
 emit_scope
