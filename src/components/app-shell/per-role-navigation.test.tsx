@@ -181,7 +181,7 @@ describe("ADM-13 D8: per-role navigation and route guard", () => {
     expect(screen.queryByText("Home content")).toBeNull()
   })
 
-  it("4. Assistant only user sees Home, History, Dashboards and the dock", async () => {
+  it("4. Assistant only user sees Home, Dashboards and the dock", async () => {
     currentPathname = "/dashboards"
     stubAuth(["assistant:ask", "dashboard:read"], "Assistant only")
 
@@ -195,8 +195,9 @@ describe("ADM-13 D8: per-role navigation and route guard", () => {
 
     // Allowed links in sidebar
     expect(screen.getByRole("link", { name: /^home/i })).toBeTruthy()
-    expect(screen.getByRole("link", { name: /^history/i })).toBeTruthy()
     expect(screen.getByRole("link", { name: /^dashboards/i })).toBeTruthy()
+    // WEB-18: no History entry; the chats are in a conversation's sidebar.
+    expect(screen.queryByRole("link", { name: /^history/i })).toBeNull()
 
     // Disallowed links
     expect(screen.queryByRole("link", { name: /^query studio/i })).toBeNull()
@@ -223,7 +224,7 @@ describe("ADM-13 D8: per-role navigation and route guard", () => {
     // All major sections and links are present
     expect(screen.getByRole("link", { name: /^home/i })).toBeTruthy()
     expect(screen.getByRole("link", { name: /^dashboards/i })).toBeTruthy()
-    expect(screen.getByRole("link", { name: /^history/i })).toBeTruthy()
+    expect(screen.queryByRole("link", { name: /^history/i })).toBeNull()
     expect(screen.getByRole("link", { name: /^catalog/i })).toBeTruthy()
     expect(screen.getByRole("link", { name: /^query studio/i })).toBeTruthy()
     expect(screen.getByRole("link", { name: /^sources/i })).toBeTruthy()
@@ -261,5 +262,41 @@ describe("ADM-13 D8: per-role navigation and route guard", () => {
     fireEvent.keyDown(document, { key: "k", ctrlKey: true })
     expect(await screen.findByText("Browse all dashboards")).toBeTruthy()
     expect(screen.getByText("Add a chart to a dashboard")).toBeTruthy()
+  })
+})
+
+// BI-61 review round 1, SHOULD-FIX 7 (owner decision 2026-11-14): the account menu has
+// one place, the sidebar's footer card, which is a real button that opens it; the navbar
+// has no profile button any more.
+describe("the account menu in the sidebar's footer (BI-61 review round 1)", () => {
+  // PR #542/#543 CI: this describe sits outside the one above, so that one's afterEach never ran
+  // for it, and its stubAuth left a `global.fetch` mock (answering `{}` to every URL) installed
+  // for every later file in the process (save-query-page, catalog tests). Restore it here.
+  afterEach(() => {
+    global.fetch = originalFetch
+  })
+
+  it("opens from the footer card with the same entries, in order, and the navbar has no account button", async () => {
+    currentPathname = "/dashboards"
+    stubAuth(["dashboard:read"], "Dashboard Viewer")
+    renderWithProviders(
+      <AppFrame>
+        <div>Dashboard content</div>
+      </AppFrame>
+    )
+    expect(await screen.findByText("Dashboard content")).toBeTruthy()
+    const card = await screen.findByRole("button", { name: "Account menu, Test User" })
+    expect(card.closest("[data-sidebar='footer'], [data-slot='sidebar-footer']")).toBeTruthy()
+    expect(card.getAttribute("aria-haspopup")).toBeTruthy()
+    // One account trigger in the whole frame: the navbar's is gone.
+    expect(screen.getAllByRole("button", { name: /^Account menu/ })).toHaveLength(1)
+    fireEvent.click(card)
+    expect(await screen.findByText("Change password")).toBeTruthy()
+    const entries = screen.getAllByRole("menuitem").map((i) => i.textContent?.trim())
+    expect(entries[0]).toBe("Change password")
+    expect(entries[1]).toBe("Theme")
+    expect(entries[2]).toMatch(/^Version /)
+    expect(entries[3]).toBe("Sign out")
+    expect(screen.getAllByText("test@rantai.dev").length).toBeGreaterThan(0)
   })
 })

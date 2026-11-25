@@ -187,13 +187,13 @@ describe("Save as template in the dashboard's menu", () => {
     isDefault: false, canWrite: true, loading: false, fullscreen: false, autoSec: "0", savedSec: "300",
     canSaveRefresh: false, savingRefresh: false,
     onRefresh: () => {}, onToggleFullscreen: () => {}, onAutoSec: () => {}, onSaveRefresh: () => {},
-    onRename: () => {}, onShare: () => {}, onExportPdf: () => {}, onDuplicate: () => {}, onDelete: () => {},
+    onRename: () => {}, onExportPdf: () => {}, onDuplicate: () => {}, onDelete: () => {},
   }
 
   it("is offered to a writer on a saved dashboard", async () => {
     let opened = false
     render(<DashboardActionsMenu {...base} onSaveTemplate={() => { opened = true }} />)
-    fireEvent.click(screen.getByRole("button", { name: "More actions" }))
+    fireEvent.click(screen.getByRole("button", { name: "Dashboard settings" }))
     fireEvent.click(await screen.findByText("Save as template…"))
     expect(opened).toBe(true)
   })
@@ -207,7 +207,7 @@ describe("Save as template in the dashboard's menu", () => {
       { canDownload: false, onSaveTemplate: () => {} },
     ]) {
       render(<DashboardActionsMenu {...base} {...over} />)
-      fireEvent.click(screen.getByRole("button", { name: "More actions" }))
+      fireEvent.click(screen.getByRole("button", { name: "Dashboard settings" }))
       await screen.findByText("Print…")
       expect(screen.queryByText("Save as template…")).toBeNull()
       cleanup()

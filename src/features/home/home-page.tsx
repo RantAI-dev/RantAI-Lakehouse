@@ -10,7 +10,7 @@ import {
   ChevronDown,
   CircleHelp,
   MessageSquare,
-  Sparkles,
+  Bot,
 } from "lucide-react"
 
 import { Skeleton } from "@/components/ui/skeleton"
@@ -501,7 +501,7 @@ export function HomePage() {
   // button was easy to miss. The second screen is top-aligned (cards
   // centred in a tall screen floated in empty space) and holds the
   // dashboard preview, Recent and Pipeline runs. The negative margins undo `AppFrame`'s padding so
-  // the scroller is exactly the viewport under the 4rem navbar, and each
+  // the scroller is exactly the viewport under the navbar (`--app-navbar-h`), and each
   // screen puts the padding back. Snapping is `proximity`, not
   // `mandatory`: it settles on a screen when the scroll ends near one and
   // otherwise leaves the scroll alone.
@@ -514,7 +514,7 @@ export function HomePage() {
         // `relative`: without a positioned scroller, absolutely positioned
         // descendants (the `sr-only` labels in Recent) escape its clipping
         // and stretch the document, which then scrolls as well.
-        "relative -m-4 h-[calc(100svh-4rem)] snap-y snap-proximity overflow-y-auto sm:-m-5 lg:-m-6",
+        "relative -m-4 h-[calc(100svh-var(--app-navbar-h))] snap-y snap-proximity overflow-y-auto sm:-m-5 lg:-m-6",
         !reduce && "scroll-smooth",
       )}
     >
@@ -844,7 +844,7 @@ function AiButton({
       // dark theme's card background.
       className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-[var(--brand-1)] transition-colors hover:bg-[color-mix(in_oklch,var(--brand-1),transparent_88%)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
     >
-      <Sparkles className="size-3" />
+      <Bot className="size-3" aria-hidden />
       {children}
     </button>
   )

@@ -107,7 +107,7 @@ export function ModeToggle({ mode, setMode }: { mode: Mode; setMode: (m: Mode) =
  */
 export function ChatComposer({
   mode, setMode, onSend, onStop, busy, placeholder, autoFocus, rows = 2,
-  enabledCaps, toggleCap, onFocus, glass, compact, solid, examples,
+  enabledCaps, toggleCap, onFocus, glass, compact, solid, examples, value, onValueChange,
 }: {
   mode: Mode;
   setMode: (m: Mode) => void;
@@ -138,8 +138,17 @@ export function ChatComposer({
    * the first one stays put.
    */
   examples?: string[];
+  /**
+   * The draft, when the caller owns it. The floating dock swaps the
+   * collapsed pill and the open composer (two mounts of this component), and
+   * a draft kept here would be lost at every open and close.
+   */
+  value?: string;
+  onValueChange?: (text: string) => void;
 }) {
-  const [input, setInput] = React.useState("");
+  const [ownInput, setOwnInput] = React.useState("");
+  const input = value ?? ownInput;
+  const setInput = onValueChange ?? setOwnInput;
   const reduce = useReducedMotion() ?? false;
   const [exampleIndex, setExampleIndex] = React.useState(0);
   const cycling = Boolean(examples?.length) && !input;
@@ -163,10 +172,12 @@ export function ChatComposer({
   // COMPACT — single-line pill (input + send). Focus/typing expands via onFocus.
   if (compact) {
     return (
-      <div className={cn("flex items-center gap-2 rounded-full border py-2 pl-4 pr-2 transition-all", glassCls)}>
-        {/* UX-4 (decision 4): back to the pre-#568 pill — no visible
-            "Message" label, no tooltip, no hidden requirement text. The
-            input names itself and keeps `aria-required` (decision 3). */}
+      // `data-slot` lets the dock animate this surface itself: an opacity or
+      // clip on a wrapper would cut the glass's backdrop blur off.
+      <div data-slot="chat-composer" className={cn("flex items-center gap-2 rounded-full border py-2 pl-4 pr-2", glassCls)}>
+        {/* UX-4 (decision 4): back to the pre-#568 pill: no visible "Message" label, no
+            tooltip, no hidden requirement text. The input names itself and keeps
+            `aria-required` (decision 3). */}
         <input
           id="copilot-compact-message"
           aria-required
@@ -283,8 +294,10 @@ export function ChatComposer({
   );
 
   return (
-    <div className={cn(
-      "rounded-2xl border p-1.5 transition-all",
+    // Owner QA 2026-11-15: `transition-all` also tweened size and radius
+    // whenever the box changed shape; only the focus colours fade now.
+    <div data-slot="chat-composer" className={cn(
+      "rounded-2xl border p-1.5 transition-[background-color,border-color,box-shadow] duration-150 ease-ui",
       solid
         ? "border-border bg-background shadow-xs focus-within:border-foreground/25"
         : glass ? `${glassCls} focus-within:bg-background/60` : `${glassCls} focus-within:border-foreground/20 focus-within:bg-muted/40 focus-within:shadow-md`,
