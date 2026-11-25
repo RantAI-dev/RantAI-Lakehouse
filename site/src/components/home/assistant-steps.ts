@@ -22,3 +22,11 @@ export const S = {
 
 /** Every step: the finished conversation, which the server renders. */
 export const ALL_STEPS = Object.values(S).join(" ");
+
+/**
+ * WEB-5 M1 (phone pass): how many steps a phone starts with, the first exchange (question, work,
+ * answer and chart: steps 1 to 5). Below 1024 px the panel never sits as an empty box while the
+ * first question types; it shows this exchange at once, and the script carries on from Build.
+ * Desktop starts from an empty chat, as before.
+ */
+export const FIRST_EXCHANGE = 5;

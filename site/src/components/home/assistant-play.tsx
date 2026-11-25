@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { FIRST_EXCHANGE, S } from "./assistant-steps";
 
 /**
  * WEB-5 O19: the only client code the assistant panel puts in the initial
@@ -55,7 +56,11 @@ export function AssistantPlay({ children }: { children: React.ReactNode }) {
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return stopSettle;
     const box = panel.getBoundingClientRect();
     if (box.top < window.innerHeight && box.bottom > 0) return stopSettle;
-    panel.dataset.s = "";
+    // WEB-5 M1 (phone pass): below 1024 px the panel starts with its first exchange shown, not
+    // empty (it is rewound while still off screen, so nothing is seen to vanish); desktop rewinds
+    // to an empty chat. The server markup is the finished chat for both, so no hydration flash.
+    const from = window.matchMedia("(max-width: 1023.98px)").matches ? FIRST_EXCHANGE : 0;
+    panel.dataset.s = Object.values(S).slice(0, from).join(" ");
     panel.classList.remove("lk-ast-still");
     // Owner QA: the play starts only when the panel is really on show: the depths stage above it
     // has (nearly) left (its section's bottom is above 35 % of the screen: the assistant rides up
@@ -79,7 +84,7 @@ export function AssistantPlay({ children }: { children: React.ReactNode }) {
         started = true;
         void import("./assistant-script").then(({ play }) => {
           if (gone) return;
-          player = play(panel);
+          player = play(panel, from);
           if (!want) player.pause();
         });
       } else if (player) {

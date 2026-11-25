@@ -36,10 +36,13 @@ export type Player = { stop: () => void; pause: () => void; resume: () => void }
  * back up and the panel is no longer in view): a step waiting for its turn waits again, and a
  * question half typed carries on from the letter it reached.
  */
-export function play(panel: HTMLElement): Player {
+export function play(panel: HTMLElement, from = 0): Player {
   const typed = panel.querySelector<HTMLElement>("[data-typed]");
   const questions = [...panel.querySelectorAll<HTMLElement>("[data-q]")].map((q) => q.textContent?.trim() ?? "");
-  const reached: Step[] = [];
+  // WEB-5 M1: a phone starts with the first exchange already shown (`FIRST_EXCHANGE` in
+  // assistant-steps.ts), so the script carries on from the step after it. The script's first
+  // steps are the steps in their own order, so `from` steps reached are `SCRIPT[0..from)`.
+  const reached: Step[] = SCRIPT.slice(0, from).map(([s]) => s);
   let timer = 0;
   let typing = 0;
   let paused = false;
@@ -79,7 +82,7 @@ export function play(panel: HTMLElement): Player {
       run(i + 1);
     }, wait);
   };
-  run(0);
+  run(from);
 
   return {
     stop: () => {

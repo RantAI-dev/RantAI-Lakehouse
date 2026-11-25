@@ -1704,8 +1704,11 @@ section[data-role="admin"] .lk-gv-closed {
   container: lk-ast / inline-size;
   display: flex;
   flex-direction: column;
-  /* O41: a fixed height, like a real chat window. */
-  height: min(560px, 74svh);
+  /* O41: a fixed height, like a real chat window. WEB-5 M1 (phone pass): on a phone it was
+     about a screen tall (560 px) and empty while the first question typed; it is now sized to
+     hold one exchange (question, answer and chart), and the first exchange shows at once
+     (assistant-play.tsx). */
+  height: min(420px, 64svh);
   overflow: hidden;
   border-radius: var(--radius-3xl);
   background: var(--lk-ast-surface);
