@@ -39,39 +39,24 @@ import {
   type NavGroup,
   type NavItem,
 } from "./nav-config"
+import {
+  ACCOUNT_AVATAR_CLASS,
+  ACCOUNT_CARD_CLASS,
+  SIDEBAR_CLASS,
+  SIDEBAR_CONTENT_CLASS,
+  SIDEBAR_FOOTER_CLASS,
+  SIDEBAR_GROUP_CLASS,
+  SIDEBAR_MENU_CLASS,
+  SIDEBAR_SUB_CLASS,
+  SIDEBAR_VIEW_PANE_CLASS,
+  initialsOf,
+  navRowClass,
+} from "./sidebar-classes"
+import { SidebarChats } from "./sidebar-chats"
 import { UserMenu } from "./user-menu"
 
-/*
- * The sidebar's boxes, shared with the loading shell (`AppShellSkeleton`),
- * which draws the same frame with grey rows while the session is checked:
- * one set of classes, so the skeleton cannot drift from the real sidebar.
- */
-export const SIDEBAR_CLASS = "border-r border-sidebar-border bg-sidebar shadow-sm"
-//
-// Collapsing is one move (owner 2026-11-14, `SIDEBAR_MOTION` in `ui/sidebar.tsx`): the rows keep the
-// expanded layout in both states, left-aligned on one icon column (16 px from the edge, the centre
-// of the 48 px rail), with the same vertical rhythm, so collapsing only narrows the row's box and
-// fades the label; no icon moves and no row jumps.
-export const SIDEBAR_CONTENT_CLASS = "min-w-0"
-export const SIDEBAR_GROUP_CLASS = "gap-0 px-2 py-2"
-export const SIDEBAR_MENU_CLASS = "mt-0 flex flex-col gap-0.5"
-export const SIDEBAR_FOOTER_CLASS = "border-t border-sidebar-border p-2"
-// One compact row (Claude's footer): a 24 px avatar, the name and role, a chevron, 32 px tall.
-// Collapsed, it is the avatar alone, centred in the 32 px icon column by 4 px of padding: the faded name and chevron
-// still take room, so centring with justify-center would push the avatar out of the button's overflow-hidden box.
-export const ACCOUNT_CARD_CLASS = "h-8 gap-2 rounded-lg px-1.5 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:justify-start group-data-[collapsible=icon]:p-1!"
-export const ACCOUNT_AVATAR_CLASS =
-  "flex size-6 shrink-0 items-center justify-center rounded-full bg-primary/12 text-[10px] font-semibold text-primary"
-
-/** Up to two initials of a display name, for the avatar (the app has no pictures for people). */
-export function initialsOf(name: string | undefined): string {
-  const words = (name ?? "").trim().split(/\s+/).filter(Boolean)
-  if (words.length === 0) return "?"
-  const letters = words.length === 1 ? [...words[0]].slice(0, 2) : [[...words[0]][0], [...words[words.length - 1]][0]]
-  return letters.join("").toUpperCase()
-}
-export const NAV_ROW_CLASS = "h-8 rounded-md px-2 py-1.5 text-sm tracking-normal"
-export const SIDEBAR_SUB_CLASS = "mr-0 gap-0.5 border-sidebar-border pr-0 group-data-[collapsible=icon]:flex"
+/** The conversation page, where the sidebar lists the chats instead of the menu (`WEB-18`). */
+export const CONVERSATION_PATH = "/copilot"
 
 function BrandLogo({ branding }: { branding: BrandingView }) {
   // Logo follows the theme: navy for a light sidebar, white for a dark one.
@@ -146,6 +131,7 @@ export function AppSidebar() {
   const iconMode = state === "collapsed"
   const dashboardsRow = useDashboardsRow()
   const { user, hasPermission, logout } = useAuth()
+
   // `BI-44`: the deployment route is `settings:write`-gated, so only a
   // holder of that permission asks for it. Everyone else — and a request
   // still in flight — gets the unchanged menu; a 403 on every page load
@@ -169,6 +155,51 @@ export function AppSidebar() {
     activeLabel: activeGroup?.label,
     defaultOpenLabels,
   })
+  // WEB-18: on a conversation the sidebar lists the chats instead of the menu. "Back to menu"
+  // brings the menu back for this visit only: any navigation (another page, the browser's Back)
+  // resets it, so the next conversation opens on its chats again.
+  const hasAssistant = hasPermission("assistant:use") || hasPermission("assistant:ask")
+  const onConversation = pathname === CONVERSATION_PATH && hasAssistant
+  // Owner QA 2026-11-14: Home's split row opens the list on any page, so the view is the route's
+  // default (the list on a conversation, the menu elsewhere) unless the person chose one for this
+  // visit; any pathname change drops the choice.
+  const [chatsChoice, setChatsChoice] = React.useState<boolean | null>(null)
+  React.useEffect(() => setChatsChoice(null), [pathname])
+  const showChats = hasAssistant && (chatsChoice ?? onConversation)
+
+  // The slide between the two views. The chat view mounts the first time it is wanted, off to the
+  // right, and only then moves in, so the browser has a place to move it from; after that it stays
+  // mounted, out of view and inert, and the two views just trade places.
+  const [chatsMounted, setChatsMounted] = React.useState(showChats)
+  const [chatsIn, setChatsIn] = React.useState(showChats)
+  const chatsPaneRef = React.useRef<HTMLDivElement>(null)
+  const contentRef = React.useRef<HTMLDivElement>(null)
+  // The view that gets the focus once it is in: the control that leads back to the other one.
+  const focusOnArrival = React.useRef<"chats" | "menu" | null>(null)
+  React.useEffect(() => {
+    if (showChats && !chatsMounted) {
+      setChatsMounted(true)
+      return
+    }
+    if (showChats === chatsIn) return
+    // Lay the pane out at its starting place before it moves (a fresh pane has no "from" yet).
+    void chatsPaneRef.current?.offsetWidth
+    setChatsIn(showChats)
+  }, [showChats, chatsMounted, chatsIn])
+  React.useEffect(() => {
+    const target = focusOnArrival.current
+    if (!target) return
+    focusOnArrival.current = null
+    contentRef.current?.querySelector<HTMLElement>(`[data-view-focus="${target}"]`)?.focus({ preventScroll: true })
+  }, [chatsIn])
+  const backToMenu = () => {
+    focusOnArrival.current = "menu"
+    setChatsChoice(false)
+  }
+  const openChats = () => {
+    focusOnArrival.current = "chats"
+    setChatsChoice(true)
+  }
   const [flyout, setFlyout] = React.useState<FlyoutState>(null)
   const flyoutRef = React.useRef<HTMLDivElement>(null)
   const [mounted, setMounted] = React.useState(false)
@@ -211,13 +242,7 @@ export function AppSidebar() {
     setFlyout({ label, top: r.top, left: r.right + 8 })
   }
 
-  const menuBtnClass = (active: boolean) =>
-    cn(
-      NAV_ROW_CLASS,
-      active
-        ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
-        : "font-normal text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
-    )
+  const menuBtnClass = navRowClass
 
   /**
    * Satu baris halaman.
@@ -252,7 +277,7 @@ export function AppSidebar() {
     const first = group.items[0]
     const Icon = group.icon ?? first.icon
     // A group declared with one page shows that page's title, which is the
-    // more descriptive of the two ("History" over "History").
+    // more descriptive of the two.
     // Only the Dashboards row is named after what it opens: the last dashboard or report
     // opened (its own memory, cleared by Browse). Nothing remembered keeps "Dashboards".
     const remembered = first.href === "/dashboards" ? dashboardsRow : null
@@ -278,8 +303,15 @@ export function AppSidebar() {
             // part that is the whole touch target for a second destination, one thin separator
             // between them. Each part lights up on its own; the active route lights only its own part.
             const action = first.action
-            const actionActive = !!action && (pathname === action.href || pathname.startsWith(`${action.href}/`))
+            const href = action?.href
+            const actionActive = !!action && (href ? pathname === href || pathname.startsWith(`${href}/`) : onConversation)
             const labelActive = active && !actionActive
+            const actionClass = cn(
+              "grid size-8 shrink-0 place-items-center rounded-r-md outline-hidden ring-sidebar-ring transition-colors duration-150 focus-visible:ring-2 group-data-[collapsible=icon]:hidden [&>svg]:size-3.5",
+              actionActive
+                ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                : "text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
+            )
             return (
               <>
                 <SidebarMenuButton
@@ -308,18 +340,24 @@ export function AppSidebar() {
                     <Tooltip>
                       <TooltipTrigger
                         render={
-                          <Link
-                            href={action.href}
-                            aria-label={action.title}
-                            aria-current={actionActive ? "page" : undefined}
-                            onClick={(e) => handleNavClick(e, action.href)}
-                            className={cn(
-                              "grid size-8 shrink-0 place-items-center rounded-r-md outline-hidden ring-sidebar-ring transition-colors duration-150 focus-visible:ring-2 group-data-[collapsible=icon]:hidden [&>svg]:size-3.5",
-                              actionActive
-                                ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                                : "text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
-                            )}
-                          />
+                          href ? (
+                            <Link
+                              href={href}
+                              aria-label={action.title}
+                              aria-current={actionActive ? "page" : undefined}
+                              onClick={(e) => handleNavClick(e, href)}
+                              className={actionClass}
+                            />
+                          ) : (
+                            <button
+                              type="button"
+                              aria-label={action.title}
+                              aria-current={actionActive ? "page" : undefined}
+                              data-view-focus="menu"
+                              onClick={openChats}
+                              className={actionClass}
+                            />
+                          )
                         }
                       >
                         <action.icon />
@@ -396,28 +434,44 @@ export function AppSidebar() {
 
   const openGroup = groups.find((g) => g.label === flyout?.label)
 
+  const menuEntries = groups.map(renderEntry)
+
   return (
     <Sidebar data-print-hide collapsible="icon" side="left" className={SIDEBAR_CLASS}>
       <SidebarBrand />
 
-      <SidebarContent className={SIDEBAR_CONTENT_CLASS}>
-        <SidebarGroup className={SIDEBAR_GROUP_CLASS}>
-          <SidebarMenu className={SIDEBAR_MENU_CLASS}>
-            {groups.map(renderEntry)}
-          </SidebarMenu>
-        </SidebarGroup>
-
-        {/* A dashboard list and Copilot history used to live here. Both
-            only ever appeared once you were already on their page, so
-            they could never be used to NAVIGATE there — that was page
-            content occupying navigation space, and it vanished the moment
-            the sidebar collapsed to icons. Both now live in their own
-            page's header instead (`BoardSwitcher`, `CopilotHistoryMenu`),
-            and the sidebar purely reads `nav-config` with no per-route
-            exception. */}
-        {/* The active section's pages used to be repeated down here, in a
-            separate block. They now sit inside their own group above, so
-            the section that is open is the one you are reading. */}
+      <SidebarContent ref={contentRef} className={cn(SIDEBAR_CONTENT_CLASS, "relative overflow-hidden")}>
+        {/* WEB-18 (owner 2026-11-14): on a conversation the chat list takes the menu's place,
+            as in a chat app, so the history is beside the chat it belongs to instead of on a
+            page of its own. The account card and the logo row stay. */}
+        {/* The two views sit side by side and slide together (`SIDEBAR_VIEW_PANE_CLASS`): the
+            menu leaves to the left as the chats come in from the right, so the sidebar is never
+            empty mid-move, and its width does not change. The one out of view is inert. */}
+        <div
+          className={cn(
+            SIDEBAR_VIEW_PANE_CLASS,
+            "no-scrollbar overflow-y-auto group-data-[collapsible=icon]:overflow-hidden",
+            chatsIn && "-translate-x-full",
+          )}
+          inert={chatsIn}
+          data-sidebar-view="menu"
+        >
+          <SidebarGroup className={SIDEBAR_GROUP_CLASS}>
+            <SidebarMenu className={SIDEBAR_MENU_CLASS}>
+              {menuEntries}
+            </SidebarMenu>
+          </SidebarGroup>
+        </div>
+        {chatsMounted ? (
+          <div
+            ref={chatsPaneRef}
+            className={cn(SIDEBAR_VIEW_PANE_CLASS, !chatsIn && "translate-x-full")}
+            inert={!chatsIn}
+            data-sidebar-view="chats"
+          >
+            <SidebarChats shown={chatsIn} onBack={backToMenu} />
+          </div>
+        ) : null}
       </SidebarContent>
 
       {/* Flyout (icon mode only) */}

@@ -1,11 +1,12 @@
 "use client"
 
 import Link from "next/link"
+import { Plug } from "lucide-react"
 
 import { HEALTH_LABEL, type Health } from "@/lib/status"
 import { sourceRows, type CardRead } from "@/lib/home-cards"
 import { cn } from "@/lib/utils"
-import { CardNote, CardSection, CardSkeleton, ReadNote } from "./home-ui"
+import { CardNote, CardSection, CardSkeleton, ReadNote, ROW } from "./home-ui"
 
 const HEALTH_DOT: Record<string, string> = {
   unhealthy: "bg-destructive",
@@ -30,7 +31,7 @@ export function SourcesCard({
 }) {
   const rows = sourceRows(sources)
   return (
-    <CardSection title="Sources" link={{ href: "/connectors", label: "All sources" }}>
+    <CardSection title="Sources" icon={Plug} link={{ href: "/connectors", label: "All sources" }}>
       {read === "loading" ? (
         <CardSkeleton />
       ) : read !== "ok" ? (
@@ -44,7 +45,7 @@ export function SourcesCard({
               <Link
                 href="/connectors"
                 title={`${s.name} (${s.type}): ${HEALTH_LABEL[s.health] ?? s.health}`}
-                className="flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-sm transition-colors hover:bg-muted/60"
+                className={cn(ROW, "h-9 text-[13px] leading-5")}
               >
                 <span
                   className={cn(

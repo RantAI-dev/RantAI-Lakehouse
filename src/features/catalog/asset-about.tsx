@@ -1,10 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { Pencil } from "lucide-react"
-import { MetadataList } from "@/components/patterns/metadata-list"
 import { SelectField } from "@/components/patterns/select-field"
-import { SectionCard } from "@/components/patterns/section-card"
 import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -22,7 +19,9 @@ import { Textarea } from "@/components/ui/textarea"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { notifySuccess } from "@/lib/notify"
-import { CLASSIFICATION_LABEL } from "@/lib/status"
+import { formatBytes, formatNumber } from "@/lib/format"
+import { fmtMeasured } from "@/lib/measured"
+import { CLASSIFICATION_LABEL, ENGINE_CATEGORY_LABEL } from "@/lib/status"
 import { cn } from "@/lib/utils"
 import { assetService, tagKeysService } from "@/services"
 import type { AssetAnnotation, AssetDetail } from "@/services/contracts/assets"
@@ -53,7 +52,13 @@ function orNull(value: string): string | null {
   return trimmed.length > 0 ? trimmed : null
 }
 
-function EditDialog({
+/**
+ * Edit details: description, owner, steward, tags and governed tags
+ * (`catalog:write`). `UX-8`: opened from the page's ⋯ menu ("Edit
+ * details…"); mount it only while open, so each opening starts from the
+ * saved values.
+ */
+export function EditDetailsDialog({
   asset: a,
   open,
   onClose,
@@ -233,15 +238,29 @@ export function stricterBecauseOfColumns(a: AssetDetail): string | null {
     : `The header shows ${level} because columns ${names} are ${level}: a table is never less restrictive than its most restrictive column.`
 }
 
+/** One row of the Details list: a quiet label, and the value beside it. */
+function DetailRow({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="grid grid-cols-[7.5rem_minmax(0,1fr)] gap-3 py-1 text-sm">
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className="min-w-0 break-words">{children}</dd>
+    </div>
+  )
+}
+
 /**
- * What the asset is and who answers for it. Description, owner, steward,
- * tags and governed tags can be edited here by anyone with `catalog:write`; the rest is
- * the registry's. The whole table's sensitivity (its table-level
- * classification rule) is set here too, with `governance:write`.
+ * What the asset is, who answers for it and where it lives: one list
+ * (`UX-8`, mockup A), where the page had a facts strip under the header and
+ * an About card on the Overview that shared half their rows. The rows the
+ * header already says (layer, type, the address) are not repeated, and the
+ * column count is the Columns tab's own. Editing is in the page's ⋯ menu
+ * ("Edit details…"). The whole table's sensitivity (its table-level
+ * classification rule) is set at the end, with `governance:write`.
  */
-export function AssetAbout({
+export function AssetDetails({
   asset: a,
   schemaLabel,
+  rowsGone,
   onChanged,
 }: {
   asset: AssetDetail
@@ -251,105 +270,81 @@ export function AssetAbout({
    * table; `null` when there is none yet.
    */
   schemaLabel: string | null
+  /**
+   * QA `LH-DATA-15-07` F2 (`DATA-54`): the Iceberg table is gone, so the
+   * count the registry recorded is not shown.
+   */
+  rowsGone: boolean
   /** Called after a save, to reload the asset. */
   onChanged: () => void
 }) {
   const { hasPermission } = useAuth()
-  const [editing, setEditing] = React.useState(false)
   const tags = a.tags ?? []
   const governedPairs = governedPairLabels(a.governedTags)
   const tableRule = (a.classificationRules ?? []).find((r) => r.column === undefined)
   const stricterNote = stricterBecauseOfColumns(a)
 
   return (
-    <SectionCard
-      size="sm"
-      title="About"
-      action={
-        hasPermission("catalog:write") ? (
-          <Button size="sm" variant="ghost" onClick={() => setEditing(true)}>
-            <Pencil />
-            Edit
-          </Button>
-        ) : undefined
-      }
-    >
-      {/* The description itself is in the page header, above every tab;
-          repeating it here said the same sentence twice on one screen. */}
+    <div className="flex flex-col gap-3">
       {a.description ? null : (
-        <p className="mb-3 text-sm text-muted-foreground">
+        <p className="text-sm text-muted-foreground">
           No description yet. Ask the owner to document what one row represents.
         </p>
       )}
-      <MetadataList
-        density="compact"
-        columns={2}
-        items={[
-          { label: "Domain", value: a.domain || "—" },
-          { label: "Owner", value: a.owner || "—" },
-          ...(a.steward ? [{ label: "Steward", value: a.steward }] : []),
-          { label: "Update frequency", value: a._meta?.frekuensi || "—" },
-          ...(a._meta?.satuan ? [{ label: "Unit", value: a._meta.satuan }] : []),
-          ...(a._meta?.klasifikasi
-            ? [{ label: "Publisher classification", value: a._meta.klasifikasi }]
-            : []),
-          { label: "Columns", value: String(a.schema.length || a.columnCount) },
-          ...(schemaLabel ? [{ label: "Schema", value: schemaLabel }] : []),
-          // Governed pairs (`key: value`, tone "info") sit beside the free tags
-          // (neutral) in one row: both are how the asset is found.
-          ...(tags.length > 0 || governedPairs.length > 0
-            ? [
-                {
-                  label: "Tags",
-                  value: (
-                    <span className="flex flex-wrap gap-1">
-                      {governedPairs.map((pair) => (
-                        <Pill key={`governed:${pair}`} tone="info" title="Governed tag">
-                          {pair}
-                        </Pill>
-                      ))}
-                      {tags.map((tag) => (
-                        <Pill key={tag} tone="neutral">
-                          {tag}
-                        </Pill>
-                      ))}
-                    </span>
-                  ),
-                },
-              ]
-            : []),
-        ]}
-      />
+      <dl className="flex flex-col">
+        <DetailRow label="Owner">{a.owner || "—"}</DetailRow>
+        {a.steward ? <DetailRow label="Steward">{a.steward}</DetailRow> : null}
+        <DetailRow label="Domain">{a.domain || "—"}</DetailRow>
+        <DetailRow label="Update frequency">{a._meta?.frekuensi || "—"}</DetailRow>
+        {a._meta?.satuan ? <DetailRow label="Unit">{a._meta.satuan}</DetailRow> : null}
+        {a._meta?.klasifikasi ? (
+          <DetailRow label="Publisher classification">{a._meta.klasifikasi}</DetailRow>
+        ) : null}
+        <DetailRow label="Rows">
+          {rowsGone ? (
+            <span title="No Iceberg table for this asset: the count the registry recorded is not shown.">—</span>
+          ) : (
+            <span className="tabular-nums">{fmtMeasured(a.rows, formatNumber)}</span>
+          )}
+        </DetailRow>
+        <DetailRow label="Size">
+          <span className="tabular-nums">{fmtMeasured(a.sizeBytes, formatBytes)}</span>
+        </DetailRow>
+        <DetailRow label="Stored in">{`${ENGINE_CATEGORY_LABEL[a.engine]} · ${a.format}`}</DetailRow>
+        <DetailRow label="Residency">{a.residency || "—"}</DetailRow>
+        {schemaLabel ? <DetailRow label="Schema">{schemaLabel}</DetailRow> : null}
+        {/* Governed pairs (`key: value`, tone "info") sit beside the free tags
+            (neutral) in one row: both are how the asset is found. */}
+        {tags.length > 0 || governedPairs.length > 0 ? (
+          <DetailRow label="Tags">
+            <span className="flex flex-wrap gap-1">
+              {governedPairs.map((pair) => (
+                <Pill key={`governed:${pair}`} tone="info" title="Governed tag">
+                  {pair}
+                </Pill>
+              ))}
+              {tags.map((tag) => (
+                <Pill key={tag} tone="neutral">
+                  {tag}
+                </Pill>
+              ))}
+            </span>
+          </DetailRow>
+        ) : null}
+      </dl>
       {/* WEB-3 S3-T5a (review round 1 decision 1): the whole table's own
           classification rule, which the Access tab's Classify dialog used to
           set (S3-D2 removed it). A column's level is set on the column. */}
-      <section
-        aria-label="Sensitivity (whole table)"
-        className="mt-3 grid gap-1.5 border-t border-border pt-3 sm:grid-cols-[10rem_minmax(0,1fr)] sm:gap-3"
-      >
-        <div className="text-xs font-medium text-muted-foreground sm:pt-1.5">Sensitivity (whole table)</div>
-        <div className="flex min-w-0 flex-col gap-2">
-          <SensitivityControls
-            asset={a}
-            level={tableRule?.classification}
-            canWrite={hasPermission("governance:write")}
-            onChanged={onChanged}
-          />
-          {stricterNote ? <p className="text-xs text-muted-foreground">{stricterNote}</p> : null}
-        </div>
-      </section>
-      {editing ? (
-        // Mounted only while open, so each opening starts from the saved values.
-        <EditDialog
+      <section aria-label="Sensitivity (whole table)" className="flex flex-col gap-1.5">
+        <div className="text-xs font-medium text-muted-foreground">Sensitivity (whole table)</div>
+        <SensitivityControls
           asset={a}
-          open
-          onClose={() => setEditing(false)}
-          onSaved={() => {
-            setEditing(false)
-            onChanged()
-          }}
+          level={tableRule?.classification}
+          canWrite={hasPermission("governance:write")}
+          onChanged={onChanged}
         />
-      ) : null}
-    </SectionCard>
+        {stricterNote ? <p className="text-xs text-muted-foreground">{stricterNote}</p> : null}
+      </section>
+    </div>
   )
 }

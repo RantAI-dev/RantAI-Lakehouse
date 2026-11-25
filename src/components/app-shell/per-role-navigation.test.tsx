@@ -181,7 +181,7 @@ describe("ADM-13 D8: per-role navigation and route guard", () => {
     expect(screen.queryByText("Home content")).toBeNull()
   })
 
-  it("4. Assistant only user sees Home, History, Dashboards and the dock", async () => {
+  it("4. Assistant only user sees Home, Dashboards and the dock", async () => {
     currentPathname = "/dashboards"
     stubAuth(["assistant:ask", "dashboard:read"], "Assistant only")
 
@@ -195,8 +195,9 @@ describe("ADM-13 D8: per-role navigation and route guard", () => {
 
     // Allowed links in sidebar
     expect(screen.getByRole("link", { name: /^home/i })).toBeTruthy()
-    expect(screen.getByRole("link", { name: /^history/i })).toBeTruthy()
     expect(screen.getByRole("link", { name: /^dashboards/i })).toBeTruthy()
+    // WEB-18: no History entry; the chats are in a conversation's sidebar.
+    expect(screen.queryByRole("link", { name: /^history/i })).toBeNull()
 
     // Disallowed links
     expect(screen.queryByRole("link", { name: /^query studio/i })).toBeNull()
@@ -223,7 +224,7 @@ describe("ADM-13 D8: per-role navigation and route guard", () => {
     // All major sections and links are present
     expect(screen.getByRole("link", { name: /^home/i })).toBeTruthy()
     expect(screen.getByRole("link", { name: /^dashboards/i })).toBeTruthy()
-    expect(screen.getByRole("link", { name: /^history/i })).toBeTruthy()
+    expect(screen.queryByRole("link", { name: /^history/i })).toBeNull()
     expect(screen.getByRole("link", { name: /^catalog/i })).toBeTruthy()
     expect(screen.getByRole("link", { name: /^query studio/i })).toBeTruthy()
     expect(screen.getByRole("link", { name: /^sources/i })).toBeTruthy()

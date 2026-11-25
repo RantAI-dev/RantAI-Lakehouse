@@ -71,8 +71,9 @@ describe("the report's print view", () => {
     expect(calls[0].url).toBe("/api/render/data")
     expect(JSON.parse(calls[0].body)).toEqual({ token: "a.b.c" })
     const blocks = container.querySelector("[data-report-blocks]")!
+    // BI-62: a chart's card sits in its width box (`.rd-chart-block`).
     const order = Array.from(blocks.children).map((el) =>
-      el.getAttribute("data-report-chart") ?? el.tagName.toLowerCase(),
+      el.querySelector("[data-report-chart]")?.getAttribute("data-report-chart") ?? el.tagName.toLowerCase(),
     )
     expect(order).toEqual(["h2", "p", "c_one", "ul", "unavailable", "p"])
     expect(screen.getByTestId("tile-c_one").getAttribute("data-dark")).toBe("false")

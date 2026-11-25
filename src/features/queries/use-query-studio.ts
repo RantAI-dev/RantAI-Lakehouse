@@ -212,6 +212,37 @@ type Batch = {
    */
   runId: string | null
   engine: QueryEngine
+  /**
+   * BI-63: Stop was pressed. Stop aborts the request only after the server
+   * answered the cancel (or 2 s passed), so the loop and the statement in
+   * flight must already treat the batch as stopped before the abort lands.
+   */
+  stopped: boolean
+}
+
+/**
+ * BI-63: how long Stop waits for the server's answer to the cancel before it
+ * aborts the run request anyway. The server marks the run stopped when it
+ * receives the cancel, so the run's history row is written as stopped even
+ * though the request is dropped right after; the wait only keeps the abort
+ * from racing ahead of the cancel.
+ */
+const CANCEL_WAIT_MS = 2000
+
+/**
+ * Asks the server to end the run, and resolves when it answered or `ms` have
+ * passed, whichever is first. Never rejects: a server with no cancel route, or
+ * one that is down, must not keep Stop from working.
+ */
+function cancelRunWithin(runId: string, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms)
+    const done = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+    queryService.cancel(runId).then(done, done)
+  })
 }
 
 /**
@@ -1140,6 +1171,7 @@ export function useQueryStudio(draftKey: string | null) {
         active: true,
         runId: null,
         engine: runEngine,
+        stopped: false,
       }
       batchRef.current = batch
       setRunning(true)
@@ -1158,7 +1190,7 @@ export function useQueryStudio(draftKey: string | null) {
 
       try {
         for (let index = 0; index < list.length; index += 1) {
-          if (controller.signal.aborted) {
+          if (controller.signal.aborted || batch.stopped) {
             markNotRun(index, "stopped")
             break
           }
@@ -1180,6 +1212,12 @@ export function useQueryStudio(draftKey: string | null) {
               { engine: runEngine, runId, ...inputs },
               controller.signal
             )
+            if (batch.stopped) {
+              // Stop was pressed while the answer was on its way: the server
+              // records the run as stopped, so the page does too.
+              markNotRun(index, "stopped")
+              break
+            }
             setRuns((previous) => ({
               ...previous,
               [tabId]: (previous[tabId] ?? []).map((run, at) =>
@@ -1189,10 +1227,14 @@ export function useQueryStudio(draftKey: string | null) {
               ),
             }))
           } catch (error) {
-            if (controller.signal.aborted) {
+            if (controller.signal.aborted || batch.stopped) {
               // The person stopped the batch: the statement that was in
               // flight did not finish, and neither did the ones after it.
-              markNotRun(index, "stopped")
+              // PR #649 review 1: Stop aborts only after the cancel's
+              // answer (up to `CANCEL_WAIT_MS`), so this catch can resume
+              // after a newer Run press already owns the tab; only the
+              // batch that still owns it may write its rows.
+              if (batchRef.current === batch) markNotRun(index, "stopped")
               break
             }
             const serviceError = toServiceError(error)
@@ -1225,14 +1267,21 @@ export function useQueryStudio(draftKey: string | null) {
         }
       } finally {
         batch.active = false
-        setRunning(false)
-        if (runControllerRef.current === controller) runControllerRef.current = null
-        // Every run is recorded, including the ones that failed, so the rail
-        // has to catch up — otherwise the query you just ran is missing from
-        // your own history until a reload. Once for the whole batch.
-        if (!batch.reloaded) {
-          batch.reloaded = true
-          historyState.reload()
+        // PR #649 review 1: the same deferred abort lets a stopped batch
+        // reach this finally after a newer Run press has taken the tab
+        // (`batchRef` points at the new batch). Only the owner clears the
+        // running state and reloads history; the old batch's rows and its
+        // reload were already handled when Stop was pressed.
+        if (batchRef.current === batch) {
+          setRunning(false)
+          if (runControllerRef.current === controller) runControllerRef.current = null
+          // Every run is recorded, including the ones that failed, so the rail
+          // has to catch up — otherwise the query you just ran is missing from
+          // your own history until a reload. Once for the whole batch.
+          if (!batch.reloaded) {
+            batch.reloaded = true
+            historyState.reload()
+          }
         }
       }
     },
@@ -1297,17 +1346,28 @@ export function useQueryStudio(draftKey: string | null) {
     // flight, and the person pressed Stop for it.
     stopDownload()
     const batch = batchRef.current
-    // BI-5: ask the server to end the statement's query first. Best effort (a
-    // Trino run has no id to send: the built-in engine is the only one that can
-    // stop a query, see the feature page), and Stop aborts the request either
-    // way, so the page never waits on a query the person gave up on.
-    if (batch?.active && batch.runId && batch.engine === "clickhouse") {
-      void queryService.cancel(batch.runId).catch(() => undefined)
-    }
-    runControllerRef.current?.abort()
+    const controller = runControllerRef.current
     // The controller goes now, not when the request settles: a request
     // that never comes back would otherwise hold the console shut.
     runControllerRef.current = null
+    // BI-63 (BI-5-AC2): the server is asked to end the run for every engine
+    // (it marks the run stopped, which is what puts a stopped row in the
+    // history, and ClickHouse kills the query), and the run request is
+    // aborted only after the answer, or after 2 s. Aborting at once dropped
+    // the request before the server could record the run. The "Stopped"
+    // below still shows at once.
+    const live = batch?.active === true
+    const asked =
+      batch?.active && batch.runId
+        ? cancelRunWithin(batch.runId, CANCEL_WAIT_MS)
+        : Promise.resolve()
+    if (batch?.active) batch.stopped = true
+    void asked.then(() => {
+      controller?.abort()
+      // The row is written once the server has the cancel, which is after the
+      // reload below, so the rail asks again.
+      if (live) historyState.reload()
+    })
     if (!batch || !batch.active) return
     setRuns((previous) => {
       const current = previous[batch.tabId] ?? []

@@ -79,7 +79,11 @@ describe("QueryStudioPage Stop (BI-5)", () => {
       seen = { runId: options.runId, signal }
       return new Promise(() => {})
     }) as never)
-    const cancel = spyOn(queryService, "cancel").mockResolvedValue({ stopped: 1 })
+    // BI-63: the abort waits for the cancel's answer, so the test holds it.
+    let answer: () => void = () => {}
+    const cancel = spyOn(queryService, "cancel").mockImplementation(
+      () => new Promise((resolve) => { answer = () => resolve({ stopped: 1 }) }),
+    )
     seedDraft("SELECT sleep(100)")
     renderPage()
 
@@ -93,9 +97,13 @@ describe("QueryStudioPage Stop (BI-5)", () => {
     fireEvent.click(stop)
     expect(cancel).toHaveBeenCalledTimes(1)
     expect(cancel.mock.calls[0][0]).toBe(seen.runId as string)
-    expect(seen.signal?.aborted).toBe(true)
-    // The page is usable again: Run is back, Stop is gone.
+    // "Stopped" shows at once, but the request is not aborted before the
+    // server has answered the cancel: an aborted request is what used to
+    // keep the run out of the history (BI-5-AC2).
     await waitFor(() => expect(screen.queryByRole("button", { name: "Stop" })).toBeNull())
+    expect(seen.signal?.aborted).toBe(false)
+    answer()
+    await waitFor(() => expect(seen.signal?.aborted).toBe(true))
   })
 
   it("still aborts when the server has no cancel route yet", async () => {
@@ -112,7 +120,7 @@ describe("QueryStudioPage Stop (BI-5)", () => {
     await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
     fireEvent.click(runButton)
     fireEvent.click(await screen.findByRole("button", { name: "Stop" }))
-    expect(signal?.aborted).toBe(true)
+    await waitFor(() => expect(signal?.aborted).toBe(true))
   })
 
   it("sends each Run all statement its own id, and Stop cancels the one in flight and leaves the rest not run", async () => {
@@ -135,7 +143,7 @@ describe("QueryStudioPage Stop (BI-5)", () => {
     expect(seen.length).toBe(1)
     expect(cancel).toHaveBeenCalledTimes(1)
     expect(cancel.mock.calls[0][0]).toBe(seen[0].runId as string)
-    expect(seen[0].signal?.aborted).toBe(true)
+    await waitFor(() => expect(seen[0].signal?.aborted).toBe(true))
     await waitFor(() => expect(screen.queryByRole("button", { name: "Stop" })).toBeNull())
   })
 })

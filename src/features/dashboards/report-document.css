@@ -1,0 +1,185 @@
+/*
+ * A report as a document (`BI-62`, mockup D): the typography the editor, its
+ * Preview, the reader page and the PDF share, so writing looks like reading
+ * (spec target T1, T6).
+ *
+ * Why a stylesheet and not Tailwind classes inline (docs/CODE-STANDARD.md
+ * §4.4): the editor's text is ProseMirror's own DOM (headings, list items,
+ * quotes it creates as the person types), which cannot carry utility
+ * classes, and the reader must look the same, so both are styled by element
+ * under one root class. The landing page's `landing.css` is the precedent.
+ * Every name starts with `rd-` so nothing else in the console collides.
+ *
+ * Movement sits inside `prefers-reduced-motion: no-preference`.
+ */
+
+/* The scroll area is a size container, so a wide chart takes the room it has. */
+.rd-scroll {
+  container-type: inline-size;
+}
+
+.rd-doc {
+  color: var(--foreground);
+  font-size: 16px;
+  line-height: 1.75;
+  overflow-wrap: break-word;
+}
+.rd-doc.ProseMirror {
+  outline: none;
+  caret-color: var(--primary);
+  padding-bottom: 30vh;
+}
+.rd-doc > * + * {
+  margin-top: 0.5rem;
+}
+
+.rd-doc .rd-title {
+  font-size: 40px;
+  line-height: 1.15;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  margin: 0 0 1.25rem;
+  text-wrap: balance;
+}
+@media (max-width: 640px) {
+  .rd-doc .rd-title { font-size: 30px; }
+}
+
+/* Headings by level, whichever tag carries them (the page's title is its h1). */
+.rd-doc > [data-level="1"] {
+  font-size: 26px;
+  line-height: 1.3;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  margin-top: 2.25rem;
+  text-wrap: balance;
+}
+.rd-doc > [data-level="2"] {
+  font-size: 20px;
+  line-height: 1.4;
+  font-weight: 620;
+  letter-spacing: -0.01em;
+  margin-top: 1.75rem;
+  text-wrap: balance;
+}
+/* Level 3 is no longer written (BI-62) but still reads. */
+.rd-doc > [data-level="3"] {
+  font-size: 17px;
+  line-height: 1.5;
+  font-weight: 620;
+  margin-top: 1.5rem;
+}
+
+/* The console's base layer sets p and li to 16/24; a document reads better a little looser. */
+.rd-doc > p, .rd-doc li, .rd-doc li > p, .rd-doc > blockquote > p {
+  font-size: 16px;
+  line-height: 1.75;
+}
+.rd-doc > p, .rd-doc li, .rd-doc > blockquote > p, .rd-doc > [data-level] {
+  white-space: pre-wrap;
+}
+.rd-doc > p, .rd-doc > blockquote > p { text-wrap: pretty; }
+.rd-doc li > p { margin: 0; }
+.rd-doc strong { font-weight: 620; }
+.rd-doc em { font-style: italic; }
+
+.rd-doc > ul, .rd-doc > ol, .rd-doc li > ul, .rd-doc li > ol { padding-left: 1.6rem; }
+.rd-doc > ul, .rd-doc li > ul { list-style: disc; }
+.rd-doc > ol, .rd-doc li > ol { list-style: decimal; }
+.rd-doc li + li { margin-top: 0.125rem; }
+.rd-doc li::marker { color: var(--muted-foreground); }
+
+/* A quote is a typographic bar and a softer voice, not a box. */
+.rd-doc > blockquote {
+  padding: 0.125rem 0 0.125rem 1.1rem;
+  box-shadow: inset 3px 0 0 color-mix(in oklab, var(--foreground) 22%, transparent);
+  color: color-mix(in oklab, var(--foreground) 82%, transparent);
+  font-style: normal;
+}
+.rd-doc > blockquote > p + p { margin-top: 0.5rem; }
+
+.rd-doc > hr {
+  border: 0;
+  height: 1px;
+  background: var(--border);
+  margin: 1.75rem 0;
+}
+.rd-doc.ProseMirror > hr { cursor: pointer; }
+.rd-doc > hr.ProseMirror-selectednode { background: var(--primary); }
+
+.rd-doc a {
+  color: var(--primary);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklab, var(--primary) 35%, transparent);
+  text-underline-offset: 3px;
+  border-radius: 2px;
+}
+.dark .rd-doc a { color: oklch(0.83 0.1 230); }
+.rd-doc a:hover { text-decoration-color: currentColor; }
+.rd-doc a:focus-visible { outline: none; box-shadow: 0 0 0 3px color-mix(in oklab, var(--ring) 50%, transparent); }
+
+.rd-doc ::selection { background: color-mix(in oklab, var(--primary) 22%, transparent); }
+
+/* Charts: text width, or wide (up to 1040 px, never past the scroll area). */
+.rd-doc .rd-chart-block {
+  margin-block: 1.25rem;
+  --rd-wide: max(100%, min(1040px, calc(100cqw - 64px)));
+}
+.rd-doc .rd-chart-block[data-width="wide"] {
+  width: var(--rd-wide);
+  margin-left: calc((100% - var(--rd-wide)) / 2);
+}
+/* On paper the text column is the page: a wide chart is as wide as the text. */
+.rd-doc.rd-print .rd-chart-block[data-width="wide"] {
+  width: 100%;
+  margin-left: 0;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .rd-doc.ProseMirror .rd-chart-block {
+    transition: width 220ms cubic-bezier(0.2, 0, 0, 1), margin-left 220ms cubic-bezier(0.2, 0, 0, 1);
+  }
+}
+
+/* The editor only. */
+.rd-doc .rd-chart-block.ProseMirror-selectednode { outline: none; }
+.rd-doc > .ProseMirror-selectednode:is(p, h2, h3, h4, ul, ol, blockquote) {
+  border-radius: 6px;
+  background: color-mix(in oklab, var(--primary) 9%, transparent);
+}
+
+/* Placeholders: the title always; the hint on the only line under the title, else only on the line with the cursor. */
+.rd-doc .is-empty::before {
+  content: attr(data-placeholder);
+  color: var(--muted-foreground);
+  opacity: 0.7;
+  pointer-events: none;
+  float: left;
+  height: 0;
+}
+.rd-doc > p.is-empty:not(.has-focus)::before,
+.rd-doc > [data-level].is-empty:not(.has-focus)::before { content: none; }
+.rd-doc > .rd-title + p.is-empty:last-child::before { content: attr(data-placeholder); }
+.rd-doc:not(.ProseMirror-focused) > p.is-empty:not(.rd-title + p:last-child)::before { content: none; }
+.rd-doc[contenteditable="false"] .is-empty:not(.rd-title)::before { content: none; }
+.rd-doc .rd-title.is-empty::before { opacity: 0.45; }
+
+/* Where a dragged block will land. */
+.rd-dropcursor {
+  background: color-mix(in oklab, var(--primary) 70%, transparent);
+  border-radius: 2px;
+}
+
+/* Fading edges of a scrolling list (DESIGN.md §3): only where something is hidden. */
+.rd-fade-y {
+  mask-image: linear-gradient(to bottom, transparent, black 12px, black calc(100% - 12px), transparent);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  /* Menus grow from where they were opened (150 ms). */
+  .rd-pop { animation: rd-pop 150ms cubic-bezier(0.23, 1, 0.32, 1) both; }
+  /* The handle appears softly beside the row. */
+  .rd-handle { animation: rd-fade 120ms ease-out both; }
+}
+
+@keyframes rd-pop { from { opacity: 0; transform: scale(0.97); } to { opacity: 1; transform: scale(1); } }
+@keyframes rd-fade { from { opacity: 0; } to { opacity: 1; } }
