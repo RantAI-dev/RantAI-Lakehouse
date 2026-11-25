@@ -11,9 +11,11 @@ import { SITE_NAME } from "./seo";
  * `SoftwareSourceCode`, not of `SoftwareApplication`, where validators flag
  * it.
  *
- * Principle 2: there is no `aggregateRating`, `review` or `offers`, because
- * there are none to state, and none are invented to win a rich result. A
- * test fails if one appears.
+ * Principle 2: there is no `aggregateRating` or `review`, because there are
+ * none to state, and none are invented to win a rich result. The one offer
+ * is the price the page itself states ("Free and open source", AGPL-3.0):
+ * 0. A test fails if a rating or review appears, or the offer is anything
+ * but free.
  */
 export function homeStructuredData({
   locale,
@@ -31,6 +33,9 @@ export function homeStructuredData({
     "@id": `${LINKS.rantai}/#organization`,
     name: "RantAI",
     url: LINKS.rantai,
+    // The logo rantai.dev itself names as the company's (rantai-page
+    // `app/[locale]/page.tsx`).
+    logo: `${LINKS.rantai}/rant-ai.png`,
   };
   return {
     "@context": "https://schema.org",
@@ -46,6 +51,7 @@ export function homeStructuredData({
         operatingSystem: "Linux",
         license: "https://www.gnu.org/licenses/agpl-3.0.html",
         isAccessibleForFree: true,
+        offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
         publisher: { "@id": organization["@id"] },
       },
       {

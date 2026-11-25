@@ -24,7 +24,15 @@ test("the repository is SoftwareSourceCode pointing at the application (review f
   assert.deepEqual(code.targetProduct, { "@id": app["@id"] });
 });
 
-test("homeStructuredData invents no rating, review or offer (principle 2)", () => {
+test("the only offer is the free one the page states; no rating or review (principle 2)", () => {
+  const app = graph.find((n) => n["@type"] === "SoftwareApplication")!;
+  assert.deepEqual(app.offers, { "@type": "Offer", price: "0", priceCurrency: "USD" });
   const text = JSON.stringify(data);
-  for (const k of ["aggregateRating", "review", "offers", "ratingValue"]) assert.ok(!text.includes(k), k);
+  for (const k of ["aggregateRating", "review", "ratingValue"]) assert.ok(!text.includes(k), k);
+});
+
+test("the Organization carries rantai.dev's own logo", () => {
+  const org = graph.find((n) => n["@type"] === "Organization")!;
+  assert.equal(org.url, "https://rantai.dev");
+  assert.equal(org.logo, "https://rantai.dev/rant-ai.png");
 });

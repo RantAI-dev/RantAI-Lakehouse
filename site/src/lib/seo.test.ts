@@ -46,3 +46,21 @@ test("buildPageMetadata asks for the large preview card and never sets robots", 
   assert.equal((m.twitter as Record<string, unknown>).card, "summary_large_image");
   assert.equal(m.robots, undefined);
 });
+
+test("every page's title and description fit a search result, in both languages", async () => {
+  for (const locale of ["en", "id"]) {
+    const messages = (await import(`../messages/${locale}/metadata.json`)).default as Record<
+      string,
+      { title: string; description: string }
+    >;
+    for (const page of ["home", "contact"]) {
+      const { title, description } = messages[page];
+      assert.ok(title.length >= 15 && title.length <= 60, `${locale} ${page} title is ${title.length} characters`);
+      assert.ok(
+        description.length >= 70 && description.length <= 160,
+        `${locale} ${page} description is ${description.length} characters`,
+      );
+      assert.ok(title.includes(SITE_NAME), `${locale} ${page} title names the product`);
+    }
+  }
+});
