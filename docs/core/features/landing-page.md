@@ -6,7 +6,7 @@
 | Backlog | `WEB-1` (the page), `WEB-5` (the page as its own static site, in English and Indonesian) |
 | Kind | Feature |
 | Spec | `WEB-1`: none, it was planned with the engineering plan. `WEB-5`: `docs/core/specs/web-5.md` |
-| Status | `WEB-1`: In Acceptance (#107). `WEB-5`: Building (PR #379). The checklist below targets the site and has not been run |
+| Status | `WEB-1`: In Acceptance (#107). `WEB-5`: In review (PR #379). The owner approved the look on 2026-11-25. The measured rows below carry their evidence; the rows that need a real GPU, a phone or the acceptor are not run |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
@@ -20,8 +20,16 @@ It is the Lakehouse site in `site/`, its own package, built as a static export
 (`next build` writes `site/out/`): English at `/`, Indonesian at `/id/`. The
 console has no `/landing` any more. An installed Lakehouse answers it with the
 console's page-not-found, and the release's install proof checks for that.
-Where the site is hosted is not decided yet (`WEB-5` D2). Build and serve
-steps: `site/README.md`.
+It is hosted on GitHub Pages at `https://lakehouse.rantai.dev`
+(`WEB-5` D22, which closes D2). `.github/workflows/deploy-landing.yml` builds
+`site/` and publishes `site/out` on a push to `main` that touches `site/**`.
+Build and serve steps: `site/README.md`.
+
+**Limits of the host.** GitHub Pages sends no response headers the site
+controls. The Content Security Policy and the referrer policy are therefore
+`<meta>` tags in the page's `<head>`. There is no HSTS, no `frame-ancestors`
+(a meta tag ignores it, so framing is not refused) and no
+`X-Content-Type-Options`. They are limits of the host, not passes.
 
 ## Problem
 
@@ -94,8 +102,9 @@ gets elsewhere, and without claiming anything the build does not do.
 - Customer logos, user counts, uptime figures, benchmark numbers,
   testimonials or a "trusted by" row. There are none.
 - Analytics, tracking scripts, cookies or a cookie banner.
-- Hosting, a domain and a deploy workflow (`WEB-5` D2: decided later). The
-  build needs the site's address (`NEXT_PUBLIC_SITE_URL`) and has no default.
+- Any other host. The site is host-agnostic (`WEB-5` D1) and the build needs
+  the site's address (`NEXT_PUBLIC_SITE_URL`), which has no default; the
+  workflow sets it to `https://lakehouse.rantai.dev`.
 - A link to the site from inside the console (open question 1).
 - Languages other than English and Indonesian.
 - The console itself: the site describes the product, it does not replace
@@ -119,6 +128,10 @@ does not apply (`WEB-5` D13).
 | 6 | Where it lives, on an installed Lakehouse | Not there. The console has no landing route since `WEB-5`, and its image leaves `site/` out of its build context, so `/landing` answers with the console's page-not-found (the install proof checks it) | Product owner, 2026-11-02 (QA-1 decisions); `WEB-5` D11 |
 | 7 | Languages | English at `/`, Indonesian at `/id/`, no redirect by browser language, an EN · ID switch, the "Tersedia dalam Bahasa Indonesia" offer | Product owner, 2026-11-04 (`WEB-5` D3) |
 | 8 | Performance and SEO | The targets in `docs/core/specs/web-5.md`, measured in `docs/plans/WEB-5-RESULT.md` | Product owner, 2026-11-04 (`WEB-5` spec, D4, D5) |
+| 9 | Show the real product (`WEB-5` D19) | Screenshots of the real console, framed in the site's style, next to the illustrations | Product owner, 2026-11-07 (plan §10, D19) |
+| 10 | Get started in three steps (`WEB-5` D20) | The install steps are on the page, copyable, so the visitor is not sent to another document first | Product owner, 2026-11-07 (plan §10, D20) |
+| 11 | Answer the doubts where people decide (`WEB-5` D21) | A short line under the main button and in the sections where a visitor decides: cost, data safety, next step | Product owner, 2026-11-07 (plan §10, D21) |
+| 12 | Hosting (`WEB-5` D22, closes D2) | GitHub Pages at `https://lakehouse.rantai.dev`, published from `site/out` by `.github/workflows/deploy-landing.yml`; the security policy is a `<meta>` tag because the host sets no headers | Product owner, 2026-11-25 (plan §11, D22) |
 
 ## Limits to tell a customer
 
@@ -129,10 +142,20 @@ does not apply (`WEB-5` D13).
   parallax and no eye that follows the pointer.
 - The people, the numbers and the charts in the illustrations are made up.
   Each block that holds one says so.
-- The page says nothing about prices, hosting, uptime or how many customers
-  there are, because none of that is settled.
-- The site is static: no server, no API call, no cookie. It is hosted wherever
-  the owner decides (`WEB-5` D2); until then it is a build, not a URL.
+- The page says nothing about prices, uptime or how many customers there are,
+  because none of that is settled.
+- The site is static: no server, no API call, no cookie. It is served by
+  GitHub Pages at `https://lakehouse.rantai.dev`. Pages sets no response
+  headers, so the security policy is a `<meta>` tag, and there is no HSTS, no
+  `frame-ancestors` and no `X-Content-Type-Options`.
+- By day, at 320 px wide, the hero's reassurance line can still be the
+  largest paint (LCP): the headline's area is 25,344 px against the line's
+  28,086 px there. At 360 px and wider the headline is the LCP. Fixing it
+  would change what the visitor sees, so it is not done.
+- The WebGL path (the real 3D lake, the eye, the dip) cannot be verified on
+  CI or on a machine without a GPU. The measured scores are of the DOM hero.
+  It was exercised only with a spoofed context, and needs a real GPU and a
+  phone.
 - Measured against the spec's targets in `docs/plans/WEB-5-RESULT.md`. A
   target the build misses is written there with its number.
 
@@ -146,6 +169,12 @@ or Not run with the reason. A step not performed is never Pass.
 `WEB-1-AC1` to `WEB-1-AC17` were written for `/landing` in the console. They
 are replaced by the list below. The console-side checks that remain are
 `WEB-5-AC17` and `WEB-5-AC18`.
+
+The performance, accessibility and policy rows (`AC19` to `AC23`) carry their
+evidence from `docs/plans/WEB-5-RESULT.md` (2026-11-25; `lighthouse@13.6.0`,
+mobile, simulated throttling, median of runs, on the DOM hero because the VM
+has no GPU). They are measured by the developer, not accepted. The Result
+column says "Measured" or "Owner QA"; Pass is for the acceptor.
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
@@ -167,6 +196,11 @@ are replaced by the list below. The console-side checks that remain are
 | `WEB-5-AC16` | Open `/sitemap.xml`, `/robots.txt`, and a missing path such as `/nope/` | The sitemap lists `/` with its Indonesian alternate; robots allows everything and names the sitemap; the missing path shows the site's not-found page | |
 | `WEB-5-AC17` | On an installed Lakehouse, open `/landing` | The console's page-not-found. The console does not serve the product page | |
 | `WEB-5-AC18` | Open the browser's network panel on `/` | Only the site's own files load: no API, no analytics, no cookie is set | |
+| `WEB-5-AC19` | Run Lighthouse (mobile, simulated throttling) on `/` and `/id/`, at night and by day (local time 06:00 to 17:59 is day) | Performance is 90 or more on all four. Medians: `/` night 91 and `/id/` night 93 (T3b); `/` day 90.5 (six runs, was 74) and `/id/` day 92 (day-mode LCP) | Measured, 2026-11-25. Run on a shared VM, single runs swing by up to 20 points (day `/`: 86 to 94). The WebGL path is not in the numbers. Owner QA on a real phone |
+| `WEB-5-AC20` | Read the accessibility, SEO and best-practices scores of the same runs | 100 on each, on `/` and `/id/` | Measured, 2026-11-25: 100 in every run of T4 and of the day-mode pass |
+| `WEB-5-AC21` | Load `/`, `/id/`, `/contact/` and `/id/contact/` in a browser, scroll to the bottom, and watch the console | No `securitypolicyviolation` and no console message | Measured, 2026-11-25, headless Chrome over CDP: 0 and 0 on all four pages. The WebGL scene chunk did not run (no GPU). Owner QA with a GPU |
+| `WEB-5-AC22` | Run `bun run size` in `site/` | The initial JavaScript is under 200 KB | Measured, 2026-11-25: 193.8 KB home, 165.8 KB contact (budget 200 KB) |
+| `WEB-5-AC23` | On a machine with a GPU, and on a phone, refresh `/` and `/id/` several times | One hero: the lake is the first thing in the hero, with no DOM hero (the creature, sun or moon centred) showing first and then a jump to the 3D lake | Owner QA. The DOM side is measured (`5a6a6549e`: the creature is held back while the 3D lake is expected; never stuck hidden). The real 3D path is not verified |
 
 **Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
 

@@ -2008,3 +2008,35 @@ Then push, wait for CI to go green, and mark #379 ready. The team merges.
   - **Why accepted:** they are decorative (`aria-hidden`, not selectable), which is WCAG 1.4.3's "incidental" exemption, and generated line numbers are a common code-viewer pattern.
   - **What it means for the score:** accessibility 100 for that node comes from the exemption, not from raised contrast. RESULT says so.
   - The caption nudges are a visible change and wait for the owner's QA before push.
+
+### Handoff (T1–T5), 2026-11-25
+
+Commits on `feat/web-5-landing-refresh` since `06095fc8e`, oldest first (the merge brought in `origin/main`'s own commits):
+
+| Commit | Task | What it did |
+| --- | --- | --- |
+| `1f73419db` | T1 | Merged `origin/main`; dropped the in-console landing export (`ops/landing-pages/`, `scripts/build-landing-pages.ts`, `build:landing`) |
+| `3025a6409` | T2 | Rewrote `deploy-landing.yml` to build `site/` and publish `site/out` (CNAME, `.nojekyll`, file checks) |
+| `c6f2fff84` | T4 | `site/` Next.js 16.4.3 to 16.4.6 (dependency review) |
+| `4feeb8e23` | T2 | CI: the site job is not a gate (OPS-25 gate-groups lint) |
+| `ce10be3d6`, `809796fae` | T3 | WebGL probe after first paint; lineage and open-tables pictures loaded after first paint (bundle 209.3 to 193.7 KB) |
+| `5002cd324` | T3 | RESULT: performance pass |
+| `2b52c39c8`, `518da111e`, `903ae2fa9` | T4 | JSON-LD offer and logo; CSP script hashes at build time instead of `'unsafe-inline'`; contrast to 4.5:1 |
+| `b5dbd2c97`, `e98c90a73` | T4 | RESULT: SEO, accessibility and policy pass; planner review |
+| `3ba5d2acd`, `3e95b4c97` | T3b | `content-visibility: auto` on governance, get-started and FAQ; the intro's rules end on a class |
+| `5a6a6549e`, `a1cfd7a00` | T3b | One hero, not the DOM hero and then the 3D lake; RESULT |
+| `779a73ab5`, `e0a7585ee`, `d009a6f36` | T3b | Day-mode LCP: a transparent text-shadow keeps the headline the largest paint; RESULT |
+| T5 commit | T5 | This docs pass: feature page, backlog, changelog and this handoff |
+
+Checks, quoted from the agents' reports in `docs/plans/WEB-5-RESULT.md`:
+- Lighthouse mobile (`lighthouse@13.6.0`, simulated throttling, median of 3 or 6): `/` night 91, `/id/` night 93, `/` day 90.5 (was 74), `/id/` day 92. Accessibility, SEO and best practices 100 in every run.
+- Zero CSP violations and zero console messages on `/`, `/id/`, `/contact/` and `/id/contact/` after scrolling to the bottom (headless Chrome, CDP).
+- `bun run size`: 193.8 KB home, 165.8 KB contact (budget 200 KB). `typecheck`, `lint`, `bun test src` pass (the claims test reads `docs/`, so it runs in the repo).
+- Look unchanged: 48 intro frames, day and night, 1190x800 and 390x844, 0 differing pixels (day-mode fix); page heights equal before and after (T3b).
+
+Not verified:
+- **The WebGL path.** The VM has no GPU, so the real 3D lake, the eye, the dip and "no DOM hero before the lake" were never seen. Needs the owner's machine and the iPhone.
+- **The real Pages deploy.** The workflow was run locally against a fresh export, not on GitHub. It first runs on a push to `main` that touches `site/**`.
+- **320 px wide by day.** The reassurance line is still the LCP there (28,086 px against the headline's 25,344 px). A fix would change what is seen.
+- Host limits, not passes: no HSTS, no `frame-ancestors`, no `X-Content-Type-Options` on Pages.
+- Owner acceptance and the acceptor's checklist run are open; the merger flips the WEB-5 status after merge (step 6).
