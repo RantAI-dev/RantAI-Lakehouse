@@ -131,9 +131,7 @@ export function AppSidebar() {
   const iconMode = state === "collapsed"
   const dashboardsRow = useDashboardsRow()
   const { user, hasPermission, logout } = useAuth()
-  // The workspace's own name and logo (`ADM-2`); the product's own stand
-  // in for whatever it did not set.
-  const branding = useBranding()
+
   // `BI-44`: the deployment route is `settings:write`-gated, so only a
   // holder of that permission asks for it. Everyone else — and a request
   // still in flight — gets the unchanged menu; a 403 on every page load

@@ -1,3 +1,7 @@
+// `AppSidebar` reads the route through `next/navigation`, which needs a
+// Next.js AppRouter context that a bare happy-dom environment does not
+// have, so the module is stubbed at the boundary (the same pattern as
+// `per-role-navigation.test.tsx`).
 mock.module("next/navigation", () => ({
   usePathname: () => "/catalog",
   useSearchParams: () => new URLSearchParams(""),
@@ -271,6 +275,7 @@ function renderBranded() {
 function pictures(container: HTMLElement): HTMLImageElement[] {
   return Array.from(container.querySelectorAll("img"))
 }
+
 
 describe("the sidebar header shows the workspace's own branding (ADM-2)", () => {
   it("shows the workspace name and logo from settings, not a fixed product name", async () => {
