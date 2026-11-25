@@ -2514,7 +2514,9 @@ mod tests {
             .await
             .unwrap();
 
-            let response = run(
+            // SEC-75's extra AppState field pushes this run() future past
+            // clippy's 16 KiB large_futures limit; box it as clippy suggests.
+            let response = Box::pin(run(
                 State(state),
                 HeaderMap::new(),
                 Query(RunQuery {
@@ -2522,7 +2524,7 @@ mod tests {
                     token: None,
                 }),
                 Some(Extension(service_principal())),
-            )
+            ))
             .await
             .expect("a service-identity principal must pass the run-token guard");
 
@@ -2684,7 +2686,9 @@ mod tests {
         }
 
         async fn call_run(state: &AppState, id: Option<&str>) -> Value {
-            run(
+            // SEC-75's extra AppState field pushes this run() future past
+            // clippy's 16 KiB large_futures limit; box it as clippy suggests.
+            Box::pin(run(
                 State(state.clone()),
                 HeaderMap::new(),
                 Query(RunQuery {
@@ -2692,7 +2696,7 @@ mod tests {
                     token: None,
                 }),
                 Some(Extension(service_principal())),
-            )
+            ))
             .await
             .expect("a service-identity principal must pass the run-token guard")
             .0
@@ -3443,7 +3447,9 @@ mod alert_run_tenant_scope {
         // four tenants: no tenant's reach covers the shared catalog.
         let state = state_for_with(&pool, &server.uri(), None);
 
-        let response = run(
+        // SEC-75's extra AppState field pushes this run() future past
+        // clippy's 16 KiB large_futures limit; box it as clippy suggests.
+        let response = Box::pin(run(
             State(state),
             HeaderMap::new(),
             Query(RunQuery {
@@ -3451,7 +3457,7 @@ mod alert_run_tenant_scope {
                 token: None,
             }),
             Some(Extension(cron())),
-        )
+        ))
         .await
         .expect("a service identity passes the run-token guard");
 
@@ -3478,7 +3484,9 @@ mod alert_run_tenant_scope {
         let server = engine_for("999").await;
         let state = state_for(&pool, &server.uri());
 
-        let response = run(
+        // SEC-75's extra AppState field pushes this run() future past
+        // clippy's 16 KiB large_futures limit; box it as clippy suggests.
+        let response = Box::pin(run(
             State(state),
             HeaderMap::new(),
             Query(RunQuery {
@@ -3486,7 +3494,7 @@ mod alert_run_tenant_scope {
                 token: None,
             }),
             Some(Extension(cron())),
-        )
+        ))
         .await
         .expect("a service identity passes the run-token guard");
 

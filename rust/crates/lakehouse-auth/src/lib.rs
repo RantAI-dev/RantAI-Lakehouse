@@ -50,6 +50,7 @@ pub mod repository;
 pub mod secret;
 pub mod service_token;
 pub mod session;
+pub mod source_throttle;
 pub mod throttle;
 mod token;
 

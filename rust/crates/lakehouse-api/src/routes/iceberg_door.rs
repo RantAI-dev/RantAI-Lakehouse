@@ -106,6 +106,13 @@ use crate::state::AppState;
 use crate::upstream_error::{self, Class, FailedAs};
 
 /// The one namespace the door serves (ADR 0016 point 2).
+///
+/// DATA-65: Silver publications also exist in Iceberg, but the door stays
+/// deliberately Gold-only — its namespace path guard, its grant and every
+/// outside-reader count are scoped to `gold`, and widening it would expose
+/// a namespace ADR 0016 never authorised. Silver tables are published for
+/// readers that reach the catalog through their own credentials; this
+/// proxy does not serve them.
 pub const GOLD_NAMESPACE: &str = "gold";
 
 /// The catalog principal the door forwards an outside tool's call under

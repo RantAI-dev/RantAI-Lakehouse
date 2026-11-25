@@ -174,6 +174,9 @@ async fn dependent_pipelines_are_derived_from_pipeline_definition(
     let pipeline = create_pipeline(
         &pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             inputs: Vec::new(),
             steps: Vec::new(),
             name: "dependents test pipeline".to_owned(),

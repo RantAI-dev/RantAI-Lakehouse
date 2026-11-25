@@ -40,14 +40,15 @@ use lakehouse_core::ApiError;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::config::{InstallMode, QueryEngine};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::policy_engine::PolicyEngineObligations;
 use crate::routes::support::{
-    SpecRunFailure, failure_as_api_error, render_stored_spec, run_statement_limited,
-    try_run_spec_sql,
+    SpecRunFailure, describe_trino_preview_columns, failure_as_api_error, render_stored_spec,
+    run_statement_limited, run_trino_preview, try_run_spec_sql,
 };
-use crate::sql_guard::check_sql_source;
+use crate::sql_guard::{check_sql_source, check_sql_source_for_mode};
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -106,6 +107,20 @@ const SQL_SOURCE: upstream_error::Context = upstream_error::Context::new(
 /// that `ClickHouse` is unreachable (503). The detail is only logged.
 fn classify_ch_error(err: &ChError) -> ApiError {
     upstream_error::ch_error(&SQL_SOURCE, err)
+}
+
+/// A `bi-only` install on `Trino` has no `ClickHouse` metadata store: the
+/// `lakehouse_bi::store` tables that hold saved sources, charts and boards
+/// live in the engine that was deliberately not deployed. Refuse BEFORE a
+/// dial so no request silently attempts to start the missing engine
+/// (`AGENTS.md` principles 2 and 3). Preview over unsaved SQL still works —
+/// it is the one dashboard surface slice 3 moves to `Trino`.
+fn bi_only_trino_persistence_refusal(state: &AppState) -> Option<ApiError> {
+    (state.config.is_bi_only() && state.config.query_engine == QueryEngine::Trino).then(|| {
+        ApiError::Unavailable(
+            "Saving or listing dashboard SQL sources needs the ClickHouse metadata store, which a bi-only Trino installation does not deploy. Preview unsaved SQL instead; saved sources are not available in this installation.".to_owned(),
+        )
+    })
 }
 
 /// Steps 1 and 2 of the module posture: the lexical gate, then the policy
@@ -237,6 +252,9 @@ pub async fn list(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
 ) -> ApiResult<ApiJson<Value>> {
+    if let Some(refusal) = bi_only_trino_persistence_refusal(&state) {
+        return Err(refusal.into());
+    }
     // BI-19 B2 (plan D8): the chart builder lists sources for somebody who can
     // edit a dashboard through a rule alone; the router asks only "signed in".
     // `viewer_for` refuses somebody with neither `dashboard:read` nor a rule.
@@ -301,6 +319,9 @@ pub async fn create(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    if let Some(refusal) = bi_only_trino_persistence_refusal(&state) {
+        return Err(refusal.into());
+    }
     let body: SourceBody = parse(&body)?;
     let source = save(
         &state,
@@ -334,6 +355,9 @@ pub async fn update(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    if let Some(refusal) = bi_only_trino_persistence_refusal(&state) {
+        return Err(refusal.into());
+    }
     let body: SourceBody = parse(&body)?;
     let id = body
         .id
@@ -397,6 +421,9 @@ pub async fn delete(
     Extension(principal): Extension<Principal>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    if let Some(refusal) = bi_only_trino_persistence_refusal(&state) {
+        return Err(refusal.into());
+    }
     let id =
         q.id.as_deref()
             .map(str::trim)
@@ -474,6 +501,12 @@ pub async fn preview(
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let body: PreviewBody = parse(&body)?;
+    // `BI-44` slice 3: the one-engine install has no `ClickHouse` to probe
+    // or execute on. Branch before building anything that holds
+    // `state.clickhouse`; the full path below is unchanged.
+    if state.config.is_bi_only() && state.config.query_engine == QueryEngine::Trino {
+        return preview_bi_only_trino(&state, &principal, &headers, body).await;
+    }
     let obligations = PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
     let time = crate::routes::settings::time_context(&state).await?;
     let out = preview_for_roles(
@@ -495,6 +528,62 @@ pub async fn preview(
     )
     .await?;
     Ok(ApiJson(out))
+}
+
+/// The `bi-only+trino` half of [`preview`]: guard, gate, governance rewrite,
+/// column probe and row read all on the installed engine. The same steps as
+/// [`preview_for_roles`], with `Trino`'s dialect and client instead of
+/// `ClickHouse`'s — no call here can reach `ClickHouse`, which was not
+/// deployed.
+///
+/// An inline `chart` is refused honestly: the chart builder still produces
+/// `ClickHouse` `SETTINGS` text, so there is no `Trino` statement to run for
+/// it yet. That limit is written down on the feature page and in the plan's
+/// slice-3 handoff; it is not papered over with a query that would fail.
+///
+/// # Errors
+///
+/// 400 for a chart, 422 when the guard, rewrite, probe or run refuses, 503
+/// when `Trino` cannot be reached. Every engine failure is classified.
+async fn preview_bi_only_trino(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+    body: PreviewBody,
+) -> ApiResult<ApiJson<Value>> {
+    if body.chart.is_some() {
+        return Err(ApiError::Unprocessable(
+            "Inline chart previews are not available in a bi-only Trino installation: the chart builder still needs the ClickHouse metadata store. Preview the SQL source without a chart.".to_owned(),
+        )
+        .into());
+    }
+    let normalized = check_sql_source_for_mode(&body.sql, InstallMode::BiOnly, QueryEngine::Trino)
+        .map_err(|r| ApiError::Unprocessable(r.message().to_owned()))?;
+    let trino_dialect = crate::sql_rewrite::TrinoDialect::default();
+    let gate = crate::routes::query::StatementGate::new(
+        state,
+        crate::routes::query::GateActor::Caller { principal, headers },
+        &trino_dialect,
+    );
+    gate.check(&normalized).await?;
+    let obligations = PolicyEngineObligations::from_state(state);
+    let rewritten = crate::policy_engine::rewrite_sql_for_roles(
+        &normalized,
+        &trino_dialect,
+        crate::sql_rewrite::Engine::Trino,
+        &principal.role_names,
+        &crate::routes::support::placeholders_for(principal),
+        &obligations,
+    )
+    .await
+    .map_err(|err| crate::routes::support::enforcement_refusal(&normalized, &err))?;
+    let columns = describe_trino_preview_columns(state, principal, &rewritten).await?;
+    let sql = format!("SELECT * FROM (\n{rewritten}\n) AS src LIMIT {PREVIEW_ROWS}");
+    let result = run_trino_preview(state, principal, &sql).await?;
+    Ok(ApiJson(json!({
+        "columns": columns,
+        "rows": result.get("rows").cloned().unwrap_or(Value::Null),
+    })))
 }
 
 /// The body of [`preview`], in the order the module posture fixes: guard and

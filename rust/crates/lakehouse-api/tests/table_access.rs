@@ -1614,6 +1614,9 @@ async fn an_authored_pipeline_compile_call_for_a_narrowed_author_is_not_found() 
     let pipeline = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            incremental_strategy: "append".to_owned(),
+            partition_granularity: "day".to_owned(),
+            lookback_hours: 0,
             // BLD-1 part 1 review R1-B2: the run route compiles the stored
             // definition, so the table the author may not read is the
             // pipeline's input.

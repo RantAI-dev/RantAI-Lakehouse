@@ -57,8 +57,22 @@ dashboard it embeds elsewhere.
   console's `/api` proxy gets the proxy's own error, because the API stops
   reading at that cap.
 
-## Acceptance checklist (owner)
+## Acceptance checklist
 
-The checklist is in the spec, `ADM-2-AC1` to `ADM-2-AC10`. It covers the
-whole item, and both slices are merged, so the owner can run it now.
-Every step reads "Not run" until the owner runs it.
+The checklist is the spec's `ADM-2-AC1` to `ADM-2-AC10`
+([`specs/adm-2.md`](../specs/adm-2.md)), run on staging.
+
+| ID | Do this | Expect | Result |
+| --- | --- | --- | --- |
+| `ADM-2-AC1` | In Settings → General, set the name to "Contoh Workspace" and save | After a reload, the sidebar header and the browser tab show it | Passed 2026-11-21 (Auditor on staging) |
+| `ADM-2-AC2` | Upload a PNG logo | After signing out, the sign-in page shows that logo and the name | Passed 2026-11-21 (Auditor on staging) |
+| `ADM-2-AC3` | Upload a dark-mode logo, then switch the console to dark | The dark logo shows. Remove it, and the light logo shows in dark mode too | Passed 2026-11-21 (Auditor on staging) |
+| `ADM-2-AC4` | Upload an icon | The browser tab shows it | Passed 2026-11-21 (Auditor on staging) |
+| `ADM-2-AC5` | Try an SVG file, a 2 MB PNG, and a text file renamed to `.png` | Each is refused with a message that names the rule it broke | Passed 2026-11-21 (Auditor on staging) |
+| `ADM-2-AC6` | Open an embedded dashboard | Its footer shows the workspace's name, and `logo=none` still hides it | Passed 2026-11-21 (Auditor on staging) |
+| `ADM-2-AC7` | Sign in as a user without `settings:write` | The General section is not offered, and a direct call to save is refused | Passed 2026-11-21 (Auditor on staging) |
+| `ADM-2-AC8` | Press Reset | The product's name, logo and icon return | Passed 2026-11-21 (Auditor on staging) |
+| `ADM-2-AC9` | Save the settings, then press Reset, and open the audit trail | It shows each save and the reset | Passed 2026-11-21 (Auditor on staging) |
+| `ADM-2-AC10` | Open a public link of a dashboard | Its header shows the workspace's name and logo, and its footer reads "Powered by RantAI Lakehouse" | Passed 2026-11-21 (Auditor on staging) |
+
+**Acceptor:** Auditor **Date:** 2026-11-21
