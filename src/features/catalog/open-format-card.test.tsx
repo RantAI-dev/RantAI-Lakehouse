@@ -868,3 +868,98 @@ describe("OpenFormatCard", () => {
   })
 
 })
+
+describe("OpenFormatCard — Silver assets (DATA-65)", () => {
+  const silverPublication = {
+    ...publicationBody,
+    zone: "silver",
+    mart: "orders_clean",
+    latestCopy: {
+      table: "silver.orders_clean_latest",
+      holds: { copyExportedAt: "2026-10-02T04:00:00Z", rows: 42, replacedAt: "2026-10-02T04:00:01Z" },
+      lastRun: { status: "success", reason: null, cleanup: null, finishedAt: "2026-10-02T04:00:01Z" },
+    },
+  }
+
+  it("renders the card for a silver asset with the silver Iceberg name and copy details", async () => {
+    const urls: string[] = []
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString()
+      urls.push(url)
+      if (url.includes("/consumers")) return jsonResponse(consumersRefusalBody)
+      if (url.includes("/publication")) return jsonResponse(silverPublication)
+      if (url.includes("/api/gold/export/orders_clean") && !url.includes("/exports")) {
+        return jsonResponse({ ...readBackBody, zone: "silver", namespace: "silver", table: "orders_clean" })
+      }
+      if (url.includes("/api/gold/exports")) return jsonResponse({ mart: "orders_clean", runs: [] })
+      throw new Error(`unexpected fetch: ${url}`)
+    }) as unknown as typeof fetch
+
+    render(<OpenFormatCard assetId="silver.orders_clean" />)
+    await waitFor(() =>
+      expect(screen.getByTestId("iceberg-table").textContent).toBe("silver.orders_clean"),
+    )
+    expect(screen.getByText("silver.orders_clean_latest")).toBeDefined()
+    expect(screen.getByText(/The copy published/)).toBeDefined()
+    expect(urls.some((u) => u.includes("/api/gold/export/orders_clean/publication?zone=silver"))).toBe(true)
+    expect(urls.some((u) => u.includes("/api/gold/exports?mart=orders_clean&zone=silver"))).toBe(true)
+  })
+
+  it("toggles publication with ?zone=silver", async () => {
+    const calls: { url: string; method?: string }[] = []
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString()
+      calls.push({ url, method: init?.method })
+      if (url.includes("/consumers")) return jsonResponse(consumersRefusalBody)
+      if (url.includes("/publication")) {
+        return jsonResponse(init?.method === "PUT" ? { ...silverPublication, enabled: true } : silverPublication)
+      }
+      if (url.includes("/api/gold/export/orders_clean") && !url.includes("/exports")) {
+        return jsonResponse({ ...readBackBody, zone: "silver", namespace: "silver" })
+      }
+      if (url.includes("/api/gold/exports")) return jsonResponse({ mart: "orders_clean", runs: [] })
+      throw new Error(`unexpected fetch: ${init?.method} ${url}`)
+    }) as unknown as typeof fetch
+
+    render(<OpenFormatCard assetId="silver.orders_clean" />)
+    await waitFor(() => expect(screen.getByTestId("iceberg-table")).toBeDefined())
+    fireEvent.click(screen.getByTestId("open-format-toggle"))
+    await waitFor(() =>
+      expect(calls.some((c) => c.method === "PUT" && c.url.includes("?zone=silver") && c.url.includes("/publication"))).toBe(true),
+    )
+  })
+
+  it("publishes now with ?zone=silver", async () => {
+    const posts: string[] = []
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString()
+      if (url.includes("/consumers")) return jsonResponse(consumersRefusalBody)
+      if (url.includes("/publication")) return jsonResponse(silverPublication)
+      if (init?.method === "POST" && url.includes("/api/gold/export/orders_clean")) {
+        posts.push(url)
+        return jsonResponse({
+          zone: "silver",
+          namespace: "silver",
+          table: "orders_clean",
+          formatVersion: 2,
+          rowsExported: 42,
+          snapshotId: { value: 1, measured: true },
+          exportedAt: "2026-10-02T04:00:00Z",
+          copyExportedAt: null,
+          latestCopy: null,
+        })
+      }
+      if (url.includes("/api/gold/export/orders_clean") && !url.includes("/exports")) {
+        return jsonResponse({ ...readBackBody, zone: "silver", namespace: "silver" })
+      }
+      if (url.includes("/api/gold/exports")) return jsonResponse({ mart: "orders_clean", runs: [] })
+      throw new Error(`unexpected fetch: ${init?.method} ${url}`)
+    }) as unknown as typeof fetch
+
+    render(<OpenFormatCard assetId="silver.orders_clean" />)
+    await waitFor(() => expect(screen.getByTestId("iceberg-table")).toBeDefined())
+    fireEvent.click(screen.getByRole("button", { name: "Publish now" }))
+    await waitFor(() => expect(posts.length).toBe(1))
+    expect(posts[0]).toBe("/api/gold/export/orders_clean?zone=silver")
+  })
+})
