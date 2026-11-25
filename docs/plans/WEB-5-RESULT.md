@@ -616,3 +616,77 @@ Accessibility, best practices: 100 in every run. The spread in performance is TB
 
 - At 320 px wide the headline's area (25,344 px) is still below the line's (28,086 px), so the line still becomes the LCP there by day. That is a 2013-size phone; the next step would be a different hero text size or a shorter line, both visible changes.
 - The option that was not taken: showing the reassurance line with the headline (beat 3 earlier) or removing its halo by day. Both change what the visitor sees.
+
+## 2026-11-25 phone pass (plan §12, M1–M11)
+
+Goal: below 1024 px, the phone audit's eleven items (owner-approved 2026-11-25), with the desktop unchanged and the performance budget held. Result: **done; desktop pixel-identical (one 3/255 dither, below), Lighthouse mobile 94 / 94 median on `/` and `/id/`, 194.4 KB initial JS, zero CSP violations.** The owner's iPhone 13 QA is still open.
+
+### What changed, per item
+
+| Item | Change below 1024 px (unless noted) | Commit |
+| --- | --- | --- |
+| M1 assistant | Chat height `min(420px, 64svh)` below 768 px (was 560 px); the panel is rewound off screen to the end of its first exchange, not to an empty chat, and the script carries on from Build | `0b9a55ec3` |
+| M2 dashboards | Still pinned and scroll-driven (a native swipe row would sit next to M3's, and DESIGN.md asks for no repeated layout in neighbouring sections): the stage centres heading, one screen-wide tile and position dots; the rail steps one tile at a time, holding each still. Reduced motion: a snapping swipe row with a peek | `4832c0bc5` |
+| M3 governance | Lineage drawn vertically (Bronze over Silver over Gold, 12 px, the traced path down a left gutter) as a full-width card; the other four tiles are one swipe row below 768 px (snap, edge fades only where a tile is cut, scroll-driven dots; all CSS). From 768 px the row is `display: contents`, so the grid is as before | `e33fbaeb7` |
+| M4 code | Narrower gutter, every line of the real excerpt fits at 360 px; the one long line ends in an ellipsis, the edge fade goes | `6325a7d08` |
+| M5 hosting | Service cards show name and "Started" only; labels 12 px; the two options 40 px | `819e6197d` |
+| M6 footer | Below 640 px Product and Connect share a row (two columns sized to content), RantAI products full width below; 14 px links under 400 px in those two columns (rantai-page: 15 px); socials 40 px | `49e9d9f3b` |
+| M7 hero (ID) | `hero.subPhone`: "Dashboard bawaan, tabel terbuka, dan jawaban dalam bahasa sehari-hari." (EN: same text as `hero.sub`, two lines at 360 px) | `163a32b51` |
+| M8 Get started | `steps[1].notePhone` in EN and ID, two lines instead of four | `d091f2e1d` |
+| M9 footer call | Home page: the "Then … · Full guide →" line hidden; contact page keeps it with a 40 px link | `2d07b2909` |
+| M10 text size | Source chips, "Scroll to dive", depths cards' labels, bento chips, PII tag, badges, console mock labels at 12 px; the sankey gets a phone drawing (15-unit labels, 12.3 px at 360 px); KPI delta 15.5 units | `6f89e7242` |
+| M11 taps | Analyst/Admin 40 px, "Read the source" 40 px, the top bar's mark link 40 px tall | `48b5d2eb4` |
+| fixes | The longest empty band (assistant to dashboards) cut; governance's intrinsic size under 375 px; the phone sankey drops the pointer's tooltips (HTML size, see Lighthouse) | `369c3aae0`, `950a7ca9b` |
+
+`contain-intrinsic-block-size` re-measured at 390 px: governance EN 1245.52 (under 375 px 1312.16), ID 1265.77; get-started EN 788.56, ID 753.63; FAQ unchanged. "Install it" lands `#get-started` at the bar (64 px) at 390 and 360 px, EN and ID, and at 1190 px (before the pass it landed at 110 px at 360 EN).
+
+### Phone audit (after build :3402 against before :3401, 390x844 and 360x740, EN and ID, `?tod=night`)
+
+| Check | Before (en-390 / id-390 / en-360 / id-360) | After |
+| --- | --- | --- |
+| Elements wider than the viewport | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| Visible text under 12 px (SVG text at its rendered size) | 72 / 72 / 74 / 74 | 0 / 0 / 0 / 0 |
+| Links and buttons under 40 px | 13 / 12 / 12 / 13 | 0 / 0 / 0 / 0 |
+| Headings over 2 lines | 0 | 0 |
+| Descriptions over 2 lines | 0 / 2 / 1 / 1 | 0 / 0 / 0 / 0 |
+| Longest empty band in one screen (rows with no content, below the bar) | 330–358 px at 390, 316–318 px at 360 | 279 px at 390, 256 px at 360 |
+| Screens with an empty band over 40 % of the screen (below the bar) | 1 / 2 / 2 / 2 | 0 / 0 / 0 / 0 |
+| Page height | 16,549 / 16,760 / 15,830 / 15,881 | 16,269 / 16,413 / 15,423 / 15,432 |
+
+Before/after sheets, one per item, each with before and after at 390 EN, 390 ID, 360 EN and 360 ID: `web-5-screens/m1-assistant.jpg`, `m2-dashboards.jpg`, `m3-governance-swipe.jpg`, `m6-footer.jpg`, `m8-get-started.jpg`, `m10-sankey.jpg` (the other seven sheets were checked and not committed). No-JS and reduced motion at 390 px: complete and readable; the dashboards rail without JavaScript shows its first tile, as before the pass.
+
+### Desktop unchanged
+
+Before against after, `prefers-reduced-motion: reduce`, night, a screenshot every 600 px down the whole page, page heights equal (1190x800: 11,001 EN / 11,127 ID; 1440x900: 11,417 / 11,551):
+
+| Size | EN | ID |
+| --- | --- | --- |
+| 1190x800 | 18 of 19 shots 0 px; 1 shot 151 px | 19 of 19 shots 0 px |
+| 1440x900 | 20 of 20 shots 0 px | 20 of 20 shots 0 px |
+
+The one shot (1190 EN, the footer at y = 10,200) differs in 151 pixels inside the 12 %-opacity "Lakehouse" wordmark, by 3 or 4 of 255 per channel: gradient dithering, reproducible, no layout or visible change. An earlier run had a similar 1440 px wordmark diff that did not reproduce. Base against base: 0 px.
+
+### Lighthouse (mobile, 13.6.0, `TZ=Asia/Jakarta` at 21:5x, night; three runs interleaved before/after)
+
+| Page | Build | Performance (runs) | Median | LCP | TBT median |
+| --- | --- | --- | --- | --- | --- |
+| `/` | before | 92 / 91 / 93 | 92 | 1.66 s | 303 ms |
+| `/` | after | 94 / 95 / 85 | **94** | 1.66 s | 246 ms |
+| `/id/` | before | 92 / 94 / 93 | 93 | 1.66 s | 296 ms |
+| `/id/` | after | 95 / 92 / 94 | **94** | 1.66 s | 254 ms |
+
+Accessibility, SEO and best practices: 100 in all twelve runs; CLS 0. A first round, before `950a7ca9b`, had `/id/` at FCP and LCP 1.81 s in three of three runs (LCP element still the H1): the page's HTML had grown 50 KB (5 KB gzip), mostly the phone sankey's tooltips rendered twice (HTML and RSC data), and `/id/` crossed a step in the simulated document download. Without them the home page is 33 KB larger than before the pass (3.7 KB gzip) and `/id/` is back to 1.66 s.
+
+### Checks
+
+- `bun run size`: 194.4 KB initial JS on `/` and `/id/` (was 193.8; budget 200). The phone behaviour is CSS and server markup; the new client code is the dashboards' stepping and dots and the assistant's phone start.
+- CSP: zero violations and zero page errors on `/`, `/id/`, `/contact/`, `/id/contact/` at 390x844 and 1440x900, scrolled to the bottom (deferred chunks loaded).
+- `bun run typecheck`, `bun run lint` pass; `bun run test` 94 of 94 in the repo.
+- Kept: `content-visibility` on governance, get-started and FAQ (re-measured above), the deferred lineage and open-tables pictures, the one-hero `lk-gl-wait` logic, the day-mode LCP text-shadow fix.
+
+### Not verified, not done
+
+- The owner's iPhone 13 (Safari) QA. Measured in headless Chrome only: Safari's toolbar changes `svh`, and the M3 edge fades and dots need scroll-driven animations (Safari 26; without them, a fixed right fade and no dots).
+- The 3D dive band after the hero (needs a GPU), out of scope.
+- At 360 px the Indonesian footer link "Semua mengalir masuk" wraps to two lines (42 px tap).
+- In the M3 swipe row every tile is as tall as the tallest (the audit log), so the masking tile has space between its picture and its title.
