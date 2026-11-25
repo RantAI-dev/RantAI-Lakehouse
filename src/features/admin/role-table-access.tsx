@@ -3,6 +3,7 @@
 import * as React from "react"
 import { ChevronDownIcon, ChevronRightIcon } from "lucide-react"
 
+import { HelpHint } from "@/components/patterns/help-hint"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
@@ -261,10 +262,10 @@ export function RoleTableAccessSection({
         <h2 id={`${idPrefix}-table-access-title`} className="text-sm font-semibold">
           Tables this role can read
         </h2>
+        {/* PR UX-7 review SHOULD-FIX 1: the one help popover, `HelpHint`, ends the one-line help. */}
         <p className="text-xs text-muted-foreground">
-          A person reads the union of their roles&apos; tables. A table this role may not read is
-          hidden everywhere and a query naming it answers the same &quot;not found&quot; as a
-          missing table.
+          People read every table any of their roles allows.{" "}
+          <HelpHint>A table a role may not read is hidden everywhere, and a query naming it answers &quot;not found&quot;, as for a missing table.</HelpHint>
         </p>
       </div>
 
@@ -274,8 +275,7 @@ export function RoleTableAccessSection({
             This role&apos;s tables could not be loaded: {accessError.message}
           </p>
           <p className="text-xs text-muted-foreground">
-            They are left as they are: saving the role does not change them, so a stale choice
-            cannot replace them.
+            Saving the role leaves these as they are.
           </p>
           {retry ? (
             <Button type="button" variant="outline" size="sm" onClick={retry}>

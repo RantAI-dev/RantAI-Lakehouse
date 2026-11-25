@@ -13,6 +13,7 @@ import { readableErrorMessage } from "@/lib/notify-message"
 import { dashboardReportService, dashboardService } from "@/services"
 import type { LibraryItem } from "./library-items"
 import { forgetLastBoard } from "./last-board"
+import { forgetRow } from "./dashboards-row"
 
 /** Whether a row can be ticked: the built-in board cannot be moved or deleted, and templates are never filed. */
 export function pickable(item: LibraryItem): boolean {
@@ -57,8 +58,11 @@ export async function trashItems(items: readonly LibraryItem[]): Promise<BulkOut
         await dashboardService.deleteBoard(item.id)
         // `/dashboards` must not lead back to a board that is in the trash.
         forgetLastBoard(item.id)
+        // BI-61 T11: nor the sidebar's Dashboards row, as the single delete does.
+        forgetRow({ kind: "dashboard", id: item.id })
       } else if (item.kind === "report") {
         await dashboardReportService.deleteReport(item.id)
+        forgetRow({ kind: "report", id: item.id })
       } else {
         continue
       }
