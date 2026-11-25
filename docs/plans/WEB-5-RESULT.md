@@ -372,3 +372,59 @@ Measured on `85187993` (D14 S1–S5), interleaved against the R7 commit
 - **Reading:** every target is met.
   - EN run 2 of R12, at 295.5 ms, was taken at the highest load of the session (7.1). The other two EN runs of R12 are below the earlier build's median.
   - The ID median is 23 ms higher. That is within the spread of the earlier build's own runs, 87–195 ms.
+
+## 2026-11-25 performance pass (T3)
+
+### Method
+
+- **Builds:** each build is made from a copy of `site/` outside the repo (`NEXT_PUBLIC_SITE_URL=https://example.invalid bun run build`), served with `serve@14.2.4` on two ports and measured side by side, so both see the same machine load.
+- **Lighthouse:** `lighthouse@13.6.0`, the hub command (mobile, simulated throttling, `--headless=new --no-sandbox`), three runs per page and build, alternating pages and builds. The median of the three is the number. Load average was 1.6 to 3.4. There is no GPU, so these runs measure the DOM hero (the 3D lake is not part of any number).
+- **Versions:** "before" is `3025a6409` with Next 16.4.3. "After" is `809796fae` with Next 16.4.6 (the dependency bump, `c6f2fff84`, is part of it).
+- **Look check:** headless Chrome screenshots at 1190×800 and 390×844 (top, governance bento, Open tables panel), before and after, are identical. Page height is identical (14,799 px and 16,549 px). Hovering a lineage column moves the highlight the same way in both builds. No console errors.
+
+### Why the English LCP waited
+
+- **LCP element:** the hero `<h1>` on both pages (`div.sticky > div.mx-auto > div.max-w-[660px] > h1.lk-display`). So there is no difference in what is measured.
+- **Cause:** `/` is not slower in itself. The English page runs the full first-visit intro (`hero-intro.tsx`), whose inline script creates a WebGL2 context to decide between the 3D and the DOM path. It ran in `<body>` while the parser was still on it, so it sat in front of the first paint. On a cold browser (Lighthouse starts a fresh profile) creating the first WebGL context starts the GPU process. In 2 of 6 baseline English runs the observed FCP was 2.2 s instead of 0.2 s (LCP 2.4 s and 2.1 s), and on a busy VM it was worse (the 4.2 to 4.8 s LCP of 2026-11-24). `/id/` takes the light intro, which never probes, so it was never hit. The h1 itself is never hidden (it is masked, not at opacity 0), and fonts, the language offer and hydration are not in the delay: the breakdown is TTFB 22 ms plus element render delay 2.2 s on the slow run, against 0.2 s on the others.
+- **Fix** (`ce10be3d6`): the probe runs one task after the first paint. The page starts on the 3D hold (black sea, the headline masked, the same first frames as the DOM beats) and drops it if the answer is no. Six runs before: two slow. Six runs after: none (observed FCP 0.16 to 0.22 s). `scene-mode.tsx` only takes the "3D path at hydration" shortcut when the probe has already answered yes; otherwise it takes its ordinary after-idle path.
+
+### Before and after (median of 3, mobile)
+
+| Page | Build | Performance (runs) | LCP | TBT (runs) | FCP | CLS | Speed Index |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `/` | before | 86 / 85 / 85, **85** | 1.66 s | 504 / 528 / 468, **504 ms** | 1.66 s | 0 / 0 / 0 | 2.79 s |
+| `/` | after | 87 / 83 / 86, **86** | 1.66 s | 451 / 593 / 487, **487 ms** | 1.66 s | 0 / 0 / 0 | 2.91 s |
+| `/id/` | before | 92 / 86 / 88, **88** | 1.67 s | 329 / 523 / 461, **461 ms** | 1.67 s | 0 / 0 / 0 | 1.67 s |
+| `/id/` | after | 90 / 92 / 92, **92** | 1.66 s | 350 / 319 / 305, **319 ms** | 1.66 s | 0 / 0 / 0 | 1.68 s |
+
+- Accessibility 97, SEO 100 and best practices 100 in all runs (the 97 is the colour-contrast audit, T4).
+- Earlier runs of the same baseline, one hour before (unpaired): `/` 66 / 85 / 86 / 86 / 83 / 76 (two with LCP 2.1 to 2.4 s) and `/id/` 93 / 92 / 93 / 90 / 87 / 83.
+- On a quieter machine the English LCP gap of 2026-11-24 is gone: LCP equals FCP on both pages (1.66 s, the floor of the simulated network).
+
+### Misses
+
+- **`/` performance 86 (median), target 90: missed.** TBT 487 ms is the cause. Every other metric is in the green. `/id/` reaches 92.
+- **Where the English TBT goes** (unthrottled trace, 4× CPU in the simulation): hydration of the whole page in one task of about 70 ms, one full style recalculation of about 80 ms when the intro ends and its classes leave `<html>` (about 2.9 s), the `motion-ready` class (reveals) and the first layout of the 2.7 k-element page. Removing the language offer and using the light intro on `/` (a visible change, not kept) lowered the median to 399 ms (89, 86, 89), so even those two do not reach 90 alone.
+- **Tried and dropped:** wrapping the below-the-fold sections in `<Suspense>` (hoping React would hydrate them in separate tasks) did not move TBT (median 594 ms over four English runs against 486 ms for the same build without it), so it was reverted.
+- **Not done, would need the owner:** these change what is seen or how it moves.
+  - The first-visit intro on `/` (3D hold, mask, 2.4 s of beats) and its end-of-intro class removal.
+  - `content-visibility: auto` on the sections below the hero, which would cut the first layout and style cost but can move pinned and measured sections.
+  - Lazy hydration of below-the-fold sections on scroll, which can leave a reveal hidden for a moment on a fast jump.
+- **Left as it was:** legacy JavaScript (Next's own polyfill module, about 14 KiB, ships in the framework chunk and cannot be dropped from the app), render-blocking CSS (3 files, 31 KB gzip, needed for the first paint) and forced reflows (about 60 ms in total, in hydration effects that read layout once).
+
+### Bundle budget (`bun run size`)
+
+CI on `4feeb8e23` failed the 200 KB budget (the budget stays at 200 KB). The cause was the two pictures added later, not the Next bump (16.4.3 and 16.4.6 both give 209.4 KB).
+
+| | `/` and `/id/` | `/contact/` and `/id/contact/` |
+| --- | --- | --- |
+| before | 209.3 KB in 12 files, OVER | 165.8 KB, OK |
+| after `809796fae` | **193.7 KB** in 12 files, OK | 165.8 KB, OK |
+
+The column-lineage and "one table, many readers" pictures are split into a stateless view (the server renders it as the page's still picture, with the markup unchanged) and a live version (the loop and the pointer) in a `next/dynamic` chunk that `shared/deferred-live.tsx` mounts after the first paint, only while the picture is off screen. It renders the same elements, so nothing moves. Without JavaScript, under reduced motion, and if the chunk fails to load, the still picture stays. The scene chunk (155.9 KB) and Lenis (5.9 KB) are unchanged and not counted.
+
+### Commits
+
+- `c6f2fff84` `WEB-5 chore(deps): site Next.js 16.4.3 to 16.4.6 (dependency review)`
+- `ce10be3d6` `WEB-5 perf(site): run the WebGL probe after the first paint, not before it`
+- `809796fae` `WEB-5 perf(site): load the lineage and open-tables pictures after the first paint`
