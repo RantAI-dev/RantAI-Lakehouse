@@ -34,6 +34,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
+use lakehouse_auth::source_throttle;
 use lakehouse_auth::throttle;
 use lakehouse_auth::{
     AuthError, Authenticator, Credential, Principal, PrincipalId, Secret, password, session,
@@ -51,6 +52,7 @@ use uuid::Uuid;
 
 use crate::audit_coverage;
 use crate::auth::{AuthenticatedPrincipal, SESSION_COOKIE_NAME, session_cookie_from_headers};
+use crate::client_source::ClientSource;
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::state::AppState;
@@ -143,12 +145,18 @@ fn sign_in_executed_event(user_id: Uuid, principal_kind: &str) -> NewAuditEvent 
 /// the hash of a password typed into the identifier box. An unknown email
 /// writes the identical row: the trail is not an account oracle. The lock row
 /// keeps no identifier material either (plan D5b).
-fn sign_in_refused_event() -> NewAuditEvent {
+///
+/// `SEC-75` decision 5: the row names the SOURCE the sign-in came from —
+/// the address the request came from (`crate::client_source`). It names
+/// nothing else the caller typed: not the identifier, not the password, and
+/// not a hash of either.
+fn sign_in_refused_event(source: &str) -> NewAuditEvent {
     NewAuditEvent {
         action: "auth.login".to_owned(),
         outcome: "refused".to_owned(),
         actor_label: Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM.to_owned()),
         detail: Some(SIGN_IN_REFUSED_DETAIL.to_owned()),
+        args: Some(serde_json::json!({ "source": source })),
         ..Default::default()
     }
 }
@@ -220,6 +228,58 @@ fn locked_response(locked_until: Option<time::OffsetDateTime>) -> ApiError {
     }
 }
 
+/// The answer of a sign-in refused because its SOURCE is over the
+/// per-source limit (`SEC-75` decision 2).
+///
+/// This refusal exists only when an edge is declared (`SEC-75 decision B`):
+/// without one every caller shares the peer as its source, so there is no
+/// address to limit by. The count behind it still runs either way.
+///
+/// The same fixed sentence for every source, and nothing about the
+/// account in it: the refusal says that the address is over its budget,
+/// never whether the account exists or whether the password was right.
+fn source_limited_response(retry_after_secs: u64) -> ApiError {
+    ApiError::TooManyRequests {
+        message: "Too many failed sign-in attempts from this address. Try again later.".to_owned(),
+        retry_after_secs,
+    }
+}
+
+/// Refuse a sign-in whose source is over its budget (`SEC-75` decision 2).
+///
+/// The caller invokes this only when a trusted edge is declared
+/// (`SEC-75 decision B`). Counting and audit compaction run in every
+/// deployment; only this refusal is gated on the edge.
+///
+/// `Ok(())` when the source may try again. The check runs BEFORE the
+/// password is checked and BEFORE the account throttle is touched: a
+/// refused sign-in costs this one query and nothing else — no hash, no
+/// account walked toward its own lock, no audit row.
+///
+/// Decision 3: a sign-in refused here still counts against the source. The
+/// caller is still trying, and the count is what the summary row of the
+/// window reports. The refusal writes no row of its own: the first failure
+/// of the window wrote that.
+///
+/// # Errors
+///
+/// Returns a `429` when the source is over its budget (`SEC-75`
+/// decision 2), only where a trusted edge is declared (`SEC-75 decision
+/// B`). When the counter cannot be read, the storage error of
+/// [`source_throttle::current`] surfaces as its classified 500
+/// (`"authentication error"`).
+async fn check_source_budget(pool: &PgPool, source: &str) -> ApiResult<()> {
+    if let Some(window) = source_throttle::current(pool, source).await?
+        && window.failures >= source_throttle::MAX_FAILURES_PER_SOURCE
+    {
+        if let Err(err) = source_throttle::record_failure(pool, source).await {
+            tracing::warn!(%err, "failed to count a refused sign-in against its source");
+        }
+        return Err(source_limited_response(window.retry_after_secs()).into());
+    }
+    Ok(())
+}
+
 /// The longest `User-Agent` a session records, in characters. A browser's
 /// header is short; the cap keeps a caller from storing a kilobyte of text
 /// under the column the Sessions page renders.
@@ -260,13 +320,34 @@ fn session_user_agent(headers: &HeaderMap) -> Option<String> {
 /// (best-effort: a failed audit write is logged, not propagated). On a successful login,
 /// `clear` resets the count.
 ///
+/// # Per-source limit (SEC-75)
+///
+/// The account throttle cannot protect the installation: every attempt
+/// with a NEW identifier is a new key, so one caller can guess forever.
+/// The route therefore counts the failures per SOURCE (the address the
+/// request came from, `crate::client_source`) and answers `429` with a
+/// `Retry-After` once that source is over its budget — before the
+/// account throttle is touched and before the password is checked, so a
+/// refused sign-in costs no hash and never walks an account toward its
+/// own lock. A successful sign-in does NOT reset the count: the budget
+/// belongs to the address, not to the person who happened to type the
+/// right password once.
+///
+/// `SEC-75 decision B`: the `429` applies only when a trusted edge is
+/// declared — the parsed `TRUSTED_PROXIES` list is non-empty. Without one,
+/// the source is every caller's own peer and a header is never read, so
+/// there is no address to limit by. The count and its audit compaction run
+/// in every deployment, edge or no edge.
+///
 /// # Errors
 ///
 /// 400 on an unparseable body; 401 on bad credentials (same status for
 /// "no such email" and "wrong password" — see the module doc comment);
-/// 429 when the key is locked; 503 if no Postgres pool is configured.
+/// 429 when the key is locked or, where a trusted edge is declared, the
+/// source is over its limit; 503 if no Postgres pool is configured.
 pub async fn login(
     State(state): State<AppState>,
+    source: ClientSource,
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Response> {
@@ -277,6 +358,19 @@ pub async fn login(
                 .to_owned(),
         )
     })?;
+
+    // `SEC-75 decision B`: the source's `429` exists only where an edge is
+    // declared; with no trusted proxy the peer is everyone's source. The
+    // per-source count and its compaction still run either way. When it
+    // applies, the check runs BEFORE anything else the request would cost:
+    // an over-budget source gets `429` and a `Retry-After`, its account is
+    // not touched and its password is never checked.
+    let edge_declared = !state.config.trusted_proxy_cidrs.is_empty()
+        || !state.config.trusted_proxy_names.is_empty();
+    if edge_declared {
+        check_source_budget(pool, source.as_str()).await?;
+    }
+
     let LoginBody {
         identifier,
         password,
@@ -311,55 +405,7 @@ pub async fn login(
         password: Secret::new(password),
     };
     match auth.local.authenticate(&credential).await {
-        Ok(principal) => {
-            throttle::clear(pool, &key).await?;
-            let PrincipalId::User(user_id) = principal.id else {
-                tracing::warn!("login failed");
-                return Err(ApiError::Unauthorized(
-                    "Invalid username/email or password.".to_owned(),
-                )
-                .into());
-            };
-            let principal_kind = principal.kind_for_audit();
-            let must_change_password = password::must_change_password(pool, user_id)
-                .await
-                .unwrap_or(false);
-            let token = session::create_session(
-                pool,
-                user_id,
-                session::DEFAULT_SESSION_TTL,
-                // ADM-14 D10: no address — the API sits behind the console's
-                // own server and has no trusted source for the client's.
-                None,
-                session_user_agent(&headers).as_deref(),
-                &[],
-            )
-            .await?;
-            let body = LoginResponse {
-                id: user_id.to_string(),
-                name: principal.display_name,
-                must_change_password,
-            };
-            // `GOV-1`: the sign-in is on the audit trail. Nobody was signed in
-            // when the form was submitted, so the actor is the form, and the
-            // principal is set only because the password verified. Nothing the
-            // visitor typed goes in: not the email, not the password.
-            audit_coverage::record_best_effort(
-                &state,
-                sign_in_executed_event(user_id, principal_kind),
-            )
-            .await;
-            let mut response = (StatusCode::OK, ApiJson(body)).into_response();
-            response.headers_mut().append(
-                header::SET_COOKIE,
-                session_cookie_header(
-                    state.config.is_dev,
-                    token.expose(),
-                    session::DEFAULT_SESSION_TTL,
-                ),
-            );
-            Ok(response)
-        }
+        Ok(principal) => complete_sign_in(&state, pool, &source, &headers, principal, &key).await,
         // Only a rejected password counts toward the lock, and only it
         // renders as the non-enumerated 401: a storage error mid-login
         // must reach the caller as its classified error (see
@@ -368,35 +414,15 @@ pub async fn login(
         // user toward a lockout over a database hiccup (review blocker 1,
         // 2026-10-03).
         Err(AuthError::InvalidCredentials) => {
-            // SEC-49: the try was already counted before hashing; the try
-            // that reached the limit is the one that set the lock.
-            if attempt_lock.is_some() && attempt == policy.max_failures {
-                // Plan D5b: the row holds no identifier material — the key
-                // prefix it used to carry was the first 12 hex characters of
-                // the unsalted SHA-256 of what was typed into the identifier
-                // box, and a reader of the trail could match it against
-                // guessed emails. Nobody signed in, so there is no principal
-                // and no resource either; the fixed sentence is all the row
-                // says. Rows written before this change keep their prefix:
-                // `audit_event` is append-only, so nothing rewrites them.
-                let event = NewAuditEvent {
-                    action: "auth.login_locked".to_owned(),
-                    outcome: "refused".to_owned(),
-                    // QA LH-SEC-2-06 (SEC-70, decision D3): nobody signed in
-                    // yet, so the event names the form that produced it.
-                    actor_label: Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM.to_owned()),
-                    detail: Some(SIGN_IN_LOCKED_DETAIL.to_owned()),
-                    ..Default::default()
-                };
-                audit_coverage::record_best_effort(&state, event).await;
-            }
-            // `GOV-1`: every refused sign-in is on the audit trail, with no
-            // principal (nobody proved who they were) and nothing the visitor
-            // typed, not even a hash of it (`GOV-1 review`). An unknown email
-            // writes the identical row: the trail is not an account oracle.
-            audit_coverage::record_best_effort(&state, sign_in_refused_event()).await;
-            tracing::warn!("login failed");
-            Err(ApiError::Unauthorized("Invalid username/email or password.".to_owned()).into())
+            refuse_sign_in(
+                &state,
+                pool,
+                &source,
+                attempt,
+                attempt_lock,
+                policy.max_failures,
+            )
+            .await
         }
         Err(err) => {
             // SEC-49: the try was counted before hashing; a storage error is
@@ -412,6 +438,175 @@ pub async fn login(
             Err(ApiError::from(err).into())
         }
     }
+}
+
+/// Finish a sign-in whose password verified: clear the account throttle,
+/// create the session, write the `auth.login` row, and answer with the
+/// session cookie.
+///
+/// It is a helper of its own so that the ORDER of these steps stays
+/// readable in one place. The session deliberately records no network
+/// address (`ADM-14` D10; `SEC-82` may change that) and the audit row is
+/// written only after the session exists; a reader who has to scroll
+/// through the whole route to see that order will eventually break it.
+///
+/// # Errors
+///
+/// The underlying [`lakehouse_auth::AuthError`] on a storage failure, and
+/// the non-enumerated 401 when the principal is not a user.
+async fn complete_sign_in(
+    state: &AppState,
+    pool: &PgPool,
+    // Kept in the signature: callers pass it positionally; the address is
+    // deliberately not recorded (`ADM-14` D10; `SEC-82`).
+    _source: &ClientSource,
+    headers: &HeaderMap,
+    principal: Principal,
+    key: &str,
+) -> ApiResult<Response> {
+    throttle::clear(pool, key).await?;
+    let PrincipalId::User(user_id) = principal.id else {
+        tracing::warn!("login failed");
+        return Err(
+            ApiError::Unauthorized("Invalid username/email or password.".to_owned()).into(),
+        );
+    };
+    let principal_kind = principal.kind_for_audit();
+    let must_change_password = password::must_change_password(pool, user_id)
+        .await
+        .unwrap_or(false);
+    let token = session::create_session(
+        pool,
+        user_id,
+        session::DEFAULT_SESSION_TTL,
+        // `ADM-14` D10: the API has no trusted source for the client's
+        // address, so the session records none and the Sessions page says
+        // "Not recorded" rather than showing a wrong address. `SEC-82` may
+        // change this.
+        None,
+        session_user_agent(headers).as_deref(),
+        &[],
+    )
+    .await?;
+    let body = LoginResponse {
+        id: user_id.to_string(),
+        name: principal.display_name,
+        must_change_password,
+    };
+    // `GOV-1`: the sign-in is on the audit trail. Nobody was signed in
+    // when the form was submitted, so the actor is the form, and the
+    // principal is set only because the password verified. Nothing the
+    // visitor typed goes in: not the email, not the password.
+    audit_coverage::record_best_effort(state, sign_in_executed_event(user_id, principal_kind))
+        .await;
+    let mut response = (StatusCode::OK, ApiJson(body)).into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        session_cookie_header(
+            state.config.is_dev,
+            token.expose(),
+            session::DEFAULT_SESSION_TTL,
+        ),
+    );
+    Ok(response)
+}
+
+/// Refuse a sign-in whose password did not verify: count the failure
+/// against its source, write the lock row when this try set the lock,
+/// write the FIRST refused row of the source's window, and answer with
+/// the non-enumerated 401.
+///
+/// It is a helper of its own so that the ORDER of these steps stays
+/// readable in one place (`SEC-75` decisions 2 and 3): the failure counts
+/// against the source before any row is written, and only the first
+/// failure of a window writes the refused row.
+///
+/// # Errors
+///
+/// The non-enumerated 401 of a refused sign-in.
+async fn refuse_sign_in(
+    state: &AppState,
+    pool: &PgPool,
+    source: &ClientSource,
+    attempt: u32,
+    attempt_lock: Option<time::OffsetDateTime>,
+    max_failures: u32,
+) -> ApiResult<Response> {
+    // `SEC-75` decision 2: this failure counts against the
+    // source's budget. Best-effort: a storage failure here must
+    // not change the answer to a sign-in — the account throttle
+    // has already counted the attempt, and a database that is
+    // failing fails there first (with a 500, not with a 401).
+    //
+    // Decision 3: the count also says whether this failure is the
+    // FIRST of the source's window. Only the first one writes the
+    // refused row; the later ones are counted and summarised by
+    // the sweep when the window closes.
+    let window = match source_throttle::record_failure(pool, source.as_str()).await {
+        Ok(window) => Some(window),
+        Err(err) => {
+            tracing::warn!(%err, "failed to count a failed sign-in against its source");
+            None
+        }
+    };
+    // SEC-49: the try was already counted before hashing; the try
+    // that reached the limit is the one that set the lock.
+    if attempt_lock.is_some() && attempt == max_failures {
+        // Plan D5b: the row holds no identifier material — the key
+        // prefix it used to carry was the first 12 hex characters of
+        // the unsalted SHA-256 of what was typed into the identifier
+        // box, and a reader of the trail could match it against
+        // guessed emails. Nobody signed in, so there is no principal
+        // and no resource either; the fixed sentence is all the row
+        // says. Rows written before this change keep their prefix:
+        // `audit_event` is append-only, so nothing rewrites them.
+        let event = NewAuditEvent {
+            action: "auth.login_locked".to_owned(),
+            outcome: "refused".to_owned(),
+            // QA LH-SEC-2-06 (SEC-70, decision D3): nobody signed in
+            // yet, so the event names the form that produced it.
+            actor_label: Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM.to_owned()),
+            detail: Some(SIGN_IN_LOCKED_DETAIL.to_owned()),
+            ..Default::default()
+        };
+        audit_coverage::record_best_effort(state, event).await;
+    }
+    // `GOV-1`: a refused sign-in is on the audit trail, with no
+    // principal (nobody proved who they were) and nothing the visitor
+    // typed, not even a hash of it (`GOV-1 review`). An unknown email
+    // writes the identical row: the trail is not an account oracle.
+    //
+    // `SEC-75` decision 3: only the FIRST failure of the source's
+    // window writes that row; the later ones only count, and the
+    // sweep writes one summary row for the window.
+    //
+    // A counter that cannot be written writes the row every time
+    // (`window.is_none_or`): refused attempts stay visible on the
+    // trail, never a silent drop — the same fail-visible fallback the
+    // gate's `record_gate_refusal` writes when its counter fails.
+    if window.is_none_or(|window| window.failures == 1) {
+        let written = audit_coverage::record_best_effort_checked(
+            state,
+            sign_in_refused_event(source.as_str()),
+        )
+        .await;
+        if written
+            && let Some(window) = window
+            && let Err(err) = source_throttle::mark_first_row_written(
+                pool,
+                source.as_str(),
+                window.window_started_at,
+            )
+            .await
+        {
+            tracing::warn!(
+                %err,
+                "failed to mark the first refused row of a window as written"
+            );
+        }
+    }
+    tracing::warn!("login failed");
+    Err(ApiError::Unauthorized("Invalid username/email or password.".to_owned()).into())
 }
 
 /// `POST /api/auth/logout` — revoke the caller's session server-side (so a
@@ -654,11 +849,10 @@ fn sessions_decision_for(principal: &Principal) -> SessionsDecision {
 ///
 /// `user_agent` is the browser as it named itself at sign-in (`ADM-14`
 /// decision D9), and `null` for a session older than that change.
-/// `created_ip` is always `null`: the API sits behind the console's own
-/// server and has no trusted source for the client's address, so the page
-/// says "Not recorded" rather than showing a wrong address as a fact
-/// (decision D10) — see `lakehouse_store::sessions::SessionRow`'s own doc
-/// comment.
+/// `created_ip` is always `null`: the API has no trusted source for the
+/// client's address, so the page says "Not recorded" rather than showing a
+/// wrong one (`ADM-14` D10; `SEC-82` may change this); see
+/// `lakehouse_store::sessions::SessionRow`'s own doc comment.
 ///
 /// # Errors
 ///
@@ -1242,6 +1436,9 @@ impl ExchangeFailure {
 )]
 pub async fn oidc_callback(
     State(state): State<AppState>,
+    // Kept in the signature: callers pass it positionally; the address is
+    // deliberately not recorded (`ADM-14` D10; `SEC-82`).
+    _source: ClientSource,
     Query(query): Query<OidcCallbackQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
@@ -1402,8 +1599,10 @@ pub async fn oidc_callback(
         pool,
         user_id,
         session::DEFAULT_SESSION_TTL,
-        // ADM-14 D10: no address — the API sits behind the console's own
-        // server and has no trusted source for the client's.
+        // `ADM-14` D10: the API has no trusted source for the client's
+        // address, so the session records none and the Sessions page says
+        // "Not recorded" rather than showing a wrong address. `SEC-82` may
+        // change this; the password sign-in does the same.
         None,
         session_user_agent(&headers).as_deref(),
         &login.mapped_role_names,
@@ -3281,6 +3480,7 @@ mod tests {
         );
         oidc_callback(
             axum::extract::State(state.clone()),
+            ClientSource::new(crate::client_source::UNKNOWN_SOURCE),
             axum::extract::Query(OidcCallbackQuery {
                 code: Some(code.to_owned()),
                 state: Some(flow.state.clone()),
@@ -3462,8 +3662,9 @@ mod tests {
             "expected the flow cookie to be cleared even on success: {set_cookies:?}"
         );
 
-        // QA LH-SEC-5-01 (ADM-14 D9/D10): the single sign-on callback records
-        // the browser it came from, and records no network address.
+        // QA LH-SEC-5-01 (ADM-14 D9/D10): the single sign-on callback
+        // records the browser it came from but no network address — the API
+        // has no trusted source for it (`SEC-82` may change that).
         let (count, user_agent, created_ip): (i64, Option<String>, Option<String>) =
             sqlx::query_as("SELECT count(*), max(user_agent), max(created_ip) FROM session")
                 .fetch_one(&pool)
@@ -3471,8 +3672,9 @@ mod tests {
         assert_eq!(count, 1, "one callback, one session");
         assert_eq!(user_agent.as_deref(), Some("QA-Browser/1.0"));
         assert_eq!(
-            created_ip, None,
-            "the network address is not recorded (ADM-14 D10)"
+            created_ip.as_deref(),
+            None,
+            "the session records no network address (ADM-14 D10; SEC-82 may change this)"
         );
         Ok(())
     }

@@ -12,9 +12,10 @@
  * createdAt, expiresAt, createdIp, userAgent }` on the wire. Both times are
  * RFC 3339 in UTC with milliseconds (`ADM-14` D11), which every browser's
  * `Date` parses. `userAgent` is the browser at sign-in (`ADM-14` D9) and
- * `null` for a session older than that change; `createdIp` is always `null`
- * — the API has no trusted source for the client's address, so the page says
- * "Not recorded" rather than showing a wrong one (`ADM-14` D10).
+ * `null` for a session older than that change. `createdIp` is always `null`
+ * — the API has no trusted source for the client's address, so the page
+ * says "Not recorded" rather than showing a wrong one (`ADM-14` D10;
+ * `SEC-82` may change this).
  */
 export type Session = {
   id: string;

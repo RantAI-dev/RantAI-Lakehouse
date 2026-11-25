@@ -131,7 +131,9 @@ export function PasswordGate({ token, onOpen }: { readonly token: string; readon
 
   return (
     <div className="grid min-h-[60vh] place-content-center px-4">
-      <form onSubmit={(e) => void submit(e)} className="flex w-72 flex-col gap-3 text-center">
+      {/* PR #648 review 2: an embed opened with `background=transparent` paints
+          over the host page, so the gate keeps a surface of its own. */}
+      <form onSubmit={(e) => void submit(e)} className="flex w-72 flex-col gap-3 rounded-xl border border-border bg-card p-6 text-center text-card-foreground">
         <p className="text-lg font-semibold">This dashboard needs a password</p>
         <div className="flex items-center gap-2">
           <Input type={shown ? "text" : "password"} aria-label="Password" autoComplete="off" autoFocus value={password}

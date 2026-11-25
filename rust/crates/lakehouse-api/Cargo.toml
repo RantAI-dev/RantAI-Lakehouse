@@ -112,7 +112,11 @@ axum = { workspace = true }
 # `tokio::time::{timeout_at, Instant, sleep}` to bound per-table/per-namespace
 # Lakekeeper calls. `io-util`: `tokio::io::duplex` backs `routes::ai::stream_chat`'s
 # NDJSON progress pipe for `POST /api/ai/chat` (`stream: true`).
-tokio = { workspace = true, features = ["sync", "time", "io-util", "process"] }
+# `net`: `crate::client_source::TrustedProxies::refresh` resolves the
+# trusted proxies' compose service names with `tokio::net::lookup_host`
+# (`SEC-75` decision 1), so the feature is named here rather than left to
+# incidental workspace feature unification.
+tokio = { workspace = true, features = ["sync", "time", "io-util", "process", "net"] }
 tower = { workspace = true }
 tower-http = { workspace = true }
 reqwest = { workspace = true }

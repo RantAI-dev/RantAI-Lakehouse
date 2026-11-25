@@ -290,9 +290,20 @@ async fn build_state_and_pool(
         .await
         .expect("connect to the test-support admin database");
 
-    let db_name = format!("lakehouse_api_test_{}", Uuid::new_v4().simple());
-    // safe: `db_name` is this helper's own prefix plus a lowercase-hex UUID;
-    // no caller text reaches the statement.
+    // OPS-23: the pid of the test process is in the name, so that the
+    // sweep of another test process drops this database at once when this
+    // process is gone: a crashed or killed run leaves nothing behind. The
+    // name is `lakehouse_api_test_p` (20 bytes) + the pid (at most 7
+    // digits on Linux) + `_` + the 32 hex characters of the UUID = 60
+    // bytes, inside Postgres's 63-byte identifier limit.
+    let db_name = format!(
+        "lakehouse_api_test_p{}_{}",
+        std::process::id(),
+        Uuid::new_v4().simple()
+    );
+    // safe: `db_name` is this helper's own prefix, the pid and a
+    // lowercase-hex UUID; no caller text reaches the statement. It holds
+    // only `[A-Za-z0-9_]`, so the sweep may quote it as an identifier.
     sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"CREATE DATABASE "{db_name}""#
     )))

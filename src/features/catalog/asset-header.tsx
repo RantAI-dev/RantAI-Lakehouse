@@ -108,8 +108,10 @@ export function AssetHeader({
   const dot = layerDot(a.layer)
   const certify = hasPermission("governance:write")
   const edit = hasPermission("catalog:write")
-  // DATA-1: Gold marts publish in open format; the card itself says who may switch it.
-  const publish = a.layer === "gold"
+  // DATA-1/DATA-65: Gold marts and Silver tables publish in open format; the
+  // card itself says who may switch it. UX-8 moved publishing here from the
+  // Overview, so the Silver affordance DATA-65 added there lives on this menu.
+  const publish = a.layer === "gold" || a.layer === "silver"
 
   return (
     <header className="flex flex-col gap-1.5">
