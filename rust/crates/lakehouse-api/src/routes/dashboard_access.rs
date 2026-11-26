@@ -1235,6 +1235,89 @@ async fn chain_rules(
     Ok((found, restricted))
 }
 
+/// What moving a chart from one dashboard to another does to who can see it:
+/// `Some(true)` when the destination's access is wider (it lists somebody the
+/// source does not, or the starting point comes back because the source is
+/// restricted and the destination is not), `Some(false)` for the same or
+/// narrower, `None` when the comparison cannot be answered (the gate then
+/// fails closed to an approval).
+///
+/// The reuse is the point (`AI-11` decision 6, plan ai-146): the per-board
+/// access pair is the same model [`access_preview`] compares for a board move
+/// between folders — a board's own rules, plus the rules of its folder chain
+/// up to the nearest mark, unless the board is itself marked (a mark gives a
+/// fresh list: its own rules only, and the starting point cut). A chart on a
+/// board is visible to exactly those who can see the board, so comparing the
+/// two boards' pairs answers "does anybody new see this chart".
+///
+/// `move_chart`'s own body still requires `edit` on both boards at execution;
+/// this comparison only picks the gate's risk tier. The built-in dashboard has
+/// no row of its own; it reads as the root pair (no folder, no rules). A
+/// personal board is `None`: the move to it is refused anyway, and a
+/// comparison that pretends to answer would be invented.
+///
+/// Pure over the store reads; no permission is checked here, because the
+/// caller has already passed the gate's `dashboard:write` check when this
+/// runs, and the answer goes to the gate, never to the model.
+pub(crate) async fn move_chart_widens(
+    state: &AppState,
+    from_board: &str,
+    to_board: &str,
+) -> Option<bool> {
+    let from = from_board.trim();
+    let to = to_board.trim();
+    if to.is_empty() {
+        return None;
+    }
+    if to == from {
+        return Some(false);
+    }
+    let pool = state.pg.as_deref()?;
+    let ch = &state.clickhouse;
+    let tree = folders::list_folders(ch, &Viewer::system()).await.ok()?;
+    let from_pair = board_pair(pool, ch, &tree, from).await?;
+    let to_pair = board_pair(pool, ch, &tree, to).await?;
+    let (gains, _loses, _start_loses, start_gains) =
+        move_difference((&from_pair.0, from_pair.1), (&to_pair.0, to_pair.1));
+    Some(!gains.is_empty() || start_gains)
+}
+
+/// One board's access pair for [`move_chart_widens`]: the rules that let
+/// somebody see it, and whether the starting point is cut. `None` for the
+/// built-in dashboard's absent row when it is not the root-pair case, for a
+/// board that cannot be read, and for a personal board.
+async fn board_pair(
+    pool: &lakehouse_store::PgPool,
+    ch: &lakehouse_clickhouse::ChClient,
+    tree: &[Folder],
+    id: &str,
+) -> Option<(Vec<rules::AccessRule>, bool)> {
+    // The built-in dashboard takes no rules and sits at the root.
+    if id == store::DEFAULT_BOARD_ID {
+        return Some((Vec::new(), false));
+    }
+    let board = store::get_board(ch, id, &Viewer::system()).await.ok()??;
+    if board.owner_id.is_some() {
+        return None;
+    }
+    let own = rules::rules_for_item(pool, "board", &board.id).await.ok()?;
+    if rules::restriction_for_item(pool, "board", &board.id)
+        .await
+        .ok()?
+        .is_some()
+    {
+        // A mark on the board itself: a fresh list, the chain counts nothing.
+        return Some((own, true));
+    }
+    let folder_id = board.folder_id.clone().unwrap_or_default();
+    let (inherited, restricted) = chain_rules(pool, &ancestors_of(tree, &folder_id))
+        .await
+        .ok()?;
+    let mut all = own;
+    all.extend(inherited);
+    Some((all, restricted))
+}
+
 /// Query of `GET /api/dashboard/access-preview`.
 #[derive(Debug, Deserialize)]
 pub struct PreviewQuery {

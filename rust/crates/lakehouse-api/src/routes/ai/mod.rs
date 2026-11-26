@@ -1476,9 +1476,17 @@ async fn run_chat(
             // RPT-1 review fix (BLOCKER) R2: who an update leaves receiving the
             // report is looked up here, before the gate, and given to it as a
             // server-side fact.
-            let (audience, reach) = gate_facts(state, principal, &call.function.name, &args).await;
-            let gate_result =
-                gate::decide_by_name(is_build, perms, &call.function.name, &args, audience, reach);
+            let (audience, reach, move_widens) =
+                gate_facts(state, principal, &call.function.name, &args).await;
+            let gate_result = gate::decide_by_name(
+                is_build,
+                perms,
+                &call.function.name,
+                &args,
+                audience,
+                reach,
+                move_widens,
+            );
             // plan 17: with an allowlist, the tools the console named are the
             // only ones a call may reach. The check is against the offered
             // list, not the request's strings, so a tool the switch removed,
@@ -2088,20 +2096,30 @@ struct ToolCallBody {
 /// moment ago is `args["confirmed"] == true`, which is precisely the
 /// signal a `WriteLow` call needs to actually execute (see [`gate::decide`]).
 ///
-/// The two facts the gate needs about a call, worked out on the server before it
-/// decides (`RPT-1` review fix (BLOCKER) R2 and `BI-37` D10): `audience` says
-/// whether a report update leaves anyone but the requester receiving it, and
-/// `reach` is the caller's own level on the dashboard a listed tool acts on.
-/// Neither is ever read from the arguments the model sent.
+/// The three facts the gate needs about a call, worked out on the server before
+/// it decides (`RPT-1` review fix (BLOCKER) R2, `BI-37` D10 and `AI-11`
+/// decision 6): `audience` says whether a report update leaves anyone but the
+/// requester receiving it, `reach` is the caller's own level on the dashboard
+/// a listed tool acts on, and `move_widens` says whether a `move_chart` call
+/// would widen who can see the chart. None is ever read from the arguments
+/// the model sent.
 async fn gate_facts(
     state: &AppState,
     principal: Option<&Principal>,
     name: &str,
     args: &Map<String, Value>,
-) -> (Option<bool>, Option<lakehouse_bi::access::Level>) {
+) -> (
+    Option<bool>,
+    Option<lakehouse_bi::access::Level>,
+    Option<bool>,
+) {
     (
         tools::report_audience(state, principal, name, args).await,
         tools::dashboard_reach(state, principal, name, args).await,
+        // AI-11 decision 6: whether a `move_chart` call widens who can see
+        // the chart. `None` for every other tool, and for a comparison the
+        // server cannot answer (the gate then fails closed to an approval).
+        tools::move_widens(state, principal, name, args).await,
     )
 }
 
@@ -2135,9 +2153,18 @@ pub async fn tool_call(
     let access = AssistantAccess::from_principal(caller);
     let is_build = !access.is_ask_only() && parsed.mode.as_deref() == Some("build");
 
-    // The two facts the gate needs beyond the arguments (see `gate_facts`).
-    let (audience, reach) = gate_facts(&state, caller, &parsed.tool, &parsed.args).await;
-    let gate_result = gate::decide_with(is_build, perms, spec, &parsed.args, audience, reach);
+    // The three facts the gate needs beyond the arguments (see `gate_facts`).
+    let (audience, reach, move_widens) =
+        gate_facts(&state, caller, &parsed.tool, &parsed.args).await;
+    let gate_result = gate::decide_with(
+        is_build,
+        perms,
+        spec,
+        &parsed.args,
+        audience,
+        reach,
+        move_widens,
+    );
     let (result, outcome, run_id, approval_id) = if let Some(refusal) = gate_result {
         if gate::is_write_high_pending(&refusal) {
             let (_, resource_id) = audit::resource_for(&parsed.tool, &parsed.args, &json!({}));

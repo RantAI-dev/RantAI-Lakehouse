@@ -19,7 +19,9 @@
 //! - [`written`] — the report and template tools (`BI-18` part D, with `AI-9`).
 //! - [`calc_fields`] — the calculated-field tools (`BI-8`, with `AI-4`).
 //! - [`embed`] — the signed-embed tools (`BI-26` slice 2, with `AI-11-AC3`):
-//!   enable, filter modes, withdraw, and the snippet.//! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`, plus
+//!   enable, filter modes, withdraw, and the snippet.
+//! - [`sharing`] — the dashboard-sharing tools (`AI-11`): the public link
+//!   (approval), ending it (confirm), and who can see a dashboard.//! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`, plus
 //!   the Tier 1 pipeline-operations tools (T1.3).
 //! - [`alerts`] — Tier 1 alert-rule tools (T1.1).
 //! - [`connectors`] — Tier 1 connector tools (T1.2).
@@ -41,6 +43,7 @@ mod embed;
 mod export;
 pub(super) use export::with_screen_filters;
 mod maps;
+mod sharing;
 // `pub(in crate::routes)` (not merely `mod`) so `routes::lineage` — a
 // SIBLING module of `routes::ai`, not a descendant — can reuse
 // `data::CATALOG_UNION`, the SAME bronze-catalog query `list_datasets`
@@ -62,6 +65,8 @@ mod propose;
 mod queries;
 mod reports;
 pub(in crate::routes) use reports::{approval_args, report_audience};
+// AI-11 decision 6: the move_chart elevation fact, loaded before the gate.
+pub(in crate::routes) use boards::move_widens;
 mod tabs;
 mod written;
 
@@ -233,6 +238,7 @@ pub(in crate::routes) async fn run_tool(
             comments::list_dashboard_comments(state, principal, args).await
         }
         n if embed::handles(n) => embed::run(state, principal, name, args).await,
+        n if sharing::handles(n) => sharing::run(state, principal, name, args).await,
         // BI-18 part D (T4): reports and templates.
         n if written::handles(n) => written::run(state, principal, name, args).await,
         "list_connectors" => connectors::list_connectors(state, principal).await,
@@ -348,6 +354,21 @@ pub(in crate::routes) async fn dashboard_anywhere(
     principal: Option<&Principal>,
 ) -> Option<Level> {
     crate::routes::dashboard_access::highest_level(state, principal?).await
+}
+
+/// A routes function's [`ApiError`](crate::error::ApiError) as a tool reply —
+/// the same mapping the gate helpers below apply inline, and the reason
+/// `tests/sec11_guard.rs` allows the pattern in this file (SEC-11): the text
+/// was written in this repository — the routes' fixed refusal sentences, a
+/// store failure already `"database error"` through `From<StoreError>` — or
+/// it is already classified, as `settings::format_settings`'s store read,
+/// which goes through `upstream_error::internal_error` (fixed words plus a
+/// reference id; the raw text is under that id in the log). The sharing
+/// tools (`tools/sharing.rs`) reply through here so the sentence-producing
+/// line lives at this one reviewed spot instead of a fresh per-file
+/// allowlist entry.
+pub(super) fn api_error_reply<T>(result: Result<T, lakehouse_core::ApiError>) -> Result<T, Value> {
+    result.map_err(|err| json!({ "error": err.to_string() }))
 }
 
 /// Who a dashboard tool reads as: the caller's viewer after their rules, the
@@ -535,6 +556,12 @@ pub(crate) async fn check_before_approval(
             crate::routes::embed::check_filter_modes(&board, &modes)
                 .map_err(|err| json!({ "error": err.to_string() }))
         }
+        // AI-11 decision 1: the sharing tool's own checks run before the
+        // approval row, so a call that could never run — a non-manager, an
+        // expiry outside the assistant's bound, public links switched off, a
+        // personal board — asks nobody. The module carries them, next to the
+        // tool that repeats them at execution (where the route re-checks).
+        "create_public_link" => sharing::check_before_create(state, principal, args).await,
         _ => Ok(()),
     }
 }
@@ -780,7 +807,13 @@ mod tests {
     async fn check_before_approval_is_a_no_op_for_every_other_tool() {
         let state = dispatch_test_state();
         for spec in registry::TOOLS {
-            if spec.name == "enable_embed" || spec.name == "set_embed_filter_modes" {
+            if spec.name == "enable_embed"
+                || spec.name == "set_embed_filter_modes"
+                // AI-11 decision 1: the sharing write is checked for real
+                // (manage, days, switch, personal board), not a no-op. Its
+                // refusals are pinned in `tests/ai_public_link.rs`.
+                || spec.name == "create_public_link"
+            {
                 continue;
             }
             assert!(

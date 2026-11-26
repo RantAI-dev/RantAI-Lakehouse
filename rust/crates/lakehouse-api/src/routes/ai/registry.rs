@@ -1169,6 +1169,38 @@ fn move_chart_schema() -> Value {
             "required": ["id", "board"] } } })
 }
 
+// ── AI-11: sharing a dashboard ───────────────────────────────────────────
+//
+// The manage gate lives in the tool (the console's public-link routes are
+// signed-in with `manage` in the handler), so the gate permission is empty
+// like the embed tools'. `create_public_link` carries no `password` argument
+// on purpose: the assistant never sets or lifts a link's password.
+
+fn create_public_link_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "create_public_link",
+        "description": "Make a dashboard's public link, or move its expiry: anyone with the link's address can open the dashboard until it expires or someone ends it. Waits for human approval. With a live link, it keeps its address and only the expiry moves. days (1 to 30, default 30) sets how long it stays live. Extra protections on the link are managed in Share > Link.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string" },
+            "days": { "type": "integer", "minimum": 1, "maximum": 30, "description": "Days until the link expires. Default 30." } },
+            "required": ["board"] } } })
+}
+
+fn revoke_public_link_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "revoke_public_link",
+        "description": "End a dashboard's public link at once, so its address stops working. Needs the person's confirm. Making a link again makes a new address.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string" } },
+            "required": ["board"] } } })
+}
+
+fn list_dashboard_access_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_dashboard_access",
+        "description": "Say who can see a dashboard: the rules naming people and roles (its own and the ones inherited from folders above), your own level, whether a public link is live and until when, and whether embedding is on. Needs manage on the dashboard. It never changes access: to give or remove a person's access, point to Share > People.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string" } },
+            "required": ["board"] } } })
+}
+
 /// `AI-2` AC1: the view filter tool. Its year sentence names the year
 /// column, because a year column holds the year itself and a date column
 /// does not: a model told only about the date column's between filter saves
@@ -3006,6 +3038,31 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "",
     },
+    // AI-11 (plan ai-146): sharing a dashboard. The gate permission is empty
+    // for the same reason as the embed tools' above: the console's public-link
+    // and access routes are signed-in with `manage` in the handler, and the
+    // tools run that one guard themselves. The link write waits for a human's
+    // approval; ending a link only narrows access, so it is a confirm; saying
+    // who can see a dashboard is a read. No tool changes the rules — Share >
+    // People does (a guard test pins it).
+    ToolSpec {
+        name: "create_public_link",
+        schema: create_public_link_schema,
+        risk: Risk::WriteHigh,
+        permission: "",
+    },
+    ToolSpec {
+        name: "revoke_public_link",
+        schema: revoke_public_link_schema,
+        risk: Risk::WriteLow,
+        permission: "",
+    },
+    ToolSpec {
+        name: "list_dashboard_access",
+        schema: list_dashboard_access_schema,
+        risk: Risk::Read,
+        permission: "",
+    },
     // BI-18 part D (T4, decisions R5 and T5): reports and templates, behind the
     // permission of their routes. Writing is a confirm in the chat; deleting a
     // report or a template is an approval, as deleting a dashboard is. Listing
@@ -3255,8 +3312,10 @@ mod tests {
         // (`BI-37` D8) + the four signed-embed tools (`BI-26` slice 2)
         // + the six report and template tools (`BI-18` part D, T4)
         // + `list_reports` (`BI-18` D review round 1, SHOULD-FIX 2)
-        // + `find_report_recipients` (`AI-30`).
-        assert_eq!(tool_schemas().len(), 123);
+        // + `find_report_recipients` (`AI-30`)
+        // + the three dashboard-sharing tools (`AI-11`: `create_public_link`,
+        // `revoke_public_link`, `list_dashboard_access`).
+        assert_eq!(tool_schemas().len(), 126);
     }
 
     /// `RPT-1` (with `AI-10`): the report tools have the console's permission,
@@ -4332,7 +4391,10 @@ mod tests {
         // tools, and `ask_user`, which stores and reads nothing. The three
         // draft tools are NOT in this list: `draft_policy` needs
         // `policy:write`, and since SEC-23 the two rule drafts need
-        // `governance:write`.
+        // `governance:write`. The three sharing tools (`AI-11`) are: their
+        // gate permission is empty because the console's public-link and
+        // access routes are signed-in with `manage` in the handler, and the
+        // tools run that one guard themselves.
         assert_eq!(
             offered_names,
             vec![
@@ -4355,6 +4417,11 @@ mod tests {
                 "set_embed_filter_modes".to_owned(),
                 "withdraw_embed_tokens".to_owned(),
                 "get_embed_snippet".to_owned(),
+                // AI-11: the sharing tools, judged by the route's own
+                // `manage` guard, so no gate permission of their own.
+                "create_public_link".to_owned(),
+                "revoke_public_link".to_owned(),
+                "list_dashboard_access".to_owned(),
             ]
         );
     }

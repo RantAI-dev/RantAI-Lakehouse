@@ -207,6 +207,47 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
     }
 }
 
+/// The reason sentence of `create_public_link` (`AI-11` decision 1), split
+/// out of [`reason_for_write_high`] because it is the one arm that reads
+/// state: the card says WHICH of the two the call does — a new link, or the
+/// live link keeping its address — because the two read differently to
+/// whoever is asked to approve. The live check is the store's row, the same
+/// one `put_link` acts on at execution (which re-reads it: the route's own
+/// check stays authoritative). With no database the honest sentence is the
+/// one that covers both; the approval step refuses anyway when nothing can
+/// be stored.
+async fn public_link_reason(
+    pg: Option<&lakehouse_store::PgPool>,
+    args: &Map<String, Value>,
+) -> String {
+    let board = args
+        .get("board")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let days = args
+        .get("days")
+        .and_then(Value::as_i64)
+        .filter(|d| (1..=30).contains(d))
+        .unwrap_or(30);
+    let live = match pg {
+        Some(pool) => lakehouse_store::public_links::get_for_board(pool, board)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|link| link.expires_at > time::OffsetDateTime::now_utc()),
+        None => false,
+    };
+    if live {
+        format!(
+            "Moves dashboard {board}'s public link to expire in {days} days. The link keeps its address; anyone who has it can still open the dashboard."
+        )
+    } else {
+        format!(
+            "Makes a new link for dashboard {board}: anyone with its address can open the dashboard, until it expires in {days} days or someone ends it."
+        )
+    }
+}
+
 /// The two `WriteHigh` embed tools' sentences (`BI-26` slice 2 D9): the sites
 /// `enable_embed` adds and who can then reach the dashboard, and each column
 /// `set_embed_filter_modes` sets with what an embed's viewer may change. Split
@@ -324,6 +365,13 @@ const WRITE_HIGH_RISK_PAUSED_PIPELINE: &str =
 const WRITE_HIGH_RISK_EMBED_FILTER_MODES: &str =
     "High-risk action: changes the filters locked for embeds; they can be set again at any time.";
 
+/// The risk statement for `create_public_link` (`AI-11`): the generic
+/// "cannot be undone" sentence would be false — a link ends when it expires,
+/// when someone revokes it, or when an administrator switches public links
+/// off. What makes the call high-risk is what the link DOES while it is
+/// live: anyone with the address can open the dashboard.
+const WRITE_HIGH_RISK_PUBLIC_LINK: &str = "High-risk action: the dashboard becomes open to anyone with the link's address, until it expires or someone ends it.";
+
 /// The risk sentence stored on a `WriteHigh` approval, chosen per tool.
 ///
 /// One sentence for every tool hid the mismatch: `delete_chart`,
@@ -345,6 +393,9 @@ pub(in crate::routes) fn risk_for_write_high(spec: &ToolSpec) -> &'static str {
         "delete_report" => WRITE_HIGH_RISK_TRASHED_REPORT,
         "pause_pipeline" => WRITE_HIGH_RISK_PAUSED_PIPELINE,
         "set_embed_filter_modes" => WRITE_HIGH_RISK_EMBED_FILTER_MODES,
+        // AI-11: a link anyone can open until it expires or someone ends it,
+        // so the generic "cannot be undone" sentence would be false.
+        "create_public_link" => WRITE_HIGH_RISK_PUBLIC_LINK,
         _ => WRITE_HIGH_RISK,
     }
 }
@@ -390,7 +441,11 @@ pub async fn create_write_high_approval(
             "tool": spec.name,
         });
     };
-    let reason = reason_for_write_high(spec, raw_args);
+    let reason = match spec.name {
+        // AI-11 decision 1: this arm reads state, so it is an async arm.
+        "create_public_link" => public_link_reason(pg, raw_args).await,
+        _ => reason_for_write_high(spec, raw_args),
+    };
     let req = NewApprovalRequest {
         tool: spec.name,
         actor,
@@ -729,6 +784,12 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             "Withdraws every embed token of dashboard {}; tokens signed before now stop working.",
             s("board")
         ),
+        // AI-11: ending a public link narrows access, so it is a Confirm; the
+        // card says what the person is confirming, as every other arm does.
+        "revoke_public_link" => format!(
+            "Ends the public link of dashboard {}; anyone who has its address stops getting in.",
+            s("board")
+        ),
         "create_report_subscription" | "update_report_subscription" => {
             report_summary(spec.name, args)
         }
@@ -872,7 +933,7 @@ pub fn decide(
     spec: &ToolSpec,
     args: &Map<String, Value>,
 ) -> Option<Value> {
-    decide_with(is_build, perms, spec, args, None, None)
+    decide_with(is_build, perms, spec, args, None, None, None)
 }
 
 /// The permission half of [`decide_with`], for `BI-37` D10: the global
@@ -916,6 +977,7 @@ pub fn decide_with(
     args: &Map<String, Value>,
     audience_needs_approval: Option<bool>,
     reach: Option<lakehouse_bi::access::Level>,
+    move_widens: Option<bool>,
 ) -> Option<Value> {
     // F2.9 (PR #59 review): the Ask-mode / permission gates check the
     // STATIC risk (a Read tool must never refuse in Ask mode regardless
@@ -925,7 +987,7 @@ pub fn decide_with(
     // of the `WriteLow` confirmation path. Ask mode is intentionally
     // unaffected: a non-Read call is refused in Ask mode whether the
     // tool is `WriteLow` or `WriteHigh` in this call.
-    let effective = effective_risk_with(spec, args, audience_needs_approval);
+    let effective = effective_risk_with(spec, args, audience_needs_approval, move_widens);
     if !is_build && effective != Risk::Read {
         return Some(ask_mode_refusal(spec.name));
     }
@@ -971,17 +1033,32 @@ pub fn decide_with(
 #[cfg(test)]
 #[must_use]
 pub fn effective_risk(spec: &ToolSpec, args: &Map<String, Value>) -> Risk {
-    effective_risk_with(spec, args, None)
+    effective_risk_with(spec, args, None, None)
 }
 
-/// [`effective_risk`] with the server-side audience fact of [`decide_with`].
+/// [`effective_risk`] with the server-side facts of [`decide_with`]. The
+/// second fact is `move_chart`'s (`AI-11` decision 6, plan ai-146):
+/// `Some(true)` when moving the chart to the named board lists somebody new
+/// or brings the starting point back, `Some(false)` for the same or narrower
+/// audience, `None` when the comparison cannot be answered — or for every
+/// other tool.
 #[must_use]
 pub fn effective_risk_with(
     spec: &ToolSpec,
     args: &Map<String, Value>,
     audience_needs_approval: Option<bool>,
+    move_widens: Option<bool>,
 ) -> Risk {
     if spec.name == "trigger_pipeline" && matches!(args.get("runConfig"), Some(Value::Object(_))) {
+        return Risk::WriteHigh;
+    }
+    // AI-11 decision 6: a move that widens who can see the chart waits for a
+    // human's approval, like every other change that opens a dashboard to
+    // somebody who cannot see it now. Fail closed: when the comparison
+    // cannot be answered (a chart or a board that cannot be read), the call
+    // gets the approval, never the bare confirm. A tool that is not
+    // `move_chart` carries no such fact and is unaffected.
+    if spec.name == "move_chart" && move_widens != Some(false) {
         return Risk::WriteHigh;
     }
     // RPT-1 / AI-10 (feature decision 10; product owner, 2026-10-17): a report
@@ -1023,9 +1100,18 @@ pub fn decide_by_name(
     args: &Map<String, Value>,
     audience_needs_approval: Option<bool>,
     reach: Option<lakehouse_bi::access::Level>,
+    move_widens: Option<bool>,
 ) -> Option<Value> {
     let spec = super::registry::find(tool_name)?;
-    decide_with(is_build, perms, spec, args, audience_needs_approval, reach)
+    decide_with(
+        is_build,
+        perms,
+        spec,
+        args,
+        audience_needs_approval,
+        reach,
+        move_widens,
+    )
 }
 
 #[cfg(test)]
@@ -1074,28 +1160,37 @@ mod tests {
         let create = spec("create_report_subscription");
         let none = no_args();
         assert_eq!(
-            effective_risk_with(update, &none, Some(true)),
+            effective_risk_with(update, &none, Some(true), None),
             Risk::WriteHigh
         );
         assert_eq!(
-            effective_risk_with(update, &none, Some(false)),
+            effective_risk_with(update, &none, Some(false), None),
             Risk::WriteLow
         );
         // Without the fact the arguments decide, as before.
-        assert_eq!(effective_risk_with(update, &none, None), Risk::WriteLow);
+        assert_eq!(
+            effective_risk_with(update, &none, None, None),
+            Risk::WriteLow
+        );
         let mut named = Map::new();
         named.insert("recipients".to_owned(), json!([{ "email": "a@b.example" }]));
-        assert_eq!(effective_risk_with(update, &named, None), Risk::WriteHigh);
+        assert_eq!(
+            effective_risk_with(update, &named, None, None),
+            Risk::WriteHigh
+        );
         // The fact says narrowing: naming a subset is a Confirm.
         assert_eq!(
-            effective_risk_with(update, &named, Some(false)),
+            effective_risk_with(update, &named, Some(false), None),
             Risk::WriteLow
         );
         assert_eq!(
-            effective_risk_with(create, &named, Some(false)),
+            effective_risk_with(create, &named, Some(false), None),
             Risk::WriteHigh
         );
-        assert_eq!(effective_risk_with(create, &none, None), Risk::WriteLow);
+        assert_eq!(
+            effective_risk_with(create, &none, None, None),
+            Risk::WriteLow
+        );
     }
 
     #[test]
@@ -1610,11 +1705,11 @@ mod tests {
     #[test]
     fn unregistered_tool_is_never_refused() {
         assert_eq!(
-            decide_by_name(false, None, "not_a_real_tool", &no_args(), None, None),
+            decide_by_name(false, None, "not_a_real_tool", &no_args(), None, None, None),
             None
         );
         assert_eq!(
-            decide_by_name(true, None, "not_a_real_tool", &no_args(), None, None),
+            decide_by_name(true, None, "not_a_real_tool", &no_args(), None, None, None),
             None
         );
     }
@@ -1719,7 +1814,7 @@ mod tests {
         ];
         for tool in ["run_sql", "run_saved_query"] {
             for perms in &without {
-                let refused = decide_by_name(true, Some(perms), tool, &no_args(), None, None)
+                let refused = decide_by_name(true, Some(perms), tool, &no_args(), None, None, None)
                     .unwrap_or_else(|| panic!("{tool} must be refused without query:read"));
                 assert_eq!(refused["reason"], json!("permission"), "{tool}");
                 assert_eq!(refused["required"], json!("query:read"), "{tool}");
@@ -1730,6 +1825,7 @@ mod tests {
                     Some(&PermissionSet::parse("query:read")),
                     tool,
                     &no_args(),
+                    None,
                     None,
                     None
                 ),
@@ -1746,21 +1842,36 @@ mod tests {
     fn run_sql_is_granted_to_assistant_ask_and_refused_to_assistant_use_alone() {
         let ask = PermissionSet::parse("assistant:ask");
         assert_eq!(
-            decide_by_name(false, Some(&ask), "run_sql", &no_args(), None, None),
+            decide_by_name(false, Some(&ask), "run_sql", &no_args(), None, None, None),
             None,
             "run_sql must be granted to assistant:ask"
         );
 
         let use_only = PermissionSet::parse("assistant:use");
-        let refused_use = decide_by_name(false, Some(&use_only), "run_sql", &no_args(), None, None)
-            .expect("assistant:use alone must be refused run_sql without query:read");
+        let refused_use = decide_by_name(
+            false,
+            Some(&use_only),
+            "run_sql",
+            &no_args(),
+            None,
+            None,
+            None,
+        )
+        .expect("assistant:use alone must be refused run_sql without query:read");
         assert_eq!(refused_use["reason"], json!("permission"));
         assert_eq!(refused_use["required"], json!("query:read"));
 
         let neither = PermissionSet::default();
-        let refused_neither =
-            decide_by_name(false, Some(&neither), "run_sql", &no_args(), None, None)
-                .expect("principal with neither must be refused run_sql");
+        let refused_neither = decide_by_name(
+            false,
+            Some(&neither),
+            "run_sql",
+            &no_args(),
+            None,
+            None,
+            None,
+        )
+        .expect("principal with neither must be refused run_sql");
         assert_eq!(refused_neither["reason"], json!("permission"));
         assert_eq!(refused_neither["required"], json!("query:read"));
     }
@@ -1770,8 +1881,16 @@ mod tests {
     #[test]
     fn write_tool_in_ask_mode_is_refused_with_ask_mode_message() {
         let ask = PermissionSet::parse("assistant:ask");
-        let refused = decide_by_name(false, Some(&ask), "create_chart", &no_args(), None, None)
-            .expect("write tool in ask mode must be refused");
+        let refused = decide_by_name(
+            false,
+            Some(&ask),
+            "create_chart",
+            &no_args(),
+            None,
+            None,
+            None,
+        )
+        .expect("write tool in ask mode must be refused");
         assert_eq!(refused, ask_mode_refusal("create_chart"));
         assert!(
             refused["error"]
@@ -1883,7 +2002,7 @@ mod tests {
         use lakehouse_bi::access::Level;
         let analyst = PermissionSet::parse("query:read");
         let read = spec("export_chart");
-        let refused = decide_with(true, Some(&analyst), read, &no_args(), None, None)
+        let refused = decide_with(true, Some(&analyst), read, &no_args(), None, None, None)
             .expect("must be refused without the permission or a level");
         assert_eq!(refused["required"], json!("dashboard:read"));
         assert_eq!(
@@ -1893,7 +2012,8 @@ mod tests {
                 read,
                 &no_args(),
                 None,
-                Some(Level::View)
+                Some(Level::View),
+                None
             ),
             None,
             "view on the dashboard is what reading its chart needs"
@@ -1907,6 +2027,7 @@ mod tests {
             &confirmed_args(),
             None,
             Some(Level::View),
+            None,
         )
         .expect("a viewer may not create a chart");
         assert_eq!(refused["required"], json!("dashboard:write"));
@@ -1917,7 +2038,8 @@ mod tests {
                 write,
                 &confirmed_args(),
                 None,
-                Some(Level::Edit)
+                Some(Level::Edit),
+                None
             ),
             None,
             "edit on the dashboard is what changing it needs"
@@ -1942,6 +2064,7 @@ mod tests {
                 &confirmed_args(),
                 None,
                 Some(Level::Manage),
+                None,
             )
             .unwrap_or_else(|| panic!("{name} must stay refused"));
             assert_eq!(refused["reason"], json!("permission"), "{name}");

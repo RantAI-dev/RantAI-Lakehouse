@@ -90,6 +90,34 @@ describe("the signed-embed tools", () => {
   })
 })
 
+// AI-11: the dashboard-sharing tools, named here or they never reach the
+// model. Saying who can see a dashboard is a read (Ask mode too); making or
+// re-expiring the public link waits in Approvals and ending it needs the
+// chat's Confirm, so both are Dashboard Builder writes.
+describe("the dashboard-sharing tools", () => {
+  const fixture = JSON.parse(
+    readFileSync(`${process.cwd()}/rust/crates/lakehouse-api/tests/fixtures/tool_schemas.json`, "utf8")
+  ) as { function: { name: string } }[]
+  const serverTools = fixture.map((t) => t.function.name)
+  const writers = ["create_public_link", "revoke_public_link"]
+
+  it("are on the server", () => {
+    for (const tool of [...writers, "list_dashboard_access"]) expect(serverTools).toContain(tool)
+  })
+
+  it("offers the access read in both modes and the link writes in build mode only", () => {
+    for (const mode of ["ask", "build"] as const) {
+      expect(toolsFromCaps(new Set(["data"]), mode)).toContain("list_dashboard_access")
+    }
+    for (const tool of writers) {
+      expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain(tool)
+      expect(toolsFromCaps(new Set(["dashboard"]), "ask")).not.toContain(tool)
+      expect(toolsFromCaps(new Set(["data"]), "build")).not.toContain(tool)
+    }
+    expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain("list_dashboard_access")
+  })
+})
+
 describe("the dashboard capability against the server's tool list", () => {
   // BI-8 review fix (BLOCKER) R1: the composer sends these names as the turn's
   // allowlist, so a dashboard tool the server has but this list lacks is never

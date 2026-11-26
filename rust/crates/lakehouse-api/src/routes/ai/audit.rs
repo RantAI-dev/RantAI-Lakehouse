@@ -140,7 +140,12 @@ pub fn resource_for(
         | "arrange_board"
         | "save_board_filters"
         | "set_board_view_filters"
-        | "set_dashboard_theme" => (Some("board"), str_field("board")),
+        | "set_dashboard_theme"
+        // AI-11: the sharing tools act on a dashboard, recorded under the
+        // board the call named (the link's own token is never a resource).
+        | "create_public_link"
+        | "revoke_public_link"
+        | "list_dashboard_access" => (Some("board"), str_field("board")),
         // The look tools (`BI-17` part A) read `chart` and `board`, not `id`
         // (merge of main into phase 3: the table was main's, written before
         // they existed).
