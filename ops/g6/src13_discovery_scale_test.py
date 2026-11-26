@@ -55,6 +55,8 @@ import g6_ingest_matrix_test as matrix
 SCHEMA = "scale_10k"
 # SEC-78: the console's runtime database role; a constant, never built from input.
 CONSOLE_ROLE = "lakehouse_app"
+# SEC-84: the read-only source role the seeded connector dials as; a constant.
+SOURCE_READER_ROLE = "lakehouse_source_reader"
 TABLES = 10_000
 BATCH = 500
 # Decision D9: the listing of 10,000 tables completes within two minutes.
@@ -110,6 +112,12 @@ def _create_tables() -> None:
             cur.execute(f"GRANT USAGE ON SCHEMA {SCHEMA} TO {CONSOLE_ROLE}")
             cur.execute(
                 f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {SCHEMA} TO {CONSOLE_ROLE}"
+            )
+            # SEC-84: the seeded connector dials as the reader. Same key grant
+            # (REFERENCES lets information_schema show constraints); no write.
+            cur.execute(f"GRANT USAGE ON SCHEMA {SCHEMA} TO {SOURCE_READER_ROLE}")
+            cur.execute(
+                f"GRANT SELECT, REFERENCES ON ALL TABLES IN SCHEMA {SCHEMA} TO {SOURCE_READER_ROLE}"
             )
         conn.commit()
         _log(f"created {TABLES} tables in schema {SCHEMA} in {time.time() - started:.1f} s")
