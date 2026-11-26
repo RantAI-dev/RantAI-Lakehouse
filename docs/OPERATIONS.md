@@ -1380,10 +1380,13 @@ so each answers `409` until an operator sets its organisation.
 
 Set it with `PUT /api/agents/employees/{id}/tenant`:
 
-- The caller needs `agent:manage`.
-- The caller must belong to the target organisation, or hold the unrestricted
-  `*:*` grant. Any other caller gets `404`, and so does an unknown organisation
-  id.
+- The caller needs `identity:write` or the unrestricted `*:*` grant. Any other
+  caller gets `403` with "changing an agent's organisation needs an
+  administrator". An operator sees that `403` when the account lacks the grant;
+  give the account `identity:write` or use an unrestricted account.
+- The caller must belong to the agent's current organisation (if it has one)
+  and to the target organisation, unless it is unrestricted (`*:*`). Any other
+  caller gets `404`, and so does an unknown organisation id.
 - The change is audited as `agent.tenant.set`, with the old and new
   organisation ids.
 
@@ -1395,7 +1398,7 @@ curl -sS -X POST "$LAKEHOUSE_URL/api/auth/login" \
   -H 'content-type: application/json' \
   -d '{"identifier":"<username>","password":"<password>"}' -c cookies.txt
 
-# Set the organisation an agent works in.
+# Set the organisation an agent works in. Needs identity:write or unrestricted (*:*).
 curl -sS -X PUT "$LAKEHOUSE_URL/api/agents/employees/<agent-id>/tenant" \
   -H 'content-type: application/json' -b cookies.txt \
   -d '{"tenantId":"<tenant-uuid>"}'

@@ -609,9 +609,13 @@ pub struct EmployeeTenantChange {
     pub old_tenant_id: Option<Uuid>,
 }
 
-/// Set the organisation an agent works in (`SEC-76`). The old value is read
-/// in the same transaction that writes the new one, so the audit row names
-/// the organisation that was really replaced.
+/// Set the organisation an agent works in (`SEC-76`).
+///
+/// `expected_old` is the organisation the caller checked against before it
+/// asked for the change. The row is locked and read in the same transaction
+/// that writes the new value, so the change lands only if the agent still has
+/// `expected_old`. The audit row then names the organisation that was really
+/// replaced. When it has moved, nothing is written and the answer is `None`.
 ///
 /// The caller checks that `tenant_id` names an existing tenant: an unknown
 /// id would otherwise surface as a foreign-key failure.
@@ -623,8 +627,9 @@ pub struct EmployeeTenantChange {
 pub async fn set_employee_tenant(
     pool: &PgPool,
     id: &str,
+    expected_old: Option<Uuid>,
     tenant_id: Uuid,
-) -> Result<EmployeeTenantChange, StoreError> {
+) -> Result<Option<EmployeeTenantChange>, StoreError> {
     let mut tx = pool.begin().await?;
     // `FOR UPDATE` holds the row while the old value is read, so a second
     // change cannot slip in between the read and the write.
@@ -636,16 +641,21 @@ pub async fn set_employee_tenant(
     let Some((name, old_tenant_id)) = current else {
         return Err(StoreError::NotFound);
     };
+    if old_tenant_id != expected_old {
+        // The transaction is dropped unchanged: the organisation moved since
+        // the caller checked it.
+        return Ok(None);
+    }
     sqlx::query("UPDATE agent_employee SET tenant_id = $2 WHERE id = $1")
         .bind(id)
         .bind(tenant_id)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(EmployeeTenantChange {
+    Ok(Some(EmployeeTenantChange {
         name,
         old_tenant_id,
-    })
+    }))
 }
 
 /// Set an employee's `status` and return the updated row. Metric columns

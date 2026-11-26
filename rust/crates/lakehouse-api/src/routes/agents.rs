@@ -199,9 +199,7 @@ async fn validate_read_roles(
             unknown.chars().take(64).collect::<String>()
         )));
     }
-    let may_escalate =
-        crate::routes::catalog::is_unrestricted(caller) || caller.has("identity:write");
-    if !may_escalate
+    if !may_go_beyond_own_roles(caller)
         && let Some(role) = requested
             .iter()
             .find(|name| !caller.role_names.iter().any(|held| held == *name))
@@ -253,20 +251,43 @@ pub struct SetEmployeeTenantBody {
     tenant_id: Uuid,
 }
 
+/// The 403 sentence a caller gets when it lacks the anti-escalation bar
+/// ([`may_go_beyond_own_roles`]) and tries to change an agent's organisation
+/// (SEC-76 review, BLOCKER 1). It is this crate's own fixed sentence.
+const ORGANISATION_NEEDS_ADMIN_SENTENCE: &str =
+    "changing an agent's organisation needs an administrator";
+
+/// The 409 sentence when the agent's organisation changed between the check
+/// and the write. Nothing is written, so the caller simply asks again.
+const ORGANISATION_CHANGED_SENTENCE: &str =
+    "this agent's organisation changed while you were setting it; try again";
+
 /// `PUT /api/agents/employees/{id}/tenant` — set the organisation an agent
 /// works in (`SEC-76`, decision 3). Needs `agent:manage` (`POLICY_TABLE`).
 ///
-/// The caller must belong to the target organisation or be unrestricted
-/// (`*:*`). Any other caller gets the same `404` `tenant_scope` gives, and an
-/// unknown organisation gets the same `404`, so the answer never shows whether
-/// an organisation exists. The change is audited as `agent.tenant.set`, with
-/// the old and new organisation ids in `args`.
+/// Checks, in this order, before anything is written:
+///
+/// 1. The caller is unrestricted (`*:*`) or holds `identity:write`
+///    ([`may_go_beyond_own_roles`], the bar #714 uses for read roles). Anyone
+///    else gets `403` with [`ORGANISATION_NEEDS_ADMIN_SENTENCE`].
+/// 2. When the agent already has an organisation, a caller who is not
+///    unrestricted belongs to that CURRENT one.
+/// 3. A caller who is not unrestricted belongs to the TARGET one.
+/// 4. The target organisation exists.
+///
+/// Refusals in 2 to 4 are the same `404` `tenant_scope` gives, so the answer
+/// never shows whether an organisation exists. The write then checks that the
+/// current organisation is still the one checked, and refuses with `409` if it
+/// moved. The change is audited as `agent.tenant.set`, with the old and new
+/// organisation ids in `args`.
 ///
 /// # Errors
 ///
-/// `400` on a malformed body; `404` if `id` is unknown, the organisation is
-/// not reachable for the caller, or it does not exist; `503` with no Postgres
-/// pool; `500` (classified) on a storage failure.
+/// `400` on a malformed body; `403` for a caller without the bar above; `404`
+/// if `id` is unknown, an organisation is not reachable for the caller, or the
+/// target does not exist; `409` if the agent's organisation changed under the
+/// request; `503` with no Postgres pool; `500` (classified) on a storage
+/// failure.
 pub async fn set_employee_tenant(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -275,21 +296,36 @@ pub async fn set_employee_tenant(
 ) -> ApiResult<ApiJson<DigitalEmployee>> {
     let body: SetEmployeeTenantBody = parse_body(&body)?;
     let pg = pool(&state)?;
+    if !may_go_beyond_own_roles(&principal) {
+        return Err(
+            ApiError::PermissionDenied(ORGANISATION_NEEDS_ADMIN_SENTENCE.to_owned()).into(),
+        );
+    }
+    let agent = agents::get_employee_run_config(pg, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Employee {id} not found")))?;
+    let unrestricted = crate::routes::catalog::is_unrestricted(&principal);
+    if let Some(current) = agent.tenant_id
+        && !unrestricted
+        && !principal.in_tenant(current)
+    {
+        return Err(ApiError::NotFound("tenant not found".to_owned()).into());
+    }
     // Membership is checked before existence, so the two refusals look the
     // same to a caller who may not reach the organisation at all.
-    if !principal.in_tenant(body.tenant_id) && !crate::routes::catalog::is_unrestricted(&principal)
-    {
+    if !unrestricted && !principal.in_tenant(body.tenant_id) {
         return Err(ApiError::NotFound("tenant not found".to_owned()).into());
     }
     if !lakehouse_store::identity::tenant_exists(pg, body.tenant_id).await? {
         return Err(ApiError::NotFound("tenant not found".to_owned()).into());
     }
-    let change = agents::set_employee_tenant(pg, &id, body.tenant_id)
+    let change = agents::set_employee_tenant(pg, &id, agent.tenant_id, body.tenant_id)
         .await
         .map_err(|err| match err {
             StoreError::NotFound => ApiError::NotFound(format!("Employee {id} not found")),
             other => other.into(),
-        })?;
+        })?
+        .ok_or_else(|| ApiError::Conflict(ORGANISATION_CHANGED_SENTENCE.to_owned()))?;
     audit_coverage::record_best_effort(
         &state,
         ai_audit::build_event(
@@ -980,6 +1016,14 @@ fn principal_for_run_auth(auth: &RunAuth) -> Option<&Principal> {
     }
 }
 
+/// `SEC-68` (#714)'s anti-escalation bar: a caller may give an agent roles it
+/// does not hold, and may change an agent's organisation, only when it is
+/// unrestricted (`*:*`) or holds `identity:write`. Every check that needs this
+/// bar calls this function, so the bar lives in one place.
+fn may_go_beyond_own_roles(caller: &Principal) -> bool {
+    crate::routes::catalog::is_unrestricted(caller) || caller.has("identity:write")
+}
+
 /// `SEC-68`: the role names an agent run uses for table access, derived from
 /// the agent's OWN explicit grant — never from whatever the trigger happens
 /// to carry.
@@ -997,9 +1041,7 @@ fn principal_for_run_auth(auth: &RunAuth) -> Option<&Principal> {
 ///
 /// [`NO_GRANT_ROLE`]: crate::table_access::NO_GRANT_ROLE
 fn effective_read_roles(grant: &[String], caller: Option<&Principal>) -> Vec<String> {
-    let may_exceed = caller.is_some_and(|principal| {
-        crate::routes::catalog::is_unrestricted(principal) || principal.has("identity:write")
-    });
+    let may_exceed = caller.is_some_and(may_go_beyond_own_roles);
     let mut roles: Vec<String> = match caller {
         None => grant.to_vec(),
         Some(_) if may_exceed => grant.to_vec(),

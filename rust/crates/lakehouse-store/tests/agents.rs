@@ -1822,9 +1822,10 @@ async fn set_employee_tenant_returns_the_old_organisation_and_the_name(
         .unwrap();
     assert_eq!(agent.tenant_id, None, "a new agent has no organisation");
 
-    let first = set_employee_tenant(&pool, &agent.id, RETAIL.parse().unwrap())
+    let first = set_employee_tenant(&pool, &agent.id, None, RETAIL.parse().unwrap())
         .await
-        .unwrap();
+        .unwrap()
+        .expect("the agent still had no organisation");
     assert_eq!(
         first,
         EmployeeTenantChange {
@@ -1833,9 +1834,15 @@ async fn set_employee_tenant_returns_the_old_organisation_and_the_name(
         }
     );
 
-    let second = set_employee_tenant(&pool, &agent.id, LOGISTICS.parse().unwrap())
-        .await
-        .unwrap();
+    let second = set_employee_tenant(
+        &pool,
+        &agent.id,
+        Some(RETAIL.parse().unwrap()),
+        LOGISTICS.parse().unwrap(),
+    )
+    .await
+    .unwrap()
+    .expect("the agent still had the organisation the caller checked");
     assert_eq!(second.old_tenant_id, Some(RETAIL.parse().unwrap()));
 
     let config = get_employee_run_config(&pool, &agent.id)
@@ -1849,7 +1856,7 @@ async fn set_employee_tenant_returns_the_old_organisation_and_the_name(
 /// An unknown agent is `NotFound`, and writes nothing.
 #[sqlx::test(migrations = "../../migrations")]
 async fn set_employee_tenant_unknown_agent_is_not_found(pool: PgPool) -> sqlx::Result<()> {
-    let err = set_employee_tenant(&pool, "emp-does-not-exist", RETAIL.parse().unwrap())
+    let err = set_employee_tenant(&pool, "emp-does-not-exist", None, RETAIL.parse().unwrap())
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::NotFound), "{err:?}");
@@ -1910,7 +1917,10 @@ async fn deleting_an_organisation_leaves_its_agents_unset(pool: PgPool) -> sqlx:
     let agent = create_employee(&pool, &employee_input("tenant-delete-agent"))
         .await
         .unwrap();
-    set_employee_tenant(&pool, &agent.id, org_id).await.unwrap();
+    set_employee_tenant(&pool, &agent.id, None, org_id)
+        .await
+        .unwrap()
+        .expect("the agent had no organisation");
 
     sqlx::query("DELETE FROM tenant WHERE id = $1")
         .bind(org_id)
@@ -1922,5 +1932,34 @@ async fn deleting_an_organisation_leaves_its_agents_unset(pool: PgPool) -> sqlx:
         .unwrap()
         .expect("the agent still exists");
     assert_eq!(config.tenant_id, None);
+    Ok(())
+}
+
+/// SEC-76 review, BLOCKER 1: the write lands only if the organisation is still
+/// the one the caller checked. A change that raced in first is refused, and
+/// nothing is written, so the first caller's check cannot be overtaken.
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_employee_tenant_writes_nothing_when_the_organisation_moved(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let agent = create_employee(&pool, &employee_input("tenant-moved-agent"))
+        .await
+        .unwrap();
+    set_employee_tenant(&pool, &agent.id, None, RETAIL.parse().unwrap())
+        .await
+        .unwrap()
+        .expect("the agent had no organisation");
+
+    // A caller that checked "no organisation" arrives after the move to Retail.
+    let stale = set_employee_tenant(&pool, &agent.id, None, LOGISTICS.parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(stale, None);
+
+    let config = get_employee_run_config(&pool, &agent.id)
+        .await
+        .unwrap()
+        .expect("the agent exists");
+    assert_eq!(config.tenant_id, Some(RETAIL.parse().unwrap()));
     Ok(())
 }

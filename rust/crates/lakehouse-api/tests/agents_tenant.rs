@@ -141,17 +141,32 @@ async fn tenant_of(pool: &PgPool, employee: &str) -> Option<Uuid> {
         .expect("read the agent's organisation")
 }
 
+/// A session for a new person with `permissions`, who belongs to each of
+/// `tenants` and to no other organisation. Restricted unless the permissions
+/// say otherwise (`*:*` is never granted here).
+async fn principal_in(pool: &PgPool, permissions: &str, tenants: &[&str]) -> String {
+    let user = create_principal_with_permissions(pool, permissions).await;
+    for tenant in tenants {
+        sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2::uuid)")
+            .bind(user)
+            .bind(tenant)
+            .execute(pool)
+            .await
+            .expect("put the person in an organisation");
+    }
+    session_cookie_for_user(pool, user).await
+}
+
 /// A person with `agent:manage` who belongs to one organisation and is not
 /// unrestricted: the caller the organisation checks are about.
 async fn manager_in(pool: &PgPool, tenant: &str) -> String {
-    let user = create_principal_with_permissions(pool, "agent:manage, query:read").await;
-    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2::uuid)")
-        .bind(user)
-        .bind(tenant)
-        .execute(pool)
-        .await
-        .expect("put the manager in one organisation");
-    session_cookie_for_user(pool, user).await
+    principal_in(pool, "agent:manage, query:read", &[tenant]).await
+}
+
+/// `agent:manage` plus `identity:write`: the administrator who may move an
+/// agent between organisations (SEC-76 review, BLOCKER 1).
+async fn administrator_in(pool: &PgPool, tenants: &[&str]) -> String {
+    principal_in(pool, "agent:manage, identity:write, query:read", tenants).await
 }
 
 /// A scheduled run of an agent with no organisation is refused with 409 and
@@ -275,7 +290,7 @@ async fn setting_the_organisation_audits_the_old_and_the_new_ids() {
 async fn a_caller_outside_the_target_organisation_is_not_found_and_changes_nothing() {
     let app = spin_up().await;
     insert_employee(&app.pool, "emp-outside-target", None).await;
-    let cookie = manager_in(&app.pool, LOGISTICS).await;
+    let cookie = administrator_in(&app.pool, &[LOGISTICS]).await;
 
     let resp = put_tenant(&app.router, "emp-outside-target", &cookie, RETAIL).await;
 
@@ -409,4 +424,91 @@ async fn a_scheduled_run_lists_only_the_agents_organisation() {
         !ids.contains(&RETAIL_CONNECTOR),
         "another organisation's connector is not listed: {ids:?}"
     );
+}
+
+/// The fixed sentence a caller without `identity:write` (and not unrestricted)
+/// gets when it tries to change an agent's organisation
+/// (`routes::agents::ORGANISATION_NEEDS_ADMIN_SENTENCE`).
+const NEEDS_ADMIN: &str = "changing an agent's organisation needs an administrator";
+
+/// SEC-76 review, BLOCKER 1: `agent:manage` alone is not enough to move an
+/// agent between organisations. A person who holds `agent:manage` in both
+/// organisations, but not `identity:write`, gets 403 with the fixed sentence,
+/// and the agent keeps its organisation with no audit row. The permission check
+/// answers first, so the person's memberships do not matter here.
+#[tokio::test]
+async fn an_agent_manager_without_identity_write_is_refused_and_nothing_changes() {
+    let app = spin_up().await;
+    insert_employee(&app.pool, "emp-manager-refused", Some(RETAIL)).await;
+    let cookie = principal_in(&app.pool, "agent:manage, query:read", &[RETAIL, LOGISTICS]).await;
+
+    let resp = put_tenant(&app.router, "emp-manager-refused", &cookie, LOGISTICS).await;
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = json_body(resp).await;
+    // `ApiError::PermissionDenied` prefixes its code, as every 403 does.
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(error.ends_with(NEEDS_ADMIN), "{body}");
+    assert_eq!(
+        tenant_of(&app.pool, "emp-manager-refused")
+            .await
+            .map(|t| t.to_string()),
+        Some(RETAIL.to_owned())
+    );
+    let rows = audit_rows(&app.pool, "agent.tenant.set").await;
+    assert!(
+        rows.is_empty(),
+        "a refused change writes no audit row: {rows:?}"
+    );
+}
+
+/// SEC-76 review, BLOCKER 1: once an agent has an organisation, an administrator
+/// who is not unrestricted must belong to that CURRENT organisation too. This
+/// one holds `identity:write` in the target (Logistics) only, so the agent in
+/// Retail is not theirs to move: 404, same as `tenant_scope`, nothing changed.
+#[tokio::test]
+async fn an_administrator_outside_the_agents_current_organisation_is_not_found() {
+    let app = spin_up().await;
+    insert_employee(&app.pool, "emp-current-outside", Some(RETAIL)).await;
+    let cookie = administrator_in(&app.pool, &[LOGISTICS]).await;
+
+    let resp = put_tenant(&app.router, "emp-current-outside", &cookie, LOGISTICS).await;
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        tenant_of(&app.pool, "emp-current-outside")
+            .await
+            .map(|t| t.to_string()),
+        Some(RETAIL.to_owned())
+    );
+    let rows = audit_rows(&app.pool, "agent.tenant.set").await;
+    assert!(
+        rows.is_empty(),
+        "a refused change writes no audit row: {rows:?}"
+    );
+}
+
+/// SEC-76 review, BLOCKER 1: an administrator who belongs to both the agent's
+/// current organisation and the target moves it, and the change is audited with
+/// the old and the new organisation ids.
+#[tokio::test]
+async fn an_administrator_in_both_organisations_moves_the_agent_and_it_is_audited() {
+    let app = spin_up().await;
+    insert_employee(&app.pool, "emp-both-orgs", Some(RETAIL)).await;
+    let cookie = administrator_in(&app.pool, &[RETAIL, LOGISTICS]).await;
+
+    let resp = put_tenant(&app.router, "emp-both-orgs", &cookie, LOGISTICS).await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        tenant_of(&app.pool, "emp-both-orgs")
+            .await
+            .map(|t| t.to_string()),
+        Some(LOGISTICS.to_owned())
+    );
+    let rows = audit_rows(&app.pool, "agent.tenant.set").await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["args"]["old_tenant_id"].as_str(), Some(RETAIL));
+    assert_eq!(rows[0]["args"]["new_tenant_id"].as_str(), Some(LOGISTICS));
+    assert_eq!(rows[0]["principal_kind"].as_str(), Some("user"));
 }
