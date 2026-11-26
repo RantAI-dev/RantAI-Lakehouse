@@ -325,7 +325,7 @@ async fn a_drafted_policy_for_a_table_outside_the_callers_reach_is_refused_and_s
     assert_eq!(
         body["result"]["error"],
         json!(
-            "\"serving.mart_customer_segment\" is not a table you can read. Pick the table as silver.<table>, serving.<table> or bronze.<table>."
+            "\"serving.mart_customer_segment\" is not a table you can read. Pick the table as silver.<table>, serving.<table>, bronze.<table> or gold.<table>."
         ),
         "{body}"
     );

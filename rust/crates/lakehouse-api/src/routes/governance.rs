@@ -466,6 +466,75 @@ async fn retain_policies_in_reach(
         .collect())
 }
 
+/// `SEC-83`: the one sentence a policy's table that is not there and one
+/// the writer's reach hides both get, so neither answer says which tables
+/// exist. The quality writers' sentence (`crate::routes::quality::
+/// unreadable_table`) offers the three zones a quality rule can check; a
+/// policy may also bind a published gold table — the G8 acceptance gate
+/// (`ops/g8/g8_governance_test.py`) authors its Trino-leg policy on
+/// `gold.<mart>` — so the policy's sentence offers the fourth. Two
+/// constructors, not one shared: each caller offers the zones it actually
+/// accepts, and the quality text stays as it is.
+fn unreadable_policy_table(asset: &str) -> ApiError {
+    ApiError::BadRequest(format!(
+        "\"{asset}\" is not a table you can read. Pick the table as \
+         silver.<table>, serving.<table>, bronze.<table> or gold.<table>."
+    ))
+}
+
+/// `SEC-83`: whether the table a policy's condition binds is there, for the
+/// policy writers — [`crate::routes::quality::quality_table_present`] for
+/// the zones a quality rule can check (`silver`, `serving`, `bronze`, one
+/// source of truth), plus the `gold` zone a policy has always been able to
+/// bind and a quality rule cannot: the published Iceberg table, asked about
+/// with the same failing question the bronze arm asks
+/// (`crate::routes::catalog_source::iceberg_table_presence_in`), under the
+/// `gold` namespace the Gold export publishes into
+/// (`lakehouse_iceberg::gold::GOLD_NAMESPACE`). The G8 gate binds exactly
+/// such a policy, so the zone stays admissible; `SEC-83` keeps the check,
+/// not a prohibition. Any other zone is absent, as before — fail closed.
+///
+/// # Errors
+///
+/// [`ApiError::Unavailable`] (`503`) with the one sentence
+/// [`crate::routes::quality::quality_table_present`] answers an outage with,
+/// for a present zone that cannot be checked: a check that cannot be made
+/// is not a refusal, and presence is asked before the reach (`SEC-80`'s
+/// order) so the outage answers every name alike.
+async fn policy_table_present(state: &AppState, asset: &str) -> Result<bool, ApiError> {
+    let Some((zone, table)) = asset.trim().split_once('.') else {
+        return Ok(false);
+    };
+    match zone.to_lowercase().as_str() {
+        "silver" | "serving" | "bronze" => {
+            crate::routes::quality::quality_table_present(state, asset).await
+        }
+        "gold" => {
+            match crate::routes::catalog_source::iceberg_table_presence_in(
+                state,
+                lakehouse_iceberg::gold::GOLD_NAMESPACE,
+                table,
+            )
+            .await
+            {
+                Ok(present) => Ok(present),
+                // No query database: nothing can read a published table, so
+                // the gold name is absent — the bronze arm's reading.
+                Err(crate::routes::catalog_source::PresenceUnknown::NoQueryDatabase) => Ok(false),
+                Err(crate::routes::catalog_source::PresenceUnknown::Unanswered) => {
+                    // The same sentence `quality_table_present` answers an
+                    // outage with; the constructor stays there, so the two
+                    // callers that share it stay one check.
+                    Err(ApiError::Unavailable(
+                        "The table could not be checked. Try again.".to_owned(),
+                    ))
+                }
+            }
+        }
+        _ => Ok(false),
+    }
+}
+
 /// A fixed, classified message for a failed governance read. The raw
 /// upstream text used to be returned as `"Error: …"`: the Data Quality
 /// page and the copilot showed `DB::Exception: Database _silver_meta does
@@ -1773,11 +1842,10 @@ fn create_policy_body(body: Value) -> Result<CreatePolicyInput, ApiError> {
 /// # Errors
 ///
 /// 400 on a malformed body or an authored `conditions` blob with no real
-/// obligation; 400 with [`crate::routes::quality::unreadable_table`]'s one
-/// sentence for a condition naming a table that is not there or that the
-/// writer's reach does not cover (`SEC-83` — the answer never says which),
-/// and 503 when that table cannot be checked; 409 if the name is taken;
-/// 503/500 as above.
+/// obligation; 400 with [`unreadable_policy_table`]'s one sentence for a
+/// condition naming a table that is not there or that the writer's reach
+/// does not cover (`SEC-83` — the answer never says which), and 503 when
+/// that table cannot be checked; 409 if the name is taken; 503/500 as above.
 pub async fn create_policy(
     State(state): State<AppState>,
     actor: Option<&Principal>,
@@ -1788,20 +1856,21 @@ pub async fn create_policy(
         .map_err(|err| ApiError::BadRequest(format!("invalid JSON: {err}")))?;
     let input = create_policy_body(body)?;
     // `SEC-83`: a policy binds a table the writer must be able to read — the
-    // rule `ensure_rule_table_with` holds a quality rule to. Presence is
-    // asked first, so an outage answers a name another tenant claimed and a
-    // name no table has alike; then the reach, and both refusals are the one
-    // `unreadable_table` sentence. A policy that binds no table (`conditions`
-    // absent or prose) is not checked.
+    // rule `ensure_rule_table_with` holds a quality rule to, plus the gold
+    // zone a policy has always been able to bind (`policy_table_present`).
+    // Presence is asked first, so an outage answers a name another tenant
+    // claimed and a name no table has alike; then the reach, and both
+    // refusals are the one `unreadable_policy_table` sentence. A policy that
+    // binds no table (`conditions` absent or prose) is not checked.
     if let Some(conditions) = input.conditions.as_deref()
         && let Some(cond) = crate::policy_engine::PolicyCondition::parse_opt(Some(conditions))
     {
-        let present = crate::routes::quality::quality_table_present(&state, &cond.table).await?;
+        let present = policy_table_present(&state, &cond.table).await?;
         if !crate::routes::quality::quality_key_in_reach(&state, actor, headers, &cond.table)
             .await?
             || !present
         {
-            return Err(crate::routes::quality::unreadable_table(&cond.table).into());
+            return Err(unreadable_policy_table(&cond.table).into());
         }
     }
     let created = governance::create_policy(pool(&state)?, &input).await?;

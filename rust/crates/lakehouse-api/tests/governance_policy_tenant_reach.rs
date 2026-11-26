@@ -18,7 +18,9 @@
 //!
 //! A Bronze table's presence is answered through the Iceberg query database
 //! (`DESCRIBE TABLE icecat_api.bronze.<table>` on the `ClickHouse` stand-in),
-//! so "there" and "checked" are both under the test's control.
+//! and a published gold table's presence the same way
+//! (`DESCRIBE TABLE icecat_api.gold.<table>`), so "there" and "checked" are
+//! both under the test's control.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -48,18 +50,24 @@ const OTHER_TENANT: &str = "11111111-1111-4111-8111-000000000002";
 const GROUP_TABLE: &str = "group_orders";
 /// The upload table the other tenant holds.
 const RETAIL_TABLE: &str = "retail_orders";
+/// The published gold table a policy may bind, as the G8 gate's Trino leg
+/// does (`ops/g8/g8_governance_test.py` publishes its own mart through the
+/// Gold export and authors its policy on `gold.g8_gate_subjects`).
+const GOLD_TABLE: &str = "g8_gate_subjects";
 
 /// Holds exactly what authoring a policy needs.
 const POLICY_WRITER: &str = "policy:write";
 /// Holds exactly what reading the policy list needs.
 const POLICY_READER: &str = "policy:read";
 
-/// The refusal a writer gives for a table the caller may not read
-/// (`routes::quality::unreadable_table`), for the other tenant's table.
+/// The refusal a policy writer gives for a table the caller may not read
+/// (`routes::governance::unreadable_policy_table`): the policy path, unlike
+/// the quality path, also binds published gold tables, so its sentence
+/// offers the fourth zone.
 fn unreadable_sentence(asset: &str) -> String {
     format!(
         "\"{asset}\" is not a table you can read. Pick the table as \
-         silver.<table>, serving.<table> or bronze.<table>."
+         silver.<table>, serving.<table>, bronze.<table> or gold.<table>."
     )
 }
 
@@ -418,6 +426,89 @@ async fn a_policy_for_a_table_that_cannot_be_checked_is_a_503_and_nothing_is_sto
         );
         assert_eq!(policies_named(&pool, name).await, 0, "{table}");
     }
+}
+
+// ── A policy may bind a published gold table ────────────────────────────
+
+/// The G8 gate's Trino leg in miniature (`ops/g8/g8_governance_test.py`
+/// publishes its own mart through the Gold export and authors its policy on
+/// `gold.g8_gate_subjects`): a policy whose condition binds a published gold
+/// table is authored. The catalog's tenant reaches it — a gold name belongs
+/// to no upload, so it is shared — when the query database describes the
+/// published table; a gold name nothing describes is refused with the one
+/// sentence, and so is the same present gold table for the other tenant's
+/// writer, whose reach no shared name enters. The sentence cannot say which.
+#[tokio::test]
+async fn a_policy_may_bind_a_published_gold_table_and_other_gold_names_are_refused_alike() {
+    let ch = MockServer::start().await;
+    // The published gold table, as the query database describes it: one
+    // column. Mounted before `mount_clickhouse`'s catch-all `DESCRIBE`, so
+    // this more specific match is the one that answers for `gold.<table>`.
+    Mock::given(method("POST"))
+        .and(body_string_contains("DESCRIBE TABLE"))
+        .and(body_string_contains(format!("gold.{GOLD_TABLE}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [{"name": "name", "type": "String"}, {"name": "type", "type": "String"}],
+            "data": [{"name": "email", "type": "String"}],
+            "rows": 1,
+        })))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+    mount_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_for_the_policy_writers(&ch).await;
+    let writer = cookie_in_tenant(&pool, POLICY_WRITER, CATALOG_TENANT).await;
+    let uri = "/api/governance/policies";
+    let gold_name = format!("gold.{GOLD_TABLE}");
+
+    // The published gold table: authored, as the G8 gate's own request is.
+    let (status, body) = send(
+        &router,
+        "POST",
+        uri,
+        &writer,
+        Some(policy_body("writer on gold", &gold_name)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(policies_named(&pool, "writer on gold").await, 1);
+
+    // A gold name nothing describes: not there — the identical sentence.
+    let (status, body) = send(
+        &router,
+        "POST",
+        uri,
+        &writer,
+        Some(policy_body("writer on missing gold", "gold.nobody_gold")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"],
+        json!(unreadable_sentence("gold.nobody_gold")),
+        "{body}"
+    );
+    assert_eq!(policies_named(&pool, "writer on missing gold").await, 0);
+
+    // The same present gold table, from the other tenant's writer: a gold
+    // name is outside a tenant writer's reach, whatever the query database
+    // answers about it. The same sentence as a gold name that is not there.
+    let other = cookie_in_tenant(&pool, POLICY_WRITER, OTHER_TENANT).await;
+    let (status, body) = send(
+        &router,
+        "POST",
+        uri,
+        &other,
+        Some(policy_body("other writer on gold", &gold_name)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"],
+        json!(unreadable_sentence(&gold_name)),
+        "{body}"
+    );
+    assert_eq!(policies_named(&pool, "other writer on gold").await, 0);
 }
 
 // ── Status and delete answer an out-of-reach policy as unknown (`SEC-83` D3) ──

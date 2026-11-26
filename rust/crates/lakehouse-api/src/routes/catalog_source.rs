@@ -76,13 +76,20 @@ async fn clickhouse_columns(
 /// `(name, type)` of an Iceberg table via `DESCRIBE` — `system.columns`
 /// does not list `DataLakeCatalog` tables. The error is kept: a caller that
 /// has to tell "no such table" from "could not ask" needs it
-/// ([`iceberg_table_presence`]).
+/// ([`iceberg_table_presence`]). `namespace` is the Iceberg namespace the
+/// table lives in; the SQL interpolates it between the backticks that wrap
+/// the namespaced table name, the way the gates spell a `ClickHouse` read
+/// of an Iceberg table: `icecat_api`.`bronze.orders`. It is always a
+/// compile-time constant of a crate (`BRONZE_NAMESPACE` here,
+/// `lakehouse_iceberg::gold::GOLD_NAMESPACE` for the policy path's gold
+/// arm), never caller input.
 async fn iceberg_describe(
     ch: &ChClient,
     db: &Ident,
+    namespace: &str,
     table: &Ident,
 ) -> Result<Vec<(String, String)>, ChError> {
-    let sql = format!("DESCRIBE TABLE {db}.`{BRONZE_NAMESPACE}.{table}`");
+    let sql = format!("DESCRIBE TABLE {db}.`{namespace}.{table}`");
     Ok(ch
         .rows(&sql, None)
         .await?
@@ -95,7 +102,9 @@ async fn iceberg_describe(
 /// failure, including "no such table" and an unreachable catalog, reads as
 /// "not available".
 async fn iceberg_columns(ch: &ChClient, db: &Ident, table: &Ident) -> Vec<(String, String)> {
-    iceberg_describe(ch, db, table).await.unwrap_or_default()
+    iceberg_describe(ch, db, BRONZE_NAMESPACE, table)
+        .await
+        .unwrap_or_default()
 }
 
 /// A `ClickHouse` table `db.table`, when it exists.
@@ -160,12 +169,8 @@ pub(crate) enum PresenceUnknown {
 /// Whether the Bronze Iceberg table `bronze.<table>` exists, as a question
 /// that can fail.
 ///
-/// [`iceberg_source`] cannot serve a caller that must not assume a name is
-/// free: it answers `None` for "no such table" and for "the catalog is
-/// unreachable" alike. Here the first is `Ok(false)` (`ClickHouse`'s own
-/// `UNKNOWN_TABLE`, the same test `routes::lakehouse` applies to a missing
-/// results table) and everything else, including an unrecognised error, is
-/// [`PresenceUnknown`], so a doubt is never read as absence.
+/// [`iceberg_table_presence_in`] for the Bronze namespace — the question the
+/// quality writers (`SEC-80`) ask.
 ///
 /// # Errors
 ///
@@ -176,17 +181,49 @@ pub(crate) async fn iceberg_table_presence(
     state: &AppState,
     table: &str,
 ) -> Result<bool, PresenceUnknown> {
+    iceberg_table_presence_in(state, BRONZE_NAMESPACE, table).await
+}
+
+/// Whether the Iceberg table `<namespace>.<table>` exists, as a question
+/// that can fail.
+///
+/// [`iceberg_source`] cannot serve a caller that must not assume a name is
+/// free: it answers `None` for "no such table" and for "the catalog is
+/// unreachable" alike. Here the first is `Ok(false)` (`ClickHouse`'s own
+/// `UNKNOWN_TABLE`, the same test `routes::lakehouse` applies to a missing
+/// results table) and everything else, including an unrecognised error, is
+/// [`PresenceUnknown`], so a doubt is never read as absence.
+///
+/// The namespace is part of the lookup because the query database holds
+/// every published namespace of the one Lakekeeper catalog, spelled the way
+/// Trino spells them minus the catalog (`iceberg.gold.<table>` there is
+/// ``<db>.`gold.<table>` `` here): `bronze` for an upload, `gold` for a
+/// published mart (`SEC-83`'s policy writers ask for that one). It is a
+/// compile-time constant at every call site, and re-validated as an
+/// [`Ident`] here so nothing unvalidated can reach the SQL through this
+/// door.
+///
+/// # Errors
+///
+/// [`PresenceUnknown::NoQueryDatabase`] when no Iceberg query database is
+/// configured; [`PresenceUnknown::Unanswered`] when the question got no
+/// definite answer.
+pub(crate) async fn iceberg_table_presence_in(
+    state: &AppState,
+    namespace: &str,
+    table: &str,
+) -> Result<bool, PresenceUnknown> {
     let Some(db) = state.config.iceberg_query_db.as_ref() else {
         return Err(PresenceUnknown::NoQueryDatabase);
     };
-    let Ok(table) = Ident::new(table) else {
+    let (Ok(namespace), Ok(table)) = (Ident::new(namespace), Ident::new(table)) else {
         return Err(PresenceUnknown::Unanswered);
     };
-    match iceberg_describe(&state.clickhouse, db, &table).await {
+    match iceberg_describe(&state.clickhouse, db, namespace.as_str(), &table).await {
         Ok(columns) => Ok(!columns.is_empty()),
         Err(ChError::Server(body)) if super::lakehouse::is_unknown_table_error(&body) => Ok(false),
         Err(err) => {
-            tracing::warn!(%err, "could not tell whether a Bronze Iceberg table exists");
+            tracing::warn!(%err, "could not tell whether an Iceberg table exists");
             Err(PresenceUnknown::Unanswered)
         }
     }
