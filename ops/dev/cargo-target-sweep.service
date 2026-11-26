@@ -1,0 +1,23 @@
+# Daily cargo target sweep on the build machine (OPS-17).
+#
+# Fill @SCRIPT@ with where the sweep script is installed, @TARGET_DIR@
+# with the shared cargo target directory, and @CAP@ with the size cap
+# (for example 60G). No machine-specific path or user is baked in here.
+#
+# The script refuses to sweep while cargo or rustc is running: deleting
+# build output a live build may still read would break that build. It
+# reports that safe skip with exit 75, so SuccessExitStatus makes the
+# skipped run a success instead of a broken unit every time a build
+# overlaps the timer.
+#
+# Nice and an idle I/O class keep the sweep below real build work.
+
+[Unit]
+Description=Keep the build machine's cargo target within its size cap
+
+[Service]
+Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+ExecStart=@SCRIPT@ @TARGET_DIR@ @CAP@
+SuccessExitStatus=75

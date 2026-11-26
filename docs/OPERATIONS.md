@@ -3298,3 +3298,66 @@ internet. The bundle carries the newer `lakehousectl` too, so an update does not
   (`ops/sso/docker-compose.staging-keycloak.override.yml`, profile `sso`) is a repository
   file, not a release asset; an internal identity provider must be deployed separately.
 - One host, Linux `x86_64` only. An update stops the stack while it switches releases.
+
+## Keeping the build machine's cargo target in bounds
+
+Cargo never removes its own old build output, so the shared target directory
+on the build machine grows until something else cleans it up. The sweep
+script `ops/dev/cargo-target-sweep.sh` keeps it under a byte cap.
+
+Run it with an optional `--dry-run` flag, a target directory and a cap:
+
+```bash
+ops/dev/cargo-target-sweep.sh --dry-run <target-dir> <cap>
+ops/dev/cargo-target-sweep.sh <target-dir> <cap>
+```
+
+A cap is a size such as `60G`, `500M`, `5T`, `500K`, or a plain byte count.
+While the directory is over the cap, the script deletes the oldest entries by
+mtime. It looks only inside each profile's `deps`, `build` and `incremental`
+subdirectories, for every profile such as `debug` and `release`, and inside
+`tmp`. It deletes one file at a time in `deps`, `build` and `tmp`, and one
+whole directory at a time in `incremental`. It never follows symlinks, never
+deletes anything outside those subtrees, and never deletes the target
+directory itself. One summary line records the size before, the size after
+and the number of entries deleted, for the journal.
+
+Run `--dry-run` first. It prints every entry it would delete and the size it
+would reach, and deletes nothing. Use it to check the cap and the scope before
+the timer starts deleting anything.
+
+Pick the cap from the size of one cold workspace gate round, about 13 GB
+(measured 2026-10-07). Four to five rounds is a sane starting point, so `60G`
+is a reasonable first cap.
+
+The script refuses to run while a `cargo` or `rustc` process is running. It
+deletes nothing and exits before touching any file, because deleting objects
+a live build may still need would break that build.
+
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | The directory was already under the cap, or the cap was reached. |
+| `1` | Usage error, such as a missing directory or a bad cap. Nothing was deleted. |
+| `75` | A `cargo` or `rustc` process is running, so the run was skipped. Nothing was deleted. |
+| `2` | The cap could not be reached after deleting everything allowed. The final size is printed. |
+
+Exit `75` is a skipped run, not a failure. It is the safe outcome when a build
+overlaps the timer, so the service counts it as a success instead of reporting
+a broken sweep every time that happens.
+
+Two systemd templates sit beside the script. `ops/dev/cargo-target-sweep.service`
+is a `Type=oneshot` service that runs the script with `Nice=19`, an idle I/O
+class and `SuccessExitStatus=75`. `ops/dev/cargo-target-sweep.timer` runs it
+daily with `Persistent=true` and a one-hour randomised delay. Fill in the
+three placeholders before installing them:
+
+- `@SCRIPT@` is where the sweep script is installed.
+- `@TARGET_DIR@` is the shared cargo target directory to keep in bounds.
+- `@CAP@` is the size cap, for example `60G`.
+
+The templates bake in no machine path and no user name. Install them as a user
+service or a system service, whichever fits the build machine. Installing them
+is the operator's step on the build machine: the repository ships the
+templates, not an installed timer.
