@@ -70,7 +70,9 @@ they are not re-reported as newly passing. The new expectations are
 - A temporary access grant gives a permission, not a table. A `query:read` grant made from a table's page opens that table's page (`GOV-11`), but only where the person's roles may read the table.
 - Dagster's own builds and quality checks run as the system and are not narrowed.
 - Narrowing the Dashboard Viewer role also narrows every embed and public link.
-- A scheduled agent run has no person behind it and is not narrowed either (`SEC-68`).
+- An agent works in one organisation. A scheduled run acts as the agent: its own principal, in the agent's organisation, with the agent's read roles (`SEC-68`, `SEC-76`).
+- A manual run by a person uses the agent's organisation. A person outside it, who is not unrestricted, gets 404 and no run.
+- No organisation, no run: a scheduled run of an agent with no organisation answers 409, before any tool or model call.
 - Names are compared without regard to case, as masks are. Two tables that differ only by case share one grant.
 - The check costs one database read per governed request: about 3.4 ms at the median and 4.6 to 5.1 ms at p95, measured in an unoptimised test build on a shared machine (plan, S1 handoff, T5). A release build is not measured.
 - A Bronze table is granted by its registry table name under the schema `bronze`. A Bronze dataset whose registry records no table name cannot be named by a grant, so it stays hidden from a narrowed role's catalog and search.

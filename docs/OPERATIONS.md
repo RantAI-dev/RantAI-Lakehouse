@@ -150,12 +150,14 @@ variable while one is empty, whatever profile is active:
 | `LAKEHOUSE_DB_DAGSTER_PASSWORD` | Dagster's instance database role (`lakehouse_dagster`) password (`SEC-78`). `dagster-db-init` sets it on every start, so a rotation applies on the next `up` of the `dagster` profile. Not the owner's, and not the console's |
 | `POSTGRES_PASSWORD` | PostgreSQL password: the database OWNER's password. The `postgres` image itself reads it when the data directory is first created; after that it reaches only the operator-side services — `lakehouse-db-migrate` (the migrations and the console role's setup run with it), Lakekeeper's and OpenFGA's own services (init, migrate and runtime — they dial their own databases), the three Dagster services (Dagster's own instance database), the backup job and the gate runners. It is not in `lakehouse-api`'s connection string any more (`SEC-78`) |
 | `LAKEHOUSE_DB_APP_PASSWORD` | the console's runtime database role's (`lakehouse_app`) password (`SEC-78`) — see "Database roles" below |
+| `LAKEHOUSE_DB_SOURCE_READER_PASSWORD` | the password of the source role `lakehouse_source_reader` (`SEC-84`; `SELECT` and `REFERENCES` on the source schemas, no write and no `CREATE`), held by Dagster's code location and by the seeded connector. Not the owner's, and not the console's |
 | `RUSTFS_ACCESS_KEY` / `RUSTFS_SECRET_KEY` | RustFS root key pair |
 | `LAKEKEEPER_ENCRYPTION_KEY` | Encrypts what Lakekeeper stores in its own schema |
 
-`CONNECTOR_PG_PASSWORD` falls back to `LAKEHOUSE_DB_APP_PASSWORD` (the
-runtime role's — a connector that dials the console's own database does so
-as `lakehouse_app`, not as the owner) and `CONNECTOR_S3_ACCESS_KEY` /
+`CONNECTOR_PG_PASSWORD` falls back to `LAKEHOUSE_DB_SOURCE_READER_PASSWORD`
+(the source role's — a connector that dials the console's own
+database does so as `lakehouse_source_reader`, not as the owner and not as
+the runtime role, `SEC-84`) and `CONNECTOR_S3_ACCESS_KEY` /
 `_SECRET_KEY` fall back to the RustFS keys, never to a literal. `SEAWEEDFS_ACCESS_KEY` /
 `SEAWEEDFS_SECRET_KEY` are used only by `--profile seaweedfs`; compose
 interpolates the whole file whatever profiles are active, so `${X:?}` there
@@ -1367,6 +1369,47 @@ The bootstrap admin is **not** re-activated by a restart: it is seeded
 only when an account with that email does not exist yet, so a bootstrap
 admin an administrator deliberately switched off stays off.
 
+## Set an agent's organisation
+
+An agent works in one organisation. On an install with exactly one
+organisation, the migration sets every agent to it. On an install with more
+than one, each agent starts with no organisation, and an agent with no
+organisation does not run: a scheduled run answers `409` with "this agent has
+no organisation; set one before it runs", before any tool or model call.
+
+Staging has 4 organisations and 12 agents. All 12 start with no organisation,
+so each answers `409` until an operator sets its organisation.
+
+Set it with `PUT /api/agents/employees/{id}/tenant`:
+
+- The caller needs `identity:write` or the unrestricted `*:*` grant. Any other
+  caller gets `403` with "changing an agent's organisation needs an
+  administrator". An operator sees that `403` when the account lacks the grant;
+  give the account `identity:write` or use an unrestricted account.
+- The caller must belong to the agent's current organisation (if it has one)
+  and to the target organisation, unless it is unrestricted (`*:*`). Any other
+  caller gets `404`, and so does an unknown organisation id.
+- The change is audited as `agent.tenant.set`, with the old and new
+  organisation ids.
+
+The response is the agent, with `tenantId` and `principalId`.
+
+```bash
+# Sign in first, and keep the session cookie (as in "Adding a user without SSO").
+curl -sS -X POST "$LAKEHOUSE_URL/api/auth/login" \
+  -H 'content-type: application/json' \
+  -d '{"identifier":"<username>","password":"<password>"}' -c cookies.txt
+
+# Set the organisation an agent works in. Needs identity:write or unrestricted (*:*).
+curl -sS -X PUT "$LAKEHOUSE_URL/api/agents/employees/<agent-id>/tenant" \
+  -H 'content-type: application/json' -b cookies.txt \
+  -d '{"tenantId":"<tenant-uuid>"}'
+```
+
+After that, a scheduled run of the agent works in that organisation. A 409
+from a scheduled run means the agent still has no organisation: set it, then
+run again. A Dagster scheduled run shows the API's reason as its skip reason ("this agent has no organisation; set one before it runs").
+
 ## Roles and pages per role (ADM-13)
 
 Under ADM-13, the console enforces per-role page gating: users only see navigation
@@ -1542,9 +1585,11 @@ grants before and after.
   the development measurement it cost about 3.4 ms at the median and 4.6
   to 5.1 ms at p95 per governed read (unoptimised test build, 10 roles
   and 200 grants); a release build was not measured.
-- **A run with no person behind it is not narrowed.** A service identity
-  reads what its scopes allow, and a scheduled agent run, Dagster's own
-  builds and its quality checks run as the system.
+- **A scheduled agent run acts as its agent.** It runs as the agent's own
+  principal, in the agent's organisation, with the agent's read roles. An
+  agent with no organisation does not run (409); see "Set an agent's
+  organisation". A service identity reads what its scopes allow, and Dagster's
+  own builds and its quality checks run as the system.
 - **Narrowing Dashboard Viewer narrows every embed and public link**,
   because they read with that fixed role.
 - **A temporary access grant gives a permission, not a table**
@@ -1573,7 +1618,8 @@ owner's privileges:
 | Role | Who holds its password | What it may do |
 | --- | --- | --- |
 | the owner (`POSTGRES_USER`, default `lakehouse`) | `POSTGRES_PASSWORD`, held by `lakehouse-db-migrate`, Lakekeeper's and OpenFGA's own services (init, migrate and runtime — they dial their own databases), the backup job and the gate runners | everything: it applies the migrations and sets the runtime role up |
-| `lakehouse_app` | `LAKEHOUSE_DB_APP_PASSWORD`, held by `lakehouse-api`, `dagster-code-location` and the connectors that dial this database | read and write the console's tables in `public` and `bronze_meta`; nothing more |
+| `lakehouse_app` | `LAKEHOUSE_DB_APP_PASSWORD`, held by `lakehouse-api` and the hand-made connectors that dial this database as this role | read and write the console's tables in `public` and `bronze_meta`; nothing more. Not held by `dagster-code-location` since `SEC-84` |
+| `lakehouse_source_reader` | `LAKEHOUSE_DB_SOURCE_READER_PASSWORD`, held by `lakehouse-db-migrate` (which sets it on every run), `dagster-code-location` and the seeded `conn-pg-lakehouse` connector | `CONNECT` on the console's database, and `SELECT` and `REFERENCES` on the source schemas (`SOURCE_READER_SCHEMAS`, default `ingest_demo`); no write and no `CREATE`; no grant on `public` or `bronze_meta` (`SEC-84`) |
 | `lakehouse_dagster` | `LAKEHOUSE_DB_DAGSTER_PASSWORD`, held by `dagster-db-init` (which sets it on every start), `dagster-code-location`, `dagster-webserver` and `dagster-daemon` | owns the `dagster` database and every object in it; nothing in the console's database (`SEC-78`, second change) |
 
 The one-shot `lakehouse-db-migrate` service runs `lakehouse-api migrate`
@@ -1614,6 +1660,13 @@ password on every run), then restart `lakehouse-api`. `ops/init-env.sh`
 generates the role's password independently of `POSTGRES_PASSWORD`; keep
 the two different — they belong to two different roles.
 
+**Rotating the source reader's password:** change
+`LAKEHOUSE_DB_SOURCE_READER_PASSWORD` in `.env`, run the migrate service once
+(it sets the role's password on every run), then restart `dagster-code-location`
+and `lakehouse-api`: the seeded connector dials the reader with
+`CONNECTOR_PG_PASSWORD`, which falls back to this value. The code location
+runs pipeline code, so it never holds the runtime role's password (`SEC-84`).
+
 **Dagster's role** (`lakehouse_dagster`, `SEC-78`, second change) owns the
 `dagster` database, and nothing in the console's database. The one-shot
 `dagster-db-init` service creates the role and sets its password on every
@@ -1636,11 +1689,11 @@ superuser is not supported today: setup fails closed there, and the
 ### What each job runs against this database
 
 Every query a job runs against the console's database, and the grant of
-`lakehouse_app` that covers it:
+`lakehouse_source_reader` (the role the code location and the seeded connector run as) that covers it:
 
 | Job | What it runs against this database | Covered by |
 | --- | --- | --- |
-| `replication_slot_check_job` (`dagster/dispar_orchestrate/replication_metrics.py:349-355`) | one read of `pg_replication_slots` for the logical slots, plus `pg_wal_lsn_diff(pg_current_wal_lsn(), …)` | the `pg_monitor` grant; reading the view needs no `REPLICATION` attribute |
+| `replication_slot_check_job` (`dagster/dispar_orchestrate/replication_metrics.py:349-355`) | one read of `pg_replication_slots` for the logical slots, plus `pg_wal_lsn_diff(pg_current_wal_lsn(), …)` | none: `lakehouse_source_reader` needs no extra role. The check reads `pg_replication_slots` and the WAL position with the reader's own privileges (`SEC-84`) |
 | `cdc_apply_job` (`dagster/dispar_orchestrate/cdc_apply.py`) | nothing: it reads Kafka and the API over HTTP and writes Iceberg through Lakekeeper — logical replication lives on the connector's source database, not here | — |
 | the maintenance job (`dagster/dispar_orchestrate/maintenance.py`) | nothing: it works on ClickHouse, Trino and Lakekeeper | — |
 | the bronze ingest path (`dagster/dispar_orchestrate/dlt_pipeline.py:239-353`) | runs the dlt `sql_database` source, which reflects `information_schema` and reads the source table with `SELECT` | the schema and table grants |
@@ -1653,12 +1706,15 @@ Known limits, stated so nobody has to find them in a failed job:
   deprovisioned by the console — the last row of the table above names
   what it would need. No seeded connector does this today
   (`conn-pg-lakehouse` is `adapter='sql'`).
-- The role's grants cover `public` and `bronze_meta` only. A schema
-  something else creates must be granted to the role by whoever creates
-  it: in this repository, the `g3a-source-init` gate fixture grants
-  `lakehouse_app` on `ingest_demo`, and the g6 scale-test script grants it
-  on its own schema. A connector pointed at a schema nobody granted the
-  role sees no tables in it.
+- `lakehouse_app`'s grants cover `public` and `bronze_meta` only. The
+  source role `lakehouse_source_reader` gets `SELECT` and `REFERENCES` on
+  the source schemas and no grant on `public` or `bronze_meta` (PUBLIC keeps
+  its default `USAGE` on `public`, which is not a table right). A schema
+  something else creates must be granted to the source role by whoever
+  creates it: in this repository, the `g3a-source-init` gate fixture grants
+  `lakehouse_app` and `lakehouse_source_reader` on `ingest_demo`, and the g6
+  scale-test script grants both on `scale_10k`. A connector pointed at a
+  schema nobody granted the source role sees no tables in it.
 
 ## Postgres: unreachable is loud, a mismatched schema refuses to start
 
@@ -3242,3 +3298,66 @@ internet. The bundle carries the newer `lakehousectl` too, so an update does not
   (`ops/sso/docker-compose.staging-keycloak.override.yml`, profile `sso`) is a repository
   file, not a release asset; an internal identity provider must be deployed separately.
 - One host, Linux `x86_64` only. An update stops the stack while it switches releases.
+
+## Keeping the build machine's cargo target in bounds
+
+Cargo never removes its own old build output, so the shared target directory
+on the build machine grows until something else cleans it up. The sweep
+script `ops/dev/cargo-target-sweep.sh` keeps it under a byte cap.
+
+Run it with an optional `--dry-run` flag, a target directory and a cap:
+
+```bash
+ops/dev/cargo-target-sweep.sh --dry-run <target-dir> <cap>
+ops/dev/cargo-target-sweep.sh <target-dir> <cap>
+```
+
+A cap is a size such as `60G`, `500M`, `5T`, `500K`, or a plain byte count.
+While the directory is over the cap, the script deletes the oldest entries by
+mtime. It looks only inside each profile's `deps`, `build` and `incremental`
+subdirectories, for every profile such as `debug` and `release`, and inside
+`tmp`. It deletes one file at a time in `deps`, `build` and `tmp`, and one
+whole directory at a time in `incremental`. It never follows symlinks, never
+deletes anything outside those subtrees, and never deletes the target
+directory itself. One summary line records the size before, the size after
+and the number of entries deleted, for the journal.
+
+Run `--dry-run` first. It prints every entry it would delete and the size it
+would reach, and deletes nothing. Use it to check the cap and the scope before
+the timer starts deleting anything.
+
+Pick the cap from the size of one cold workspace gate round, about 13 GB
+(measured 2026-10-07). Four to five rounds is a sane starting point, so `60G`
+is a reasonable first cap.
+
+The script refuses to run while a `cargo` or `rustc` process is running. It
+deletes nothing and exits before touching any file, because deleting objects
+a live build may still need would break that build.
+
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | The directory was already under the cap, or the cap was reached. |
+| `1` | Usage error, such as a missing directory or a bad cap. Nothing was deleted. |
+| `75` | A `cargo` or `rustc` process is running, so the run was skipped. Nothing was deleted. |
+| `2` | The cap could not be reached after deleting everything allowed. The final size is printed. |
+
+Exit `75` is a skipped run, not a failure. It is the safe outcome when a build
+overlaps the timer, so the service counts it as a success instead of reporting
+a broken sweep every time that happens.
+
+Two systemd templates sit beside the script. `ops/dev/cargo-target-sweep.service`
+is a `Type=oneshot` service that runs the script with `Nice=19`, an idle I/O
+class and `SuccessExitStatus=75`. `ops/dev/cargo-target-sweep.timer` runs it
+daily with `Persistent=true` and a one-hour randomised delay. Fill in the
+three placeholders before installing them:
+
+- `@SCRIPT@` is where the sweep script is installed.
+- `@TARGET_DIR@` is the shared cargo target directory to keep in bounds.
+- `@CAP@` is the size cap, for example `60G`.
+
+The templates bake in no machine path and no user name. Install them as a user
+service or a system service, whichever fits the build machine. Installing them
+is the operator's step on the build machine: the repository ships the
+templates, not an installed timer.

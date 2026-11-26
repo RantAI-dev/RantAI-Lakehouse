@@ -1382,6 +1382,13 @@ fn agents_router() -> Router<AppState> {
             "/api/agents/employees/{id}/read-roles",
             axum::routing::put(agents::set_employee_read_roles),
         )
+        // SEC-76: set the organisation a digital employee works in. A
+        // scheduled run refuses an agent with none (409), so this is how an
+        // operator makes that agent run.
+        .route(
+            "/api/agents/employees/{id}/tenant",
+            axum::routing::put(agents::set_employee_tenant),
+        )
         .route(
             "/api/agents/employees/{id}/run",
             axum::routing::post(agents::run_employee),

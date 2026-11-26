@@ -5365,3 +5365,42 @@ async fn web4_retired_observability_kind_answers_404_to_a_signed_in_caller() {
     let unknown = request_with_cookie(&router, "GET", "/api/ops/bogus-kind", &cookie).await;
     assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
 }
+
+/// SEC-76 decision 3: `PUT /api/agents/employees/{id}/tenant` needs
+/// `agent:manage`, and both directions are named here with real principals.
+/// A seeded Analyst (no `agent:manage`) is refused with 403. Platform Admin
+/// is not refused by the auth gate; the handler then answers 404 for the
+/// unknown agent this request names, which is the handler's business.
+#[tokio::test]
+async fn the_agent_tenant_route_is_refused_without_agent_manage_and_admitted_with_it() {
+    let TestApp { router, pool } = spin_up().await;
+    let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+    let admin = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let body = br#"{"tenantId":"11111111-1111-4111-8111-000000000002"}"#.to_vec();
+
+    let refused = request_with_cookie_and_body(
+        &router,
+        "PUT",
+        "/api/agents/employees/emp-x/tenant",
+        &analyst,
+        body.clone(),
+    )
+    .await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Analyst must be denied agent:manage"
+    );
+
+    let admitted = request_with_cookie_and_body(
+        &router,
+        "PUT",
+        "/api/agents/employees/emp-x/tenant",
+        &admin,
+        body,
+    )
+    .await;
+    assert_ne!(admitted.status(), StatusCode::FORBIDDEN);
+    assert_ne!(admitted.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(admitted.status(), StatusCode::NOT_FOUND);
+}

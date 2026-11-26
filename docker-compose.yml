@@ -2,7 +2,9 @@
 # compose refuses to start without them (`${X:?}`): POSTGRES_PASSWORD,
 # RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY, LAKEKEEPER_ENCRYPTION_KEY,
 # LAKEHOUSE_DB_APP_PASSWORD (SEC-78: the console's runtime role's own
-# password; it is NOT the owner's).
+# password; it is NOT the owner's), LAKEHOUSE_DB_SOURCE_READER_PASSWORD
+# (SEC-84: the read-only role Dagster reads its sources as; it is NOT the
+# console's).
 # `CONNECTOR_PG_PASSWORD` / `CONNECTOR_S3_*` fall back to those, never to a
 # literal. `ops/init-env.sh` writes a local `.env` with generated values;
 # docs/OPERATIONS.md has the upgrade note. Compose interpolates the whole
@@ -211,6 +213,10 @@ services:
       # The runtime role's password. Set on every run, so a rotation
       # applies on the next deploy. MUST SET, never a default (SEC-18).
       LAKEHOUSE_DB_APP_PASSWORD: ${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      # SEC-84: the read-only source role's password. The migrate step
+      # creates that role and sets its password on every run, as it does for
+      # the runtime role. MUST SET, never a default (SEC-18).
+      LAKEHOUSE_DB_SOURCE_READER_PASSWORD: ${LAKEHOUSE_DB_SOURCE_READER_PASSWORD:?LAKEHOUSE_DB_SOURCE_READER_PASSWORD is required (the read-only source role's password; run ops/init-env.sh or see docs/OPERATIONS.md)}
 
   lakehouse-api:
     # CI-SPEED-PLAN §4.2: a name for the image, so the `images` job in
@@ -611,12 +617,13 @@ services:
       # separate NAMES, not necessarily separate values. Point them at
       # least-privilege credentials in any deployment that accepts connector
       # definitions from callers you do not fully trust.
-      # SEC-78: the console's own runtime role's password, not the OWNER's.
-      # The seeded `conn-pg-lakehouse` connector dials the console database
-      # as `lakehouse_app` from now on (a migration moves the seeded row's
-      # user), so a connector can never authenticate with the owner's
-      # credentials.
-      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
+      # SEC-84: the read-only source role's password, not the OWNER's and
+      # not the console's runtime role's. The seeded `conn-pg-lakehouse`
+      # connector dials the console database as `lakehouse_source_reader`
+      # (migration SEC-84 moves the seeded row's user), so this value must be
+      # that role's password. The API's own pool still connects as
+      # `lakehouse_app` (`DATABASE_URL` above).
+      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${LAKEHOUSE_DB_SOURCE_READER_PASSWORD:?LAKEHOUSE_DB_SOURCE_READER_PASSWORD is required (the read-only source role's password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       # SEC-14 part B (D5/D7): CA certificate for connector dials. Mounted
@@ -2668,12 +2675,10 @@ services:
       AZURE_TENANT_ID: ${AZURE_TENANT_ID:-}
       AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
       AZURE_CLIENT_SECRET: ${AZURE_CLIENT_SECRET:-}
-      # SEC-78: the OWNER's password still reaches this container for
-      # Dagster's OWN instance database (`DAGSTER_PG_*` below). That database
-      # gets its own role in the second change of SEC-78. Until it lands, this
-      # container holds the owner's password; the gap is written down here
-      # instead of hidden
-      # (principle 2: state the gap where the reader looks).
+      # Dagster's OWN instance database (`DAGSTER_PG_*` below) has its own
+      # role, `lakehouse_dagster`, which `dagster-db-init` creates. This
+      # container never receives the owner's password (SEC-78) and never the
+      # console's runtime role's password (SEC-84).
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
       DAGSTER_PG_USER: lakehouse_dagster
@@ -2710,16 +2715,16 @@ services:
       # recognize the `postgres://` scheme alias.
       BRONZE_SOURCE_DB_HOST: postgres
       BRONZE_SOURCE_DB_PORT: "5432"
-      # SEC-78: the demo pipeline reads the console
-      # database as a SOURCE, so it connects as the console's RUNTIME
-      # role, not the owner: the owner's password must not reach this
-      # container for that. The default below is that role
-      # (`lakehouse_app`), overridable for a source role that needs
-      # more than the runtime role has — a CDC source needs
-      # `REPLICATION`, which the runtime role deliberately lacks (see
+      # SEC-84: the demo pipeline reads the console database as a SOURCE,
+      # so it connects as `lakehouse_source_reader`: a login role with
+      # SELECT on the source schemas and nothing else. It holds no right on
+      # `public` or `bronze_meta`, so the console's runtime role's password
+      # must not reach this container either (SEC-78 decision 4). The
+      # default below is that role, overridable for a source role that
+      # needs more, such as a CDC source that needs `REPLICATION` (see
       # docs/OPERATIONS.md, "Database roles").
-      BRONZE_SOURCE_DB_USER: ${BRONZE_SOURCE_DB_USER:-lakehouse_app}
-      BRONZE_SOURCE_DB_PASSWORD: ${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      BRONZE_SOURCE_DB_USER: ${BRONZE_SOURCE_DB_USER:-lakehouse_source_reader}
+      BRONZE_SOURCE_DB_PASSWORD: ${LAKEHOUSE_DB_SOURCE_READER_PASSWORD:?LAKEHOUSE_DB_SOURCE_READER_PASSWORD is required (the read-only source role's password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       # Verification correction: `BRONZE_SOURCE_DB_PASSWORD` above
       # only ever fed the g3a demo pipeline's OWN hardcoded credential
       # assembly (`dlt_pipeline.py`). The SEEDED `conn-pg-lakehouse`
@@ -2734,16 +2739,13 @@ services:
       # deployment of this compose file, not just the gate. Exported here
       # under its own name, same value as above, so both readers resolve
       # it.
-      # SEC-78: the seeded connector's row now dials the
-      # console database as the role `lakehouse_app` (the seeded row's
-      # user moves to that role in the same PR), so the secret its
-      # `secretRef` resolves to must be the ROLE's password: the default
-      # below is the role's password, not the owner's. It is the same
-      # value `BRONZE_SOURCE_DB_PASSWORD` above carries — the two readers
-      # still resolve one value — unless the operator sets
-      # `CONNECTOR_PG_PASSWORD` in the environment, which overrides this
-      # default and must then hold the role's password too.
-      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
+      # SEC-84: the seeded connector's row dials the console database as
+      # `lakehouse_source_reader`, so the secret its `secretRef` resolves to
+      # must be that role's password. The default below is that password,
+      # the same value `BRONZE_SOURCE_DB_PASSWORD` above carries. An operator
+      # who sets `CONNECTOR_PG_PASSWORD` in the environment must give the
+      # reader's password too.
+      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${LAKEHOUSE_DB_SOURCE_READER_PASSWORD:?LAKEHOUSE_DB_SOURCE_READER_PASSWORD is required (the read-only source role's password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       BRONZE_SOURCE_DB_NAME: ${POSTGRES_DB:-lakehouse}
       BRONZE_SOURCE_SCHEMA: ${BRONZE_SOURCE_SCHEMA:-ingest_demo}
       BRONZE_SOURCE_TABLE: ${BRONZE_SOURCE_TABLE:-orders}
@@ -3147,7 +3149,11 @@ services:
     # those to the role. This fixture OWNS `ingest_demo` (it creates it, as
     # the owner), so it grants the role on it here — the demo pipeline and
     # the seeded `conn-pg-lakehouse` connector both read these tables as
-    # `lakehouse_app` (SEC-78), not as the owner.
+    # `lakehouse_source_reader` (SEC-84), not as the owner. The reader gets
+    # SELECT and REFERENCES only: REFERENCES is needed for information_schema
+    # to show constraints, and it opens no write path (no CREATE).
+    # `lakehouse_app` keeps its grants above for the console's
+    # own pool (SEC-78).
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
@@ -3175,6 +3181,8 @@ services:
         WHERE NOT EXISTS (SELECT 1 FROM ingest_demo.customers);
         GRANT USAGE ON SCHEMA ingest_demo TO lakehouse_app;
         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ingest_demo TO lakehouse_app;
+        GRANT USAGE ON SCHEMA ingest_demo TO lakehouse_source_reader;
+        GRANT SELECT, REFERENCES ON ALL TABLES IN SCHEMA ingest_demo TO lakehouse_source_reader;
         "
     restart: "no"
 

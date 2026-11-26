@@ -1,0 +1,16 @@
+# Daily cargo target sweep on the build machine (OPS-17).
+#
+# The delay spreads sweeps away from the exact top of the day, and
+# Persistent makes a missed run happen at the next boot rather than
+# silently waiting a whole day.
+
+[Unit]
+Description=Daily cargo target sweep on the build machine
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target
