@@ -24,6 +24,7 @@ import unittest
 from unittest import mock
 
 import requests
+from dagster import build_op_context
 
 from dispar_orchestrate import agent_runs
 
@@ -164,6 +165,77 @@ class BuildAgentRunSchedulesTest(unittest.TestCase):
             schedules = agent_runs.build_agent_run_schedules(_cfg(run_token=""))
         self.assertEqual(schedules, [])
         mocked_get.assert_not_called()
+
+
+def _conflict_response(
+    json_body: object = None, json_error: Exception | None = None
+) -> mock.Mock:
+    """A mocked 409 from `post_run`, with the body `response.json()` returns."""
+    response = mock.Mock(spec=requests.Response)
+    response.status_code = 409
+    if json_error is not None:
+        response.json.side_effect = json_error
+    else:
+        response.json.return_value = json_body
+    return response
+
+
+class RunAgentEmployeeConflictReasonTest(unittest.TestCase):
+    """The 409 branch of `run_agent_employee` records the API's own `error`
+    sentence as the skip reason (SEC-76), so an agent with no organisation
+    is not reported as suspended."""
+
+    def _run_and_record_skip(self, response: mock.Mock) -> list[str]:
+        with (
+            mock.patch.object(agent_runs, "post_run", return_value=response),
+            mock.patch.object(agent_runs, "ClickHouseTarget"),
+            mock.patch.object(agent_runs, "record_maintenance_run") as record,
+        ):
+            agent_runs.run_agent_employee(
+                build_op_context(op_config={"employee_id": "emp-x"})
+            )
+        record.assert_called_once()
+        return record.call_args.kwargs["skipped_verbs"]
+
+    def test_a_409_for_a_suspended_employee_records_the_api_sentence_as_the_reason(
+        self,
+    ) -> None:
+        response = _conflict_response(
+            json_body={"error": 'Employee emp-x has status "paused" and cannot be run'}
+        )
+        self.assertEqual(
+            self._run_and_record_skip(response),
+            ['run_skipped: Employee emp-x has status "paused" and cannot be run'],
+        )
+
+    def test_a_409_for_an_agent_with_no_organisation_records_that_sentence_not_suspended(
+        self,
+    ) -> None:
+        response = _conflict_response(
+            json_body={"error": "this agent has no organisation; set one before it runs"}
+        )
+        self.assertEqual(
+            self._run_and_record_skip(response),
+            ["run_skipped: this agent has no organisation; set one before it runs"],
+        )
+
+    def test_a_409_without_a_readable_error_string_records_the_fallback_reason(
+        self,
+    ) -> None:
+        cases = {
+            "the body is not JSON": _conflict_response(
+                json_error=ValueError("Expecting value")
+            ),
+            "the body has no error key": _conflict_response(
+                json_body={"detail": "something else"}
+            ),
+        }
+        for label, response in cases.items():
+            with self.subTest(label):
+                self.assertEqual(
+                    self._run_and_record_skip(response),
+                    ["run_skipped: the agent cannot run now (409)"],
+                )
 
 
 if __name__ == "__main__":
