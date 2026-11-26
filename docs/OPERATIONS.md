@@ -1367,6 +1367,44 @@ The bootstrap admin is **not** re-activated by a restart: it is seeded
 only when an account with that email does not exist yet, so a bootstrap
 admin an administrator deliberately switched off stays off.
 
+## Set an agent's organisation
+
+An agent works in one organisation. On an install with exactly one
+organisation, the migration sets every agent to it. On an install with more
+than one, each agent starts with no organisation, and an agent with no
+organisation does not run: a scheduled run answers `409` with "this agent has
+no organisation; set one before it runs", before any tool or model call.
+
+Staging has 4 organisations and 12 agents. All 12 start with no organisation,
+so each answers `409` until an operator sets its organisation.
+
+Set it with `PUT /api/agents/employees/{id}/tenant`:
+
+- The caller needs `agent:manage`.
+- The caller must belong to the target organisation, or hold the unrestricted
+  `*:*` grant. Any other caller gets `404`, and so does an unknown organisation
+  id.
+- The change is audited as `agent.tenant.set`, with the old and new
+  organisation ids.
+
+The response is the agent, with `tenantId` and `principalId`.
+
+```bash
+# Sign in first, and keep the session cookie (as in "Adding a user without SSO").
+curl -sS -X POST "$LAKEHOUSE_URL/api/auth/login" \
+  -H 'content-type: application/json' \
+  -d '{"identifier":"<username>","password":"<password>"}' -c cookies.txt
+
+# Set the organisation an agent works in.
+curl -sS -X PUT "$LAKEHOUSE_URL/api/agents/employees/<agent-id>/tenant" \
+  -H 'content-type: application/json' -b cookies.txt \
+  -d '{"tenantId":"<tenant-uuid>"}'
+```
+
+After that, a scheduled run of the agent works in that organisation. A 409
+from a scheduled run means the agent still has no organisation: set it, then
+run again. A Dagster scheduled run shows the API's reason as its skip reason ("this agent has no organisation; set one before it runs").
+
 ## Roles and pages per role (ADM-13)
 
 Under ADM-13, the console enforces per-role page gating: users only see navigation
@@ -1542,9 +1580,11 @@ grants before and after.
   the development measurement it cost about 3.4 ms at the median and 4.6
   to 5.1 ms at p95 per governed read (unoptimised test build, 10 roles
   and 200 grants); a release build was not measured.
-- **A run with no person behind it is not narrowed.** A service identity
-  reads what its scopes allow, and a scheduled agent run, Dagster's own
-  builds and its quality checks run as the system.
+- **A scheduled agent run acts as its agent.** It runs as the agent's own
+  principal, in the agent's organisation, with the agent's read roles. An
+  agent with no organisation does not run (409); see "Set an agent's
+  organisation". A service identity reads what its scopes allow, and Dagster's
+  own builds and its quality checks run as the system.
 - **Narrowing Dashboard Viewer narrows every embed and public link**,
   because they read with that fixed role.
 - **A temporary access grant gives a permission, not a table**

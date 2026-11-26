@@ -24,7 +24,8 @@ use crate::permissions::PermissionSet;
 pub enum PrincipalId {
     /// An `app_user.id`.
     User(Uuid),
-    /// A `service_identity.id`.
+    /// A `service_identity.id`, or an `agent_employee.principal_id` for a
+    /// scheduled agent run (`SEC-76`).
     Service(Uuid),
 }
 

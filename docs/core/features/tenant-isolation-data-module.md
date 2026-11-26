@@ -81,6 +81,7 @@ Signed by the product owner on 2026-10-15: the defaults below, as built.
   taken by someone. Only part B removes that.
 - Annotations already stored for assets that do not exist stay in the
   database; they are no longer readable or writable through these routes.
+- An agent works in one organisation. A scheduled run acts as the agent in that organisation, a manual run uses it too, and an agent with no organisation does not run (409). See `table-access-per-role.md`.
 
 ## Acceptance checklist
 

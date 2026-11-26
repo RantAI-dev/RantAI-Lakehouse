@@ -27,17 +27,22 @@ use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
 use lakehouse_store::agents::{
-    COPILOT_EMPLOYEE_ID, CreateEmployeeInput, CreatedApproval, Decision, LinkedApprovalRequest,
-    NewApprovalRequest, RunStep, append_run_step, count_active_agent_runs,
+    COPILOT_EMPLOYEE_ID, CreateEmployeeInput, CreatedApproval, Decision, EmployeeTenantChange,
+    LinkedApprovalRequest, NewApprovalRequest, RunStep, append_run_step, count_active_agent_runs,
     count_agent_run_outcomes, count_pending_approvals, create_direct_grant, create_employee,
     create_linked_approval, create_pending_approval, create_run, decide_approval, finish_run,
     get_employee, get_employee_run_config, get_employee_with_metrics, get_run, holds_asset_grant,
     list_approvals, list_employees, list_runs, list_scheduled_employees, list_workflows,
     mark_run_waiting_approval, pending_tool_call, recompute_employee_metrics, record_run_budget,
-    record_run_outcome, resume_employee, revoke_asset_grant, revoke_employee, suspend_employee,
+    record_run_outcome, resume_employee, revoke_asset_grant, revoke_employee, set_employee_tenant,
+    suspend_employee,
 };
+use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use serde_json::json;
 use sqlx::PgPool;
+use sqlx::migrate::Migrator;
+use std::borrow::Cow;
+use uuid::Uuid;
 
 /// Insert a minimal `agent_run` row directly, bypassing the store's own
 /// [`create_run`] (kept as a plain-SQL fixture helper for tests that only
@@ -1683,5 +1688,239 @@ async fn holds_asset_grant_counts_both_origins_and_only_while_in_force(
             .expect("asking about another resource"),
         "…and not another resource"
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// SEC-76: the organisation an agent works in, and the identity it runs as
+// ---------------------------------------------------------------------
+
+/// The seeded organisations (`0002_seed_identity.sql`).
+const RETAIL: &str = "11111111-1111-4111-8111-000000000002";
+const LOGISTICS: &str = "11111111-1111-4111-8111-000000000003";
+
+/// The migration set the API runs, compiled in (the shape `upload_folders.rs`
+/// uses for a migration that backfills existing rows).
+static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
+
+fn employee_input(name: &str) -> CreateEmployeeInput {
+    CreateEmployeeInput {
+        name: name.to_owned(),
+        purpose: "p".to_owned(),
+        autonomy: "L1".to_owned(),
+        allowed_tools: vec![],
+        data_scope: "d".to_owned(),
+        budget_limit: 0.0,
+        owner: None,
+        prompt: Some("Cek kunjungan harian.".to_owned()),
+        schedule_cron: None,
+        mode: Some("ask".to_owned()),
+        permissions: None,
+        read_roles: Vec::new(),
+    }
+}
+
+/// Applies every migration before `0160`, so a test inserts its rows and
+/// sets the tenant count the backfill will read.
+async fn migrate_up_to_before_0160(pool: &PgPool) -> sqlx::Result<()> {
+    let before: Vec<_> = MIGRATOR
+        .iter()
+        .filter(|m| m.version < 160)
+        .cloned()
+        .collect();
+    let first = Migrator {
+        migrations: Cow::Owned(before),
+        ..Migrator::DEFAULT
+    };
+    first.run(pool).await?;
+    Ok(())
+}
+
+async fn count_agents(pool: &PgPool, where_clause: &str) -> sqlx::Result<i64> {
+    // safe: the clause is a constant written in this file, never input.
+    let sql = format!("SELECT count(*) FROM agent_employee WHERE {where_clause}");
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_one(pool)
+        .await
+}
+
+/// Migration `0160`, one organisation: every agent is backfilled to it.
+#[sqlx::test(migrations = false)]
+async fn migration_0160_sets_every_agent_to_the_only_tenant(pool: PgPool) -> sqlx::Result<()> {
+    migrate_up_to_before_0160(&pool).await?;
+    let keep: Uuid = sqlx::query_scalar("SELECT id FROM tenant ORDER BY slug LIMIT 1")
+        .fetch_one(&pool)
+        .await?;
+    sqlx::query("DELETE FROM app_user_tenant WHERE tenant_id <> $1")
+        .bind(keep)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM tenant WHERE id <> $1")
+        .bind(keep)
+        .execute(&pool)
+        .await?;
+    assert!(
+        count_agents(&pool, "true").await? > 0,
+        "the seeds create agents"
+    );
+
+    MIGRATOR.run(&pool).await?;
+
+    assert_eq!(count_agents(&pool, "tenant_id IS NULL").await?, 0);
+    let outside = format!("tenant_id <> '{keep}'");
+    assert_eq!(count_agents(&pool, &outside).await?, 0);
+    Ok(())
+}
+
+/// Migration `0160`, several organisations: no agent is guessed into one.
+#[sqlx::test(migrations = false)]
+async fn migration_0160_leaves_every_agent_unset_with_several_tenants(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    migrate_up_to_before_0160(&pool).await?;
+    let tenants: i64 = sqlx::query_scalar("SELECT count(*) FROM tenant")
+        .fetch_one(&pool)
+        .await?;
+    assert!(tenants > 1, "the seeds create several organisations");
+
+    MIGRATOR.run(&pool).await?;
+
+    assert_eq!(
+        count_agents(&pool, "tenant_id IS NULL").await?,
+        count_agents(&pool, "true").await?
+    );
+    Ok(())
+}
+
+/// Migration `0160` gives each agent its own run identity: the column is
+/// filled for every existing row, and no two rows share a value.
+#[sqlx::test(migrations = false)]
+async fn migration_0160_gives_every_agent_a_distinct_principal_id(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    migrate_up_to_before_0160(&pool).await?;
+    MIGRATOR.run(&pool).await?;
+
+    let total = count_agents(&pool, "true").await?;
+    assert!(total > 0);
+    let distinct: i64 =
+        sqlx::query_scalar("SELECT count(DISTINCT principal_id) FROM agent_employee")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(distinct, total);
+    Ok(())
+}
+
+/// Setting an agent's organisation returns the organisation it had before and
+/// the agent's name, which is what the audit row records.
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_employee_tenant_returns_the_old_organisation_and_the_name(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let agent = create_employee(&pool, &employee_input("tenant-set-agent"))
+        .await
+        .unwrap();
+    assert_eq!(agent.tenant_id, None, "a new agent has no organisation");
+
+    let first = set_employee_tenant(&pool, &agent.id, RETAIL.parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        first,
+        EmployeeTenantChange {
+            name: "tenant-set-agent".to_owned(),
+            old_tenant_id: None,
+        }
+    );
+
+    let second = set_employee_tenant(&pool, &agent.id, LOGISTICS.parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(second.old_tenant_id, Some(RETAIL.parse().unwrap()));
+
+    let config = get_employee_run_config(&pool, &agent.id)
+        .await
+        .unwrap()
+        .expect("the agent exists");
+    assert_eq!(config.tenant_id, Some(LOGISTICS.parse().unwrap()));
+    Ok(())
+}
+
+/// An unknown agent is `NotFound`, and writes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_employee_tenant_unknown_agent_is_not_found(pool: PgPool) -> sqlx::Result<()> {
+    let err = set_employee_tenant(&pool, "emp-does-not-exist", RETAIL.parse().unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound), "{err:?}");
+    Ok(())
+}
+
+/// Two new agents never share a run identity, and the identity reads back the
+/// same through the detail and run-config projections, so an operator can map
+/// a UUID in a row to its agent.
+#[sqlx::test(migrations = "../../migrations")]
+async fn each_agent_has_its_own_run_identity_visible_in_every_projection(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let first = create_employee(&pool, &employee_input("identity-first"))
+        .await
+        .unwrap();
+    let second = create_employee(&pool, &employee_input("identity-second"))
+        .await
+        .unwrap();
+    assert_ne!(first.principal_id, second.principal_id);
+    assert_ne!(first.principal_id, Uuid::nil());
+
+    let detail = get_employee_with_metrics(&pool, &first.id)
+        .await
+        .unwrap()
+        .expect("the agent exists");
+    assert_eq!(detail.principal_id, first.principal_id);
+    let config = get_employee_run_config(&pool, &first.id)
+        .await
+        .unwrap()
+        .expect("the agent exists");
+    assert_eq!(config.principal_id, first.principal_id);
+    let listed = get_employee(&pool, &first.id)
+        .await
+        .unwrap()
+        .expect("listed");
+    assert_eq!(listed.principal_id, first.principal_id);
+    Ok(())
+}
+
+/// S2 (SEC-76): deleting an organisation leaves its agents with none, so a
+/// run of such an agent is refused with 409 rather than the delete failing or
+/// the agent pointing at a tenant that no longer exists.
+#[sqlx::test(migrations = "../../migrations")]
+async fn deleting_an_organisation_leaves_its_agents_unset(pool: PgPool) -> sqlx::Result<()> {
+    let org = create_tenant(
+        &pool,
+        &CreateTenantInput {
+            name: "sec76 organisation".to_owned(),
+            slug: "sec76-organisation".to_owned(),
+            plan: "starter".to_owned(),
+            residency: "in-region".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    let org_id: Uuid = org.id.parse().unwrap();
+    let agent = create_employee(&pool, &employee_input("tenant-delete-agent"))
+        .await
+        .unwrap();
+    set_employee_tenant(&pool, &agent.id, org_id).await.unwrap();
+
+    sqlx::query("DELETE FROM tenant WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await?;
+
+    let config = get_employee_run_config(&pool, &agent.id)
+        .await
+        .unwrap()
+        .expect("the agent still exists");
+    assert_eq!(config.tenant_id, None);
     Ok(())
 }

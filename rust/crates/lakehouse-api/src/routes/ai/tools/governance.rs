@@ -64,8 +64,9 @@ async fn governance_kind(state: &AppState, kind: &str) -> Value {
 /// governance tools follow (the tool has no request headers of its own).
 pub(super) async fn get_audit_history(state: &AppState, principal: Option<&Principal>) -> Value {
     let Some(principal) = principal else {
-        // A headless run has no person behind it: it belongs to no tenant
-        // and owns no row of the trail.
+        // A call with no principal has no person behind it and belongs to
+        // no tenant. A scheduled run is not this case: it carries its
+        // agent's own principal, in the agent's organisation (SEC-76).
         return json!({ "error": "reading the audit trail needs a signed-in user" });
     };
     let scope = match crate::routes::audit_scope::scope_for_principal(

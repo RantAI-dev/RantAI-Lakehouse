@@ -245,6 +245,82 @@ pub async fn set_employee_read_roles(
     map_transition_result(&id, result)
 }
 
+/// The `PUT /api/agents/employees/{id}/tenant` body: the organisation the
+/// agent works in, as a camelCase `tenantId`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetEmployeeTenantBody {
+    tenant_id: Uuid,
+}
+
+/// `PUT /api/agents/employees/{id}/tenant` — set the organisation an agent
+/// works in (`SEC-76`, decision 3). Needs `agent:manage` (`POLICY_TABLE`).
+///
+/// The caller must belong to the target organisation or be unrestricted
+/// (`*:*`). Any other caller gets the same `404` `tenant_scope` gives, and an
+/// unknown organisation gets the same `404`, so the answer never shows whether
+/// an organisation exists. The change is audited as `agent.tenant.set`, with
+/// the old and new organisation ids in `args`.
+///
+/// # Errors
+///
+/// `400` on a malformed body; `404` if `id` is unknown, the organisation is
+/// not reachable for the caller, or it does not exist; `503` with no Postgres
+/// pool; `500` (classified) on a storage failure.
+pub async fn set_employee_tenant(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<DigitalEmployee>> {
+    let body: SetEmployeeTenantBody = parse_body(&body)?;
+    let pg = pool(&state)?;
+    // Membership is checked before existence, so the two refusals look the
+    // same to a caller who may not reach the organisation at all.
+    if !principal.in_tenant(body.tenant_id) && !crate::routes::catalog::is_unrestricted(&principal)
+    {
+        return Err(ApiError::NotFound("tenant not found".to_owned()).into());
+    }
+    if !lakehouse_store::identity::tenant_exists(pg, body.tenant_id).await? {
+        return Err(ApiError::NotFound("tenant not found".to_owned()).into());
+    }
+    let change = agents::set_employee_tenant(pg, &id, body.tenant_id)
+        .await
+        .map_err(|err| match err {
+            StoreError::NotFound => ApiError::NotFound(format!("Employee {id} not found")),
+            other => other.into(),
+        })?;
+    audit_coverage::record_best_effort(
+        &state,
+        ai_audit::build_event(
+            principal.kind_for_audit(),
+            Some(&principal),
+            None,
+            AGENT_TENANT_SET_ACTION,
+            Some("digital_employee"),
+            Some(&id),
+            &json!({
+                "old_tenant_id": change.old_tenant_id.map(|tenant| tenant.to_string()),
+                "new_tenant_id": body.tenant_id.to_string(),
+            }),
+            "executed",
+            None,
+            None,
+            None,
+        ),
+    )
+    .await;
+    let employee = agents::get_employee_with_metrics(pg, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Employee {id} not found")))?;
+    Ok(ApiJson(employee))
+}
+
+/// The audit action [`set_employee_tenant`] writes. The coverage table in
+/// `crate::audit_coverage` names it, and its guard test looks for this
+/// literal in `src/routes/`.
+const AGENT_TENANT_SET_ACTION: &str = "agent.tenant.set";
+
 fn map_transition_result(
     id: &str,
     result: Result<DigitalEmployee, lakehouse_store::StoreError>,
@@ -859,6 +935,11 @@ pub struct RunEmployeeQuery {
     token: Option<String>,
 }
 
+/// The 409 sentence a run of an agent with no organisation gets (`SEC-76`,
+/// decision 5). It is this crate's own fixed sentence, so no upstream text
+/// reaches the response.
+const NO_ORGANISATION_SENTENCE: &str = "this agent has no organisation; set one before it runs";
+
 /// `POST /api/agents/employees/{id}/run` request body: an optional prompt
 /// override for this one run, in place of the employee's own
 /// `agent_employee.prompt`.
@@ -936,30 +1017,36 @@ fn effective_read_roles(grant: &[String], caller: Option<&Principal>) -> Vec<Str
     }
 }
 
-/// The [`Principal`] an agent run acts as for every tool call (`SEC-68`).
+/// The [`Principal`] an agent run acts as for every tool call (`SEC-68`,
+/// `SEC-76`).
 ///
-/// A human-triggered run keeps the human's identity, permissions and tenants
-/// (so tenant scoping and audit stay truthful) but carries the narrowed
-/// [`effective_read_roles`] as its role names. A scheduled run has no caller,
-/// so it gets a synthetic service principal carrying the same roles and the
-/// employee's own permission ceiling — tools that require a principal can
-/// now run, but only within the grant. Audit identity is derived separately
-/// from [`RunAuth`] and is unaffected.
+/// A human-triggered run keeps the human's id, display name and permissions,
+/// so the audit stays truthful, but it acts in the agent's organisation
+/// (`agent_tenant_id`) and carries the narrowed [`effective_read_roles`] as
+/// its role names. A scheduled run has no caller, so it acts as the agent
+/// itself: its id is the agent's `principal_id` (`agent_principal_id`), its
+/// tenant is the agent's, and it carries the same roles and the employee's
+/// own permission ceiling. Tools that require a principal run it only within
+/// the grant. Audit identity is derived separately from [`RunAuth`] and is
+/// unaffected.
 fn build_run_principal(
     auth: &RunAuth,
     roles: Vec<String>,
     perms: &PermissionSet,
     actor_label: &str,
+    agent_principal_id: Uuid,
+    agent_tenant_id: Uuid,
 ) -> Principal {
     match auth {
         RunAuth::Principal(human) => {
             let mut run = human.clone();
             run.role_names = roles;
+            run.tenant_ids = vec![agent_tenant_id];
             run
         }
         RunAuth::Token => Principal {
-            id: PrincipalId::Service(Uuid::nil()),
-            tenant_ids: Vec::new(),
+            id: PrincipalId::Service(agent_principal_id),
+            tenant_ids: vec![agent_tenant_id],
             display_name: actor_label.to_owned(),
             permissions: perms.clone(),
             provider: "service".to_owned(),
@@ -1318,10 +1405,11 @@ async fn run_headless_loop_inner(
     ];
     let tools = headless_tools(perms, is_build);
 
-    // `principal` is the SAME `Principal` `run_employee`'s auth guard
-    // already built for this request (`principal_for_run_auth`) — passed
-    // down once, not reloaded, and used for the run's entire duration: a
-    // user-triggered run acts as that one user for every tool call below.
+    // `principal` is the run principal `run_employee` built once, before the
+    // run starts (`build_run_principal`, `SEC-68`/`SEC-76`), and it is used
+    // for the run's entire duration: a scheduled run acts as the agent's own
+    // identity in the agent's organisation, and a manual run acts as the
+    // triggering person in that organisation.
 
     let mut step_no: u32 = 0;
     let mut budget_consumed: f64 = 0.0;
@@ -1659,9 +1747,8 @@ async fn run_headless_loop_inner(
                         // SEC-57: the approval names the HUMAN who started
                         // this run, when a person started it — so the API
                         // can refuse them deciding their own request. A
-                        // scheduled run (`RunAuth::Token`) has no
-                        // principal at all, and a service identity's id
-                        // is never an `app_user.id`, so both record NULL:
+                        // scheduled run acts as its agent's service identity,
+                        // which `user_id` does not name, so it records NULL:
                         // nobody asked in person, so nobody is refused as
                         // "the requester".
                         requested_by: principal.and_then(Principal::user_id),
@@ -1724,12 +1811,12 @@ async fn run_headless_loop_inner(
             // itself is the authorization, mirroring how `gold_export_job`
             // already runs its own `WriteLow`-equivalent export unattended.
             step_no += 1;
-            // `principal` is `run_employee`'s own auth-guard result,
-            // forwarded unchanged (C2-F2/C2-F3): a manually-triggered run
-            // acts as the triggering user for every tool call in this run,
-            // a schedule-triggered run passes `None`, and a principal-
-            // requiring tool (`run_saved_query`) is responsible for
-            // refusing `None` with a named reason rather than a bare 401.
+            // `principal` is the run principal from `build_run_principal`,
+            // forwarded unchanged. A manual run acts as the triggering person
+            // for every tool call, and a scheduled run acts as the agent's
+            // own identity (`SEC-76`), so a run always has a principal here.
+            // A principal-requiring tool still refuses `None` with a named
+            // reason, as a defence for callers that pass none.
             let result = ai_tools::run_tool(state, principal, &call.function.name, &args).await;
             // LH-QS-2-08 (owner 2026-11-12): the step's detail is read by a
             // browser, so it stores the browser's copy of an engine failure
@@ -1845,9 +1932,12 @@ fn push_tool_result(
 /// * 400 — `id` is the reserved `emp-copilot` row (interactive-only, never
 ///   runnable headlessly); or the employee has no `prompt` and none was
 ///   supplied in the body; or the body is malformed JSON.
-/// * 404 — `id` is unknown.
+/// * 404 — `id` is unknown, or the caller is a person outside the
+///   employee's organisation who is not unrestricted (the same answer as an
+///   unknown id, so the organisation is not revealed).
 /// * 409 — the employee's `status` is `"paused"` (suspended) or
-///   `"cancelled"` (revoked).
+///   `"cancelled"` (revoked), or the employee has no organisation (`"this
+///   agent has no organisation; set one before it runs"`).
 /// * 503 — no Postgres pool configured.
 ///
 /// # The permission ceiling (plan invariant 7)
@@ -1907,6 +1997,21 @@ pub async fn run_employee(
         .into());
     }
 
+    // SEC-76 decisions 5 and 6: a run works in the agent's organisation, so
+    // an agent with none set does not run, scheduled or manual, and no tool
+    // or model call is made. A person outside that organisation who is not
+    // unrestricted gets the same 404 an unknown employee gets, so the answer
+    // reveals nothing about the agent's organisation.
+    let Some(tenant_id) = config.tenant_id else {
+        return Err(ApiError::Conflict(NO_ORGANISATION_SENTENCE.to_owned()).into());
+    };
+    if let RunAuth::Principal(human) = &auth
+        && !human.in_tenant(tenant_id)
+        && !crate::routes::catalog::is_unrestricted(human)
+    {
+        return Err(ApiError::NotFound(format!("Employee {id} not found")).into());
+    }
+
     let body: RunEmployeeBody = if body.is_empty() {
         RunEmployeeBody::default()
     } else {
@@ -1934,7 +2039,8 @@ pub async fn run_employee(
         &config.read_roles,
         principal.as_ref().map(|Extension(principal)| principal),
     );
-    let run_principal = build_run_principal(&auth, roles, &perms, &actor);
+    let run_principal =
+        build_run_principal(&auth, roles, &perms, &actor, config.principal_id, tenant_id);
     crate::table_access::for_principal(state.pg.as_deref(), &run_principal).await?;
 
     let run_id = format!("run-emp-{}", Uuid::new_v4());
@@ -2133,7 +2239,14 @@ mod tests {
     fn the_run_principal_carries_the_narrowed_roles() {
         let human = principal_with("agent:manage, query:read", &["Finance"]);
         let auth = RunAuth::Principal(human);
-        let run = build_run_principal(&auth, grant(&["Finance"]), &PermissionSet::parse(""), "x");
+        let run = build_run_principal(
+            &auth,
+            grant(&["Finance"]),
+            &PermissionSet::parse(""),
+            "x",
+            AGENT_PRINCIPAL,
+            AGENT_TENANT,
+        );
         assert_eq!(run.role_names, grant(&["Finance"]));
         assert_eq!(run.id, PrincipalId::User(Uuid::from_u128(7)));
         assert!(run.has("query:read"));
@@ -2143,10 +2256,85 @@ mod tests {
             grant(&[crate::table_access::NO_GRANT_ROLE]),
             &PermissionSet::parse("query:read"),
             "Scheduled Agent",
+            AGENT_PRINCIPAL,
+            AGENT_TENANT,
         );
-        assert_eq!(run.id, PrincipalId::Service(Uuid::nil()));
+        // SEC-76 decision 4: a scheduled run is the agent's own identity,
+        // not the nil UUID it carried before this change.
+        assert_eq!(run.id, PrincipalId::Service(AGENT_PRINCIPAL));
         assert_eq!(run.role_names, grant(&[crate::table_access::NO_GRANT_ROLE]));
         assert!(run.has("query:read"));
+    }
+
+    /// The agent `Uuid` and organisation the run-principal tests use. Fixed
+    /// constants, never real ids (AGENTS.md: no real tenant ids in tests).
+    const AGENT_PRINCIPAL: Uuid = Uuid::from_u128(0x5ec7_6000_0000_0000_0000_0000_0000_0001);
+    const AGENT_TENANT: Uuid = Uuid::from_u128(0x5ec7_6000_0000_0000_0000_0000_0000_0002);
+    const OTHER_TENANT: Uuid = Uuid::from_u128(0x5ec7_6000_0000_0000_0000_0000_0000_0003);
+
+    /// SEC-76 decision 4: a scheduled run acts as its agent. Its id is the
+    /// agent's `principal_id`, its one tenant is the agent's organisation,
+    /// and the name is the employee's, so the run is never the shared
+    /// `Service(nil)` any more.
+    #[test]
+    fn a_scheduled_run_acts_as_its_agents_principal_in_its_tenant() {
+        let run = build_run_principal(
+            &RunAuth::Token,
+            grant(&["Finance"]),
+            &PermissionSet::parse("query:read"),
+            "Nightly Ingest Bot",
+            AGENT_PRINCIPAL,
+            AGENT_TENANT,
+        );
+        assert_eq!(run.id, PrincipalId::Service(AGENT_PRINCIPAL));
+        assert_eq!(run.tenant_ids, vec![AGENT_TENANT]);
+        assert_eq!(run.display_name, "Nightly Ingest Bot");
+    }
+
+    /// Two agents never share a scheduled-run identity: each run's id is
+    /// its own agent's `principal_id`.
+    #[test]
+    fn two_agents_get_different_scheduled_run_identities() {
+        let other_agent = Uuid::from_u128(0x5ec7_6000_0000_0000_0000_0000_0000_0004);
+        let first = build_run_principal(
+            &RunAuth::Token,
+            grant(&[]),
+            &PermissionSet::parse(""),
+            "first",
+            AGENT_PRINCIPAL,
+            AGENT_TENANT,
+        );
+        let second = build_run_principal(
+            &RunAuth::Token,
+            grant(&[]),
+            &PermissionSet::parse(""),
+            "second",
+            other_agent,
+            AGENT_TENANT,
+        );
+        assert_ne!(first.id, second.id);
+    }
+
+    /// SEC-76 decision 6: a manual run keeps the person's id, name and
+    /// permissions, and acts in the agent's organisation, not the person's
+    /// own first one.
+    #[test]
+    fn a_manual_run_keeps_the_person_and_uses_the_agents_tenant() {
+        let mut human = principal_with("agent:manage, query:read", &["Finance"]);
+        human.tenant_ids = vec![OTHER_TENANT];
+        let auth = RunAuth::Principal(human);
+        let run = build_run_principal(
+            &auth,
+            grant(&["Finance"]),
+            &PermissionSet::parse(""),
+            "x",
+            AGENT_PRINCIPAL,
+            AGENT_TENANT,
+        );
+        assert_eq!(run.id, PrincipalId::User(Uuid::from_u128(7)));
+        assert_eq!(run.display_name, "Tester");
+        assert!(run.has("query:read"));
+        assert_eq!(run.tenant_ids, vec![AGENT_TENANT]);
     }
 
     async fn seed_role(pool: &PgPool, name: &str, permissions: &str) {
