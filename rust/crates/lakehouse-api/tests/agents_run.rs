@@ -30,10 +30,17 @@ use common::{
     session_cookie_for_seeded_user, session_cookie_for_user, spin_up_with_env,
 };
 
+/// The seeded organisation `Meridian Retail` (`0002_seed_identity.sql`).
+/// Every test agent here works in it, and `sari` and `fajar` belong to it.
+const RETAIL_TENANT: &str = "11111111-1111-4111-8111-000000000002";
+
 /// Insert a digital employee row directly (bypassing `POST
 /// /api/agents/employees`, so a test can set an arbitrary
 /// mode/permissions/prompt/status combination in one call without also
 /// exercising the create route). Test-only fixture helper.
+///
+/// The agent works in [`RETAIL_TENANT`] (`SEC-76`): a run of an agent with no
+/// organisation is refused with 409, so these fixtures set one.
 async fn insert_employee(
     pool: &PgPool,
     id: &str,
@@ -45,7 +52,7 @@ async fn insert_employee(
 ) {
     sqlx::query(
         "INSERT INTO agent_employee (id, name, purpose, autonomy, status, prompt, mode, \
-         permissions) VALUES ($1, $2, 'test purpose', 'L1', $3, $4, $5, $6)",
+         permissions, tenant_id) VALUES ($1, $2, 'test purpose', 'L1', $3, $4, $5, $6, $7::uuid)",
     )
     .bind(id)
     .bind(name)
@@ -53,6 +60,7 @@ async fn insert_employee(
     .bind(prompt)
     .bind(mode)
     .bind(permissions)
+    .bind(RETAIL_TENANT)
     .execute(pool)
     .await
     .expect("insert a test employee");
