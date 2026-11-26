@@ -501,6 +501,7 @@ jobs:
               --profile seaweedfs \
               --profile dagster \
               --profile trino \
+              --profile cdc \
               "$@"
           }
 
@@ -652,6 +653,7 @@ jobs:
               --profile seaweedfs \
               --profile dagster \
               --profile trino \
+              --profile cdc \
               "$@"
           }
           api_container="$(compose ps -q lakehouse-api | head -1)"
