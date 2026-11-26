@@ -137,6 +137,29 @@ def post_run(cfg: AgentRunConfig, employee_id: str) -> requests.Response:
     )
 
 
+# The reason a 409 records when its body has no readable `error` string.
+_CONFLICT_FALLBACK_REASON = "the agent cannot run now (409)"
+
+
+def _conflict_reason(resp: requests.Response) -> str:
+    """Return the API's own `error` sentence from a 409 body, or the fallback.
+
+    The API answers `{"error": "<sentence>"}` (`ErrorBody` in
+    `rust/crates/lakehouse-api/src/error.rs`). The two 409 sentences
+    `run_employee` returns are this crate's own fixed text, one of them
+    echoing the employee id. They are not upstream error text, so recording
+    them is safe (AGENTS principle 4 covers upstream text only).
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return _CONFLICT_FALLBACK_REASON
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, str) and error:
+        return error
+    return _CONFLICT_FALLBACK_REASON
+
+
 @op(
     config_schema={
         "employee_id": Field(
@@ -178,8 +201,11 @@ def run_agent_employee(context) -> dict[str, Any]:
       run failing (e.g. its prompt asked for something the LLM couldn't
       do), not this job failing to trigger it. This job's job is "did the
       trigger succeed", not "did the employee's task succeed".
-    * 409 — the employee is `paused` (suspended) or `cancelled` (revoked).
-      Logged as a warning and treated as this op's SUCCESS, not a failure:
+    * 409 — the API refused the run and says why in its `error` sentence
+      (the employee is `paused` or `cancelled`, or the agent has no
+      organisation). The reason is recorded as the skip reason (see
+      `_conflict_reason`). Logged as a warning and treated as this op's
+      SUCCESS, not a failure:
       an operator suspending an employee is an intentional, in-band action
       (the same reason `bronze_maintenance_job` doesn't fail when there are
       zero Bronze tables to maintain) — a suspended employee's schedule
@@ -211,16 +237,15 @@ def run_agent_employee(context) -> dict[str, Any]:
         raise
 
     if resp.status_code == 409:
-        # Suspended/revoked — see the doc comment above for why this is a
-        # deliberate success, not a failure.
-        context.log.warning(
-            f"employee {employee_id!r} is suspended/revoked (409); nothing to run"
-        )
+        # A refusal the API states in its own `error` sentence — see the doc
+        # comment above for why this is a deliberate success, not a failure.
+        reason = _conflict_reason(resp)
+        context.log.warning(f"employee {employee_id!r} cannot run now (409): {reason}")
         record_maintenance_run(
             table_name=f"agent_employee.{employee_id}",
             dry_run_metrics={},
             applied_metrics={},
-            skipped_verbs=["run_skipped: employee suspended or revoked (409)"],
+            skipped_verbs=[f"run_skipped: {reason}"],
             target=ClickHouseTarget.from_env(),
         )
         context.add_output_metadata({"employee_id": employee_id, "outcome": "skipped_409"})

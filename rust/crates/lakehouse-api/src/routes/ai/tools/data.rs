@@ -784,8 +784,10 @@ pub(super) async fn list_datasets(
     principal: Option<&Principal>,
     args: &Map<String, Value>,
 ) -> Value {
-    // SEC-20, plan 97: no principal is a scheduled run, which has no tenant
-    // to read the shared registry as.
+    // SEC-20, plan 97: no principal is a call with no caller, which has no
+    // tenant to read the shared registry as. A scheduled run never gets
+    // here: it carries its agent's own principal, in the agent's
+    // organisation (SEC-76).
     let Some(principal) = principal else {
         return json!({ "error": DATASETS_NEED_A_USER });
     };
