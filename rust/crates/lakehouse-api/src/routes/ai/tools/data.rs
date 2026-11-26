@@ -1098,6 +1098,20 @@ const ONE_SUBJECT: &str = "Call get_lineage with exactly one of slug (a dataset 
 /// and no upstream error text reaches the answer (principle 4).
 const NO_VISIBLE_CHART: &str = "No chart lineage is available for that id.";
 
+/// The one reason for a `slug` focus that is not a table name (`AI-13`
+/// review SHOULD-FIX): `used_by::read` refuses such a focus with
+/// `BadRequest`, and this sentence names that cause, which is the
+/// caller's to fix.
+const USED_BY_NOT_A_TABLE: &str =
+    "charts are listed for a table name such as serving.<table>, not this focus";
+
+/// The one reason for every other used-by failure (`AI-13` review
+/// SHOULD-FIX, principle 2): a table the caller's role hides (`GOV-7` D6
+/// answers the route's 404), a tenant or shared-catalog refusal, a
+/// database failure. True for its cause, names no table's existence, and
+/// no upstream error text reaches the answer.
+const USED_BY_UNREADABLE: &str = "the used-by list could not be read for this user";
+
 /// The compact path for the model (`AI-13`): the chart route answer's own
 /// steps, nearest the chart first, each with its refresh time or "not
 /// recorded". The arrow between two steps is the kind of the edge that
@@ -1263,11 +1277,18 @@ pub(super) async fn get_lineage(
     {
         Ok(answer) => answer,
         // A focus that is not a table name (a dataset slug, say) has no
-        // used-by answer; an honest refusal, never an empty list that would
-        // read as "no chart uses it". The cause stays out of the answer.
+        // used-by answer at all. Every other failure — a table the caller's
+        // role hides (`GOV-7` D6), a tenant or shared-catalog refusal, a
+        // database failure — gets one honest sentence true for its cause,
+        // never an empty list that would read as "no chart uses it", and no
+        // upstream error text (principle 2, review SHOULD-FIX).
+        Err(ApiError::BadRequest(_)) => json!({
+            "supported": false,
+            "reason": USED_BY_NOT_A_TABLE,
+        }),
         Err(_) => json!({
             "supported": false,
-            "reason": "charts are listed for a table name such as serving.<table>, not this focus",
+            "reason": USED_BY_UNREADABLE,
         }),
     };
     out

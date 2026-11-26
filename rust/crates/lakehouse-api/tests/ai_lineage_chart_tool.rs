@@ -463,6 +463,43 @@ async fn a_slug_call_also_lists_the_charts_that_use_the_table() {
     assert!(!reason.is_empty(), "{body}");
 }
 
+/// A slug naming a table the caller's role hides (`GOV-7` D6) is a real
+/// table name, so the used-by refusal must not claim the focus was not a
+/// table name: the honest sentence says the list could not be read for
+/// this user, and stays true for every other failure cause too (review
+/// SHOULD-FIX on `get_lineage`'s slug path, principle 2).
+#[tokio::test]
+async fn a_hidden_tables_used_by_refusal_says_the_list_could_not_be_read() {
+    let stack = Stack::start().await;
+    rows(
+        &stack.ch,
+        "FROM console.bi_chart",
+        vec![chart_row("c_1", "Visitors", "b_1", "ui")],
+    )
+    .await;
+    // The role may read no table at all: `serving.mart_visits` is hidden,
+    // and with it the used-by list — `used_by::read` answers the same 404
+    // an unknown asset gets, before any chart is read.
+    let cookie = stack.catalog_member_listed(CHAT_LINEAGE, &[]).await;
+
+    let (status, body) = stack
+        .get_lineage(&cookie, json!({ "slug": "serving.mart_visits" }))
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let result = &body["result"];
+    assert!(
+        result.get("nodes").is_some(),
+        "the graph answer still stands: {body}"
+    );
+    assert_eq!(result["usedBy"]["supported"], json!(false), "{body}");
+    assert_eq!(
+        result["usedBy"]["reason"],
+        json!("the used-by list could not be read for this user"),
+        "the honest sentence, not the not-a-table-name one: {body}"
+    );
+}
+
 /// The chart path sits beside the slug path, not instead of it: the legacy
 /// `focus` argument still works.
 #[tokio::test]
