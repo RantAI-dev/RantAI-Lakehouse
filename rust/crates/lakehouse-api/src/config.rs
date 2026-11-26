@@ -918,6 +918,19 @@ pub struct Config {
     /// [`lakehouse_core::secret::SecretValue`], so it is neither logged nor
     /// printed.
     pub db_app_password: Option<lakehouse_core::secret::SecretValue>,
+    /// The password of the source reader role (`LAKEHOUSE_DB_SOURCE_READER_PASSWORD`,
+    /// `ops-145` decision 1). `None` when unset or empty.
+    ///
+    /// Only the `migrate` command needs it, for the same reason as
+    /// [`Self::db_app_password`]. The Dagster code location holds this
+    /// password, never the console's.
+    pub db_source_reader_password: Option<lakehouse_core::secret::SecretValue>,
+    /// The schemas the source reader role may read (`SOURCE_READER_SCHEMAS`,
+    /// `ops-145` decision 2): a comma list, default `ingest_demo`.
+    ///
+    /// Only the `migrate` command reads it. A console schema in the list is
+    /// refused there, see [`crate::db_roles::setup_source_reader_role`].
+    pub source_reader_schemas: Vec<String>,
     /// ADR 0010/0011 — path to a file holding the `gold-export` Lakekeeper
     /// principal's pre-minted static bearer token (`iceberg-catalog-rest`'s
     /// `token` property — see `lakehouse-iceberg::catalog`'s module doc on
@@ -1537,6 +1550,11 @@ impl std::fmt::Debug for Config {
                 &self.db_app_password.as_ref().map(|_| REDACTED),
             )
             .field(
+                "db_source_reader_password",
+                &self.db_source_reader_password.as_ref().map(|_| REDACTED),
+            )
+            .field("source_reader_schemas", &self.source_reader_schemas)
+            .field(
                 "lakekeeper_gold_export_token_file",
                 &self.lakekeeper_gold_export_token_file,
             )
@@ -1982,6 +2000,18 @@ fn parse_role_map(raw: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// Parse `SOURCE_READER_SCHEMAS`' `"schema1,schema2"` format into the list
+/// of schema names. Entries are trimmed, and an empty entry is skipped, the
+/// same way [`parse_role_map`] skips a malformed one: a stray comma is not a
+/// reason to refuse to start.
+fn parse_schema_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|schema| !schema.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 impl Config {
     /// Resolve configuration from an explicit map, for testability without
     /// touching real process environment.
@@ -2275,6 +2305,13 @@ impl Config {
             database_url: or_default(env, "DATABASE_URL", ""),
             db_app_password: truthy(env, "LAKEHOUSE_DB_APP_PASSWORD")
                 .map(lakehouse_core::secret::SecretValue::new),
+            db_source_reader_password: truthy(env, "LAKEHOUSE_DB_SOURCE_READER_PASSWORD")
+                .map(lakehouse_core::secret::SecretValue::new),
+            source_reader_schemas: parse_schema_list(&or_default(
+                env,
+                "SOURCE_READER_SCHEMAS",
+                "ingest_demo",
+            )),
             lakekeeper_gold_export_token_file: or_default(
                 env,
                 "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE",
@@ -2513,6 +2550,44 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect()
+    }
+
+    /// With no `SOURCE_READER_SCHEMAS`, the source reader may read `ingest_demo`
+    /// and nothing else (`ops-145`, decision 2).
+    #[test]
+    fn the_source_reader_reads_ingest_demo_when_no_schema_list_is_set() {
+        let cfg = Config::from_map(&map(&[])).unwrap();
+        assert_eq!(cfg.source_reader_schemas, vec!["ingest_demo".to_owned()]);
+        assert!(cfg.db_source_reader_password.is_none());
+    }
+
+    /// The schema list is a comma list: entries are trimmed, and an empty
+    /// entry is skipped rather than refused.
+    #[test]
+    fn the_source_reader_schema_list_trims_entries_and_skips_empty_ones() {
+        let cfg =
+            Config::from_map(&map(&[("SOURCE_READER_SCHEMAS", " ingest_demo , ,sales,")])).unwrap();
+        assert_eq!(
+            cfg.source_reader_schemas,
+            vec!["ingest_demo".to_owned(), "sales".to_owned()]
+        );
+    }
+
+    /// The source reader's password is read from its own variable, and its
+    /// `Debug` output does not carry the value.
+    #[test]
+    fn the_source_reader_password_is_read_from_its_variable_and_not_debug_printed() {
+        let cfg = Config::from_map(&map(&[(
+            "LAKEHOUSE_DB_SOURCE_READER_PASSWORD",
+            "sec84-test-value-not-a-secret",
+        )]))
+        .unwrap();
+        let password = cfg
+            .db_source_reader_password
+            .as_ref()
+            .expect("the password is read");
+        assert_eq!(password.expose_secret(), "sec84-test-value-not-a-secret");
+        assert!(!format!("{cfg:?}").contains("sec84-test-value-not-a-secret"));
     }
 
     /// A plain identifier is kept; anything that could not be interpolated

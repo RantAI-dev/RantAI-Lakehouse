@@ -68,12 +68,16 @@ use crate::cli::{InstallModeArg, QueryEngineArg};
 pub const ENV_EXAMPLE: &str = include_str!("../../../../.env.example");
 
 /// The keys `ops/init-env.sh` fills with hexadecimal.
-const FILLED_HEX: [&str; 10] = [
+const FILLED_HEX: [&str; 11] = [
     "POSTGRES_PASSWORD",
     // SEC-78: the console's runtime role's password. It is a must-set
     // setting, so an install that left it empty would write a `.env` the
     // stack refuses to start from.
     "LAKEHOUSE_DB_APP_PASSWORD",
+    // ops-145 (SEC-84): the source reader role's password, which the
+    // Dagster code location holds in place of the console's. The same
+    // must-set rule: an empty line makes the stack refuse to start.
+    "LAKEHOUSE_DB_SOURCE_READER_PASSWORD",
     // SEC-78 (second change): Dagster's instance database role's password,
     // the same rule as the console's: a must-set setting.
     "LAKEHOUSE_DB_DAGSTER_PASSWORD",
@@ -803,10 +807,13 @@ mod tests {
         let filled = ensure_must_set_secrets(directory.path()).expect("the secrets are filled");
         let text = std::fs::read_to_string(&path).expect("the .env is readable");
 
+        // The old install has no line for the source reader's password, so
+        // the update appends it; the empty lines are filled in place.
         assert_eq!(
             filled,
             vec![
                 "LAKEHOUSE_DB_APP_PASSWORD".to_string(),
+                "LAKEHOUSE_DB_SOURCE_READER_PASSWORD".to_string(),
                 "LAKEHOUSE_DB_DAGSTER_PASSWORD".to_string()
             ]
         );
@@ -814,7 +821,11 @@ mod tests {
             read_value(&text, "POSTGRES_PASSWORD").as_deref(),
             Some("operators-own-value")
         );
-        for name in ["LAKEHOUSE_DB_APP_PASSWORD", "LAKEHOUSE_DB_DAGSTER_PASSWORD"] {
+        for name in [
+            "LAKEHOUSE_DB_APP_PASSWORD",
+            "LAKEHOUSE_DB_SOURCE_READER_PASSWORD",
+            "LAKEHOUSE_DB_DAGSTER_PASSWORD",
+        ] {
             let value = read_value(&text, name).expect("the key is set");
             assert!(!value.is_empty(), "{name} is filled");
         }
@@ -850,6 +861,7 @@ mod tests {
     fn the_dagster_password_is_a_must_set_secret_of_the_installer() {
         assert!(FILLED_HEX.contains(&"LAKEHOUSE_DB_DAGSTER_PASSWORD"));
         assert!(FILLED_HEX.contains(&"LAKEHOUSE_DB_APP_PASSWORD"));
+        assert!(FILLED_HEX.contains(&"LAKEHOUSE_DB_SOURCE_READER_PASSWORD"));
     }
 
     #[test]

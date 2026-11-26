@@ -150,12 +150,14 @@ variable while one is empty, whatever profile is active:
 | `LAKEHOUSE_DB_DAGSTER_PASSWORD` | Dagster's instance database role (`lakehouse_dagster`) password (`SEC-78`). `dagster-db-init` sets it on every start, so a rotation applies on the next `up` of the `dagster` profile. Not the owner's, and not the console's |
 | `POSTGRES_PASSWORD` | PostgreSQL password: the database OWNER's password. The `postgres` image itself reads it when the data directory is first created; after that it reaches only the operator-side services — `lakehouse-db-migrate` (the migrations and the console role's setup run with it), Lakekeeper's and OpenFGA's own services (init, migrate and runtime — they dial their own databases), the three Dagster services (Dagster's own instance database), the backup job and the gate runners. It is not in `lakehouse-api`'s connection string any more (`SEC-78`) |
 | `LAKEHOUSE_DB_APP_PASSWORD` | the console's runtime database role's (`lakehouse_app`) password (`SEC-78`) — see "Database roles" below |
+| `LAKEHOUSE_DB_SOURCE_READER_PASSWORD` | the password of the source role `lakehouse_source_reader` (`SEC-84`; `SELECT` and `REFERENCES` on the source schemas, no write and no `CREATE`), held by Dagster's code location and by the seeded connector. Not the owner's, and not the console's |
 | `RUSTFS_ACCESS_KEY` / `RUSTFS_SECRET_KEY` | RustFS root key pair |
 | `LAKEKEEPER_ENCRYPTION_KEY` | Encrypts what Lakekeeper stores in its own schema |
 
-`CONNECTOR_PG_PASSWORD` falls back to `LAKEHOUSE_DB_APP_PASSWORD` (the
-runtime role's — a connector that dials the console's own database does so
-as `lakehouse_app`, not as the owner) and `CONNECTOR_S3_ACCESS_KEY` /
+`CONNECTOR_PG_PASSWORD` falls back to `LAKEHOUSE_DB_SOURCE_READER_PASSWORD`
+(the source role's — a connector that dials the console's own
+database does so as `lakehouse_source_reader`, not as the owner and not as
+the runtime role, `SEC-84`) and `CONNECTOR_S3_ACCESS_KEY` /
 `_SECRET_KEY` fall back to the RustFS keys, never to a literal. `SEAWEEDFS_ACCESS_KEY` /
 `SEAWEEDFS_SECRET_KEY` are used only by `--profile seaweedfs`; compose
 interpolates the whole file whatever profiles are active, so `${X:?}` there
@@ -1616,7 +1618,8 @@ owner's privileges:
 | Role | Who holds its password | What it may do |
 | --- | --- | --- |
 | the owner (`POSTGRES_USER`, default `lakehouse`) | `POSTGRES_PASSWORD`, held by `lakehouse-db-migrate`, Lakekeeper's and OpenFGA's own services (init, migrate and runtime — they dial their own databases), the backup job and the gate runners | everything: it applies the migrations and sets the runtime role up |
-| `lakehouse_app` | `LAKEHOUSE_DB_APP_PASSWORD`, held by `lakehouse-api`, `dagster-code-location` and the connectors that dial this database | read and write the console's tables in `public` and `bronze_meta`; nothing more |
+| `lakehouse_app` | `LAKEHOUSE_DB_APP_PASSWORD`, held by `lakehouse-api` and the hand-made connectors that dial this database as this role | read and write the console's tables in `public` and `bronze_meta`; nothing more. Not held by `dagster-code-location` since `SEC-84` |
+| `lakehouse_source_reader` | `LAKEHOUSE_DB_SOURCE_READER_PASSWORD`, held by `lakehouse-db-migrate` (which sets it on every run), `dagster-code-location` and the seeded `conn-pg-lakehouse` connector | `CONNECT` on the console's database, and `SELECT` and `REFERENCES` on the source schemas (`SOURCE_READER_SCHEMAS`, default `ingest_demo`); no write and no `CREATE`; no grant on `public` or `bronze_meta` (`SEC-84`) |
 | `lakehouse_dagster` | `LAKEHOUSE_DB_DAGSTER_PASSWORD`, held by `dagster-db-init` (which sets it on every start), `dagster-code-location`, `dagster-webserver` and `dagster-daemon` | owns the `dagster` database and every object in it; nothing in the console's database (`SEC-78`, second change) |
 
 The one-shot `lakehouse-db-migrate` service runs `lakehouse-api migrate`
@@ -1657,6 +1660,13 @@ password on every run), then restart `lakehouse-api`. `ops/init-env.sh`
 generates the role's password independently of `POSTGRES_PASSWORD`; keep
 the two different — they belong to two different roles.
 
+**Rotating the source reader's password:** change
+`LAKEHOUSE_DB_SOURCE_READER_PASSWORD` in `.env`, run the migrate service once
+(it sets the role's password on every run), then restart `dagster-code-location`
+and `lakehouse-api`: the seeded connector dials the reader with
+`CONNECTOR_PG_PASSWORD`, which falls back to this value. The code location
+runs pipeline code, so it never holds the runtime role's password (`SEC-84`).
+
 **Dagster's role** (`lakehouse_dagster`, `SEC-78`, second change) owns the
 `dagster` database, and nothing in the console's database. The one-shot
 `dagster-db-init` service creates the role and sets its password on every
@@ -1679,11 +1689,11 @@ superuser is not supported today: setup fails closed there, and the
 ### What each job runs against this database
 
 Every query a job runs against the console's database, and the grant of
-`lakehouse_app` that covers it:
+`lakehouse_source_reader` (the role the code location and the seeded connector run as) that covers it:
 
 | Job | What it runs against this database | Covered by |
 | --- | --- | --- |
-| `replication_slot_check_job` (`dagster/dispar_orchestrate/replication_metrics.py:349-355`) | one read of `pg_replication_slots` for the logical slots, plus `pg_wal_lsn_diff(pg_current_wal_lsn(), …)` | the `pg_monitor` grant; reading the view needs no `REPLICATION` attribute |
+| `replication_slot_check_job` (`dagster/dispar_orchestrate/replication_metrics.py:349-355`) | one read of `pg_replication_slots` for the logical slots, plus `pg_wal_lsn_diff(pg_current_wal_lsn(), …)` | none: `lakehouse_source_reader` needs no extra role. The check reads `pg_replication_slots` and the WAL position with the reader's own privileges (`SEC-84`) |
 | `cdc_apply_job` (`dagster/dispar_orchestrate/cdc_apply.py`) | nothing: it reads Kafka and the API over HTTP and writes Iceberg through Lakekeeper — logical replication lives on the connector's source database, not here | — |
 | the maintenance job (`dagster/dispar_orchestrate/maintenance.py`) | nothing: it works on ClickHouse, Trino and Lakekeeper | — |
 | the bronze ingest path (`dagster/dispar_orchestrate/dlt_pipeline.py:239-353`) | runs the dlt `sql_database` source, which reflects `information_schema` and reads the source table with `SELECT` | the schema and table grants |
@@ -1696,12 +1706,15 @@ Known limits, stated so nobody has to find them in a failed job:
   deprovisioned by the console — the last row of the table above names
   what it would need. No seeded connector does this today
   (`conn-pg-lakehouse` is `adapter='sql'`).
-- The role's grants cover `public` and `bronze_meta` only. A schema
-  something else creates must be granted to the role by whoever creates
-  it: in this repository, the `g3a-source-init` gate fixture grants
-  `lakehouse_app` on `ingest_demo`, and the g6 scale-test script grants it
-  on its own schema. A connector pointed at a schema nobody granted the
-  role sees no tables in it.
+- `lakehouse_app`'s grants cover `public` and `bronze_meta` only. The
+  source role `lakehouse_source_reader` gets `SELECT` and `REFERENCES` on
+  the source schemas and no grant on `public` or `bronze_meta` (PUBLIC keeps
+  its default `USAGE` on `public`, which is not a table right). A schema
+  something else creates must be granted to the source role by whoever
+  creates it: in this repository, the `g3a-source-init` gate fixture grants
+  `lakehouse_app` and `lakehouse_source_reader` on `ingest_demo`, and the g6
+  scale-test script grants both on `scale_10k`. A connector pointed at a
+  schema nobody granted the source role sees no tables in it.
 
 ## Postgres: unreachable is loud, a mismatched schema refuses to start
 

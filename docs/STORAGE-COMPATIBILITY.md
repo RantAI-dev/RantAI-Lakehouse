@@ -90,7 +90,8 @@ compose service:
 ```bash
 # SEC-18: no default credentials. Run `sh ops/init-env.sh` once (or export
 # POSTGRES_PASSWORD, LAKEHOUSE_DB_APP_PASSWORD (the console's runtime role's
-# password), LAKEHOUSE_DB_DAGSTER_PASSWORD (Dagster's role's password), which
+# password), LAKEHOUSE_DB_DAGSTER_PASSWORD (Dagster's role's password),
+# LAKEHOUSE_DB_SOURCE_READER_PASSWORD (the source role's password), which
 # that script also generates — RUSTFS_ACCESS_KEY,
 # RUSTFS_SECRET_KEY, LAKEKEEPER_ENCRYPTION_KEY and, for SeaweedFS,
 # SEAWEEDFS_ACCESS_KEY / SEAWEEDFS_SECRET_KEY) first.
