@@ -74,4 +74,4 @@ Run on the QA stack (main `0ea686e5` plus the open console pull requests) by bro
 - `BI-10-AC5`: pass.
 - `AI-6-AC1` (BI-10 part): partial: it asked which column once; the binned chart it drafted had no limit and showed 20 of 95 bins without saying so (follow-up item).
 - 2026-11-24 (`AI-36`, `PR #722`): fixed — a binned chart drafted with no `limit` now reports in its result that it shows at most 20 values by default and that a `limit` shows more, so the assistant says so or sets a limit.
-- 2026-11-25 (`AI-36`): the server now appends the default cap sentence to a binned chart's reply when the chart has no `limit`, so the reply says it shows at most 20 values.
+- 2026-11-25 (`AI-36`, `PR #729`): the server now appends the default cap sentence to a binned chart's reply when the chart has no `limit`, so the reply says it shows at most 20 values.

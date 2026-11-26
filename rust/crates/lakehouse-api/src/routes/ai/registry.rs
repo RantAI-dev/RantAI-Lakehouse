@@ -413,9 +413,10 @@ fn describe_dataset_schema() -> Value {
 
 fn get_lineage_schema() -> Value {
     json!({ "type": "function", "function": { "name": "get_lineage",
-        "description": "Recorded lineage of a dataset or table: what feeds it and what it feeds (publisher, connector ingest, catalog registry, authored pipelines, views, Gold export). Every edge comes from a platform record; nothing is inferred from names.",
-        "parameters": { "type": "object", "properties": { "slug": { "type": "string", "description": "a dataset slug, or a table name such as serving.<table> or bronze.<table>" } },
-            "required": ["slug"] } } })
+        "description": "The recorded lineage of a dataset, a table or a chart: what feeds it and what it feeds, from platform records only.",
+        "parameters": { "type": "object", "properties": {
+            "slug": { "type": "string", "description": "a dataset slug or a table name" },
+            "chart": { "type": "string", "description": "a chart id" } } } } })
 }
 
 fn get_quality_schema() -> Value {
