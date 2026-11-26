@@ -1,8 +1,10 @@
 //! Integration tests for `0034_seed_connector_ingest_spec.sql` against a
-//! real Postgres. (`0149_seed_connector_dials_as_app_role.sql` later
-//! repoints the seeded row's `dial.user` at the console's runtime role
-//! `lakehouse_app`, SEC-78; these tests pin the row as it stands after
-//! the full migration chain.)
+//! real Postgres. (`0149_seed_connector_dials_as_app_role.sql` first
+//! pointed the seeded row's `dial.user` at the console's runtime role
+//! `lakehouse_app`, SEC-78; `0161_seed_connector_dials_as_source_reader.sql`
+//! repoints it at the read-only source role `lakehouse_source_reader`,
+//! SEC-84. These tests pin the row as it stands after the full migration
+//! chain.)
 //!
 //! # Postgres backing
 //!
@@ -47,7 +49,7 @@ async fn seeded_pg_lakehouse_dial_parses_as_postgres(pool: PgPool) -> sqlx::Resu
     match dial {
         Dial::Sql(sql) => {
             assert_eq!(
-                sql.user, "lakehouse_app",
+                sql.user, "lakehouse_source_reader",
                 "dial.user must be a literal, never env:-prefixed"
             );
         }

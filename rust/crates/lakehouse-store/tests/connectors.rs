@@ -229,9 +229,10 @@ async fn dial_info_returns_type_host_and_secret_refs(pool: PgPool) -> sqlx::Resu
         .unwrap()
         .unwrap();
     assert_eq!(pg.kind, "PostgreSQL");
-    // SEC-78: migration 0149 repointed the seeded row's literal user from
-    // the owner's name (`lakehouse`) to the runtime role's.
-    assert_eq!(pg.host, "lakehouse_app@postgres:5432/lakehouse");
+    // SEC-84: migration 0161 repointed the seeded row's literal user from
+    // the runtime role (`lakehouse_app`, set by 0149 from the owner's name)
+    // to the read-only source role.
+    assert_eq!(pg.host, "lakehouse_source_reader@postgres:5432/lakehouse");
     // Connector-DEDICATED refs, not the API's own secrets — migration 0023.
     // The seed used to name `env:POSTGRES_PASSWORD` (the console's own
     // database password) and the RustFS root keys, which made them reachable
