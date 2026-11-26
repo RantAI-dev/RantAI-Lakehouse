@@ -23,7 +23,9 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use common::{TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up};
+use common::{
+    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up, spin_up_with_env,
+};
 
 mod identity {
     use super::*;
@@ -409,6 +411,10 @@ mod identity {
         //! refusals say what stands in the way.
 
         use super::*;
+        use std::collections::HashMap;
+
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         /// The seeded `Analyst` role, which people hold (`0002_seed_identity.sql`).
         const SEEDED_ANALYST: &str = "22222222-2222-4222-8222-000000000001";
@@ -482,6 +488,34 @@ mod identity {
             .await;
             assert_eq!(status, StatusCode::CREATED, "{body}");
             body["id"].as_str().expect("the new rule's id").to_owned()
+        }
+
+        /// The app's deployment with a `ClickHouse` stand-in for the one
+        /// lookup a rule-writing request makes: `SEC-83` has `POST
+        /// /api/governance/policies` check the bound table before it stores
+        /// (`SEC-80`'s presence check, asked through `system.columns` for a
+        /// `serving.` table). These tests never test absence, so the
+        /// stand-in answers only that one table, present, and mounts
+        /// nothing else: wiremock's 404 keeps any other query loud.
+        async fn spin_up_with_the_rule_table_present() -> TestApp {
+            let ch = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("system.columns"))
+                .and(body_string_contains("database = 'serving'"))
+                .and(body_string_contains("table = 'mart_customer_segment'"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [
+                        {"name": "name", "type": "String"},
+                        {"name": "type", "type": "String"}
+                    ],
+                    "data": [{"name": "email", "type": "String"}],
+                    "rows": 1,
+                })))
+                .mount(&ch)
+                .await;
+            let mut env = HashMap::new();
+            env.insert("CH_URL".to_owned(), ch.uri());
+            spin_up_with_env(&env).await
         }
 
         /// The stored name and conditions of an access rule.
@@ -588,7 +622,7 @@ mod identity {
         /// enforced the moment someone makes it ready.
         #[tokio::test]
         async fn a_rename_is_refused_while_an_access_rule_names_the_role() {
-            let app = spin_up().await;
+            let app = spin_up_with_the_rule_table_present().await;
             let admin = create_principal_with_permissions(&app.pool, "*:*").await;
             let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
             let id = create_role(&app, &admin_cookie, "Reviewers").await;
@@ -646,7 +680,7 @@ mod identity {
         /// stand in its way.
         #[tokio::test]
         async fn a_rename_is_allowed_when_no_access_rule_names_the_role() {
-            let app = spin_up().await;
+            let app = spin_up_with_the_rule_table_present().await;
             let admin = create_principal_with_permissions(&app.pool, "*:*").await;
             let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
             let id = create_role(&app, &admin_cookie, "Reviewers").await;
@@ -673,7 +707,7 @@ mod identity {
         /// people it applied to before.
         #[tokio::test]
         async fn a_description_only_edit_is_allowed_while_an_access_rule_names_the_role() {
-            let app = spin_up().await;
+            let app = spin_up_with_the_rule_table_present().await;
             let admin = create_principal_with_permissions(&app.pool, "*:*").await;
             let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
             let id = create_role(&app, &admin_cookie, "Reviewers").await;
