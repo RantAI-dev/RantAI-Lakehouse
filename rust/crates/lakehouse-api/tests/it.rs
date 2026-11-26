@@ -127,6 +127,7 @@ mod frame_check;
 mod gold_export_auth;
 mod gold_latest_copy;
 mod gold_publication;
+mod governance_policy_tenant_reach;
 mod home_layout;
 mod iceberg_door;
 mod identity_deactivate;

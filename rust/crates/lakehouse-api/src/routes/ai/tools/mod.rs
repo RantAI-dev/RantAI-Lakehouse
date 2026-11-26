@@ -261,7 +261,7 @@ pub(in crate::routes) async fn run_tool(
         "kill_query" => ops::kill_query(state, args).await,
         "export_gold_mart" => gold::export_gold_mart(state, principal, args).await,
         "get_gold_export" => gold::get_gold_export(state, principal, args).await,
-        "draft_policy" => governance::draft_policy(state, args).await,
+        "draft_policy" => governance::draft_policy(state, principal, args).await,
         "draft_classification_rule" => governance::draft_classification_rule(state, args).await,
         "draft_quality_rule" => governance::draft_quality_rule(state, principal, args).await,
         "get_ingest_spec" => ingest::get_ingest_spec(state, args).await,
