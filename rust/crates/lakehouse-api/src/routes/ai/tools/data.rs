@@ -2,6 +2,8 @@
 //! `describe_dataset`, `get_lineage`, `get_quality`, `describe_mart`.
 //! Moved out of `ai.rs` unchanged (T0.1 registry refactor).
 
+use std::fmt::Write as _;
+
 use lakehouse_auth::Principal;
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ApiError;
@@ -1144,18 +1146,22 @@ fn chart_chain(answer: &Value) -> String {
         };
         if let Some(to) = previous {
             let edge = kinds.get(&(id, to)).copied().unwrap_or("upstream");
-            chain.push_str(&format!(" -[{edge}]-> "));
+            let _ = write!(chain, " -[{edge}]-> ");
         }
         chain.push_str(label);
-        chain.push_str(&format!(" ({kind}"));
+        let _ = write!(chain, " ({kind}");
         match (
             step.get("refreshedAt").and_then(Value::as_str),
             step.get("refreshSource").and_then(Value::as_str),
         ) {
-            (Some(at), Some(source)) => chain.push_str(&format!(", refreshed {at} via {source}")),
-            (Some(at), None) => chain.push_str(&format!(", refreshed {at}")),
+            (Some(at), Some(origin)) => {
+                let _ = write!(chain, ", refreshed {at} via {origin}");
+            }
+            (Some(at), None) => {
+                let _ = write!(chain, ", refreshed {at}");
+            }
             (None, _) if step.get("notRecorded") == Some(&json!(true)) => {
-                chain.push_str(", refresh not recorded")
+                let _ = write!(chain, ", refresh not recorded");
             }
             (None, _) => {}
         }
