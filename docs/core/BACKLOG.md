@@ -467,7 +467,7 @@ estimate (S, M, L), which the base has no field for.
 | `OPS-18` | Task | `security.yml` downloads the `gitleaks` and `cargo-deny` binaries without a retry, so a GitHub release-download outage (2026-11-08, 16:02 to 17:35 WIB) failed three jobs without scanning anything. Add a retry | Operations | P3 | Done | #691 | PR #423 |
 | `DATA-45` | Task | Iceberg tables with no catalog entry (for example some Gold export tables) are no longer listed anywhere since `WEB-3` slice 2 removed the Table Maintenance list; their pages work by address only | Data | P3 | Done | #701 | #374 handoff |
 | `DATA-46` | Task | Data Quality > Schedules lists only tables with a saved schedule and cannot add a schedule for another table (needs a table picker) | Data | P3 | Done | #696 | #376 handoff |
-| `OPS-17` | Task | bluefin's daily cargo sweep let the shared target reach 272 GB on 2026-11-04 (pruned to 88 GB by hand); check the `cargo-target-sweep.timer` there | Operations | P3 | Todo |  | 2026-11-04 |
+| `OPS-17` | Task | bluefin's daily cargo sweep let the shared target reach 272 GB on 2026-11-04 (pruned to 88 GB by hand); check the `cargo-target-sweep.timer` there | Operations | P3 | Done | #737 | 2026-11-04; script shipped; installing it on the build machine is the operator's step |
 | `WEB-6` | Task | Some existing failure toasts read the action's error right after it fails and get the old value, so the API's sentence may be missing (for example the Access tab's policy buttons); the `WEB-3` dialogs show the error inside the dialog instead | Platform | P3 | Done | #690 | #376 handoff |
 | `OPS-3` | Feature | Run on several servers; high availability. The product owner wants clustering supported later (2026-11-04); `DATA-44` stays on one server | Platform | P3 | Idea |  | PRODUCT §1, §2 |
 | `SRC-3` | Feature | Connectors for business apps: first Databricks' ten generally available SaaS connectors, then its beta list by customer demand. `DEC-9` decided 2026-10-19; `SRC-12` merged. Feature page `features/business-app-connectors.md`. Eight of the ten are built and supported (gate-tested on mock vendors only; no real account); Workday Reports and NetSuite are built and stay unsupported until `SRC-27`. Result: `plans/SRC-3-RESULT.md`. Follow-ups: `SRC-26` to `SRC-31`. Accepted by the product owner on 2026-11-02 for the eight supported vendors; Workday Reports and NetSuite wait for `SRC-27`. Back to In Acceptance on 2026-11-13: its QA cases do not prove it yet (product owner, 2026-11-13: a feature is ready only when its QA cases show it). | Data | P3 | In Acceptance | #216 | PRODUCT §2 |
@@ -583,7 +583,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-10`, `ADM-5`, `AI-21`, `AI-26`, `AI-27`, `AI-28`, `AI-29`, `AI-30`, `AI-31`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BI-3`, `BI-42`, `BI-43`, `BI-44`, `BI-45`, `BI-46`, `BI-47`, `BI-48`, `BI-49`, `BI-50`, `BI-51`, `BI-52`, `BI-53`, `BI-54`, `BI-55`, `BIZ-1`, `BIZ-2`, `BLD-11`, `BLD-14`, `DATA-20`, `DATA-22`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-30`, `DATA-43`, `DATA-44`, `DATA-45`, `DATA-46`, `DATA-4`, `DATA-55`, `DATA-6`, `DATA-8`, `GOV-12`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-17`, `OPS-18`, `OPS-3`, `OPS-6`, `QA-2`, `QRY-1`, `REL-13`, `REL-14`, `REL-15`, `REL-17`, `SEC-40`, `SEC-54`, `SEC-58`, `SEC-59`, `SEC-60`, `SEC-64`, `SEC-65`, `SEC-66`, `SEC-67`, `SRC-15`, `SRC-18`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-2`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-43`, `SRC-47`, `SRC-48`, `SRC-49`, `SRC-4`, `SRC-5`, `VER-1`, `WEB-11`, `WEB-4`, `WEB-6`, `WEB-7`, `WEB-8`, `REL-28`
+`ADM-10`, `ADM-5`, `AI-21`, `AI-26`, `AI-27`, `AI-28`, `AI-29`, `AI-30`, `AI-31`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BI-3`, `BI-42`, `BI-43`, `BI-44`, `BI-45`, `BI-46`, `BI-47`, `BI-48`, `BI-49`, `BI-50`, `BI-51`, `BI-52`, `BI-53`, `BI-54`, `BI-55`, `BIZ-1`, `BIZ-2`, `BLD-11`, `BLD-14`, `DATA-20`, `DATA-22`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-30`, `DATA-43`, `DATA-44`, `DATA-45`, `DATA-46`, `DATA-4`, `DATA-55`, `DATA-6`, `DATA-8`, `GOV-12`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-18`, `OPS-3`, `OPS-6`, `QA-2`, `QRY-1`, `REL-13`, `REL-14`, `REL-15`, `REL-17`, `SEC-40`, `SEC-54`, `SEC-58`, `SEC-59`, `SEC-60`, `SEC-64`, `SEC-65`, `SEC-66`, `SEC-67`, `SRC-15`, `SRC-18`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-2`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-43`, `SRC-47`, `SRC-48`, `SRC-49`, `SRC-4`, `SRC-5`, `VER-1`, `WEB-11`, `WEB-4`, `WEB-6`, `WEB-7`, `WEB-8`, `REL-28`
 
 ## Dates
 
@@ -612,6 +612,7 @@ set by the product owner and are left empty until they are.
 | `OPS-40` | 2026-11-21 | 2026-11-21 (#657) | |
 | `OPS-37` | 2026-11-19 | 2026-11-21 (#605, #636, #656) | |
 | `OPS-39` | 2026-11-19 | 2026-11-21 (#628) | |
+| `OPS-17` | 2026-11-26 | 2026-11-26 (#737) | |
 | `OPS-35` | 2026-11-16 | 2026-11-18 (#581) | |
 | `ADM-2` | 2026-11-15 | 2026-11-21 | |
 | `SEC-76` | | | |
