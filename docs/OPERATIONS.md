@@ -3316,8 +3316,8 @@ A cap is a size such as `60G`, `500M`, `5T`, `500K`, or a plain byte count.
 While the directory is over the cap, the script deletes the oldest entries by
 mtime. It looks only inside each profile's `deps`, `build` and `incremental`
 subdirectories, for every profile such as `debug` and `release`, and inside
-`tmp`. It deletes one file at a time in `deps`, `build` and `tmp`, and one
-whole directory at a time in `incremental`. It never follows symlinks, never
+`tmp`. It deletes one file at a time in `deps` and `tmp`, and one whole
+directory at a time in `build` and `incremental`. It never follows symlinks, never
 deletes anything outside those subtrees, and never deletes the target
 directory itself. One summary line records the size before, the size after
 and the number of entries deleted, for the journal.

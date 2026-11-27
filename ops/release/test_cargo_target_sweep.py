@@ -16,6 +16,8 @@ an assumption about filesystem metadata.
 from __future__ import annotations
 
 import os
+import shlex
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -59,15 +61,44 @@ class CargoTargetSweepTest(unittest.TestCase):
         output = subprocess.check_output(["du", "-sb", str(path)], text=True)
         return int(output.split()[0])
 
-    def run_sweep(self, *arguments: object) -> subprocess.CompletedProcess[str]:
+    def run_sweep(
+        self,
+        *arguments: object,
+        extra_environment: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         environment = dict(os.environ)
         environment["SWEEP_PROC_ROOT"] = str(self.proc_root)
+        environment.update(extra_environment or {})
         return subprocess.run(
             [str(SCRIPT), *(str(argument) for argument in arguments)],
             capture_output=True,
             text=True,
             env=environment,
         )
+
+    def fake_du_wrapper(self) -> tuple[Path, Path]:
+        """Put a logging wrapper around `du` and return its directory and log.
+
+        The wrapper appends one line per call (the arguments it received)
+        to the log, then execs the real `du`, so the script under test
+        cannot tell the difference. Only a `run_sweep` call whose
+        environment prepends the returned directory to `PATH` sees it;
+        the script's own interface is unchanged.
+        """
+        real_du = shutil.which("du")
+        self.assertIsNotNone(real_du, "no real du on PATH to fall back to")
+        fake_bin = self.root / "fake-bin"
+        fake_bin.mkdir()
+        du_log = self.root / "du-calls.log"
+        wrapper = fake_bin / "du"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" >> \"$SWEEP_DU_LOG\"\n"
+            f"exec {shlex.quote(str(real_du))} \"$@\"\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        return fake_bin, du_log
 
     def fake_running_process(self, name: str) -> Path:
         comm = self.proc_root / "4242" / "comm"
@@ -96,6 +127,48 @@ class CargoTargetSweepTest(unittest.TestCase):
         self.assertIn("after=", output)
         self.assertIn("deleted=2", output)
 
+    def test_a_build_script_directory_is_deleted_as_a_whole_and_a_newer_one_survives(self) -> None:
+        oldest_build = self.write_directory(self.target / "debug/build/crate-a-deadbeef", BASE_TIME + 100)
+        newest_build = self.write_directory(self.target / "debug/build/crate-b-feedface", BASE_TIME + 200)
+        cap = self.du_size(self.target) - self.du_size(oldest_build) + 1
+
+        result = self.run_sweep(str(self.target), str(cap))
+        output = result.stdout + result.stderr
+
+        self.assertEqual(result.returncode, 0, output)
+        self.assertFalse(oldest_build.exists(), "the oldest build script directory should be deleted whole")
+        self.assertTrue(newest_build.exists(), f"the newer build script directory should survive: {output}")
+        self.assertIn("deleted=1", output)
+
+    def test_the_sweep_calls_du_on_the_whole_target_exactly_twice_however_many_entries_it_deletes(self) -> None:
+        for index in range(200):
+            self.write_file(self.target / f"debug/deps/gen_{index:03d}.bin", 2_000, BASE_TIME + 100 + index)
+        fake_bin, du_log = self.fake_du_wrapper()
+        cap = self.du_size(self.target) - 150 * 2_000
+
+        result = self.run_sweep(
+            str(self.target),
+            str(cap),
+            extra_environment={
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "SWEEP_DU_LOG": str(du_log),
+            },
+        )
+        output = result.stdout + result.stderr
+
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("deleted=150", output)
+        whole_target_calls = [
+            line
+            for line in du_log.read_text(encoding="utf-8").splitlines()
+            if line == f"-sb {self.target}"
+        ]
+        self.assertEqual(
+            len(whole_target_calls),
+            2,
+            f"du should measure the whole target once at the start and once at the end, saw: {whole_target_calls}",
+        )
+
     def test_a_dry_run_prints_the_planned_deletions_and_deletes_nothing(self) -> None:
         oldest = self.write_file(self.target / "debug/deps/old.bin", 20_000, BASE_TIME + 100)
         second = self.write_file(self.target / "tmp/tmp_old.bin", 20_000, BASE_TIME + 150)
@@ -112,6 +185,21 @@ class CargoTargetSweepTest(unittest.TestCase):
         self.assertIn("would-delete=2", output)
         self.assertIn("after=", output)
         for path in (oldest, second, newer):
+            self.assertTrue(path.exists(), f"{path} should still exist after a dry run")
+
+    def test_a_dry_run_prints_build_directories_and_deletes_nothing(self) -> None:
+        oldest_build = self.write_directory(self.target / "debug/build/crate-a-deadbeef", BASE_TIME + 100)
+        newest_build = self.write_directory(self.target / "debug/build/crate-b-feedface", BASE_TIME + 200)
+        cap = self.du_size(self.target) - self.du_size(oldest_build) + 1
+
+        result = self.run_sweep("--dry-run", str(self.target), str(cap))
+        output = result.stdout + result.stderr
+
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn(f"would delete: {oldest_build}", output)
+        self.assertNotIn(f"would delete: {newest_build}", output)
+        self.assertIn("would-delete=1", output)
+        for path in (oldest_build, newest_build):
             self.assertTrue(path.exists(), f"{path} should still exist after a dry run")
 
     def test_a_running_cargo_process_makes_the_sweep_skip_with_exit_seventy_five(self) -> None:
@@ -174,6 +262,25 @@ class CargoTargetSweepTest(unittest.TestCase):
         self.assertIn(str(self.du_size(self.target)), output)
         self.assertFalse(oldest.exists(), "all allowed entries should be deleted first")
         self.assertTrue(outside.exists(), "a file outside the swept subtrees must survive")
+
+    def test_an_unreachable_cap_in_a_dry_run_exits_two_with_a_projected_after_below_before_and_deletes_nothing(self) -> None:
+        oldest = self.write_file(self.target / "debug/deps/old.bin", 20_000, BASE_TIME + 100)
+        outside = self.write_file(self.target / "outside/keep.bin", 20_000, BASE_TIME)
+
+        result = self.run_sweep("--dry-run", str(self.target), "1")
+        output = result.stdout + result.stderr
+
+        self.assertEqual(result.returncode, 2, output)
+        self.assertIn("final size", output)
+        before = int(output.split("before=")[1].split()[0])
+        after = int(output.split("after=")[1].split()[0])
+        self.assertLess(
+            after,
+            before,
+            f"a dry-run must print the projected size from its own subtraction, never a re-measured one: {output}",
+        )
+        for path in (oldest, outside):
+            self.assertTrue(path.exists(), f"{path} should still exist after a dry run")
 
 
 if __name__ == "__main__":

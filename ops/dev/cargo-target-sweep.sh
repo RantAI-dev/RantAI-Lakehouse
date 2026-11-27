@@ -4,9 +4,12 @@
 # Cargo never removes its own old build output, so a long-lived build
 # machine grows until something else cleans up. This sweeps only the
 # subtrees whose contents are disposable build products, oldest mtime
-# first, and stops as soon as `du -sb` reports a size at or under the cap.
-# It refuses to run under a cargo or rustc process: deleting objects a
-# live build may still need would break that build.
+# first. It measures each candidate once and subtracts its size from a
+# running total, so the walk stays linear in the number of deletions,
+# and re-measures the target exactly once at the end; the exit code
+# follows that real size. It refuses to run under a cargo or rustc
+# process: deleting objects a live build may still need would break
+# that build.
 
 set -eu
 
@@ -96,18 +99,23 @@ du_size() {
 }
 
 # One candidate per disposable file, or per whole directory under
-# incremental. `find` without -L and -type f/-type d keep symlinks out.
+# incremental and build. Cargo stores one directory per build script
+# under build/ (`build/<crate>-<hash>/`), so its entries are listed with
+# -type d exactly like incremental's, and one candidate is removed whole
+# with `rm -rf --`. `find` without -L and -type f/-type d keep symlinks
+# out.
 collect_candidates() {
     sweep_root=$1
     for profile in "$sweep_root"/*; do
         if [ ! -d "$profile" ] || [ -L "$profile" ]; then
             continue
         fi
-        for subdirectory in deps build; do
-            if [ -d "$profile/$subdirectory" ]; then
-                find "$profile/$subdirectory" -mindepth 1 -maxdepth 1 -type f -printf '%T@ %p\n'
-            fi
-        done
+        if [ -d "$profile/deps" ]; then
+            find "$profile/deps" -mindepth 1 -maxdepth 1 -type f -printf '%T@ %p\n'
+        fi
+        if [ -d "$profile/build" ]; then
+            find "$profile/build" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n'
+        fi
         if [ -d "$profile/incremental" ]; then
             find "$profile/incremental" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n'
         fi
@@ -124,8 +132,21 @@ deleted=0
 newline='
 '
 
+# Measure each candidate once and subtract its size from a running
+# total, instead of re-walking the whole target after every deletion:
+# `du -sb` over a real target (100k+ files) once per `rm` made a full
+# sweep quadratic. The loop stops as soon as the running total reaches
+# the cap, and the target itself is re-measured exactly once afterwards,
+# so the reported size and the exit code follow a real measurement, not
+# the estimate.
 while [ "$size" -gt "$cap_bytes" ]; do
     if [ -z "$candidates" ]; then
+        # Nothing left to free. A real run reports the real, re-measured
+        # size; a dry-run keeps the projected running total from its own
+        # subtractions and never re-measures.
+        if [ "$dry_run" -eq 0 ]; then
+            size=$(du_size "$target_dir")
+        fi
         printf '%s: cannot reach cap %s bytes: final size %s bytes\n' "$PROGRAM" "$cap_bytes" "$size"
         printf '%s: before=%s after=%s deleted=%s\n' "$PROGRAM" "$before" "$size" "$deleted"
         exit 2
@@ -142,20 +163,25 @@ while [ "$size" -gt "$cap_bytes" ]; do
             ;;
     esac
     path=${first#* }
+    entry_size=$(du_size "$path")
 
     if [ "$dry_run" -eq 1 ]; then
-        entry_size=$(du_size "$path")
-        size=$((size - entry_size))
         printf 'would delete: %s\n' "$path"
     else
         rm -rf -- "$path"
-        size=$(du_size "$target_dir")
     fi
+    size=$((size - entry_size))
     deleted=$((deleted + 1))
 done
 
 if [ "$dry_run" -eq 1 ]; then
     printf '%s: before=%s after=%s would-delete=%s\n' "$PROGRAM" "$before" "$size" "$deleted"
 else
+    size=$(du_size "$target_dir")
     printf '%s: before=%s after=%s deleted=%s\n' "$PROGRAM" "$before" "$size" "$deleted"
+    if [ "$size" -gt "$cap_bytes" ]; then
+        # Files may have grown during the run; never claim success on the
+        # estimate alone.
+        exit 2
+    fi
 fi

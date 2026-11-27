@@ -468,7 +468,7 @@ estimate (S, M, L), which the base has no field for.
 | `OPS-18` | Task | `security.yml` downloads the `gitleaks` and `cargo-deny` binaries without a retry, so a GitHub release-download outage (2026-11-08, 16:02 to 17:35 WIB) failed three jobs without scanning anything. Add a retry | Operations | P3 | Done | #691 | PR #423 |
 | `DATA-45` | Task | Iceberg tables with no catalog entry (for example some Gold export tables) are no longer listed anywhere since `WEB-3` slice 2 removed the Table Maintenance list; their pages work by address only | Data | P3 | Done | #701 | #374 handoff |
 | `DATA-46` | Task | Data Quality > Schedules lists only tables with a saved schedule and cannot add a schedule for another table (needs a table picker) | Data | P3 | Done | #696 | #376 handoff |
-| `OPS-17` | Task | bluefin's daily cargo sweep let the shared target reach 272 GB on 2026-11-04 (pruned to 88 GB by hand); check the `cargo-target-sweep.timer` there | Operations | P3 | Done | #737 | 2026-11-04; script shipped; installing it on the build machine is the operator's step |
+| `OPS-17` | Task | bluefin's daily cargo sweep let the shared target reach 272 GB on 2026-11-04 (pruned to 88 GB by hand); check the `cargo-target-sweep.timer` there | Operations | P3 | Done | #737, #740 | 2026-11-04; script shipped; installing it on the build machine is the operator's step |
 | `WEB-6` | Task | Some existing failure toasts read the action's error right after it fails and get the old value, so the API's sentence may be missing (for example the Access tab's policy buttons); the `WEB-3` dialogs show the error inside the dialog instead | Platform | P3 | Done | #690 | #376 handoff |
 | `OPS-3` | Feature | Run on several servers; high availability. The product owner wants clustering supported later (2026-11-04); `DATA-44` stays on one server | Platform | P3 | Idea |  | PRODUCT §1, §2 |
 | `SRC-3` | Feature | Connectors for business apps: first Databricks' ten generally available SaaS connectors, then its beta list by customer demand. `DEC-9` decided 2026-10-19; `SRC-12` merged. Feature page `features/business-app-connectors.md`. Eight of the ten are built and supported (gate-tested on mock vendors only; no real account); Workday Reports and NetSuite are built and stay unsupported until `SRC-27`. Result: `plans/SRC-3-RESULT.md`. Follow-ups: `SRC-26` to `SRC-31`. Accepted by the product owner on 2026-11-02 for the eight supported vendors; Workday Reports and NetSuite wait for `SRC-27`. Back to In Acceptance on 2026-11-13: its QA cases do not prove it yet (product owner, 2026-11-13: a feature is ready only when its QA cases show it). | Data | P3 | In Acceptance | #216 | PRODUCT §2 |
@@ -613,7 +613,7 @@ set by the product owner and are left empty until they are.
 | `OPS-40` | 2026-11-21 | 2026-11-21 (#657) | |
 | `OPS-37` | 2026-11-19 | 2026-11-21 (#605, #636, #656) | |
 | `OPS-39` | 2026-11-19 | 2026-11-21 (#628) | |
-| `OPS-17` | 2026-11-26 | 2026-11-26 (#737) | |
+| `OPS-17` | 2026-11-26 | 2026-11-26 (#737, #740) | |
 | `OPS-35` | 2026-11-16 | 2026-11-18 (#581) | |
 | `ADM-2` | 2026-11-15 | 2026-11-21 | |
 | `SEC-76` | | | |
