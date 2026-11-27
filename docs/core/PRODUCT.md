@@ -379,7 +379,6 @@ an order in its roadmap phase.
 | Business-app connectors, the rest (`SRC-3` follow-ups `SRC-26` to `SRC-31`): the second wave by customer demand, real-account tests | The first ten are built in #216 (eight supported); the second wave of about 45 waits for demand |
 | Snippets, charts from SQL results, and dashboard filters and dropdowns from parameters (`QS-5` part 2 and later) | The bridge from Query Studio to dashboards, after the basics. Part 1 (parameters in SQL) accepted 2026-11-14 |
 | Instant copies of a table; self-refreshing tables | Expected by Snowflake users |
-| Open-first Gold: store curated data in Iceberg, serve from a fast copy | Removes publishing entirely; needs a fresh measurement |
 | Import dashboards from other BI tools | Eases switching |
 | Search over documents | Needs a vector store |
 | Hosted cloud version; enterprise edition | Business decisions |
