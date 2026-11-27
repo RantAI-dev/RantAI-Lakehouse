@@ -435,11 +435,15 @@ async fn retain_rows_in_reach(
 /// (`actor` of `None`) is not narrowed, the convention `quality_key_in_reach`
 /// keeps. The claims are read once for the distinct tables.
 ///
+/// Shared with the role-rename refusal (`SEC-83` follow-up), whose 409 names
+/// only the rules in the caller's reach while its count stays every rule —
+/// the one reason this is `pub(crate)`.
+///
 /// # Errors
 ///
 /// The 503 of [`crate::routes::query::reachable_names`] when the claims
 /// cannot be read; the response carries its fixed sentence, never the cause.
-async fn retain_policies_in_reach(
+pub(crate) async fn retain_policies_in_reach(
     state: &AppState,
     actor: Option<&Principal>,
     headers: &HeaderMap,
