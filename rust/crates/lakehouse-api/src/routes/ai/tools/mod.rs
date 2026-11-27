@@ -75,6 +75,7 @@ use lakehouse_auth::Principal;
 use lakehouse_bi::access::{Level, Viewer};
 use serde_json::{Map, Value, json};
 
+use super::gate;
 use super::registry;
 use crate::error::ApiResult;
 use crate::state::AppState;
@@ -552,14 +553,16 @@ pub(crate) async fn check_before_approval(
             // before an approval exists.
             merged_origins(&board, &sites)
                 .map(|_| ())
-                .map_err(|err| json!({ "error": err }))
+                .map_err(|err| json!({ "error": err }))?;
+            require_another_approver(state, principal, name, args, embed::NO_OTHER_APPROVER).await
         }
         "set_embed_filter_modes" => {
             let board = managed_embed_board(state, principal, args).await?;
             embed_configured(state)?;
             let modes = arg_filter_modes(args)?;
             crate::routes::embed::check_filter_modes(&board, &modes)
-                .map_err(|err| json!({ "error": err.to_string() }))
+                .map_err(|err| json!({ "error": err.to_string() }))?;
+            require_another_approver(state, principal, name, args, embed::NO_OTHER_APPROVER).await
         }
         // AI-11 decision 1: the sharing tool's own checks run before the
         // approval row, so a call that could never run — a non-manager, an
@@ -569,6 +572,82 @@ pub(crate) async fn check_before_approval(
         "create_public_link" => sharing::check_before_create(state, principal, args).await,
         _ => Ok(()),
     }
+}
+
+/// `AI-11`: a request is refused, with `sentence` and no approval
+/// row, unless somebody other than the requester could decide it and run it
+/// as the approver. The approval route checks the approver's `agent:approve`
+/// and the tool's own permission at the approver's level on the board
+/// (`routes/agents.rs`, `decide_approval`); this counts the accounts that pass
+/// that same check, with the same `dashboard_reach` and `permission_granted`.
+///
+/// Any failure while counting counts as nobody, so the refusal is the answer:
+/// a call that may never run does not ask a person to approve it.
+pub(super) async fn require_another_approver(
+    state: &AppState,
+    requester: Option<&Principal>,
+    name: &str,
+    args: &Map<String, Value>,
+    sentence: &str,
+) -> Result<(), Value> {
+    if another_approver_exists(state, requester, name, args).await {
+        Ok(())
+    } else {
+        Err(json!({ "error": sentence }))
+    }
+}
+
+async fn another_approver_exists(
+    state: &AppState,
+    requester: Option<&Principal>,
+    name: &str,
+    args: &Map<String, Value>,
+) -> bool {
+    let (Some(requester), Some(pg), Some(spec)) =
+        (requester, state.pg.as_deref(), registry::find(name))
+    else {
+        return false;
+    };
+    let Ok(ids) = lakehouse_auth::repository::active_user_ids(pg).await else {
+        return false;
+    };
+    for id in ids {
+        if id == requester.id.uuid() {
+            continue;
+        }
+        // A candidate who fails to load is skipped: that can only refuse the
+        // request, never let one through.
+        let Ok(candidate) = lakehouse_auth::repository::load_principal_for_user(
+            pg,
+            id,
+            requester.provider.clone(),
+            false,
+        )
+        .await
+        else {
+            continue;
+        };
+        if !candidate.has("agent:approve") {
+            continue;
+        }
+        // The replay runs as the approver and checks the board with the same
+        // guard the console uses (`managed_board`), so an approver without
+        // manage on the board cannot run the call and does not count. The
+        // tool-level permission is the one `decide_approval` checks too; these
+        // tools declare none, so it is granted and the board guard decides.
+        let board = arg_str(args, "board");
+        if crate::routes::public_links::managed_board(state, &candidate, Some(&board))
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        let reach = dashboard_reach(state, Some(&candidate), name, args).await;
+        if gate::permission_granted(spec, Some(&candidate.permissions), reach) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The dashboard an embed tool acts on: the caller must manage it, by the one

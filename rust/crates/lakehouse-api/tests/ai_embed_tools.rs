@@ -45,6 +45,10 @@ const ONLY_VALUE_FILTERS: &str = "Only a filter that picks values can be locked 
 /// The routes' sentence for a mode on a column the dashboard has no filter for.
 const NOT_A_FILTER: &str = "A mode can only be set for a filter the dashboard has.";
 
+/// `AI-11`: the refusal when nobody other than the requester can
+/// both decide the approval and run it as its approver.
+const NO_OTHER_APPROVER: &str = "Only another manager of this dashboard can approve this, and it has none; make the change yourself in Share > Embed.";
+
 /// The dashboards the stand-in holds: `(id, embed_enabled)`.
 const BOARDS: [(&str, &str); 2] = [("b1", "0"), ("b2", "1")];
 
@@ -409,6 +413,68 @@ async fn a_requester_without_manage_is_refused_and_no_approval_is_written() {
 }
 
 #[tokio::test]
+async fn an_embed_write_nobody_else_can_approve_is_refused_and_makes_no_approval_row() {
+    // The requester manages `b1` through their rule alone: nobody else holds
+    // a manage rule on it, so neither write asks a person who could never
+    // run the call — the fixed sentence, and no approval row (`AI-11`
+    // decision 1).
+    let (app, _ch) = app(Some(SECRET), Store::with_earlier_site()).await;
+    let (user, cookie) = manager(&app).await;
+    // The seeded Platform Admin holds `*:*`, so it could decide and run the
+    // call; deactivating every other account leaves the requester alone, which
+    // is the case this test is about (`AI-11`).
+    sqlx::query("UPDATE app_user SET status = 'inactive' WHERE id <> $1")
+        .bind(user)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+
+    for (tool, args) in [
+        (
+            "enable_embed",
+            json!({ "board": "b1", "sites": ["https://example.com"] }),
+        ),
+        (
+            "set_embed_filter_modes",
+            json!({ "board": "b1", "modes": { "region": "locked" } }),
+        ),
+    ] {
+        let body = call(&app, &cookie, tool, args, "build").await;
+        assert_eq!(
+            body["result"]["error"],
+            json!(NO_OTHER_APPROVER),
+            "{tool}: {body}"
+        );
+        assert_eq!(body["outcome"], "failed", "{tool}: {body}");
+        assert_eq!(approvals_for(&app, tool).await, 0, "{tool}");
+    }
+}
+
+#[tokio::test]
+async fn an_embed_approver_who_cannot_manage_the_board_does_not_make_a_request_creatable() {
+    // `AI-11`: as for the public link, an approver without manage on `b1`
+    // could never run the embed write, so nothing is asked of them.
+    let (app, _ch) = app(Some(SECRET), Store::with_earlier_site()).await;
+    let (user, cookie) = manager(&app).await;
+    sqlx::query("UPDATE app_user SET status = 'inactive' WHERE id <> $1")
+        .bind(user)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let _outsider = create_principal_with_permissions(&app.pool, "agent:approve").await;
+    let body = call(
+        &app,
+        &cookie,
+        "enable_embed",
+        json!({ "board": "b1", "sites": ["https://example.com"] }),
+        "build",
+    )
+    .await;
+    assert_eq!(body["result"]["error"], json!(NO_OTHER_APPROVER), "{body}");
+    assert_eq!(approvals_for(&app, "enable_embed").await, 0);
+}
+
+#[tokio::test]
 async fn without_embed_secret_all_four_are_refused_with_the_routes_sentence() {
     let (app, _ch) = app(None, Store::with_earlier_site()).await;
     let (_user, cookie) = manager(&app).await;
@@ -541,6 +607,9 @@ async fn ask_mode_refuses_the_three_writes() {
 async fn an_approved_enable_embed_turns_it_on_and_adds_the_site_to_the_earlier_ones() {
     let (app, _ch) = app(Some(SECRET), Store::with_earlier_site()).await;
     let (user, cookie) = manager(&app).await;
+    // The approver exists before the ask, so the request is creatable
+    // (`AI-11`).
+    let approver_cookie = approver(&app, &["b1"], &[user]).await;
     let asked = call(
         &app,
         &cookie,
@@ -559,8 +628,7 @@ async fn an_approved_enable_embed_turns_it_on_and_adds_the_site_to_the_earlier_o
     assert!(reason.contains("https://example.com"), "{reason}");
     assert_eq!(approvals_for(&app, "enable_embed").await, 1);
 
-    let (status, decided) =
-        decide(&app, &approver(&app, &["b1"], &[user]).await, &approval_id).await;
+    let (status, decided) = decide(&app, &approver_cookie, &approval_id).await;
     assert_eq!(status, StatusCode::OK, "{decided}");
     assert_eq!(decided["executed"], json!(true), "{decided}");
     assert_eq!(decided["result"]["enabled"], json!(true), "{decided}");
@@ -588,7 +656,10 @@ async fn an_approved_enable_embed_turns_it_on_and_adds_the_site_to_the_earlier_o
 #[tokio::test]
 async fn an_approver_without_manage_is_recorded_and_the_enable_does_not_run() {
     let (app, _ch) = app(Some(SECRET), Store::with_earlier_site()).await;
-    let (_user, cookie) = manager(&app).await;
+    let (user, cookie) = manager(&app).await;
+    // The approval exists because another manager could run it (`AI-11`
+    // decision 1); the person who decides it below is not that person.
+    let _other_manager_approver = approver(&app, &["b1"], &[user]).await;
     let asked = call(
         &app,
         &cookie,
@@ -639,6 +710,9 @@ async fn an_approver_without_manage_is_recorded_and_the_enable_does_not_run() {
 async fn set_embed_filter_modes_waits_for_approval_then_the_snippet_lists_the_locked_column() {
     let (app, _ch) = app(Some(SECRET), Store::with_earlier_site()).await;
     let (user, cookie) = manager(&app).await;
+    // The approver exists before the ask, so the request is creatable
+    // (`AI-11`).
+    let approver_cookie = approver(&app, &["b1"], &[user]).await;
     let asked = call(
         &app,
         &cookie,
@@ -654,7 +728,7 @@ async fn set_embed_filter_modes_waits_for_approval_then_the_snippet_lists_the_lo
 
     let (status, decided) = decide(
         &app,
-        &approver(&app, &["b1"], &[user]).await,
+        &approver_cookie,
         asked["result"]["approval_id"].as_str().unwrap(),
     )
     .await;
