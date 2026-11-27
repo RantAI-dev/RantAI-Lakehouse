@@ -1,4 +1,4 @@
-//! The dashboard-sharing tools (`AI-11`, plan ai-146): make a public link only
+//! The dashboard-sharing tools (`AI-11`): make a public link only
 //! with a human's approval, end one on a chat confirm, and say who can see a
 //! dashboard.
 //!
@@ -78,6 +78,11 @@ pub(super) async fn run(
 /// `public_links::managed_board`); its sentence names "the embed tools", so
 /// this module carries its own copy of the guard with words that name these
 /// tools — the underlying route guard is shared, not duplicated.
+///
+/// # Errors
+///
+/// The tool-result JSON the model sees: the no-caller sentence, or the
+/// route guard's refusal as `api_error_reply` maps it.
 async fn sharing_board(
     state: &AppState,
     principal: Option<&Principal>,
@@ -97,6 +102,11 @@ async fn sharing_board(
 /// `days` as the tool reads it: absent means the default; a value outside
 /// 1 to 30 is refused (`AI-11` decision 1). A non-integer is refused the
 /// same way, never truncated.
+///
+/// # Errors
+///
+/// The tool-result JSON the model sees: `DAYS_REFUSED` for a `days` that
+/// is not an integer or sits outside 1 to 30.
 fn requested_days(args: &Map<String, Value>) -> Result<i64, Value> {
     let Some(raw) = args.get("days") else {
         return Ok(DEFAULT_DAYS);

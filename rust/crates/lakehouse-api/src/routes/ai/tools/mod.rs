@@ -367,6 +367,11 @@ pub(in crate::routes) async fn dashboard_anywhere(
 /// tools (`tools/sharing.rs`) reply through here so the sentence-producing
 /// line lives at this one reviewed spot instead of a fresh per-file
 /// allowlist entry.
+///
+/// # Errors
+///
+/// The tool-result JSON the model sees, as the routes' own sentence,
+/// whenever `result` is `Err`.
 pub(super) fn api_error_reply<T>(result: Result<T, lakehouse_core::ApiError>) -> Result<T, Value> {
     result.map_err(|err| json!({ "error": err.to_string() }))
 }

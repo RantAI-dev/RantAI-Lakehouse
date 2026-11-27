@@ -3038,7 +3038,7 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "",
     },
-    // AI-11 (plan ai-146): sharing a dashboard. The gate permission is empty
+    // AI-11: sharing a dashboard. The gate permission is empty
     // for the same reason as the embed tools' above: the console's public-link
     // and access routes are signed-in with `manage` in the handler, and the
     // tools run that one guard themselves. The link write waits for a human's

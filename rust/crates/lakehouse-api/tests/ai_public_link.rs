@@ -1,5 +1,5 @@
 //! The dashboard-sharing tools through `POST /api/ai/tool` and the approvals
-//! route (plan ai-146, `AI-11` public-link half): `create_public_link` waits
+//! route (`AI-11` public-link half): `create_public_link` waits
 //! for a human's approval and makes no link before it, a live link keeps its
 //! address when the expiry moves, `days` outside 1 to 30, a non-manager, a
 //! switched-off install and a personal board are refused before any approval
@@ -41,7 +41,7 @@ const PERSONAL_NOT_SHAREABLE: &str =
     "A dashboard in the personal space cannot be shared. Move it to a folder first.";
 
 /// The sharing tools' own bound for `days` (the route allows 1 hour to a
-/// year; the assistant may ask for 1 to 30 days, ai-146 decision 1).
+/// year; the assistant may ask for 1 to 30 days).
 const DAYS_REFUSED: &str = "The link can be made for 1 to 30 days.";
 
 /// The dashboards the stand-in holds: `(id, embed_enabled)`; the personal
@@ -724,6 +724,10 @@ async fn list_dashboard_access_shows_rules_level_link_and_embed_and_never_a_toke
     assert!(
         !has_key(result, "token"),
         "no token anywhere in the answer: {body}"
+    );
+    assert!(
+        !has_key(result, "password"),
+        "no password key anywhere in the answer (`hasPassword`, the flag, is legitimate and stays): {body}"
     );
 }
 

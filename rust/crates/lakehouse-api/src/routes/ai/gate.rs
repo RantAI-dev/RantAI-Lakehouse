@@ -1037,7 +1037,7 @@ pub fn effective_risk(spec: &ToolSpec, args: &Map<String, Value>) -> Risk {
 }
 
 /// [`effective_risk`] with the server-side facts of [`decide_with`]. The
-/// second fact is `move_chart`'s (`AI-11` decision 6, plan ai-146):
+/// second fact is `move_chart`'s (`AI-11` decision 6):
 /// `Some(true)` when moving the chart to the named board lists somebody new
 /// or brings the starting point back, `Some(false)` for the same or narrower
 /// audience, `None` when the comparison cannot be answered — or for every

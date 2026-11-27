@@ -1242,7 +1242,7 @@ async fn chain_rules(
 /// narrower, `None` when the comparison cannot be answered (the gate then
 /// fails closed to an approval).
 ///
-/// The reuse is the point (`AI-11` decision 6, plan ai-146): the per-board
+/// The reuse is the point (`AI-11` decision 6): the per-board
 /// access pair is the same model [`access_preview`] compares for a board move
 /// between folders — a board's own rules, plus the rules of its folder chain
 /// up to the nearest mark, unless the board is itself marked (a mark gives a
@@ -1256,9 +1256,11 @@ async fn chain_rules(
 /// personal board is `None`: the move to it is refused anyway, and a
 /// comparison that pretends to answer would be invented.
 ///
-/// Pure over the store reads; no permission is checked here, because the
-/// caller has already passed the gate's `dashboard:write` check when this
-/// runs, and the answer goes to the gate, never to the model.
+/// Pure over the store reads, and no permission check runs here: the
+/// comparison answers only the gate. Its result never reaches a caller:
+/// the permission refusal precedes the risk-tier branch, so an
+/// unpermissioned caller never observes it, and the chart reads are
+/// caller-scoped through `scope_for_write`.
 pub(crate) async fn move_chart_widens(
     state: &AppState,
     from_board: &str,
