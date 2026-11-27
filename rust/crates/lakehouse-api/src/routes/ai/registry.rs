@@ -3329,8 +3329,9 @@ mod tests {
         // + `list_reports` (`BI-18` D review round 1, SHOULD-FIX 2)
         // + `find_report_recipients` (`AI-30`)
         // + the three dashboard-sharing tools (`AI-11`: `create_public_link`,
-        // `revoke_public_link`, `list_dashboard_access`).
-        assert_eq!(tool_schemas().len(), 126);
+        // `revoke_public_link`, `list_dashboard_access`) + `undo_last_change`
+        // (`AI-21`, which takes the board back to before the assistant's last change).
+        assert_eq!(tool_schemas().len(), 127);
     }
 
     /// `RPT-1` (with `AI-10`): the report tools have the console's permission,
