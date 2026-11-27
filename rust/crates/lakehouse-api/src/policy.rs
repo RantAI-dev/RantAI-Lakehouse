@@ -564,6 +564,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    branch is unchanged. ────────────────────────────────────────────
     ("GET",  "/api/gold/export/{mart}",  Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
     ("POST", "/api/gold/export/{mart}",  Policy::RequiresAuth),
+    // DATA-66 D10: the authored pipeline's after-write ask. The same pair
+    // as the export WRITE — `RequiresAuth` floor plus `check_export_token`
+    // in the handler — which is what the pipeline's own credentials clear.
+    ("POST", "/api/gold/export/{mart}/after-write", Policy::RequiresAuth),
     // History (WS6 item 3): the same read grant as read-back — row counts
     // and run timing, not public data.
     ("GET",  "/api/gold/exports",        Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),

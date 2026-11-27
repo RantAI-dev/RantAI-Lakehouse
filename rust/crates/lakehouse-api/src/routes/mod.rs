@@ -1506,6 +1506,13 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/gold/exports", get(gold::exports))
         .route("/api/gold/export/{mart}/consumers", get(gold::consumers))
+        // DATA-66 D7: the authored op's ask, right after its write. The
+        // longer path is registered beside the export route; POLICY_TABLE
+        // mirrors it below.
+        .route(
+            "/api/gold/export/{mart}/after-write",
+            axum::routing::post(gold::after_write),
+        )
         // DATA-1: per-mart publish-to-Iceberg switches — the scheduler's
         // list of enabled marts, and the per-mart switch the asset page
         // flips. POLICY_TABLE mirrors both paths below.

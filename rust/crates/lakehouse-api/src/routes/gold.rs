@@ -686,6 +686,140 @@ pub async fn export(
     })))
 }
 
+/// `POST /api/gold/export/{mart}/after-write?zone=` — the authored
+/// pipeline's ask (`DATA-66` D7): its write is done, so sync this one
+/// publication now if its mode says so.
+///
+/// The answer is always `200`, with `launched`/`reason`/`runId`, because
+/// nothing here may fail the pipeline that asked (`DATA-66` D3): the
+/// `ClickHouse` write already happened, and the watcher's `change` key
+/// will sync it if this launch does not. `reason` is `publishing_off`
+/// (no row, or switched off), `scheduled`, `manual`, or `not_started`
+/// (the orchestrator refused or could not be reached — the upstream text
+/// goes to the log under a reference id, never into the body; D11).
+///
+/// The launch is the per-table [`crate::iceberg_sync::ICEBERG_SYNC_JOB`]
+/// with the `pipeline` trigger, so it exports and trims one `(zone, mart)`
+/// and carries the tag `dagster.yaml` limits to one run per table (D6).
+///
+/// The pair is `RequiresAuth` in `POLICY_TABLE` plus
+/// [`check_export_token`] here — the same two layers as the export WRITE
+/// it stands beside (D10).
+///
+/// # Errors
+///
+/// Returns 401/503 from [`check_export_token`], 400 for an invalid zone
+/// or mart, the tenant gate's own 404/422/503 (`SEC-50`), or a classified
+/// store failure. A launch failure is never an error status (D11).
+pub async fn after_write(
+    State(state): State<AppState>,
+    Path(mart): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<ExportQuery>,
+    principal: Option<Extension<Principal>>,
+) -> ApiResult<ApiJson<Value>> {
+    let header_token = headers.get("x-run-token").and_then(|v| v.to_str().ok());
+    check_export_token(
+        state.config.gold_export_run_token.as_deref(),
+        header_token,
+        query.token.as_deref(),
+        principal.as_ref().map(|Extension(p)| p),
+    )?;
+
+    let zone = parse_zone(query.zone.as_deref())?;
+    let mart_ident =
+        Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+
+    // The same tenant gate the export makes, so a caller that may not
+    // read the mart cannot ask for its publish either (`SEC-50` R4).
+    let actor = gold_export_gate_actor(principal.as_ref().map(|Extension(p)| p), &headers);
+    gated_source_table(&state, mart_ident.as_str(), actor, zone).await?;
+
+    let pool = pool(&state)?;
+    let publication = lakehouse_store::gold_publication::get_in_zone(
+        pool,
+        zone.namespace_name(),
+        mart_ident.as_str(),
+    )
+    .await
+    .map_err(ApiError::from)?;
+    let reason = match publication.as_ref() {
+        None | Some(GoldPublication { enabled: false, .. }) => Some("publishing_off"),
+        Some(row) => match row.sync_mode {
+            SyncMode::Scheduled => Some("scheduled"),
+            SyncMode::Manual => Some("manual"),
+            SyncMode::OnUpdate => None,
+        },
+    };
+    if let Some(reason) = reason {
+        return Ok(ApiJson(json!({
+            "launched": false,
+            "reason": reason,
+            "runId": null,
+        })));
+    }
+
+    let config = crate::iceberg_sync::run_config(
+        zone,
+        mart_ident.as_str(),
+        crate::iceberg_sync::TRIGGER_PIPELINE,
+    );
+    let target = crate::iceberg_sync::target_tag_value(zone, mart_ident.as_str());
+    let tags = [
+        (
+            crate::iceberg_sync::ICEBERG_SYNC_TARGET_TAG,
+            target.as_str(),
+        ),
+        (
+            crate::iceberg_sync::ICEBERG_SYNC_TRIGGER_TAG,
+            crate::iceberg_sync::TRIGGER_PIPELINE,
+        ),
+    ];
+    match state
+        .dagster
+        .launch_run_with_config_and_tags(crate::iceberg_sync::ICEBERG_SYNC_JOB, &config, &tags)
+        .await
+    {
+        Ok(outcome) if outcome.failure.is_none() => Ok(ApiJson(json!({
+            "launched": true,
+            "reason": null,
+            "runId": outcome.run_id,
+        }))),
+        Ok(outcome) => {
+            // The typed outcome carries no upstream text (the Dagster
+            // client logs that at its boundary), so the fixed label is
+            // the honest whole of what this site knows.
+            tracing::warn!(
+                mart = mart_ident.as_str(),
+                job = crate::iceberg_sync::ICEBERG_SYNC_JOB,
+                failure = outcome
+                    .failure
+                    .map_or("refused", lakehouse_dagster::LaunchFailure::as_str),
+                "DATA-66: the orchestrator refused the sync launch; the watcher retries"
+            );
+            Ok(ApiJson(json!({
+                "launched": false,
+                "reason": "not_started",
+                "runId": null,
+            })))
+        }
+        Err(err) => {
+            // D11: the raw transport text goes to the log under a
+            // reference id, never into the answer (`SEC-11`).
+            crate::upstream_error::report(
+                &crate::upstream_error::SERVICE,
+                crate::upstream_error::Class::Failed,
+                &err,
+            );
+            Ok(ApiJson(json!({
+                "launched": false,
+                "reason": "not_started",
+                "runId": null,
+            })))
+        }
+    }
+}
+
 /// The `latestCopy` field of [`export`]'s answer (D6, D13): the launched
 /// job's table name and status, or `null` when this publish wrote no
 /// copy (a zero-row publish — nothing to copy, and the field says so,

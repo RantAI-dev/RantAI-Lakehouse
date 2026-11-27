@@ -36,6 +36,8 @@ use tower::ServiceExt;
 use common::{
     TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
 };
+use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// ONE `ClickHouse` per test binary, shared by every test: these tests
 /// seed and read `serving.*` marts, and one container per binary is far
@@ -1790,4 +1792,231 @@ async fn publications_list_reports_each_marts_sync_mode() {
     assert_eq!(item["schedule"]["minute"], 15, "{body}");
     assert_eq!(item["timeZone"], "UTC", "{body}");
     assert!(item["nextSyncAt"].is_string(), "{body}");
+}
+
+// ── DATA-66 T4: POST /api/gold/export/{mart}/after-write ──────────────
+
+/// The shared `ClickHouse` plus a `wiremock` Dagster at `dagster_url`,
+/// so the after-write route's launch (or its absence) is observable.
+async fn spin_up_with_dagster_and_clickhouse(dagster_url: String) -> (TestApp, ChClient) {
+    let (ch_url, _container) = shared_clickhouse().await;
+    let mut overrides = HashMap::new();
+    overrides.insert("CH_URL".to_owned(), ch_url.clone());
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    overrides.insert("DAGSTER_URL".to_owned(), dagster_url);
+    let app = spin_up_with_env(&overrides).await;
+    let ch = ChClient::new(ch_url.clone(), "default".to_owned(), String::new());
+    (app, ch)
+}
+
+/// DATA-66 D7: an `on_update` publication is synced through ONE
+/// `launchRun` of `iceberg_sync_job`, carrying the run config (zone,
+/// mart, `pipeline` trigger) and both D6 tags.
+#[tokio::test]
+async fn after_write_launches_one_on_update_sync_with_its_config_and_tags() {
+    let dagster = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "launchRun": {
+                "__typename": "LaunchRunSuccess",
+                "run": { "runId": "run-sync-1" },
+            } }
+        })))
+        .expect(1)
+        .mount(&dagster)
+        .await;
+    let (app, ch) = spin_up_with_dagster_and_clickhouse(format!("{}/graphql", dagster.uri())).await;
+    seed_mart(&ch, "after_write_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    // `on_update` is the mode a switched-on mart gets (D4).
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/after_write_mart/publication",
+        Some(&cookie),
+        Some(serde_json::json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["syncMode"], "on_update", "{body}");
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/after_write_mart/after-write?zone=gold",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["launched"], serde_json::Value::Bool(true), "{body}");
+    assert!(body["reason"].is_null(), "{body}");
+    assert_eq!(body["runId"], "run-sync-1", "{body}");
+
+    let requests = dagster.received_requests().await.expect("the mock records");
+    assert_eq!(requests.len(), 1, "exactly one launch");
+    let sent = String::from_utf8_lossy(&requests[0].body).into_owned();
+    assert!(sent.contains("iceberg_sync_job"), "{sent}");
+    assert!(sent.contains("iceberg_sync_target"), "{sent}");
+    assert!(sent.contains("\"zone\":\"gold\""), "{sent}");
+    assert!(sent.contains("\"mart\":\"after_write_mart\""), "{sent}");
+    assert!(sent.contains("\"trigger\":\"pipeline\""), "{sent}");
+    assert!(sent.contains("lakehouse/iceberg-sync-target"), "{sent}");
+    assert!(sent.contains("gold.after_write_mart"), "{sent}");
+    assert!(sent.contains("lakehouse/iceberg-sync-trigger"), "{sent}");
+}
+
+/// DATA-66 D7/D10: scheduled, manual and switched-off publications start
+/// nothing, and the answer says which. No request reaches Dagster at all.
+#[tokio::test]
+async fn after_write_launches_nothing_for_scheduled_manual_or_switched_off() {
+    let dagster = MockServer::start().await;
+    let (app, ch) = spin_up_with_dagster_and_clickhouse(format!("{}/graphql", dagster.uri())).await;
+    seed_mart(&ch, "after_write_idle").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/after_write_idle/after-write",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["launched"], serde_json::Value::Bool(false), "{body}");
+    assert_eq!(body["reason"], "publishing_off", "{body}");
+    assert!(body["runId"].is_null(), "{body}");
+
+    for (setting, reason) in [
+        (
+            serde_json::json!({ "enabled": true, "syncMode": "manual" }),
+            "manual",
+        ),
+        (
+            serde_json::json!({
+                "enabled": true,
+                "syncMode": "scheduled",
+                "schedule": { "kind": "hourly", "minute": 15 },
+                "timeZone": "UTC",
+            }),
+            "scheduled",
+        ),
+    ] {
+        let (status, body) = send(
+            &sessions.app.router,
+            "PUT",
+            "/api/gold/export/after_write_idle/publication",
+            Some(&cookie),
+            Some(setting),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = send(
+            &sessions.app.router,
+            "POST",
+            "/api/gold/export/after_write_idle/after-write",
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["launched"], serde_json::Value::Bool(false), "{body}");
+        assert_eq!(body["reason"], reason, "{body}");
+    }
+
+    let requests = dagster.received_requests().await.expect("the mock records");
+    assert!(
+        requests.is_empty(),
+        "no mode but on_update may reach the orchestrator: {requests:?}"
+    );
+}
+
+/// DATA-66 D11: a refused launch is `200 not_started`, and the
+/// orchestrator's own text never reaches the answer (`SEC-11`).
+#[tokio::test]
+async fn after_write_answers_not_started_and_never_the_upstream_text() {
+    let dagster = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "launchRun": {
+                "__typename": "PythonError",
+                "message": "upstream-secret-text-9f2",
+                "className": "DagsterUserCodeUnreachableError",
+            } }
+        })))
+        .mount(&dagster)
+        .await;
+    let (app, ch) = spin_up_with_dagster_and_clickhouse(format!("{}/graphql", dagster.uri())).await;
+    seed_mart(&ch, "after_write_refused").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/after_write_refused/publication",
+        Some(&cookie),
+        Some(serde_json::json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/after_write_refused/after-write",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["launched"], serde_json::Value::Bool(false), "{body}");
+    assert_eq!(body["reason"], "not_started", "{body}");
+    assert!(
+        !body.to_string().contains("upstream-secret-text-9f2"),
+        "the orchestrator's text must not reach the answer: {body}"
+    );
+}
+
+/// DATA-66 D11: an orchestrator that cannot be reached is the same
+/// `200 not_started` — the `ClickHouse` write already happened, and the
+/// watcher retries it.
+#[tokio::test]
+async fn after_write_answers_not_started_for_an_unreachable_orchestrator() {
+    let (app, ch) =
+        spin_up_with_dagster_and_clickhouse("http://127.0.0.1:1/graphql".to_owned()).await;
+    seed_mart(&ch, "after_write_unreachable").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/after_write_unreachable/publication",
+        Some(&cookie),
+        Some(serde_json::json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/after_write_unreachable/after-write",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["launched"], serde_json::Value::Bool(false), "{body}");
+    assert_eq!(body["reason"], "not_started", "{body}");
 }

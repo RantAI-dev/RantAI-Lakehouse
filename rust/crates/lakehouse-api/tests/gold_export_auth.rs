@@ -59,7 +59,7 @@ const CATALOG_TENANT: &str = "11111111-1111-4111-8111-000000000001";
 /// scope matters: a no-scope principal authenticates but is refused at
 /// `auth_gate` with `403 permission_denied: gold:read, gold:export` on
 /// `GET /api/gold/export/{mart}` and `GET /api/gold/exports`.
-async fn seed_gold_export_service_credential(pool: &sqlx::PgPool, token: &str) {
+pub(crate) async fn seed_gold_export_service_credential(pool: &sqlx::PgPool, token: &str) {
     let identity = lakehouse_store::identity::create_service_identity(
         pool,
         &lakehouse_store::identity::CreateServiceIdentityInput {

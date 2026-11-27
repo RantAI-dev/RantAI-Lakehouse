@@ -40,6 +40,8 @@
 
 use crate::common;
 
+use std::collections::HashMap;
+
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use lakehouse_api::policy::{POLICY_TABLE, Policy};
@@ -4554,6 +4556,62 @@ async fn the_door_needs_the_iceberg_read_scope_and_a_service_identity() {
             resp.status()
         );
     }
+}
+
+/// `DATA-66` D7/D10: `POST /api/gold/export/{mart}/after-write` is the
+/// authored pipeline's ask. `POLICY_TABLE` floors it at `RequiresAuth`
+/// and the handler adds `check_export_token`, the export WRITE's pair:
+/// no credentials is a 401, and the scheduler's own credential pair (the
+/// seeded `gold-export-scheduler` identity plus the shared run token)
+/// clears both and reaches the handler, whose honest answer for a mart
+/// nobody switched on is `200 publishing_off`.
+#[tokio::test]
+async fn the_after_write_route_requires_credentials_and_accepts_the_scheduler_pair() {
+    const TOKEN: &str = "data66-after-write-token";
+    /// The tenant that owns the shared catalog — Meridian Group, the first
+    /// tenant `0002_seed_identity.sql` seeds.
+    const CATALOG_TENANT: &str = "11111111-1111-4111-8111-000000000001";
+    let mut overrides = HashMap::new();
+    overrides.insert("GOLD_EXPORT_RUN_TOKEN".to_owned(), TOKEN.to_owned());
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+    crate::gold_export_auth::seed_gold_export_service_credential(&pool, TOKEN).await;
+
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/gold/export/mart_x/after-write")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(
+        anonymous.status(),
+        StatusCode::UNAUTHORIZED,
+        "no credential must not reach the handler"
+    );
+
+    let scheduler = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/gold/export/mart_x/after-write")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("x-run-token", TOKEN)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    let status = scheduler.status();
+    assert!(
+        !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+        "the scheduler's own credential pair must clear both layers, got {status}"
+    );
 }
 
 // `BI-40` T2 (`D1`, `D2`, `D6`): `POST /api/alerts/test` is a person's door, so
