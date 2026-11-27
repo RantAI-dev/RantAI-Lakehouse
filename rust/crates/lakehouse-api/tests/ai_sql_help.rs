@@ -646,8 +646,11 @@ const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
 // draft") and carries no zone words, so this pin does not move; the zone
 // wording is pinned by `tests/fixtures/tool_schemas.json` instead. The
 // offered-tool list above is untouched — no tool was added or removed.
+//
+// Updated by hand for PR #735 (`AI-13`): the pin follows the ASK prompt's
+// text, which gained the chart-lineage sentence. (Before: `61ee2789...d159`.)
 const SYSTEM_SHA256_WITHOUT_ALLOWLIST: &str =
-    "61ee27897923e5f8bdbd74f359bd2086f65e23948a685f742b819e71e113d159";
+    "233ecf8228edaf1ff021f27e25b0993985ba7d0738d971b125d779e7154e8c4f";
 
 fn sha256_hex(text: &str) -> String {
     use std::fmt::Write as _;

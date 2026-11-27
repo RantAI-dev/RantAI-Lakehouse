@@ -1314,6 +1314,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // action, with the handler's own no-escalation check on top (a caller
     // without *:*/identity:write may only grant roles it holds itself).
     ("PUT",  "/api/agents/employees/{id}/read-roles", Policy::RequiresPermission("agent:manage")),
+    // SEC-76: the organisation an agent works in is an agent:manage action
+    // too. The handler adds the membership check: a caller must belong to
+    // the organisation it sets, or be unrestricted (`*:*`).
+    ("PUT",  "/api/agents/employees/{id}/tenant", Policy::RequiresPermission("agent:manage")),
     // `/employees/{id}/run` (T3.2, copilot-operations-handover plan): same
     // "floor" shape as `/api/alerts/run`/`/api/gold/export/{mart}` —
     // `RequiresAuth` here, PLUS `routes::agents::check_employee_run_auth`'s

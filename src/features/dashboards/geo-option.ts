@@ -157,13 +157,28 @@ export function buildGeoOption(spec: GeoSpec, rows: Row[], dark: boolean, look: 
   });
   const geo = { map: mapId, ...roam, silent: true, label: { show: false }, itemStyle: land };
 
+  // The tooltip of a point on the map: its name (the coordinates when there is none) and its value.
+  const pointTip = (p: unknown) => {
+    const o = p as { name: string; value: number[] };
+    const [lon, lat, value] = o.value;
+    // No label column: the coordinates are the only honest name.
+    const title = o.name ? escapeHtml(o.name) : `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
+    return `${title}<br/><b>${fmtInt(value)}</b>`;
+  };
+
   if (spec.kind === "geoheat") {
     const option: EChartsOption = {
-      ...base, tooltip: { show: false }, geo,
+      // BI-73 (f): the density map answers the pointer like the point map. A heat layer has no
+      // shapes to hover, so an invisible point on each row carries the tooltip.
+      ...base, tooltip: { ...tooltip, show: true, trigger: "item", formatter: pointTip }, geo,
       visualMap: visualMap(HEAT_RAMP, false),
       series: [{
         type: "heatmap", coordinateSystem: "geo", pointSize: 9, blurSize: 16,
         data: set.points.map((p) => [p.lon, p.lat, p.value]),
+      }, {
+        type: "scatter", coordinateSystem: "geo", z: 5, symbolSize: 14, itemStyle: { opacity: 0 },
+        emphasis: { disabled: true },
+        data: set.points.map((p) => ({ name: p.label, value: [p.lon, p.lat, p.value] })),
       }],
     };
     return { option, notices };
@@ -175,13 +190,7 @@ export function buildGeoOption(spec: GeoSpec, rows: Row[], dark: boolean, look: 
     ...base,
     tooltip: {
       ...tooltip, trigger: "item",
-      formatter: (p: unknown) => {
-        const o = p as { name: string; value: number[] };
-        const [lon, lat, value] = o.value;
-        // No label column: the coordinates are the only honest name.
-        const title = o.name ? escapeHtml(o.name) : `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
-        return `${title}<br/><b>${fmtInt(value)}</b>`;
-      },
+      formatter: pointTip,
     },
     geo,
     visualMap: visualMap(look.byValue ?? POINT_RAMP(dark), true),

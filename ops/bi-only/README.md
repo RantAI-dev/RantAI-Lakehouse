@@ -78,8 +78,9 @@ warehouse-only sidebar pages and offers only that engine in Query Studio
      --env-file .env -p lakehouse-bi up -d
    ```
 
-   `POSTGRES_PASSWORD`, `LAKEHOUSE_DB_APP_PASSWORD` and
-   `CONNECTOR_SECRETS_KEY` are must-set (no default credential is baked
+   `POSTGRES_PASSWORD`, `LAKEHOUSE_DB_APP_PASSWORD`,
+   `LAKEHOUSE_DB_SOURCE_READER_PASSWORD` and `CONNECTOR_SECRETS_KEY` are
+   must-set (no default credential is baked
    into either file). `AUTH_BOOTSTRAP_EMAIL` and
    `AUTH_BOOTSTRAP_PASSWORD` are needed to sign in for the first time.
 

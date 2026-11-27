@@ -120,6 +120,8 @@ services:
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${POSTGRES_DB:-lakehouse}
       LAKEHOUSE_DB_APP_PASSWORD: ${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      # SEC-84: the read-only source role is created by this same migrate step.
+      LAKEHOUSE_DB_SOURCE_READER_PASSWORD: ${LAKEHOUSE_DB_SOURCE_READER_PASSWORD:?LAKEHOUSE_DB_SOURCE_READER_PASSWORD is required (the read-only source role's password; run ops/init-env.sh or see docs/OPERATIONS.md)}
 
   # ── The API. The two `LAKEHOUSE_*` variables are the installation mode
   # and the engine; config resolution refuses to start if a second engine
@@ -154,7 +156,9 @@ services:
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
       AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
       DATABASE_URL: ${DATABASE_URL:-postgres://lakehouse_app:${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${POSTGRES_DB:-lakehouse}}
-      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
+      # SEC-84: the seeded connector dials as `lakehouse_source_reader`, so
+      # its secret is that role's password. The API pool stays on DATABASE_URL.
+      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${LAKEHOUSE_DB_SOURCE_READER_PASSWORD:?LAKEHOUSE_DB_SOURCE_READER_PASSWORD is required (the read-only source role's password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       CONNECTOR_TLS_CA_FILE: ${CONNECTOR_TLS_CA_FILE:-/run/certs/postgres/ca.crt}
       CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS: ${CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS:-}
       CONNECTOR_PROBE_ALLOWED_CIDRS: ${CONNECTOR_PROBE_ALLOWED_CIDRS:-}

@@ -78,7 +78,16 @@ const DIGEST_MAX: usize = 300;
 /// is `lakehouse-bi/src/builder.rs`'s `limit_value().unwrap_or(20)`, used at
 /// its three query-build sites; `the_reported_default_cap_matches_every_builder_default`
 /// reads that source at compile time and fails if the two drift apart.
-const DEFAULT_CHART_LIMIT: u32 = 20;
+pub(super) const DEFAULT_CHART_LIMIT: u32 = 20;
+
+/// The cap a chart relies on, when one is reported at all (`AI-36` F5). A bin
+/// cuts its dimension to the builder's default rows; a `limit` shows more and
+/// a BI-46 breakdown cap cuts a different set, so neither one is reported as
+/// the default. Keeping the test here, with the number, is what lets the
+/// digest, the saved result and the draft result carry the same marker.
+pub(super) fn default_cap(def: &ChartInput, caps_built: bool) -> Option<u32> {
+    (def.shape.bin.is_some() && def.limit.is_none() && !caps_built).then_some(DEFAULT_CHART_LIMIT)
+}
 
 /// The `limit: …` part of [`definition_digest`] (`BI-46`, plan D15), or `None`
 /// when the chart has no limit and nothing to say about one.
@@ -168,23 +177,21 @@ fn limit_digest(def: &ChartInput, breakdown: Option<&str>, caps_built: bool) -> 
         return Some(part);
     }
     // F5: the builder caps rows at `DEFAULT_CHART_LIMIT` when the call sets
-    // no `limit`. Say so when the capped dimension is a bin, and only when
-    // no other cap was built — `caps_built` is the BI-46 breakdown cap, and
-    // naming the default beside it would describe a cut the chart does not
-    // make. A `limit` shows more than the default.
-    let default_cap = def.shape.bin.is_some() && !caps_built;
+    // no `limit`. [`default_cap`] also feeds the result fields the reply
+    // reads, so the digest never claims a cap the result does not carry.
+    let cap = default_cap(def, caps_built);
     let mut part = String::new();
     if def.shape.sort.is_some() || breakdown.is_some() {
         part.push_str("limit: none (default applies)");
     }
-    if default_cap {
+    if let Some(cap) = cap {
         use std::fmt::Write;
         if !part.is_empty() {
             part.push_str("; ");
         }
         let _ = write!(
             part,
-            "shows at most {DEFAULT_CHART_LIMIT} values by default; set a `limit` to show more"
+            "shows at most {cap} values by default; set a `limit` to show more"
         );
     }
     if !part.is_empty() {
@@ -735,17 +742,24 @@ pub(super) async fn create_chart(
             Ok(()) => {
                 place_new_chart(ch, &spec.board, &spec.spec.id).await;
                 snapshot_as(ch, &spec.board, principal).await;
-                json!({
+                let caps = caps_in_statement(&input, &spec.spec.sql);
+                let mut reply = json!({
                 "created": true,
                 "id": spec.spec.id,
                 "title": spec.spec.title,
                 "kind": spec.spec.kind,
                 "mart": spec.spec.mart,
                 "board": spec.board,
-                "definition": definition_digest(&input, caps_in_statement(&input, &spec.spec.sql)),
+                "definition": definition_digest(&input, caps),
                 "url": "/dashboards",
                 "note": "Chart tersimpan & langsung tampil di halaman Dashboards.",
-                })
+                });
+                // F5: the reply is told the cap as a number, so the turn can
+                // say it without parsing the digest's sentence.
+                if let Some(cap) = default_cap(&input, caps) {
+                    reply["defaultCap"] = json!(cap);
+                }
+                reply
             }
             Err(failure) => failure_as_tool_reply(failure),
         },
@@ -901,7 +915,8 @@ async fn prepare_chart(
 ///
 /// A draft that builds returns the digest of the definition the save would
 /// store, for a create the call's own and for an update the stored chart
-/// merged with the call.
+/// merged with the call, and the default cap when the chart relies on one
+/// (`AI-36` F5).
 ///
 /// # Errors
 ///
@@ -912,15 +927,26 @@ pub(super) async fn check_chart_draft(
     args: &Map<String, Value>,
     id: Option<String>,
     time: &lakehouse_bi::grain::TimeContext,
-) -> Result<String, Value> {
+) -> Result<ChartDraft, Value> {
     let PreparedChart { input, .. } = prepare_chart(ch, viewer, id.as_deref(), args, time).await?;
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
-        Ok(spec) => Ok(definition_digest(
-            &input,
-            caps_in_statement(&input, &spec.spec.sql),
-        )),
+        Ok(spec) => {
+            let caps = caps_in_statement(&input, &spec.spec.sql);
+            Ok(ChartDraft {
+                definition: definition_digest(&input, caps),
+                default_cap: default_cap(&input, caps),
+            })
+        }
         Err(err) => Err(upstream_error::bi(&upstream_error::DATABASE, &err).to_json()),
     }
+}
+
+/// What a draft says about the chart it would save (F5): the definition
+/// digest, and the builder's default cap only when the chart relies on it.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ChartDraft {
+    pub(super) definition: String,
+    pub(super) default_cap: Option<u32>,
 }
 
 pub(super) async fn update_chart(
@@ -962,6 +988,7 @@ pub(super) async fn update_chart(
                         snapshot_as(ch, &old_board, principal).await;
                     }
                     snapshot_as(ch, &spec.board, principal).await;
+                    let caps = caps_in_statement(&input, &spec.spec.sql);
                     let mut reply = json!({
                         "updated": true,
                         "id": spec.spec.id,
@@ -969,12 +996,14 @@ pub(super) async fn update_chart(
                         "kind": spec.spec.kind,
                         "mart": spec.spec.mart,
                         "board": spec.board,
-                        "definition": definition_digest(
-                            &input,
-                            caps_in_statement(&input, &spec.spec.sql),
-                        ),
+                        "definition": definition_digest(&input, caps),
                         "formattingKept": formatting_kept,
                     });
+                    // F5: as on create, the marker is a number the turn can
+                    // read without parsing the digest.
+                    if let Some(cap) = default_cap(&input, caps) {
+                        reply["defaultCap"] = json!(cap);
+                    }
                     if source_kept {
                         reply["sourceKept"] = json!(true);
                     }
@@ -3583,6 +3612,53 @@ mod tests {
         assert!(digest.contains("`limit`"), "{digest}");
     }
 
+    /// F5 (review round 2): a bin with a `limit` shows the limit's rows, so no
+    /// default cap is reported for it.
+    #[test]
+    fn default_cap_is_none_for_a_bin_that_sets_a_limit() {
+        let def = input(json!({
+            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "visitors",
+            "measures": ["spend"],
+            "bin": { "mode": "count", "count": 10 },
+            "limit": 5,
+        }));
+        assert_eq!(default_cap(&def, false), None);
+    }
+
+    /// F5 (review round 2): a chart with no bin is cut by no default cap.
+    #[test]
+    fn default_cap_is_none_for_a_chart_without_a_bin() {
+        let def = input(json!({
+            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "visitors",
+            "measures": ["spend"],
+        }));
+        assert_eq!(default_cap(&def, false), None);
+    }
+
+    /// F5 (review round 2): when the statement already caps a breakdown, the
+    /// default cap is not reported for a bin that has no `limit`.
+    #[test]
+    fn default_cap_is_none_for_a_bin_without_a_limit_when_the_caps_are_built() {
+        let def = input(json!({
+            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "visitors",
+            "measures": ["spend"],
+            "bin": { "mode": "count", "count": 10 },
+        }));
+        assert_eq!(default_cap(&def, true), None);
+    }
+
+    /// F5 (review round 2): a bin with no `limit` and no built breakdown cap
+    /// reports the builder's default of 20.
+    #[test]
+    fn default_cap_is_twenty_for_a_bin_without_a_limit() {
+        let def = input(json!({
+            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "visitors",
+            "measures": ["spend"],
+            "bin": { "mode": "count", "count": 10 },
+        }));
+        assert_eq!(default_cap(&def, false), Some(20));
+    }
+
     /// F5: the cap the tool reports must track the builder's own default. The
     /// builder has no public constant, so read its source at compile time and
     /// fail here if any of its three `limit_value().unwrap_or(N)` sites drifts
@@ -3695,7 +3771,10 @@ mod tests {
             ),
             "{saved}"
         );
-        assert_eq!(saved["definition"].as_str(), Some(draft.as_str()));
+        assert_eq!(
+            saved["definition"].as_str(),
+            Some(draft.definition.as_str())
+        );
     }
 
     /// A stored bar whose formatting names a column the chart no longer
@@ -3800,7 +3879,7 @@ mod tests {
         .await
         .expect("the draft builds");
         assert_eq!(
-            draft,
+            draft.definition,
             "dimension: province; breakdown: region; measures: visitors; limit: none (default applies)"
         );
     }

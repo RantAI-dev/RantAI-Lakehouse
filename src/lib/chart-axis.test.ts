@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert"
 import { test } from "node:test"
-import { decimalsFor, formatCompactNumber, formatNumber, monthlyAxisLabel } from "./chart-axis"
+import { decimalsFor, formatCompactNumber, formatNumber, isOrderedAxis, monthlyAxisLabel } from "./chart-axis"
 
 const months = (from: number, to: number) =>
   Array.from({ length: (to - from + 1) * 12 }, (_, i) => `${from + Math.floor(i / 12)}-${String((i % 12) + 1).padStart(2, "0")}`)
@@ -57,4 +57,14 @@ test("negatives and non-finite values are handled", () => {
   assert.equal(formatCompactNumber(-1500, 0), "-1.5K")
   assert.equal(decimalsFor([Number.NaN, Infinity, 3]), 0)
   assert.equal(decimalsFor([]), 0)
+})
+
+test("isOrderedAxis: dates, months, years and numbers are ordered; names are not", () => {
+  assert.equal(isOrderedAxis(["2024", "2025", "2026"]), true)
+  assert.equal(isOrderedAxis(["2026-01", "2026-02"]), true)
+  assert.equal(isOrderedAxis(["2026-01-05", "2026-01-06"]), true)
+  assert.equal(isOrderedAxis(["Jan 2026", "Feb 2026", "Q1 2026", "Mon", "09:00", "W14", "5 Mar 2026"]), true)
+  assert.equal(isOrderedAxis(["Aceh", "Bali", "Jawa"]), false)
+  assert.equal(isOrderedAxis(["2026", "Other"]), false)
+  assert.equal(isOrderedAxis([]), false)
 })

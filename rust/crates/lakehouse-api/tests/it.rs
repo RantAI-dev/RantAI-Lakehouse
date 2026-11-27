@@ -54,6 +54,7 @@ mod agents_approval;
 // WEB-4: `agents_employee_ceiling` tested the retired employee-create
 // route's `agent:manage` ceiling; the route and its tests were removed.
 mod agents_run;
+mod agents_tenant;
 mod ai_alert_tools;
 mod ai_ask_back_turn;
 mod ai_build_tool_list;
@@ -65,8 +66,10 @@ mod ai_comment_tool;
 mod ai_dashboard_reach;
 mod ai_embed_tools;
 mod ai_export_tools;
+mod ai_lineage_chart_tool;
 mod ai_next_step;
 mod ai_prompt_size;
+mod ai_public_link;
 mod ai_report_tools;
 mod ai_sessions;
 mod ai_sql_help;
@@ -125,6 +128,7 @@ mod frame_check;
 mod gold_export_auth;
 mod gold_latest_copy;
 mod gold_publication;
+mod governance_policy_tenant_reach;
 mod home_layout;
 mod iceberg_door;
 mod identity_deactivate;

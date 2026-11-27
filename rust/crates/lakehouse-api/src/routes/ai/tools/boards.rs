@@ -82,6 +82,39 @@ fn arg_str(args: &Map<String, Value>, key: &str) -> String {
         .to_owned()
 }
 
+/// `AI-11` decision 6: the server-side fact the gate needs before it decides
+/// a `move_chart` call — `Some(true)` when moving the chart to the named
+/// board widens who can see it, `Some(false)` for the same or narrower
+/// audience, `None` when the comparison cannot be answered (the gate then
+/// fails closed to an approval). Looked up at every dispatch site
+/// (`gate_facts`), never put in the arguments, and `None` for any other tool.
+///
+/// The chart is read through the caller's own write scope, as `move_chart`
+/// itself reads it: a chart the caller cannot see or that is not there
+/// cannot be compared, so the answer is `None` and nobody learns whether a
+/// chart they cannot see exists. The boards' comparison itself is
+/// `dashboard_access::move_chart_widens`, the same access model
+/// `GET /api/dashboard/access-preview` uses.
+pub(in crate::routes) async fn move_widens(
+    state: &AppState,
+    principal: Option<&Principal>,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Option<bool> {
+    if name != "move_chart" {
+        return None;
+    }
+    let principal = principal?;
+    let scope = super::scope_for_write(state, Some(principal)).await.ok()?;
+    let stored = store::list_stored_charts(&state.clickhouse, &scope.viewer)
+        .await
+        .ok()?;
+    let id = arg_str(args, "id");
+    let chart = stored.iter().find(|c| c.spec.id == id)?;
+    crate::routes::dashboard_access::move_chart_widens(state, &chart.board, &arg_str(args, "board"))
+        .await
+}
+
 fn arg_obj<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&'a Map<String, Value>> {
     args.get(key).and_then(Value::as_object)
 }

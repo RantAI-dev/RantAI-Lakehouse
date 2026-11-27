@@ -31,6 +31,8 @@ use common::{
 const MART: &str = "mart_seeded_sales";
 const COLUMN: &str = "region_code";
 const MEASURE: &str = "sale_total";
+/// A second numeric column, so a binned numeric dimension is not also the measure.
+const MEASURE_TWO: &str = "sale_count";
 /// A second text column, for a breakdown.
 const SECOND_COLUMN: &str = "sale_month";
 
@@ -89,7 +91,7 @@ fn rows(data: &Value) -> ResponseTemplate {
 }
 
 /// `ClickHouse` for a chart draft. `mart_exists` decides whether the
-/// `serving` count finds the mart; the columns query returns the three columns above and no
+/// `serving` count finds the mart; the columns query returns the four columns above and no
 /// other column. Anything else (the saved fields, the `CREATE`/`ALTER` DDL)
 /// gets an empty answer, and an `INSERT` is recorded by `statements`.
 async fn mock_clickhouse(mart_exists: bool) -> MockServer {
@@ -107,6 +109,7 @@ async fn mock_clickhouse(mart_exists: bool) -> MockServer {
             { "name": COLUMN, "type": "String" },
             { "name": SECOND_COLUMN, "type": "String" },
             { "name": MEASURE, "type": "Float64" },
+            { "name": MEASURE_TWO, "type": "Float64" },
         ])))
         .mount(&ch)
         .await;
@@ -652,6 +655,104 @@ async fn a_claim_of_a_chart_that_no_tool_saved_is_replaced_by_the_fixed_sentence
     assert_eq!(body["note"], "tool-call limit reached", "{body}");
 }
 
+/// AI-36 F5: a binned chart with no `limit` is cut by the builder's default
+/// row cap. The draft's result carries the cap, so the server says it even
+/// though the model's own answer does not mention it.
+#[tokio::test]
+async fn a_binned_chart_draft_with_no_limit_makes_the_reply_name_the_default_cap() {
+    // A bin needs a bar: `chart_args` makes a table, which refuses bins. Its
+    // measure must differ from the binned column, or the call is refused for
+    // grouping by its own measure.
+    let mut args: Value =
+        serde_json::from_str(&chart_args_with(MEASURE, "kind", json!("bar"))).unwrap();
+    args["measures"] = json!([MEASURE_TWO]);
+    args["bin"] = json!({ "mode": "width", "width": 10 });
+    let args = args.to_string();
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "create_chart", &args)]),
+        model_round(Some("Drafted a chart of sales by bin."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(true).await;
+
+    let (status, body) = chat(&llm, &ch, "Make a chart binned by sale total.").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let step = traced_step(&body, "create_chart");
+    assert_eq!(step["result"]["needs_confirmation"], json!(true), "{body}");
+    assert_eq!(step["result"]["defaultCap"], json!(20), "{body}");
+    let answer = body["answer"].as_str().unwrap_or_default();
+    assert!(
+        answer.ends_with(
+            "This chart shows at most 20 values by default; set a `limit` to show more."
+        ),
+        "{body}"
+    );
+}
+
+/// A bar chart binned by width over `MEASURE`, with the measure `MEASURE_TWO`:
+/// the shape the default-cap tests save, with or without a `limit`.
+fn binned_chart_args(extra: &Value) -> Value {
+    let mut args = json!({
+        "title": "Sales by bin",
+        "kind": "bar",
+        "mart": MART,
+        "dimension": MEASURE,
+        "measures": [MEASURE_TWO],
+        "bin": { "mode": "width", "width": 10 },
+    });
+    for (key, value) in extra.as_object().into_iter().flatten() {
+        args[key] = value.clone();
+    }
+    args
+}
+
+/// AI-36 F5 (review round 2): the saved reply of a binned chart with no `limit`
+/// carries the cap as a number, so the turn can say it after the confirm.
+#[tokio::test]
+async fn a_binned_chart_saved_with_no_limit_reports_the_default_cap_in_its_result() {
+    let llm = mock_model(vec![]).await;
+    let ch = mock_clickhouse(true).await;
+    let args = binned_chart_args(&json!({ "confirmed": true }));
+
+    let (status, saved) = tool_call(&llm, &ch, "create_chart", &args.to_string()).await;
+
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["result"]["created"], json!(true), "{saved}");
+    assert_eq!(saved["result"]["defaultCap"], json!(20), "{saved}");
+}
+
+/// AI-36 F5 (review round 2): a binned chart that sets its own `limit` is not
+/// cut by the default, so its saved result carries no `defaultCap`.
+#[tokio::test]
+async fn a_binned_chart_saved_with_a_limit_reports_no_default_cap() {
+    let llm = mock_model(vec![]).await;
+    let ch = mock_clickhouse(true).await;
+    let args = binned_chart_args(&json!({ "confirmed": true, "limit": 5 }));
+
+    let (status, saved) = tool_call(&llm, &ch, "create_chart", &args.to_string()).await;
+
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["result"]["created"], json!(true), "{saved}");
+    assert!(saved["result"].get("defaultCap").is_none(), "{saved}");
+}
+
+/// AI-36 F5 (review round 2): the confirmed update of a binned chart with no
+/// `limit` reports the default cap in its result, as the create does.
+#[tokio::test]
+async fn a_binned_update_saved_with_no_limit_reports_the_default_cap_in_its_result() {
+    let llm = mock_model(vec![]).await;
+    let ch = mock_clickhouse_with_stored_chart("", false).await;
+    let mut args = binned_chart_args(&json!({ "confirmed": true }));
+    args["id"] = json!(STORED_CHART);
+
+    let (status, saved) = tool_call(&llm, &ch, "update_chart", &args.to_string()).await;
+
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["result"]["updated"], json!(true), "{saved}");
+    assert_eq!(saved["result"]["defaultCap"], json!(20), "{saved}");
+}
+
 /// The chart the update tests name, and the board it is filed on.
 const STORED_CHART: &str = "c_stored";
 const STORED_BOARD: &str = "b_stored";
@@ -742,6 +843,7 @@ async fn mock_clickhouse_with_stored_chart(owner: &str, stale_format: bool) -> M
             { "name": COLUMN, "type": "String" },
             { "name": SECOND_COLUMN, "type": "String" },
             { "name": MEASURE, "type": "Float64" },
+            { "name": MEASURE_TWO, "type": "Float64" },
         ])))
         .mount(&ch)
         .await;

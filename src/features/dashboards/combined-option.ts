@@ -1,6 +1,7 @@
 import { displayColumn } from "@/lib/chart-joins";
 import type { EChartsOption } from "echarts";
 import { decimalsFor, monthlyAxisLabel } from "@/lib/chart-axis";
+import { categoryAxisLabel } from "./category-labels";
 import { categoryLabel } from "@/lib/chart-transforms";
 import { resolvePalette } from "@/lib/chart-palettes";
 import type { StyleFields } from "@/lib/chart-style";
@@ -113,16 +114,23 @@ export function cutLayers(layers: readonly LayerCell[] | undefined): string[] {
 
 /**
  * The categories of the chart: the base's, then those only a layer has. Dates
- * (buckets or days) read best in date order, so they are sorted; anything else
- * keeps the base's order and appends the new values after it.
+ * (buckets or days) and numbers (years, numeric buckets) read best in order,
+ * so they are sorted, a layer-only 2019 landing before 2020 (`BI-67`); anything
+ * else keeps the base's order and appends the new values after it.
  */
+const NUMERIC_KEY = /^-?\d+(\.\d+)?$/;
+
 export function categoryKeys(baseRows: readonly Row[], x: string, layers: readonly LayerCell[]): string[] {
   const seen = new Set<string>();
   const keys: string[] = [];
   const add = (k: string) => { if (!seen.has(k)) { seen.add(k); keys.push(k); } };
   for (const r of baseRows) add(text(r[x]));
   for (const l of layers) if (answered(l)) for (const r of l.rows) add(text(r[dimensionOf(l)]));
-  return keys.length && keys.every((k) => ISO_DATE.test(k)) ? [...keys].sort() : keys;
+  if (!keys.length) return keys;
+  if (keys.every((k) => ISO_DATE.test(k))) return [...keys].sort();
+  // Compared as numbers, so 9 sorts before 10; the strict pattern keeps "2020-Q1" or "" (which Number() reads as 0) on the unsorted path.
+  if (keys.every((k) => NUMERIC_KEY.test(k))) return [...keys].sort((a, b) => Number(a) - Number(b));
+  return keys;
 }
 
 type Series = { name: string; type: LayerDraw; axis: LayerAxis; values: (number | null)[]; owner: number; area: boolean; off: boolean };
@@ -213,7 +221,7 @@ export function buildCombinedOption(input: CombinedInput, dark: boolean): Combin
     grid: { left: 8, right: 16, top: 34, bottom: 8, containLabel: true },
     xAxis: {
       type: "category", data: labels,
-      axisLabel: { color: ink, fontSize: 11, interval: 0, hideOverlap: true, rotate: labels.length > 6 ? 28 : 0, ...monthlyAxisLabel(labels) },
+      axisLabel: { ...categoryAxisLabel(ink), ...monthlyAxisLabel(labels) },
       axisLine: { lineStyle: { color: split } }, axisTick: { show: false },
     },
     yAxis: sides.map((side) => ({

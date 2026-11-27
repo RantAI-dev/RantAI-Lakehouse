@@ -101,8 +101,21 @@ async fn targets_only_the_owner(state: &AppState, owner: &str, rule: &AlertRule)
             .is_some_and(|own| own == rule.target.trim().to_ascii_lowercase())
 }
 
-/// Read one chart rule's number as its owner.
-async fn read(state: &AppState, rule: &AlertRule) -> Result<Reading, Unreadable> {
+/// The number locale a message writes its values in: the workspace's, from
+/// Settings, Reporting (`BI-73`, finding e), the one the console reads. When the
+/// setting cannot be read the message is written in the default locale and the
+/// gap is logged, so an unreadable setting never stops an alert from being sent.
+pub(crate) async fn number_locale(state: &AppState) -> String {
+    if let Ok(settings) = crate::routes::settings::format_settings(state).await {
+        settings.number_locale
+    } else {
+        tracing::warn!("alerts: the number locale could not be read, the default is used");
+        crate::routes::settings::FormatSettings::default().number_locale
+    }
+}
+
+/// Read one chart rule's number as its owner, its numbers written in `locale`.
+async fn read(state: &AppState, rule: &AlertRule, locale: &str) -> Result<Reading, Unreadable> {
     let ch = &state.clickhouse;
     let Some(owner) = rule.owner_id.as_deref() else {
         return Err(Unreadable::Stop(NO_OWNER));
@@ -204,7 +217,7 @@ async fn read(state: &AppState, rule: &AlertRule) -> Result<Reading, Unreadable>
     }
     let value = lakehouse_alerts::chart_number(shape, rule.series.as_deref(), &columns, rows)
         .map_err(Unreadable::Failed)?;
-    Ok(Reading::against_threshold(rule, &watched, value))
+    Ok(Reading::against_threshold(rule, &watched, value, locale))
 }
 
 /// The 15-minute pass over every enabled chart rule (`only` narrows it to one
@@ -224,6 +237,7 @@ pub(crate) async fn evaluate(
             return Vec::new();
         }
     };
+    let locale = number_locale(state).await;
     let mut out = Vec::new();
     for rule in rules.iter().filter(|r| {
         r.enabled
@@ -231,7 +245,7 @@ pub(crate) async fn evaluate(
             && r.chart.is_some()
             && only.is_none_or(|id| id == r.id)
     }) {
-        out.push(match read(state, rule).await {
+        out.push(match read(state, rule, &locale).await {
             Ok(reading) => {
                 lakehouse_alerts::settle(senders, silence, states, rule, Ok(reading)).await
             }

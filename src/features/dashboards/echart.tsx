@@ -4,6 +4,7 @@ import * as React from "react";
 import * as echarts from "echarts";
 import type { ChartHit } from "@/lib/chart-click";
 import { readView, withView } from "@/lib/geo-view";
+import { fitCategoryLabels, fitSignature } from "./category-labels";
 import { useRenderMode } from "./render-mode";
 
 /**
@@ -74,6 +75,9 @@ export function EChart({
   const chartCbRef = React.useRef(onChart);
   React.useEffect(() => { chartCbRef.current = onChart; }, [onChart]);
   const hasOption = React.useRef(false);
+  // BI-73: the option as built (before it was fitted to the tile's width) and what the fit decided.
+  const rawRef = React.useRef<echarts.EChartsOption | null>(null);
+  const fitRef = React.useRef<string | null>(null);
   // BI-32: the fingerprint of the option the chart now shows.
   const appliedKey = React.useRef<string | null>(null);
   // BI-1: under the PDF print view the chart draws without animation and
@@ -109,7 +113,19 @@ export function EChart({
         { x: ev?.clientX ?? 0, y: ev?.clientY ?? 0 },
       );
     });
-    const ro = new ResizeObserver(() => chart.resize());
+    const ro = new ResizeObserver(() => {
+      chart.resize();
+      // BI-73 (a, b): the label rule follows the tile's width (a drag, a side panel).
+      const el = elRef.current;
+      const raw = rawRef.current;
+      if (!el || !raw) return;
+      const fitted = fitCategoryLabels(raw, el.clientWidth);
+      const sig = fitSignature(fitted);
+      if (sig === fitRef.current) return;
+      fitRef.current = sig;
+      // A clean replace (a merge would keep the old label width), without replaying the entrance.
+      chart.setOption({ ...fitted, animation: false }, true);
+    });
     ro.observe(elRef.current);
     return () => {
       ro.disconnect();
@@ -135,7 +151,10 @@ export function EChart({
     if (appliedKey.current === key) return;
     appliedKey.current = key;
     // The first option has no view to keep (getOption would be empty).
-    const base = keepView && hasOption.current ? withView(option, readView(chart.getOption())) : option;
+    rawRef.current = option;
+    const sized = fitCategoryLabels(option, elRef.current?.clientWidth ?? 0);
+    fitRef.current = fitSignature(sized);
+    const base = keepView && hasOption.current ? withView(sized, readView(chart.getOption())) : sized;
     const timed = live ? { ...base, animationDurationUpdate: 500, animationEasingUpdate: "cubicOut" as const } : base;
     const next = renderMode ? { ...timed, animation: false } : timed;
     // notMerge=true so theme/option changes are clean (no stacking of old series);

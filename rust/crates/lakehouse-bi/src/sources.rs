@@ -21,6 +21,8 @@ use lakehouse_core::ident::SqlLiteral;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::fields::SourceKind;
+use crate::metrics::MetricDef;
 use crate::store::{StoredChartSpec, ensure_bi_table, random_hex};
 
 /// One column a SQL source returns.
@@ -188,4 +190,53 @@ pub fn charts_using_source<'a>(charts: &'a [StoredChartSpec], id: &str) -> Vec<&
         .filter(|c| c.def.sql_source.as_deref() == Some(id))
         .map(|c| c.spec.id.as_str())
         .collect()
+}
+
+/// Names of the metrics that read SQL source `id` (`BI-67`): a metric over a
+/// source that is gone cannot be evaluated, so a source a metric uses cannot
+/// be deleted either (the API answers 409 and names them, as for a chart). A
+/// mart metric never counts: `id` is a SQL source id, not a mart name.
+#[must_use]
+pub fn metrics_using_source<'a>(metrics: &'a [MetricDef], id: &str) -> Vec<&'a str> {
+    metrics
+        .iter()
+        .filter(|m| m.source_kind == SourceKind::SqlSource && m.source_id == id)
+        .map(|m| m.name.as_str())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metric(name: &str, kind: SourceKind, source_id: &str) -> MetricDef {
+        MetricDef {
+            id: format!("m_{name}"),
+            name: name.to_owned(),
+            label: name.to_owned(),
+            description: String::new(),
+            source_kind: kind,
+            source_id: source_id.to_owned(),
+            formula: "count()".to_owned(),
+            filters: Vec::new(),
+            time_column: None,
+            grain: None,
+            format: None,
+            created_by: String::new(),
+            updated_at: None,
+        }
+    }
+
+    /// `BI-67`: only a metric over this SQL source counts; a mart metric whose
+    /// mart name equals the id, and a metric over another source, do not.
+    #[test]
+    fn only_metrics_over_this_sql_source_use_it() {
+        let all = [
+            metric("visits", SourceKind::SqlSource, "s_1"),
+            metric("other", SourceKind::SqlSource, "s_2"),
+            metric("mart_named_like_it", SourceKind::Mart, "s_1"),
+        ];
+        assert_eq!(metrics_using_source(&all, "s_1"), ["visits"]);
+        assert_eq!(metrics_using_source(&all, "s_3"), Vec::<&str>::new());
+    }
 }

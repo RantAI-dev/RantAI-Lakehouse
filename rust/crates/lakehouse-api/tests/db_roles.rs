@@ -1269,6 +1269,7 @@ async fn the_migrate_command_sets_the_console_role_up_and_exits() {
         .env_clear()
         .env("DATABASE_URL", url.as_str())
         .env("LAKEHOUSE_DB_APP_PASSWORD", app_password())
+        .env("LAKEHOUSE_DB_SOURCE_READER_PASSWORD", reader_password())
         .output()
         .expect("run the migrate command");
     assert!(
@@ -1322,6 +1323,7 @@ async fn the_migrate_command_never_writes_the_role_password_into_its_log() {
         .env_clear()
         .env("DATABASE_URL", url.as_str())
         .env("LAKEHOUSE_DB_APP_PASSWORD", app_password())
+        .env("LAKEHOUSE_DB_SOURCE_READER_PASSWORD", reader_password())
         .env("RUST_LOG", "debug")
         .output()
         .expect("run the migrate command");
@@ -1399,4 +1401,718 @@ async fn seed_a_run_and_an_audit_row(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("insert an audit row that points at the run and the approval");
+}
+
+// ── The source reader role (`ops-145`) ────────────────────────────────────
+
+/// The production name of the source reader role. Only the tests that run
+/// the `migrate` command use it: they hold the role locks, as the console
+/// role's migrate tests do. Every other test here uses a unique name.
+const SOURCE_READER: &str = "lakehouse_source_reader";
+
+/// The source reader's password, built at run time like the others.
+fn reader_password() -> String {
+    encoded_repeated_byte(b'e')
+}
+
+/// The password a rotation test changes the source reader to.
+fn reader_changed_password() -> String {
+    encoded_repeated_byte(b'f')
+}
+
+/// The SQLSTATE a statement failed with, when the server sent one.
+fn sqlstate(err: &sqlx::Error) -> Option<String> {
+    err.as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(std::borrow::Cow::into_owned)
+}
+
+/// A source reader role name no other test uses.
+///
+/// The role is cluster-wide. Tests that share one name race on it, so each
+/// test here sets up its own role under a fresh name and takes no lock.
+/// Production runs under the constant `lakehouse_source_reader`, and the
+/// tests that run the `migrate` command use that constant under the
+/// existing role locks.
+fn unique_reader_role() -> String {
+    format!("lakehouse_source_reader_t{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Best-effort removal of a unique-name source reader role (`ops-145`).
+///
+/// Runs in the database `pool` is connected to. `DROP OWNED BY` removes the
+/// role's grants and default privileges there, and `DROP ROLE` removes the
+/// role cluster-wide. Every error is ignored, so a failure never fails a
+/// test. `DROP ROLE` refuses while another database still holds a privilege
+/// of the role; then the role stays behind.
+async fn drop_test_role(pool: &PgPool, role: &str) {
+    for template in ["DROP OWNED BY %I", "DROP ROLE %I"] {
+        let statement: Result<String, sqlx::Error> = sqlx::query_scalar("SELECT format($1, $2)")
+            .bind(template)
+            .bind(role)
+            .fetch_one(pool)
+            .await;
+        if let Ok(statement) = statement {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(pool)
+                .await;
+        }
+    }
+}
+
+/// The table privileges of one role, as `schema.table:PRIVILEGE`.
+async fn table_grants_of(pool: &PgPool, role: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT table_schema || '.' || table_name || ':' || privilege_type \
+         FROM information_schema.role_table_grants WHERE grantee = $1 \
+         ORDER BY 1",
+    )
+    .bind(role)
+    .fetch_all(pool)
+    .await
+    .expect("list the role's table privileges")
+}
+
+/// A migrated database with a source reader role set up for `schemas`,
+/// after `statements` ran as the owner, and the owner's pool.
+struct ReaderFixture {
+    owner_pool: PgPool,
+    role: String,
+}
+
+impl ReaderFixture {
+    async fn new(statements: &[&'static str], schemas: &[&str]) -> Self {
+        let (_state, owner_pool) = spin_up_state(&HashMap::new()).await;
+        for statement in statements {
+            sqlx::query(*statement)
+                .execute(&owner_pool)
+                .await
+                .expect("prepare the source schemas");
+        }
+        let role = unique_reader_role();
+        let schemas: Vec<String> = schemas.iter().map(|schema| (*schema).to_owned()).collect();
+        db_roles::setup_source_reader_role(
+            &owner_pool,
+            &role,
+            &SecretValue::new(reader_password()),
+            &schemas,
+        )
+        .await
+        .expect("set the source reader role up");
+        Self { owner_pool, role }
+    }
+
+    /// Closes the reader pool, then removes the role, best effort.
+    ///
+    /// The reader pool must close first: sessions of the role would hold it.
+    async fn finish(self, reader: PgPool) {
+        reader.close().await;
+        drop_test_role(&self.owner_pool, &self.role).await;
+    }
+
+    async fn reader(&self) -> PgPool {
+        connect_as(&self.owner_pool, &self.role, &reader_password())
+            .await
+            .expect("connect as the source reader")
+    }
+}
+
+/// The source reader can read a table in a source schema.
+#[tokio::test]
+async fn the_source_reader_selects_a_table_in_a_source_schema() {
+    let fixture = ReaderFixture::new(
+        &[
+            "CREATE SCHEMA ingest_demo",
+            "CREATE TABLE ingest_demo.orders (id integer)",
+            "INSERT INTO ingest_demo.orders VALUES (1), (2)",
+        ],
+        &["ingest_demo"],
+    )
+    .await;
+    let reader = fixture.reader().await;
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM ingest_demo.orders")
+        .fetch_one(&reader)
+        .await
+        .expect("the source reader selects from a source table");
+    assert_eq!(rows, 2);
+    fixture.finish(reader).await;
+}
+
+/// The source reader cannot append to the audit trail. `ingest_demo` does
+/// not exist here, so the setup skips it, and the audit table is the only
+/// thing the reader could reach.
+#[tokio::test]
+async fn the_source_reader_cannot_insert_into_the_audit_trail() {
+    let fixture = ReaderFixture::new(&[], &["ingest_demo"]).await;
+    let reader = fixture.reader().await;
+    let err = sqlx::query(
+        "INSERT INTO public.audit_event (id, action, outcome) \
+         VALUES ('sec84_probe', 'sec84.probe', 'allowed')",
+    )
+    .execute(&reader)
+    .await
+    .expect_err("the source reader may not append to the audit trail");
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some("42501"),
+        "insufficient_privilege: {err}"
+    );
+    fixture.finish(reader).await;
+}
+
+/// The source reader cannot read the console's users table.
+#[tokio::test]
+async fn the_source_reader_cannot_read_the_console_users() {
+    let fixture = ReaderFixture::new(&[], &["ingest_demo"]).await;
+    let reader = fixture.reader().await;
+    let err = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM public.app_user")
+        .fetch_one(&reader)
+        .await
+        .expect_err("the source reader may not read the console's users");
+    assert_eq!(sqlstate(&err).as_deref(), Some("42501"), "{err}");
+    fixture.finish(reader).await;
+}
+
+/// The source reader cannot create a table, in a source schema or in
+/// `public`.
+#[tokio::test]
+async fn the_source_reader_cannot_create_a_table() {
+    let fixture = ReaderFixture::new(&["CREATE SCHEMA ingest_demo"], &["ingest_demo"]).await;
+    let reader = fixture.reader().await;
+    for statement in [
+        "CREATE TABLE ingest_demo.sec84_probe (id integer)",
+        "CREATE TABLE public.sec84_probe (id integer)",
+    ] {
+        let err = sqlx::query(statement)
+            .execute(&reader)
+            .await
+            .expect_err("the source reader may not create a table");
+        assert_eq!(
+            sqlstate(&err).as_deref(),
+            Some("42501"),
+            "{statement}: {err}"
+        );
+    }
+    fixture.finish(reader).await;
+}
+
+/// The setup grants the source reader nothing on `public` or `bronze_meta`,
+/// and no default privilege there either, so a table a later migration
+/// creates in them stays closed to it. The tables are the check that
+/// matters: `public` keeps PostgreSQL's default USAGE for PUBLIC.
+#[tokio::test]
+async fn the_source_reader_has_no_privilege_on_public_or_bronze_meta() {
+    let fixture = ReaderFixture::new(
+        &[
+            "CREATE SCHEMA ingest_demo",
+            "CREATE TABLE ingest_demo.orders (id integer)",
+        ],
+        &["ingest_demo"],
+    )
+    .await;
+    // The setup grants the reader nothing on either schema: no entry of the
+    // schemas' ACLs names the reader.
+    let granted: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_namespace n, aclexplode(n.nspacl) a \
+         WHERE n.nspname::text = ANY($1) \
+           AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = $2))",
+    )
+    .bind(vec!["public", "bronze_meta"])
+    .bind(&fixture.role)
+    .fetch_one(&fixture.owner_pool)
+    .await
+    .expect("read the schema ACLs");
+    assert!(
+        !granted,
+        "the setup grants the source reader no schema right"
+    );
+    // `bronze_meta` has no default grant to PUBLIC, so the reader has no
+    // USAGE there at all. `public` does: PostgreSQL grants USAGE on it to
+    // PUBLIC by default, which is a database-wide setting this setup does
+    // not change (`ops-145` review).
+    let bronze_usage: bool =
+        sqlx::query_scalar("SELECT has_schema_privilege($1, 'bronze_meta', 'USAGE')")
+            .bind(&fixture.role)
+            .fetch_one(&fixture.owner_pool)
+            .await
+            .expect("read the bronze_meta schema privilege");
+    assert!(
+        !bronze_usage,
+        "the source reader has no USAGE on bronze_meta"
+    );
+    let reader = fixture.reader().await;
+    let err = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM bronze_meta.ingest_offset")
+        .fetch_one(&reader)
+        .await
+        .expect_err("the source reader may not read the ingest bookkeeping");
+    assert_eq!(sqlstate(&err).as_deref(), Some("42501"), "{err}");
+    fixture.finish(reader).await;
+}
+
+/// A table created in a source schema after the setup is readable by the
+/// source reader, through the default privileges the setup set.
+#[tokio::test]
+async fn a_table_created_later_in_a_source_schema_is_readable_by_the_source_reader() {
+    let fixture = ReaderFixture::new(&["CREATE SCHEMA ingest_demo"], &["ingest_demo"]).await;
+    sqlx::query("CREATE TABLE ingest_demo.later (id integer)")
+        .execute(&fixture.owner_pool)
+        .await
+        .expect("create a table after the setup");
+    sqlx::query("INSERT INTO ingest_demo.later VALUES (7)")
+        .execute(&fixture.owner_pool)
+        .await
+        .expect("insert a row");
+    let reader = fixture.reader().await;
+    let value: i32 = sqlx::query_scalar("SELECT id FROM ingest_demo.later")
+        .fetch_one(&reader)
+        .await
+        .expect("the source reader selects the later table");
+    assert_eq!(value, 7);
+    fixture.finish(reader).await;
+}
+
+/// Setting the source reader role up a second time resets its password,
+/// and the grants are the same afterwards.
+#[tokio::test]
+async fn setting_the_source_reader_up_again_resets_its_password_and_keeps_its_grants() {
+    let fixture = ReaderFixture::new(
+        &[
+            "CREATE SCHEMA ingest_demo",
+            "CREATE TABLE ingest_demo.orders (id integer)",
+        ],
+        &["ingest_demo"],
+    )
+    .await;
+    let grants_before = table_grants_of(&fixture.owner_pool, &fixture.role).await;
+
+    db_roles::setup_source_reader_role(
+        &fixture.owner_pool,
+        &fixture.role,
+        &SecretValue::new(reader_changed_password()),
+        &["ingest_demo".to_owned()],
+    )
+    .await
+    .expect("the second run succeeds");
+
+    let old = connect_as(&fixture.owner_pool, &fixture.role, &reader_password())
+        .await
+        .expect_err("the old password no longer logs in");
+    assert_eq!(sqlstate(&old).as_deref(), Some("28P01"), "{old}");
+    let reader = connect_as(
+        &fixture.owner_pool,
+        &fixture.role,
+        &reader_changed_password(),
+    )
+    .await
+    .expect("the new password logs in");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM ingest_demo.orders")
+        .fetch_one(&reader)
+        .await
+        .expect("the source reader still selects from its source table");
+    assert_eq!(rows, 0);
+    let err = sqlx::query(
+        "INSERT INTO public.audit_event (id, action, outcome) \
+         VALUES ('sec84_again', 'sec84.probe', 'allowed')",
+    )
+    .execute(&reader)
+    .await
+    .expect_err("the audit trail stays closed after the second run");
+    assert_eq!(sqlstate(&err).as_deref(), Some("42501"), "{err}");
+
+    let grants_after = table_grants_of(&fixture.owner_pool, &fixture.role).await;
+    assert_eq!(grants_after, grants_before, "a second run changes no grant");
+    fixture.finish(reader).await;
+}
+
+/// A source schema that does not exist yet is skipped: the setup succeeds
+/// and the schema that does exist is granted.
+#[tokio::test]
+async fn a_source_schema_that_does_not_exist_yet_is_skipped() {
+    let fixture = ReaderFixture::new(
+        &[
+            "CREATE SCHEMA ingest_demo",
+            "CREATE TABLE ingest_demo.orders (id integer)",
+        ],
+        &["sec84_schema_not_yet", "ingest_demo"],
+    )
+    .await;
+    let reader = fixture.reader().await;
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM ingest_demo.orders")
+        .fetch_one(&reader)
+        .await
+        .expect("the schema that exists is granted");
+    assert_eq!(rows, 0);
+    fixture.finish(reader).await;
+}
+
+/// A schema list that names a console schema is refused before any
+/// statement runs.
+#[tokio::test]
+async fn the_source_reader_refuses_a_console_schema_in_its_list() {
+    let (_state, owner_pool) = spin_up_state(&HashMap::new()).await;
+    for schema in ["public", "bronze_meta"] {
+        let result = db_roles::setup_source_reader_role(
+            &owner_pool,
+            &unique_reader_role(),
+            &SecretValue::new(reader_password()),
+            &["ingest_demo".to_owned(), schema.to_owned()],
+        )
+        .await;
+        assert!(
+            matches!(result, Err(RoleSetupError::ConsoleSchema)),
+            "{schema} is refused"
+        );
+    }
+}
+
+/// The metrics query `dagster/dispar_orchestrate/replication_metrics.py`
+/// runs on the source database (its `cur.execute`, around line 355). It is
+/// copied as text so this test runs the same statement the job runs.
+const REPLICATION_METRICS_QUERY: &str = "SELECT slot_name, active, \
+     pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint AS wal_retained_bytes, \
+     COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn), 0)::bigint \
+       AS confirmed_flush_lag_bytes \
+     FROM pg_replication_slots WHERE slot_type = 'logical'";
+
+/// The source reader can run the replication metrics query with no role
+/// beyond `CONNECT` and `USAGE` on its source schemas.
+#[tokio::test]
+async fn the_source_reader_runs_the_replication_metrics_query() {
+    let fixture = ReaderFixture::new(&["CREATE SCHEMA ingest_demo"], &["ingest_demo"]).await;
+    let reader = fixture.reader().await;
+    let rows = sqlx::query(REPLICATION_METRICS_QUERY)
+        .fetch_all(&reader)
+        .await
+        .expect("the source reader runs the replication metrics query");
+    assert!(rows.is_empty(), "the test cluster has no logical slot");
+    fixture.finish(reader).await;
+}
+
+/// The seeded `conn-pg-lakehouse` connector dials the source reader after
+/// the migrations run (migration `0161`).
+#[tokio::test]
+async fn the_seeded_connector_dials_the_source_reader_after_migrate() {
+    let (_state, owner_pool) = spin_up_state(&HashMap::new()).await;
+    let (user, host): (Option<String>, String) =
+        sqlx::query_as("SELECT dial->>'user', host FROM connector WHERE id = 'conn-pg-lakehouse'")
+            .fetch_one(&owner_pool)
+            .await
+            .expect("read the seeded connector's dial");
+    assert_eq!(user.as_deref(), Some(SOURCE_READER));
+    assert_eq!(host, "lakehouse_source_reader@postgres:5432/lakehouse");
+}
+
+/// The `migrate` command refuses to run without the source reader's
+/// password, and names the variable it needs.
+#[tokio::test]
+async fn the_migrate_command_refuses_to_run_without_the_source_reader_password() {
+    let output = Command::new(env!("CARGO_BIN_EXE_lakehouse-api"))
+        .arg("migrate")
+        .env_clear()
+        .env("DATABASE_URL", "postgres://unused.invalid/unused")
+        .env("LAKEHOUSE_DB_APP_PASSWORD", app_password())
+        .output()
+        .expect("run the migrate command");
+    assert!(
+        !output.status.success(),
+        "the migrate command refuses without the reader's password"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("LAKEHOUSE_DB_SOURCE_READER_PASSWORD"),
+        "the message names the variable: {stderr}"
+    );
+}
+
+/// The `migrate` command sets the production source reader role up: a login
+/// with no other attribute, and the password it was given. It runs under the
+/// same role locks as the console-role test above, because it uses the
+/// production role name.
+#[tokio::test]
+async fn the_migrate_command_sets_the_source_reader_role_up_to_log_in() {
+    let (_state, owner_pool) = spin_up_state(&HashMap::new()).await;
+    let _role_lock = ROLE_LOCK.lock().await;
+    let _cluster_lock = take_cluster_role_lock().await;
+    let db_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&owner_pool)
+        .await
+        .expect("read the database name");
+    let mut url = url::Url::parse(&lakehouse_test_support::database_url())
+        .expect("the test-support database URL parses");
+    url.set_path(&format!("/{db_name}"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lakehouse-api"))
+        .arg("migrate")
+        .env_clear()
+        .env("DATABASE_URL", url.as_str())
+        .env("LAKEHOUSE_DB_APP_PASSWORD", app_password())
+        .env("LAKEHOUSE_DB_SOURCE_READER_PASSWORD", reader_password())
+        .output()
+        .expect("run the migrate command");
+    assert!(
+        output.status.success(),
+        "the migrate command exits 0: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    connect_as(&owner_pool, SOURCE_READER, &reader_password())
+        .await
+        .expect("connect as the source reader the migrate command set up");
+    let attributes: (bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT rolsuper, rolcanlogin, rolcreatedb, rolcreaterole, rolinherit, \
+         rolreplication, rolbypassrls FROM pg_roles WHERE rolname = $1",
+    )
+    .bind(SOURCE_READER)
+    .fetch_one(&owner_pool)
+    .await
+    .expect("read the source reader's attributes");
+    assert_eq!(
+        attributes,
+        (false, true, false, false, false, false, false),
+        "the source reader logs in, and holds no other attribute"
+    );
+}
+
+/// The source reader sees the `restart_lsn` of a slot another role owns,
+/// which the replication metrics query needs for `wal_retained_bytes`. The
+/// test cluster runs at `wal_level = replica`, so the slot is physical: a
+/// logical slot cannot be created here, and the logical case is not covered
+/// by this test.
+#[tokio::test]
+async fn the_source_reader_sees_the_restart_lsn_of_a_slot_it_does_not_own() {
+    let fixture = ReaderFixture::new(&["CREATE SCHEMA ingest_demo"], &["ingest_demo"]).await;
+    let slot = format!("sec84_slot_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query("SELECT pg_create_physical_replication_slot($1, true)")
+        .bind(&slot)
+        .execute(&fixture.owner_pool)
+        .await
+        .expect("create a physical slot that reserves its WAL");
+    let reader = fixture.reader().await;
+    let seen: Result<bool, sqlx::Error> = sqlx::query_scalar(
+        "SELECT restart_lsn IS NULL FROM pg_replication_slots WHERE slot_name = $1",
+    )
+    .bind(&slot)
+    .fetch_one(&reader)
+    .await;
+    // Drop the slot before any assertion: a slot left behind holds WAL.
+    sqlx::query("SELECT pg_drop_replication_slot($1)")
+        .bind(&slot)
+        .execute(&fixture.owner_pool)
+        .await
+        .expect("drop the test slot");
+    let restart_is_null = seen.expect("the source reader reads the slot's row");
+    assert!(
+        !restart_is_null,
+        "the source reader sees restart_lsn, so the metrics query needs no extra grant"
+    );
+    fixture.finish(reader).await;
+}
+
+/// The source reader cannot create a table in `public`, and the refusal is
+/// SQLSTATE `42501`. The test runs the same setup on the fresh database every
+/// test gets, and it creates nothing first, so the result does not depend on
+/// what another test left in the cluster.
+#[tokio::test]
+async fn the_source_reader_cannot_create_a_table_in_public() {
+    let fixture = ReaderFixture::new(&["CREATE SCHEMA ingest_demo"], &["ingest_demo"]).await;
+    let reader = fixture.reader().await;
+    let err = sqlx::query("CREATE TABLE public.sec84_probe_public (id integer)")
+        .execute(&reader)
+        .await
+        .expect_err("the source reader may not create a table in public");
+    assert_eq!(sqlstate(&err).as_deref(), Some("42501"), "{err}");
+    fixture.finish(reader).await;
+}
+
+/// The source reader holds no table privilege in `public` or `bronze_meta`,
+/// and no schema ACL names it except on its one granted source schema.
+///
+/// Every table, view, materialized view, partitioned table and foreign table
+/// of the two schemas is checked with every table privilege. `public` keeps
+/// PostgreSQL's default USAGE for PUBLIC; that is a schema right, not a table
+/// right, and it is not a grant to the reader.
+#[tokio::test]
+async fn the_source_reader_holds_no_table_privilege_in_public_or_bronze_meta() {
+    let fixture = ReaderFixture::new(
+        &[
+            "CREATE SCHEMA ingest_demo",
+            "CREATE TABLE ingest_demo.orders (id integer)",
+        ],
+        &["ingest_demo"],
+    )
+    .await;
+    let pool = &fixture.owner_pool;
+
+    let grants = table_grants_of(pool, &fixture.role).await;
+    let outside_source: Vec<&String> = grants
+        .iter()
+        .filter(|grant| !grant.starts_with("ingest_demo."))
+        .collect();
+    assert!(
+        outside_source.is_empty(),
+        "table privileges outside the source schema: {outside_source:?}"
+    );
+
+    let (checked, held): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), \
+                count(*) FILTER (WHERE has_table_privilege($1::text, c.oid, \
+                    'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')) \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname IN ('public', 'bronze_meta') \
+           AND c.relkind IN ('r', 'p', 'v', 'm', 'f')",
+    )
+    .bind(&fixture.role)
+    .fetch_one(pool)
+    .await
+    .expect("count the relations of public and bronze_meta");
+    assert!(checked > 0, "the check covers at least one relation");
+    assert_eq!(
+        held, 0,
+        "the source reader holds a table privilege in public or bronze_meta"
+    );
+
+    let acl_schemas: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT n.nspname::text FROM pg_namespace n, aclexplode(n.nspacl) a \
+         WHERE a.grantee = (SELECT oid FROM pg_roles WHERE rolname = $1) \
+         ORDER BY 1",
+    )
+    .bind(&fixture.role)
+    .fetch_all(pool)
+    .await
+    .expect("list the schemas whose ACL names the source reader");
+    assert_eq!(
+        acl_schemas,
+        vec!["ingest_demo".to_owned()],
+        "only the granted source schema's ACL names the reader"
+    );
+
+    drop_test_role(&fixture.owner_pool, &fixture.role).await;
+}
+
+/// The source reader's password for the test that checks the `migrate`
+/// command's output. Unique to that test, so no other test's value can hide
+/// a leak of this one.
+fn output_check_reader_password() -> String {
+    encoded_repeated_byte(b'h')
+}
+
+/// The `migrate` command, run with debug logging, prints neither the source
+/// reader's password on stdout nor on stderr. The password reaches the
+/// statement that sets the role up, and the logging must not echo it.
+#[tokio::test]
+async fn the_migrate_command_never_writes_the_source_reader_password_into_its_output() {
+    let (_state, owner_pool) = spin_up_state(&HashMap::new()).await;
+    let _role_lock = ROLE_LOCK.lock().await;
+    let _cluster_lock = take_cluster_role_lock().await;
+    let db_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&owner_pool)
+        .await
+        .expect("read the database name");
+    let mut url = url::Url::parse(&lakehouse_test_support::database_url())
+        .expect("the test-support database URL parses");
+    url.set_path(&format!("/{db_name}"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lakehouse-api"))
+        .arg("migrate")
+        .env_clear()
+        .env("DATABASE_URL", url.as_str())
+        .env("LAKEHOUSE_DB_APP_PASSWORD", app_password())
+        .env(
+            "LAKEHOUSE_DB_SOURCE_READER_PASSWORD",
+            output_check_reader_password(),
+        )
+        .env("RUST_LOG", "debug")
+        .output()
+        .expect("run the migrate command");
+    assert!(
+        output.status.success(),
+        "the migrate command exits 0: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The assertion messages do not print the output: a leak must not reach
+    // the test's own log.
+    let secret = output_check_reader_password();
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains(&secret),
+        "the source reader's password is on the migrate command's stdout"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains(&secret),
+        "the source reader's password is on the migrate command's stderr"
+    );
+}
+
+/// The source reader sees the primary key of a source table through
+/// `information_schema`, and it still cannot write: an INSERT, a CREATE TABLE
+/// and an ALTER TABLE on the source table, and a CREATE TABLE and an INSERT in
+/// `public`, are each refused with SQLSTATE `42501`.
+#[tokio::test]
+async fn the_source_reader_sees_the_primary_key_of_a_source_table() {
+    let fixture = ReaderFixture::new(
+        &[
+            "CREATE SCHEMA ingest_demo",
+            "CREATE TABLE ingest_demo.orders (id integer PRIMARY KEY)",
+        ],
+        &["ingest_demo"],
+    )
+    .await;
+    let reader = fixture.reader().await;
+
+    let keys: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.table_constraints \
+         WHERE table_schema = 'ingest_demo' AND table_name = 'orders' \
+           AND constraint_type = 'PRIMARY KEY'",
+    )
+    .fetch_one(&reader)
+    .await
+    .expect("the reader reads the table constraints");
+    assert_eq!(
+        keys, 1,
+        "the reader sees the primary key of the source table"
+    );
+    let key_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.key_column_usage \
+         WHERE table_schema = 'ingest_demo' AND table_name = 'orders' \
+           AND column_name = 'id'",
+    )
+    .fetch_one(&reader)
+    .await
+    .expect("the reader reads the key columns");
+    assert_eq!(
+        key_columns, 1,
+        "the reader sees the key column of the source table"
+    );
+
+    let grants = table_grants_of(&fixture.owner_pool, &fixture.role).await;
+    assert_eq!(
+        grants,
+        vec![
+            "ingest_demo.orders:REFERENCES".to_owned(),
+            "ingest_demo.orders:SELECT".to_owned(),
+        ],
+        "the reader holds SELECT and REFERENCES on the source table, nothing else"
+    );
+
+    for statement in [
+        "INSERT INTO ingest_demo.orders (id) VALUES (1)",
+        "CREATE TABLE ingest_demo.sec84_probe (id integer)",
+        "ALTER TABLE ingest_demo.orders ADD CONSTRAINT sec84_probe_fk \
+         FOREIGN KEY (id) REFERENCES ingest_demo.orders (id)",
+        "CREATE TABLE public.sec84_probe_public (id integer)",
+        "INSERT INTO public.audit_event (id, action, outcome) \
+         VALUES ('sec84_probe', 'sec84.probe', 'allowed')",
+    ] {
+        let err = sqlx::query(statement)
+            .execute(&reader)
+            .await
+            .expect_err("the source reader may not write");
+        assert_eq!(
+            sqlstate(&err).as_deref(),
+            Some("42501"),
+            "{statement}: {err}"
+        );
+    }
+
+    fixture.finish(reader).await;
 }

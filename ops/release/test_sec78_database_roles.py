@@ -88,24 +88,48 @@ class TemplateDatabaseRolesTest(unittest.TestCase):
             "the API connects as the runtime role",
         )
 
-    def test_the_seeded_connector_dials_with_the_runtime_roles_password_and_never_with_the_owners(self) -> None:
+    def test_the_seeded_connector_dials_with_the_source_readers_password_and_never_with_the_owners(self) -> None:
         # The seeded `conn-pg-lakehouse` connector resolves its password
         # through `env:CONNECTOR_PG_PASSWORD`, so this value IS the
-        # credential the seeded connector authenticates with.
+        # credential the seeded connector authenticates with. Since SEC-84
+        # the seeded row dials as `lakehouse_source_reader`, so the value is
+        # that role's password, not the console's runtime role's.
         password = self.environment_of("lakehouse-api")["CONNECTOR_PG_PASSWORD"]
-        self.assertIn("LAKEHOUSE_DB_APP_PASSWORD", password)
+        self.assertIn("LAKEHOUSE_DB_SOURCE_READER_PASSWORD", password)
+        self.assertNotIn("LAKEHOUSE_DB_APP_PASSWORD", password)
         self.assertNotIn("POSTGRES_PASSWORD", password)
 
-    def test_the_dagster_code_location_reads_the_database_as_the_runtime_role(self) -> None:
+    def test_the_dagster_code_location_reads_the_database_as_the_source_reader_role(self) -> None:
         environment = self.environment_of("dagster-code-location")
-        # The runtime role is the DEFAULT, not a fixed value: an operator
+        # The source reader is the DEFAULT, not a fixed value: an operator
         # may point the bronze source at another role (one with
-        # `REPLICATION`, which the runtime role deliberately lacks).
+        # `REPLICATION`, which the reader deliberately lacks). The SEC-84
+        # reason for the change: the code location runs user pipeline code,
+        # so it holds the read-only role, never the console's runtime role
+        # that can write the audit trail.
         user = environment["BRONZE_SOURCE_DB_USER"]
-        self.assertEqual(user, "${BRONZE_SOURCE_DB_USER:-lakehouse_app}")
+        self.assertEqual(user, "${BRONZE_SOURCE_DB_USER:-lakehouse_source_reader}")
         self.assertNotIn("POSTGRES_USER", user)
-        self.assertIn("LAKEHOUSE_DB_APP_PASSWORD", environment["BRONZE_SOURCE_DB_PASSWORD"])
+        self.assertIn("LAKEHOUSE_DB_SOURCE_READER_PASSWORD", environment["BRONZE_SOURCE_DB_PASSWORD"])
         self.assertNotIn("POSTGRES_PASSWORD", environment["BRONZE_SOURCE_DB_PASSWORD"])
+        self.assertIn("LAKEHOUSE_DB_SOURCE_READER_PASSWORD", environment["CONNECTOR_PG_PASSWORD"])
+
+    def test_the_dagster_code_location_holds_no_console_runtime_role_password(self) -> None:
+        # SEC-84: pipeline code runs in this container. The console's runtime
+        # role can INSERT into `public.audit_event`, so its password must not
+        # reach the container under any variable name or in any value.
+        environment = self.environment_of("dagster-code-location")
+        for name, value in environment.items():
+            self.assertNotIn(
+                "LAKEHOUSE_DB_APP_PASSWORD",
+                str(name),
+                f"dagster-code-location names {name}",
+            )
+            self.assertNotIn(
+                "LAKEHOUSE_DB_APP_PASSWORD",
+                str(value),
+                f"dagster-code-location.{name} carries the console runtime role's password",
+            )
 
 
     def test_the_dagster_services_reach_their_database_as_the_dagster_role_and_never_with_the_owners_password(self) -> None:

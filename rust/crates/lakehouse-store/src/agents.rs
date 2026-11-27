@@ -251,6 +251,15 @@ pub struct DigitalEmployee {
     /// never `TableAccess::All`. Serialized as `readRoles`. An unknown name
     /// contributes nothing at read time; the write path refuses one with 400.
     pub read_roles: Vec<String>,
+    /// The organisation this agent works in (`SEC-76`, migration `0160`).
+    /// `None` means no organisation is set yet, and a run of the agent is
+    /// refused with 409 before any tool or model call. Serialized as
+    /// `tenantId`.
+    pub tenant_id: Option<Uuid>,
+    /// The identity a scheduled run of this agent acts as (`SEC-76`). Tool
+    /// rows the run writes name it, so an operator can map a UUID back to
+    /// the agent. Serialized as `principalId`.
+    pub principal_id: Uuid,
 }
 
 // WS7 item G3: budget_spent/approval_rate/success_rate/recent_runs are
@@ -264,7 +273,8 @@ pub struct DigitalEmployee {
 // `get_employee_with_metrics` (below) is the FULL projection, used by the
 // single-row DETAIL route where the cost is free.
 const EMPLOYEE_COLUMNS: &str = "id, name, purpose, owner, autonomy, status, budget_limit, \
-     allowed_tools, data_scope, prompt, schedule_cron, mode, permissions, read_roles";
+     allowed_tools, data_scope, prompt, schedule_cron, mode, permissions, read_roles, \
+     tenant_id, principal_id";
 
 /// The narrow [`EMPLOYEE_COLUMNS`] projection, row-for-row — kept as its
 /// own `FromRow` type (rather than reusing [`DigitalEmployee`] directly)
@@ -293,6 +303,10 @@ struct EmployeeListRow {
     // projection (list, detail and run config), so no read path can forget
     // it and fall back to "no restriction".
     read_roles: Vec<String>,
+    // `SEC-76`: the organisation and the run identity travel with every
+    // projection too, so a read never shows an agent without them.
+    tenant_id: Option<Uuid>,
+    principal_id: Uuid,
 }
 
 impl EmployeeListRow {
@@ -323,6 +337,8 @@ impl EmployeeListRow {
             mode: self.mode,
             permissions: self.permissions,
             read_roles: self.read_roles,
+            tenant_id: self.tenant_id,
+            principal_id: self.principal_id,
         }
     }
 }
@@ -330,8 +346,8 @@ impl EmployeeListRow {
 /// [`EMPLOYEE_COLUMNS`] plus the four real metric columns WS7 item G3
 /// recomputes — backs [`get_employee_with_metrics`] only.
 const FULL_EMPLOYEE_COLUMNS: &str = "id, name, purpose, owner, autonomy, status, budget_limit, allowed_tools, data_scope, \
-     prompt, schedule_cron, mode, permissions, read_roles, budget_spent, approval_rate, success_rate, \
-     recent_runs";
+     prompt, schedule_cron, mode, permissions, read_roles, tenant_id, principal_id, budget_spent, \
+     approval_rate, success_rate, recent_runs";
 
 /// List every digital employee, newest first. Metric columns
 /// (`budgetSpent`/`successRate`/`approvalRate`/`recentRuns`) are `None` —
@@ -447,6 +463,12 @@ pub struct EmployeeRunConfig {
     /// Empty means no grant, so the run is narrowed to zero tables rather
     /// than falling back to `TableAccess::All`.
     pub read_roles: Vec<String>,
+    /// The organisation this agent works in (`SEC-76`). `None` means a run
+    /// is refused with 409 before anything runs.
+    pub tenant_id: Option<Uuid>,
+    /// The identity a scheduled run acts as (`SEC-76`), from
+    /// `agent_employee.principal_id`.
+    pub principal_id: Uuid,
     /// Token ceiling for a headless run of this employee (WS7 item G2:
     /// `budget_limit`/`budget_consumed` are measured in tokens, not
     /// currency — `lakehouse-llm` has no price table, see
@@ -466,8 +488,8 @@ pub async fn get_employee_run_config(
     id: &str,
 ) -> Result<Option<EmployeeRunConfig>, StoreError> {
     let row: Option<EmployeeRunConfig> = sqlx::query_as(
-        "SELECT id, name, status, prompt, mode, permissions, read_roles, budget_limit \
-         FROM agent_employee WHERE id = $1",
+        "SELECT id, name, status, prompt, mode, permissions, read_roles, tenant_id, principal_id, \
+         budget_limit FROM agent_employee WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -575,6 +597,65 @@ pub async fn set_employee_read_roles(
         .await?;
     row.map(EmployeeListRow::without_metrics)
         .ok_or(StoreError::NotFound)
+}
+
+/// What [`set_employee_tenant`] changed: the agent's name and the
+/// organisation it worked in before, for the audit row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmployeeTenantChange {
+    /// The agent's display name.
+    pub name: String,
+    /// The organisation the agent worked in before, `None` if it had none.
+    pub old_tenant_id: Option<Uuid>,
+}
+
+/// Set the organisation an agent works in (`SEC-76`).
+///
+/// `expected_old` is the organisation the caller checked against before it
+/// asked for the change. The row is locked and read in the same transaction
+/// that writes the new value, so the change lands only if the agent still has
+/// `expected_old`. The audit row then names the organisation that was really
+/// replaced. When it has moved, nothing is written and the answer is `None`.
+///
+/// The caller checks that `tenant_id` names an existing tenant: an unknown
+/// id would otherwise surface as a foreign-key failure.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `id` is unknown, or
+/// [`StoreError::Database`] if a query fails.
+pub async fn set_employee_tenant(
+    pool: &PgPool,
+    id: &str,
+    expected_old: Option<Uuid>,
+    tenant_id: Uuid,
+) -> Result<Option<EmployeeTenantChange>, StoreError> {
+    let mut tx = pool.begin().await?;
+    // `FOR UPDATE` holds the row while the old value is read, so a second
+    // change cannot slip in between the read and the write.
+    let current: Option<(String, Option<Uuid>)> =
+        sqlx::query_as("SELECT name, tenant_id FROM agent_employee WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((name, old_tenant_id)) = current else {
+        return Err(StoreError::NotFound);
+    };
+    if old_tenant_id != expected_old {
+        // The transaction is dropped unchanged: the organisation moved since
+        // the caller checked it.
+        return Ok(None);
+    }
+    sqlx::query("UPDATE agent_employee SET tenant_id = $2 WHERE id = $1")
+        .bind(id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some(EmployeeTenantChange {
+        name,
+        old_tenant_id,
+    }))
 }
 
 /// Set an employee's `status` and return the updated row. Metric columns

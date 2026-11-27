@@ -2,6 +2,8 @@
 //! `describe_dataset`, `get_lineage`, `get_quality`, `describe_mart`.
 //! Moved out of `ai.rs` unchanged (T0.1 registry refactor).
 
+use std::fmt::Write as _;
+
 use lakehouse_auth::Principal;
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ApiError;
@@ -784,8 +786,10 @@ pub(super) async fn list_datasets(
     principal: Option<&Principal>,
     args: &Map<String, Value>,
 ) -> Value {
-    // SEC-20, plan 97: no principal is a scheduled run, which has no tenant
-    // to read the shared registry as.
+    // SEC-20, plan 97: no principal is a call with no caller, which has no
+    // tenant to read the shared registry as. A scheduled run never gets
+    // here: it carries its agent's own principal, in the agent's
+    // organisation (SEC-76).
     let Some(principal) = principal else {
         return json!({ "error": DATASETS_NEED_A_USER });
     };
@@ -1087,29 +1091,139 @@ pub(super) async fn lakehouse_overview(state: &AppState, principal: Option<&Prin
     })
 }
 
-/// The recorded lineage around a dataset or table: the same graph
-/// `GET /api/governance/lineage` serves (`routes::lineage`), so the
-/// copilot and the Lineage page can never disagree. `chain` lists every
-/// edge as one line for the model; `nodes`/`edges` carry the graph.
+/// The one sentence for a call that names both subjects or neither
+/// (`AI-13` decision 1): a slug (or its legacy alias `focus`) and a chart id.
+const ONE_SUBJECT: &str = "Call get_lineage with exactly one of slug (a dataset slug or a table name) or chart (a chart id).";
+
+/// The one refusal for every failure of the chart read (`AI-13` decision 3):
+/// an unknown id, somebody else's personal chart, a caller without
+/// `dashboard:read`, a caller the shared catalog refuses, and a read that
+/// failed all answer the same sentence, so no answer says the chart exists,
+/// and no upstream error text reaches the answer (principle 4).
+const NO_VISIBLE_CHART: &str = "No chart lineage is available for that id.";
+
+/// The one reason for a `slug` focus that is not a table name (`AI-13`
+/// review SHOULD-FIX): `used_by::read` refuses such a focus with
+/// `BadRequest`, and this sentence names that cause, which is the
+/// caller's to fix.
+const USED_BY_NOT_A_TABLE: &str =
+    "charts are listed for a table name such as serving.<table>, not this focus";
+
+/// The one reason for every other used-by failure (`AI-13` review
+/// SHOULD-FIX, principle 2): a table the caller's role hides (`GOV-7` D6
+/// answers the route's 404), a tenant or shared-catalog refusal, a
+/// database failure. True for its cause, names no table's existence, and
+/// no upstream error text reaches the answer.
+const USED_BY_UNREADABLE: &str = "the used-by list could not be read for this user";
+
+/// The compact path for the model (`AI-13`): the chart route answer's own
+/// steps, nearest the chart first, each with its refresh time or "not
+/// recorded". The arrow between two steps is the kind of the edge that
+/// connects them, the `{from} -[{kind}]-> {to}` shape the slug path prints
+/// per edge; a pair with no edge (branches of the same table) reads
+/// `upstream`.
+fn chart_chain(answer: &Value) -> String {
+    let Some(steps) = answer["steps"].as_array().filter(|s| !s.is_empty()) else {
+        return "no recorded lineage".to_owned();
+    };
+    let kinds: std::collections::HashMap<(&str, &str), &str> = answer["edges"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let from = e.get("from")?.as_str()?;
+            let to = e.get("to")?.as_str()?;
+            Some(((from, to), e.get("kind")?.as_str()?))
+        })
+        .collect();
+    let mut chain = String::new();
+    let mut previous: Option<&str> = None;
+    for step in steps {
+        let (Some(id), Some(label), Some(kind)) = (
+            step.get("id").and_then(Value::as_str),
+            step.get("label").and_then(Value::as_str),
+            step.get("kind").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if let Some(to) = previous {
+            let edge = kinds.get(&(id, to)).copied().unwrap_or("upstream");
+            let _ = write!(chain, " -[{edge}]-> ");
+        }
+        chain.push_str(label);
+        let _ = write!(chain, " ({kind}");
+        match (
+            step.get("refreshedAt").and_then(Value::as_str),
+            step.get("refreshSource").and_then(Value::as_str),
+        ) {
+            (Some(at), Some(origin)) => {
+                let _ = write!(chain, ", refreshed {at} via {origin}");
+            }
+            (Some(at), None) => {
+                let _ = write!(chain, ", refreshed {at}");
+            }
+            (None, _) if step.get("notRecorded") == Some(&json!(true)) => {
+                let _ = write!(chain, ", refresh not recorded");
+            }
+            (None, _) => {}
+        }
+        chain.push(')');
+        previous = Some(id);
+    }
+    chain
+}
+
+/// The `chart` path (`AI-13` decision 1): the chart-lineage route's own
+/// read, never a graph built here — `charts::read` is where every gate
+/// lives (`dashboard:read`, the shared catalog, the chart's visibility,
+/// per-role table hiding), so whatever it answers is what the route would.
+async fn chart_lineage_answer(state: &AppState, principal: &Principal, chart: &str) -> Value {
+    // `headers: HeaderMap::new()` — no `X-Tenant` selection from the copilot:
+    // the tenant resolves from the principal, the same default an interactive
+    // caller gets by omitting the header.
+    let Ok(answer) = crate::routes::lineage::charts::read(
+        state,
+        principal,
+        &axum::http::HeaderMap::new(),
+        chart,
+    )
+    .await
+    else {
+        return json!({ "error": NO_VISIBLE_CHART });
+    };
+    let mut out = answer;
+    out["chain"] = json!(chart_chain(&out));
+    out
+}
+
+/// The recorded lineage around a dataset, a table or a chart: the same
+/// graph `GET /api/governance/lineage` serves (`routes::lineage`), and for a
+/// chart the same path `GET /api/dashboard/charts/{id}/lineage` serves
+/// (`routes::lineage::charts`), so the copilot and the pages can never
+/// disagree. `chain` lists the path as one string for the model;
+/// `nodes`/`edges` carry the graph. A `slug` answer also carries `usedBy`,
+/// the charts that read the table, from the used-by route's own read.
 pub(super) async fn get_lineage(
     state: &AppState,
     principal: Option<&Principal>,
     args: &Map<String, Value>,
 ) -> Value {
-    let focus = {
-        let slug = arg_str(args, "slug");
-        if slug.is_empty() {
-            arg_str(args, "focus")
-        } else {
-            slug
-        }
+    let slug = arg_str(args, "slug");
+    let focus = if slug.is_empty() {
+        arg_str(args, "focus")
+    } else {
+        slug
     };
-    if focus.is_empty() {
-        return json!({ "error": "slug is required: a dataset slug or a table name such as serving.<table>" });
+    let chart = arg_str(args, "chart");
+    if (chart.is_empty() && focus.is_empty()) || (!chart.is_empty() && !focus.is_empty()) {
+        return json!({ "error": ONE_SUBJECT });
     }
     let Some(principal) = principal else {
         return json!({ "error": "lineage needs a signed-in user" });
     };
+    if !chart.is_empty() {
+        return chart_lineage_answer(state, principal, &chart).await;
+    }
     // SEC-20, plan 95: a caller the shared-catalog rule refuses gets no graph
     // at all from the tool. (`GET /api/governance/lineage` keeps drawing the
     // tenant's own records for such a caller, and since plan 96 its builder
@@ -1155,6 +1269,35 @@ pub(super) async fn get_lineage(
         )
     } else {
         json!(chain.join("\n"))
+    };
+    // `AI-13` decision 2: the page's other promise — the charts that read
+    // this table — from the used-by route's own read under the same caller,
+    // never a second list built here. The route caps the list (`MAX_CHARTS`);
+    // its answer passes through as it is. `headers: HeaderMap::new()` for the
+    // same reason as the chart read above.
+    out["usedBy"] = match crate::routes::lineage::used_by::read(
+        state,
+        principal,
+        &axum::http::HeaderMap::new(),
+        &focus,
+    )
+    .await
+    {
+        Ok(answer) => answer,
+        // A focus that is not a table name (a dataset slug, say) has no
+        // used-by answer at all. Every other failure — a table the caller's
+        // role hides (`GOV-7` D6), a tenant or shared-catalog refusal, a
+        // database failure — gets one honest sentence true for its cause,
+        // never an empty list that would read as "no chart uses it", and no
+        // upstream error text (principle 2, review SHOULD-FIX).
+        Err(ApiError::BadRequest(_)) => json!({
+            "supported": false,
+            "reason": USED_BY_NOT_A_TABLE,
+        }),
+        Err(_) => json!({
+            "supported": false,
+            "reason": USED_BY_UNREADABLE,
+        }),
     };
     out
 }

@@ -459,6 +459,10 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     // still calls it and its execution is audited. SEC-68's explicit role
     // grant stays: it is served by a live route and audited centrally.
     ("PUT", "/api/agents/employees/{id}/read-roles", Coverage::Central { action: "agent.read_roles.set", resource_kind: "digital_employee", id_param: IdParam::Path("id") }),
+    // SEC-76: a Handler, not Central. The central writer records field
+    // names only, and this row must carry the old and new organisation ids,
+    // which the handler writes (`routes::agents::set_employee_tenant`).
+    ("PUT", "/api/agents/employees/{id}/tenant", Coverage::Handler { action: "agent.tenant.set", resource_kind: "digital_employee" }),
     ("POST", "/api/agents/employees/{id}/run", Coverage::Central { action: "digital_employee.run", resource_kind: "digital_employee", id_param: IdParam::Path("id") }),
     ("POST", "/api/agents/approvals/{id}/decide", Coverage::Handler { action: crate::routes::agents::APPROVAL_DECIDE_ACTION, resource_kind: "approval" }),
 ];

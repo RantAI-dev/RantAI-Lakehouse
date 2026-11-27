@@ -64,6 +64,16 @@ describe("ganttOption", () => {
     expect((d.option.legend as { data: string[] }).data).toEqual(["Team 1", "Team 2"])
   })
 
+  it("BI-73 d: the Today label sits at the end of the line, not on the date axis labels", () => {
+    const d = drawn(ganttOption({ rows: [row("A", null, "2026-03-01", "2026-03-20")], dark: false, timeZone: "UTC", now: NOW }))
+    const mark = seriesOf(d).find((s) => s.markLine)?.markLine as unknown as { label: { position: string } }
+    // The task axis is inverted, so a vertical line starts at the top of the plot and ends at the date labels:
+    // the label goes at the line's start. Both fields decide where it lands.
+    expect((d.option.yAxis as { inverse: boolean }).inverse).toBe(true)
+    expect(mark.label.position).toBe("start")
+    expect(((d.option.grid as { top: number }).top)).toBeGreaterThan(16)
+  })
+
   it("draws a line at today in the report zone, and none outside the range of the tasks", () => {
     const inside = drawn(ganttOption({ rows: [row("A", null, "2026-03-01", "2026-03-20")], dark: false, timeZone: "UTC", now: NOW }))
     const mark = seriesOf(inside).find((s) => s.markLine)

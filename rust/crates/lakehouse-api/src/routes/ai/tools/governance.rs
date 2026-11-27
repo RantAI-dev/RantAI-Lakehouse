@@ -64,8 +64,9 @@ async fn governance_kind(state: &AppState, kind: &str) -> Value {
 /// governance tools follow (the tool has no request headers of its own).
 pub(super) async fn get_audit_history(state: &AppState, principal: Option<&Principal>) -> Value {
     let Some(principal) = principal else {
-        // A headless run has no person behind it: it belongs to no tenant
-        // and owns no row of the trail.
+        // A call with no principal has no person behind it and belongs to
+        // no tenant. A scheduled run is not this case: it carries its
+        // agent's own principal, in the agent's organisation (SEC-76).
         return json!({ "error": "reading the audit trail needs a signed-in user" });
     };
     let scope = match crate::routes::audit_scope::scope_for_principal(
@@ -103,6 +104,11 @@ pub(super) const QUALITY_RULES_NEED_A_USER: &str = "reading quality rules needs 
 /// is written as the person, and a headless run has none.
 pub(super) const CREATING_QUALITY_RULE_NEEDS_A_USER: &str =
     "creating a quality rule needs a signed-in user";
+
+/// Refusal for drafting a policy without a person (`SEC-83`): the policy is
+/// written as the person, and a headless run has none — `create_policy`
+/// would not narrow its table check for nobody.
+pub(super) const CREATING_POLICY_NEEDS_A_USER: &str = "creating a policy needs a signed-in user";
 
 /// `SEC-20` (plan 96): the classification list, as the person behind the chat
 /// may read it. The rows name the tables of the shared catalog and the upload
@@ -269,7 +275,18 @@ const NO_CONDITIONS_NOTE: &str = "This draft enforces nothing until a person add
 /// schema is an object, so a string means the model did not follow it.
 ///
 /// [`PolicyCondition::parse`]: crate::policy_engine::PolicyCondition::parse
-pub(super) async fn draft_policy(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn draft_policy(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    // `SEC-83`: the policy is written as the person behind the chat, and a
+    // headless run has none — `create_policy` would not narrow its table
+    // check for nobody (the mirror of `draft_quality_rule`'s `SEC-76`
+    // refusal).
+    let Some(principal) = principal else {
+        return json!({ "error": CREATING_POLICY_NEEDS_A_USER });
+    };
     let mut body = args.clone();
     body.insert("activate".to_owned(), Value::Bool(false));
     let has_conditions = match args.get("conditions") {
@@ -296,6 +313,10 @@ pub(super) async fn draft_policy(state: &AppState, args: &Map<String, Value>) ->
     let mut result = api_result_to_value(
         crate::routes::governance::create_policy(
             State(state.clone()),
+            Some(principal),
+            // The tool has no request headers of its own, so the tenant rule
+            // reads the person's own tenant (`tenant_scope::resolve`).
+            &axum::http::HeaderMap::new(),
             axum::body::Bytes::from(bytes),
         )
         .await,
@@ -424,6 +445,15 @@ mod tests {
     #[tokio::test]
     async fn draft_policy_without_a_pool_fails_rather_than_silently_activating() {
         let s = state_without_pool();
+        let principal = Principal {
+            id: lakehouse_auth::PrincipalId::User(uuid::Uuid::from_u128(1)),
+            tenant_ids: Vec::new(),
+            display_name: "Fajar".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::parse("*:*"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
         let mut args = Map::new();
         args.insert("name".to_owned(), json!("n"));
         args.insert("kind".to_owned(), json!("Row filter"));
@@ -431,8 +461,25 @@ mod tests {
         args.insert("resources".to_owned(), json!("tenant-scoped tables"));
         args.insert("effect".to_owned(), json!("Permit with obligation"));
         args.insert("activate".to_owned(), json!(true));
-        let result = draft_policy(&s, &args).await;
+        let result = draft_policy(&s, Some(&principal), &args).await;
         assert!(result.get("error").is_some(), "{result}");
+    }
+
+    /// `SEC-83`: the policy is written as the person behind the chat, so a
+    /// headless run is refused before the write — `create_policy` would not
+    /// narrow its table check for nobody (the mirror of
+    /// `draft_quality_rule`'s `SEC-76` refusal).
+    #[tokio::test]
+    async fn draft_policy_without_a_person_is_refused_before_the_write() {
+        let s = state_without_pool();
+        let mut args = Map::new();
+        args.insert("name".to_owned(), json!("n"));
+        args.insert("kind".to_owned(), json!("Row filter"));
+        args.insert("subjects".to_owned(), json!("All analysts"));
+        args.insert("resources".to_owned(), json!("tenant-scoped tables"));
+        args.insert("effect".to_owned(), json!("Permit with obligation"));
+        let result = draft_policy(&s, None, &args).await;
+        assert_eq!(result, json!({ "error": CREATING_POLICY_NEEDS_A_USER }));
     }
 }
 

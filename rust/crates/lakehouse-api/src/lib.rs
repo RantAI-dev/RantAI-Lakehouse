@@ -728,7 +728,8 @@ const MIGRATE_CONTEXT: upstream_error::Context = upstream_error::Context::new(
 ///
 /// It connects with the OWNER's URL (`DATABASE_URL`, which in compose is
 /// the owner's), waits for the database to accept a connection, runs the
-/// migrations, sets the console's own database role up, and exits. The
+/// migrations, sets the console's own database role and the source reader
+/// role up (`ops-145`), and exits. The
 /// server never does this: it only reads the database
 /// ([`bring_database_up`]), so it never holds the owner's password.
 ///
@@ -749,9 +750,15 @@ async fn migrate_database(config: &Config) -> anyhow::Result<()> {
              password of the console's own database role"
         );
     };
-    // The pool that NEVER logs a statement: this command runs the one
-    // statement whose text carries the console role's password, and
-    // `sqlx` logs a statement's text at the DEBUG level.
+    let Some(reader_password) = config.db_source_reader_password.as_ref() else {
+        anyhow::bail!(
+            "LAKEHOUSE_DB_SOURCE_READER_PASSWORD must be set to run the migrate command; it is \
+             the password of the source reader role"
+        );
+    };
+    // The pool that NEVER logs a statement: this command runs the statements
+    // whose TEXT carries a role's password, and `sqlx` logs a statement's
+    // text at the DEBUG level.
     let pool = match lakehouse_store::connect_lazy_without_statement_logging(&config.database_url) {
         Ok(pool) => pool,
         Err(err) => {
@@ -763,30 +770,49 @@ async fn migrate_database(config: &Config) -> anyhow::Result<()> {
         anyhow::bail!("{}", store_failure(&err));
     }
     if let Err(err) = db_roles::setup_app_role(&pool, password).await {
-        // A statement that did not carry the password: the upstream text
-        // goes to the log under a reference id.
-        if let Some(upstream) = err.upstream() {
-            let failure = upstream_error::report_sqlx(&MIGRATE_CONTEXT, upstream);
-            anyhow::bail!("{failure}");
-        }
-        // The statement that DID carry the password: only its SQLSTATE is
-        // logged. The server's own message for a refused statement can
-        // quote the statement, and that statement holds the password.
-        match err.sqlstate() {
-            Some(sqlstate) => {
-                tracing::error!(
-                    sqlstate = sqlstate,
-                    "the console's database role password could not be set"
-                );
-            }
-            None => {
-                tracing::error!("the console's database role password could not be set");
-            }
-        }
-        anyhow::bail!("{err}");
+        return Err(role_setup_failure(&err, CONSOLE_ROLE));
     }
-    tracing::info!("the database is migrated and the console's database role is set up");
+    if let Err(err) = db_roles::setup_source_reader_role(
+        &pool,
+        db_roles::SOURCE_READER_ROLE_NAME,
+        reader_password,
+        &config.source_reader_schemas,
+    )
+    .await
+    {
+        return Err(role_setup_failure(&err, SOURCE_READER_ROLE));
+    }
+    tracing::info!("the database is migrated and the database roles are set up");
     Ok(())
+}
+
+/// The name of the console's database role, as an operator reads it in a
+/// failure message (`ops-145`: the source reader has its own name).
+const CONSOLE_ROLE: &str = "the console's database role";
+
+/// The name of the source reader role, as an operator reads it in a failure
+/// message.
+const SOURCE_READER_ROLE: &str = "the source reader role";
+
+/// The error the `migrate` command exits with when a role could not be set
+/// up. `role` is one of the two names above.
+///
+/// A statement that did not carry a password reports its upstream text to
+/// the log under a reference id. A statement that DID carry the password
+/// logs only its SQLSTATE: the server's own message for a refused statement
+/// can quote the statement, and that statement holds the password.
+fn role_setup_failure(err: &db_roles::RoleSetupError, role: &str) -> anyhow::Error {
+    match err {
+        db_roles::RoleSetupError::Refused(upstream) => {
+            let failure = upstream_error::report_sqlx(&MIGRATE_CONTEXT, upstream);
+            anyhow::anyhow!("{failure}")
+        }
+        db_roles::RoleSetupError::PasswordRefused { sqlstate } => {
+            tracing::error!(sqlstate = ?sqlstate, "{role}'s password could not be set");
+            anyhow::anyhow!("{role}'s password could not be set")
+        }
+        db_roles::RoleSetupError::ConsoleSchema => anyhow::anyhow!("{err}"),
+    }
 }
 
 /// The message a store failure is reported as.

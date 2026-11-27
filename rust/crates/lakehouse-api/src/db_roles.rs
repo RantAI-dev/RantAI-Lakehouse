@@ -11,8 +11,8 @@
 //! it is: the migrations still run with it.
 //!
 //! WHERE THE ROLE IS SET UP: `lakehouse-api migrate` runs the migrations
-//! and then [`setup_app_role`], once per deploy, with the owner's
-//! credentials. The API's own start path only READS the database
+//! and then [`setup_app_role`] and [`setup_source_reader_role`], once per
+//! deploy, with the owner's credentials. The API's own start path only READS the database
 //! ([`check_runtime_role`]), so the API never holds the owner's password.
 //!
 //! WHY THE LISTS ARE HERE: the role's name, the schemas it may use and
@@ -120,6 +120,12 @@ pub enum RoleSetupError {
         /// The SQLSTATE the server answered with, when it sent one.
         sqlstate: Option<String>,
     },
+    /// The source reader's schema list names a console schema.
+    ///
+    /// The reader may read source schemas only (`ops-145` decision 2), so
+    /// the setup refuses before it changes anything: a console schema in
+    /// the list would otherwise be granted to the reader.
+    ConsoleSchema,
 }
 
 impl RoleSetupError {
@@ -130,7 +136,7 @@ impl RoleSetupError {
     pub fn upstream(&self) -> Option<&sqlx::Error> {
         match self {
             Self::Refused(err) => Some(err),
-            Self::PasswordRefused { .. } => None,
+            Self::PasswordRefused { .. } | Self::ConsoleSchema => None,
         }
     }
 
@@ -145,6 +151,7 @@ impl RoleSetupError {
         match self {
             Self::Refused(err) => sqlstate_of(err),
             Self::PasswordRefused { sqlstate } => sqlstate.clone(),
+            Self::ConsoleSchema => None,
         }
     }
 }
@@ -156,6 +163,9 @@ impl fmt::Display for RoleSetupError {
             Self::PasswordRefused { .. } => {
                 f.write_str("the console's database role's password could not be set")
             }
+            Self::ConsoleSchema => {
+                f.write_str("the source reader role may not be granted a console schema")
+            }
         }
     }
 }
@@ -164,7 +174,7 @@ impl std::error::Error for RoleSetupError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Refused(err) => Some(err),
-            Self::PasswordRefused { .. } => None,
+            Self::PasswordRefused { .. } | Self::ConsoleSchema => None,
         }
     }
 }
@@ -213,9 +223,9 @@ fn sqlstate_of(err: &sqlx::Error) -> Option<String> {
 /// [`RoleSetupError::PasswordRefused`], which keeps its SQLSTATE and
 /// nothing else.
 pub async fn setup_app_role(pool: &PgPool, password: &SecretValue) -> Result<(), RoleSetupError> {
-    create_role_if_missing(pool).await?;
-    set_role_attributes_and_password(pool, password).await?;
-    grant_connect_on_database(pool).await?;
+    create_role_if_missing(pool, APP_ROLE_NAME, APP_ROLE_ATTRIBUTES).await?;
+    set_role_attributes_and_password(pool, APP_ROLE_NAME, APP_ROLE_ATTRIBUTES, password).await?;
+    grant_connect_on_database(pool, APP_ROLE_NAME).await?;
     for schema in SCHEMAS {
         grant_on_schema(pool, schema).await?;
     }
@@ -230,17 +240,134 @@ pub async fn setup_app_role(pool: &PgPool, password: &SecretValue) -> Result<(),
     Ok(())
 }
 
+/// The source reader role: the login the Dagster code location reads its
+/// source tables as (`ops-145`, decision 1).
+///
+/// It holds read access to the source schemas and nothing else. It is not
+/// the console's role: it cannot append to the audit trail, and it cannot
+/// read the console's own tables (`ops-145`, decision 2).
+pub const SOURCE_READER_ROLE_NAME: &str = "lakehouse_source_reader";
+
+/// The attributes of the source reader role. `NOINHERIT` keeps it from
+/// taking on the privileges of any role it is later made a member of.
+const SOURCE_READER_ATTRIBUTES: &str =
+    "LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS";
+
+/// The attributes of the console's role, as [`setup_app_role`] sets them.
+const APP_ROLE_ATTRIBUTES: &str =
+    "LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS";
+
+/// The statements that give the source reader read access to one schema,
+/// as `format()` templates with the schema and the role as identifiers.
+///
+/// `REFERENCES` is in the table grants on purpose. The PostgreSQL manual's
+/// `information_schema` pages for `table_constraints` and
+/// `key_column_usage` show a table's constraints only to a role that owns
+/// the table or holds a privilege on it other than `SELECT`. Without
+/// `REFERENCES` the reader cannot see a source table's primary key
+/// (`ops-145` review). It opens no write path: the reader owns no table and
+/// has no `CREATE`, so it cannot add a foreign key, and `ALTER TABLE` needs
+/// ownership (`the_source_reader_sees_the_primary_key_of_a_source_table`
+/// checks that).
+///
+/// Otherwise read only: no `INSERT`, `UPDATE`, `DELETE`, no sequence and no
+/// function right. `ALTER DEFAULT PRIVILEGES` covers the tables that the
+/// owner creates in the schema after this setup, so a later table is
+/// readable without a new run.
+const SOURCE_READER_TEMPLATES: [&str; 3] = [
+    "GRANT USAGE ON SCHEMA %I TO %I",
+    "GRANT SELECT, REFERENCES ON ALL TABLES IN SCHEMA %I TO %I",
+    "ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT SELECT, REFERENCES ON TABLES TO %I",
+];
+
+/// Set the source reader role up (`ops-145`, decision 2).
+///
+/// `role` is the name of the role to set up. Production passes
+/// [`SOURCE_READER_ROLE_NAME`]. A test passes a name of its own, so that
+/// tests do not race on one cluster-wide role. The name reaches SQL only as
+/// a bound identifier.
+///
+/// `schemas` is the list the operator configured. It is checked first, so a
+/// console schema in it is refused before the role changes. A listed schema
+/// that does not exist yet is skipped with a log line: the migrate command
+/// runs on every deploy, so the schema is granted on the first run after it
+/// appears.
+///
+/// Idempotent, like [`setup_app_role`]: a second run resets the password and
+/// re-applies the same grants.
+///
+/// # Errors
+///
+/// Returns [`RoleSetupError::ConsoleSchema`] if `schemas` names `public` or
+/// `bronze_meta`, the console's own schemas. Returns the other
+/// [`RoleSetupError`] variants when the database refuses a statement, with
+/// the same meaning as in [`setup_app_role`].
+pub async fn setup_source_reader_role(
+    pool: &PgPool,
+    role: &str,
+    password: &SecretValue,
+    schemas: &[String],
+) -> Result<(), RoleSetupError> {
+    if schemas
+        .iter()
+        .any(|schema| SCHEMAS.contains(&schema.as_str()))
+    {
+        return Err(RoleSetupError::ConsoleSchema);
+    }
+    create_role_if_missing(pool, role, SOURCE_READER_ATTRIBUTES).await?;
+    set_role_attributes_and_password(pool, role, SOURCE_READER_ATTRIBUTES, password).await?;
+    grant_connect_on_database(pool, role).await?;
+    for schema in schemas {
+        grant_source_reader_on_schema(pool, role, schema).await?;
+    }
+    Ok(())
+}
+
+/// Grant the source reader read access to one configured schema, or skip it
+/// when the schema does not exist yet.
+async fn grant_source_reader_on_schema(
+    pool: &PgPool,
+    role: &str,
+    schema: &str,
+) -> Result<(), RoleSetupError> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)")
+            .bind(schema)
+            .fetch_one(pool)
+            .await
+            .map_err(RoleSetupError::Refused)?;
+    if !exists {
+        tracing::info!(
+            schema,
+            "the source reader is not granted this schema: it does not exist yet"
+        );
+        return Ok(());
+    }
+    for template in SOURCE_READER_TEMPLATES {
+        run_identifier_template(pool, template, schema, role).await?;
+    }
+    Ok(())
+}
+
 /// Create the console's role if it does not exist yet.
 ///
 /// Race-safe: the role is cluster-wide, so two `migrate` runs, or two
 /// tests in one cluster, can try to create it at the same time. The
 /// duplicate is caught by its SQLSTATE (`42710`, `duplicate_object`), so
 /// the loser of the race carries on with the role the winner created.
-async fn create_role_if_missing(pool: &PgPool) -> Result<(), RoleSetupError> {
-    let statement = format!(
-        "CREATE ROLE {APP_ROLE_NAME} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE \
-         NOREPLICATION NOBYPASSRLS"
-    );
+async fn create_role_if_missing(
+    pool: &PgPool,
+    role: &str,
+    attributes: &str,
+) -> Result<(), RoleSetupError> {
+    // The role name is an identifier the server quotes (`%I`), so a name a
+    // caller passes in never reaches SQL text by concatenation.
+    let statement: String = sqlx::query_scalar("SELECT format('CREATE ROLE %I %s', $1, $2)")
+        .bind(role)
+        .bind(attributes)
+        .fetch_one(pool)
+        .await
+        .map_err(RoleSetupError::Refused)?;
     match sqlx::query(sqlx::AssertSqlSafe(statement))
         .execute(pool)
         .await
@@ -264,17 +391,17 @@ async fn create_role_if_missing(pool: &PgPool) -> Result<(), RoleSetupError> {
 /// refused statement can quote the statement, and with it the password.
 async fn set_role_attributes_and_password(
     pool: &PgPool,
+    role: &str,
+    attributes: &str,
     password: &SecretValue,
 ) -> Result<(), RoleSetupError> {
-    let statement: String = sqlx::query_scalar(
-        "SELECT format('ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE \
-         NOREPLICATION NOBYPASSRLS PASSWORD %L', $1, $2)",
-    )
-    .bind(APP_ROLE_NAME)
-    .bind(password.expose_secret())
-    .fetch_one(pool)
-    .await
-    .map_err(RoleSetupError::Refused)?;
+    let template = format!("SELECT format('ALTER ROLE %I WITH {attributes} PASSWORD %L', $1, $2)");
+    let statement: String = sqlx::query_scalar(sqlx::AssertSqlSafe(template))
+        .bind(role)
+        .bind(password.expose_secret())
+        .fetch_one(pool)
+        .await
+        .map_err(RoleSetupError::Refused)?;
     // The statement carries the plain password as a literal. The server
     // logs a statement's text under the default `log_min_error_statement`
     // (a failing one) and under an operator's `log_statement`, so both are
@@ -313,11 +440,14 @@ pub const PASSWORD_LOG_GUARD: [&str; 2] = [
 ///
 /// The database name is an identifier, so the server quotes it (`%I`); the
 /// role name is a constant of this module.
-async fn grant_connect_on_database(pool: &PgPool) -> Result<(), RoleSetupError> {
-    let statement = format!(
-        "DO $$ BEGIN EXECUTE format('GRANT CONNECT ON DATABASE %I TO {APP_ROLE_NAME}', \
-         current_database()); END $$;"
-    );
+async fn grant_connect_on_database(pool: &PgPool, role: &str) -> Result<(), RoleSetupError> {
+    let statement: String = sqlx::query_scalar(
+        "SELECT format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), $1)",
+    )
+    .bind(role)
+    .fetch_one(pool)
+    .await
+    .map_err(RoleSetupError::Refused)?;
     sqlx::query(sqlx::AssertSqlSafe(statement))
         .execute(pool)
         .await
@@ -372,18 +502,35 @@ async fn keep_migration_ledger_read_only(pool: &PgPool) -> Result<(), RoleSetupE
 /// owner) creates from now on.
 async fn grant_default_privileges(pool: &PgPool, schema: &str) -> Result<(), RoleSetupError> {
     for template in DEFAULT_PRIVILEGE_TEMPLATES {
-        let statement: String = sqlx::query_scalar("SELECT format($1, $2, $3)")
-            .bind(template)
-            .bind(schema)
-            .bind(APP_ROLE_NAME)
-            .fetch_one(pool)
-            .await
-            .map_err(RoleSetupError::Refused)?;
-        sqlx::query(sqlx::AssertSqlSafe(statement))
-            .execute(pool)
-            .await
-            .map_err(RoleSetupError::Refused)?;
+        run_identifier_template(pool, template, schema, APP_ROLE_NAME).await?;
     }
+    Ok(())
+}
+
+/// Run one `format()` template whose two `%I` placeholders are the schema
+/// and the role, quoted by the server.
+///
+/// A schema name from configuration (the source reader's list) is an
+/// identifier, and this process never splices one into SQL text: the
+/// server quotes it here. The template is always one of this module's
+/// constants.
+async fn run_identifier_template(
+    pool: &PgPool,
+    template: &str,
+    schema: &str,
+    role: &str,
+) -> Result<(), RoleSetupError> {
+    let statement: String = sqlx::query_scalar("SELECT format($1, $2, $3)")
+        .bind(template)
+        .bind(schema)
+        .bind(role)
+        .fetch_one(pool)
+        .await
+        .map_err(RoleSetupError::Refused)?;
+    sqlx::query(sqlx::AssertSqlSafe(statement))
+        .execute(pool)
+        .await
+        .map_err(RoleSetupError::Refused)?;
     Ok(())
 }
 

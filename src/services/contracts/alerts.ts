@@ -212,7 +212,10 @@ export type AlertRunResult = {
   fired: boolean
   value?: number
   delivered?: AlertDeliverResult
+  /** Why the rule was deliberately not evaluated this check (no state, owner disabled, handled by another runner, ...). */
   skipped?: string
+  /** `BI-67`: why the rule could not be evaluated although it should have been (its metric's source is gone, the read was refused or failed). Never set with `skipped`; `lakehouse_alerts::RunResult::failed`. */
+  failed?: string
   /** `BI-19` D11: the value is back under the line and the recovery was sent. */
   recovered?: boolean
 }
