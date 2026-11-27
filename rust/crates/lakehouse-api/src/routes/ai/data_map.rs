@@ -140,6 +140,39 @@ pub(crate) struct Pieces {
     unserved_rows: Vec<(String, String)>,
 }
 
+impl Pieces {
+    /// The map's own entry for `key` — the table's name and every described
+    /// column — when these pieces hold it. A chat mention adds this exact
+    /// text; it never renders a second, divergent description (`AI-26`).
+    pub(crate) fn full_for_key(&self, key: &str) -> Option<&str> {
+        self.tables
+            .iter()
+            .find(|table| table.qualified == key)
+            .map(|table| table.full.as_str())
+    }
+
+    /// Pieces with one table per `(qualified name, already-rendered entry)`,
+    /// for chat tests that seed the shared cache without a `ClickHouse` dial.
+    /// The entries are the same [`render_table`] output the map would hold,
+    /// so a mention reads the columns the map describes (`AI-26`).
+    #[cfg(test)]
+    pub(crate) fn from_test_tables(tables: Vec<(String, String)>) -> Self {
+        Self {
+            tables: tables
+                .into_iter()
+                .map(|(qualified, full)| TablePiece {
+                    qualified,
+                    heading: GOLD_HEADING,
+                    full,
+                    line: String::new(),
+                    words: HashSet::new(),
+                })
+                .collect(),
+            ..Self::default()
+        }
+    }
+}
+
 /// The closing line about catalog datasets with no Gold table, from `entries`
 /// (`""` for none). The one place the line's words are written.
 fn render_unserved<'e>(entries: impl ExactSizeIterator<Item = &'e str>) -> String {
@@ -193,8 +226,10 @@ impl DataMapCache {
     }
 
     /// Put ready pieces into this cache as a build with no row-filtered table.
+    /// Crate-visible so a chat test can seed the map a mention reads without
+    /// dialing `ClickHouse` (`AI-26`).
     #[cfg(test)]
-    async fn seed_pieces_for_test(&self, pieces: Pieces) {
+    pub(crate) async fn seed_pieces_for_test(&self, pieces: Pieces) {
         *self.entry.lock().await = Some((Instant::now(), HashSet::new(), Arc::new(pieces)));
     }
 
@@ -234,7 +269,7 @@ fn reusable<'a>(
     (built.elapsed() < TTL && built_without == row_filtered).then_some(pieces)
 }
 
-/// The rendered DATA MAP, from cache when it is younger than [`TTL`].
+/// The shared pieces this caller may see, from cache or a fresh build.
 ///
 /// The cache holds each table's pieces ([`Pieces`]) and never a rendered
 /// map: [`assemble`] runs on every call, over the cached pieces or over
@@ -253,17 +288,19 @@ fn reusable<'a>(
 ///
 /// The lock is held while a stale map is rebuilt, so concurrent chats wait
 /// for one rebuild instead of each running the stats queries. An empty
-/// result (`ClickHouse` unreachable) is never cached.
-pub(crate) async fn data_map(
+/// result (`ClickHouse` unreachable) is never cached. Both the map and a
+/// chat mention read from these pieces (`AI-26`): the cache is built once
+/// and the role and tenant filtering happens once, so a mention can never
+/// see a table the map itself would hide.
+pub(crate) async fn pieces_for(
     cache: &DataMapCache,
     ch: &ChClient,
     withheld: Option<&Withheld>,
     notes: &Notes,
-    query_words: &HashSet<String>,
     relevant_enabled: bool,
     access: &crate::table_access::TableAccess,
     reach: Option<&super::tools::data::RegistryReach<'_>>,
-) -> String {
+) -> Arc<Pieces> {
     let cacheable = withheld.is_some_and(|w| w.masked.is_empty());
     let mut guard = cache.entry.lock().await;
     let pieces = if cacheable
@@ -285,8 +322,34 @@ pub(crate) async fn data_map(
     // `GOV-7` D6: the cache stays whole and shared; what one caller's roles
     // hide is dropped here, before any of it reaches the model.
     let pieces = visible_pieces(&pieces, access);
-    let pieces = entries_in_reach(pieces, reach).await;
-    assemble(&pieces, query_words, relevant_enabled, MAX_CHARS)
+    entries_in_reach(pieces, reach).await
+}
+
+/// The map's text from already-built pieces and this request's question.
+pub(crate) fn assemble_for(
+    pieces: &Pieces,
+    query_words: &HashSet<String>,
+    relevant_enabled: bool,
+) -> String {
+    assemble(pieces, query_words, relevant_enabled, MAX_CHARS)
+}
+
+/// Assemble the map from fresh pieces, for the tests that pin its text. A
+/// chat builds the pieces once through [`pieces_for`] and assembles them
+/// with [`assemble_for`], so this wrapper is test-only (`AI-26`).
+#[cfg(test)]
+pub(crate) async fn data_map(
+    cache: &DataMapCache,
+    ch: &ChClient,
+    withheld: Option<&Withheld>,
+    notes: &Notes,
+    query_words: &HashSet<String>,
+    relevant_enabled: bool,
+    access: &crate::table_access::TableAccess,
+    reach: Option<&super::tools::data::RegistryReach<'_>>,
+) -> String {
+    let pieces = pieces_for(cache, ch, withheld, notes, relevant_enabled, access, reach).await;
+    assemble_for(&pieces, query_words, relevant_enabled)
 }
 
 /// The caller's view of the shared pieces: unchanged for an unrestricted

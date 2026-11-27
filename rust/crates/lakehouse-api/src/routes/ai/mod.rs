@@ -319,10 +319,30 @@ struct ChatBody {
     view: Option<ScreenView>,
     #[serde(default)]
     messages: Vec<IncomingMessage>,
+    /// Tables the person pointed the chat at with `@` (`AI-26`). Only the
+    /// first five are read; an older client that sends no field gets none.
+    #[serde(default)]
+    mentions: Vec<Mention>,
     /// Answer as an NDJSON progress stream instead of one JSON body; see
     /// [`stream_chat`].
     #[serde(default)]
     stream: bool,
+}
+
+/// One `@` mention in [`ChatBody`]: a catalog table the person asked the
+/// chat about. `kind` is `"table"`; any other kind is ignored, so a future
+/// kind can be added without changing the body's shape.
+#[derive(Debug, Deserialize)]
+struct Mention {
+    kind: String,
+    key: String,
+}
+
+/// The client's page context and the tables it pointed at, carried together
+/// so the prompt builder does not grow a tenth argument (`AI-26`).
+struct PageContext<'a> {
+    raw: &'a str,
+    mentions: &'a [Mention],
 }
 
 /// `POST /api/ai/chat` — the agentic tool-calling loop: the LLM decides
@@ -441,6 +461,67 @@ fn page_context_line(raw: &str) -> String {
          answer from this context directly and say the numbers are from the screen; do not call tools for them. \
          Call tools only for data that is not shown here, or when the user asks you to verify or refresh it."
     )
+}
+
+/// The one block a mentioned table is added to the page context under
+/// (`AI-26`). It follows the client's own context, so it is the part that
+/// gives way at [`PAGE_CONTEXT_MAX_CHARS`].
+const MENTIONED_TABLES_HEADER: &str = "\nMENTIONED TABLES:\n";
+
+/// The page-context text for the tables a person pointed at with `@`
+/// (`AI-26`).
+///
+/// Each mention is checked with the catalog's OWN two reach helpers — never
+/// a second check here. One that either helper refuses is dropped without a
+/// trace, the same answer an unknown table gets, so a mention cannot name a
+/// table this caller could not read. The survivors' name and described
+/// columns come from the very pieces the data map rendered, not a separate
+/// description. Over the cap, whole trailing mentions are dropped before
+/// [`page_context_line`] would truncate anything by character.
+async fn mentioned_tables_context(
+    state: &AppState,
+    principal: &Principal,
+    headers: &axum::http::HeaderMap,
+    context: &str,
+    mentions: &[Mention],
+    pieces: &data_map::Pieces,
+) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    for mention in mentions.iter().filter(|m| m.kind == "table").take(5) {
+        let readable = crate::routes::catalog::ensure_key_in_reach(
+            state,
+            principal,
+            headers,
+            Some(&mention.key),
+        )
+        .await
+        .is_ok()
+            && crate::routes::catalog::ensure_asset_readable(state, principal, &mention.key)
+                .await
+                .is_ok();
+        if readable && let Some(entry) = pieces.full_for_key(&mention.key) {
+            kept.push(entry);
+        }
+    }
+    while !kept.is_empty()
+        && context.chars().count()
+            + MENTIONED_TABLES_HEADER.chars().count()
+            + kept
+                .iter()
+                .map(|entry| entry.chars().count())
+                .sum::<usize>()
+            > PAGE_CONTEXT_MAX_CHARS
+    {
+        kept.pop();
+    }
+    if kept.is_empty() {
+        return String::new();
+    }
+    let mut out = MENTIONED_TABLES_HEADER.to_owned();
+    for entry in kept {
+        out.push_str(entry);
+    }
+    out
 }
 
 /// What any policy withholds from the DATA MAP, for [`data_map::data_map`]:
@@ -613,6 +694,9 @@ fn data_map_access(principal: Option<&Principal>) -> MapAccess {
 /// existed. `AI_SEMANTIC_LAYER` adds [`prompt::DISTINCT_COUNT_RULES`] after
 /// the mode text and the ask-back rules, in both modes; with it off that
 /// block is absent.
+/// The prompt for a chat with no mentions. Kept as the seam the byte-pinning
+/// tests call; a chat that carries mentions uses [`system_prompt_with_mentions`].
+#[cfg(test)]
 async fn system_prompt(
     state: &AppState,
     principal: Option<&Principal>,
@@ -623,13 +707,117 @@ async fn system_prompt(
     asking: bool,
     sql_help: bool,
 ) -> String {
+    system_prompt_with_mentions(
+        state,
+        principal,
+        headers,
+        is_build,
+        &PageContext {
+            raw: context,
+            mentions: &[],
+        },
+        user_messages,
+        asking,
+        sql_help,
+    )
+    .await
+}
+
+/// The map pieces for this request, or `None` when neither the map nor a
+/// mention needs them. One build and one role/tenant pass serve both
+/// (`AI-26`); with no mentions and a withheld map nothing is built at all.
+async fn map_pieces_for(
+    state: &AppState,
+    principal: Option<&Principal>,
+    headers: &axum::http::HeaderMap,
+    withheld: Option<&data_map::Withheld>,
+    map_access: MapAccess,
+    user_messages: &[&str],
+    terms: &[lakehouse_store::chat_term::ChatTerm],
+    needed: bool,
+) -> Option<(
+    std::sync::Arc<data_map::Pieces>,
+    std::collections::HashSet<String>,
+)> {
+    if !needed {
+        return None;
+    }
+    let notes = semantic_notes(state).await;
+    // Read per request and kept out of the shared cache: the
+    // question and the caller's terms are this chat's own.
+    let query_words = if state.config.ai_relevant_tables {
+        data_map::question_words(user_messages, terms)
+    } else {
+        std::collections::HashSet::new()
+    };
+    // A caller without `query:read` gets `None` here, which drops
+    // every range and sample (`data_map` lists tables and columns
+    // only) and skips the shared cache, so such a caller costs one
+    // rebuild of the map per turn.
+    let withheld = if map_access == MapAccess::Full {
+        withheld
+    } else {
+        None
+    };
+    // `GOV-7` D6: the map is built for the caller's table access
+    // BEFORE anything reaches the model. A store that cannot say
+    // which roles may read what hides every table (fail closed) —
+    // the map still renders, with none of its tables in it.
+    let table_access = match principal {
+        // SEC-68: a role-less service identity is not a wildcard
+        // admin. `for_principal` answers zero tables for it, keeps a
+        // genuine `*:*` admin at `All`, and degrades to `All` only
+        // for a non-empty role set with no Postgres pool.
+        Some(principal) => crate::table_access::for_principal(state.pg.as_deref(), principal)
+            .await
+            .unwrap_or_else(|_| crate::table_access::TableAccess::none()),
+        None => crate::table_access::TableAccess::none(),
+    };
+    // `SEC-20`, plan 97: the closing line of the map names registry
+    // datasets, which another tenant's upload is one of. The reach is
+    // the request's own (`X-Tenant`); a reach that cannot be resolved
+    // covers nothing.
+    let reach = match principal {
+        Some(principal) => tools::data::RegistryReach::of(state, principal, headers)
+            .await
+            .unwrap_or_else(|_| tools::data::RegistryReach::nothing(state)),
+        None => tools::data::RegistryReach::nothing(state),
+    };
+    Some((
+        data_map::pieces_for(
+            &state.data_map_cache,
+            &state.clickhouse,
+            withheld,
+            &notes,
+            state.config.ai_relevant_tables,
+            &table_access,
+            Some(&reach),
+        )
+        .await,
+        query_words,
+    ))
+}
+
+/// The system prompt, with any table mentions appended to the page context.
+/// A request with no mentions renders byte for byte what it did before the
+/// field existed (`AI-26`).
+async fn system_prompt_with_mentions(
+    state: &AppState,
+    principal: Option<&Principal>,
+    headers: &axum::http::HeaderMap,
+    is_build: bool,
+    context: &PageContext<'_>,
+    user_messages: &[&str],
+    asking: bool,
+    sql_help: bool,
+) -> String {
     let latest_user = user_messages.last().copied().unwrap_or_default();
     // `BI-44` slice 3: a `bi-only` install has no lakehouse DATA MAP, and
     // the map builder below reads `ClickHouse` and Lakekeeper, which that
     // deployment never started. `full` mode never enters this helper, so
     // its prompt stays byte for byte what `AI-32` pinned.
     if state.config.is_bi_only() {
-        return bi_only_system_prompt(state, is_build, asking, sql_help, context, latest_user);
+        return bi_only_system_prompt(state, is_build, asking, sql_help, context.raw, latest_user);
     }
     let withheld = withheld_by_policy(state).await;
     let terms = users_terms(state, principal).await;
@@ -649,63 +837,29 @@ async fn system_prompt(
             .unwrap_or(Some("the shared-catalog rule could not be evaluated")),
         None => Some("no signed-in user"),
     };
+    // A caller the catalog refuses gets no map, but a mention they sent is
+    // still checked on its own by the catalog helpers, so the pieces are
+    // built for that check too. With no mentions this is the path it always
+    // was: nothing is built when the map is withheld.
+    let wants_mentions = context.mentions.iter().any(|m| m.kind == "table");
+    let pieces = map_pieces_for(
+        state,
+        principal,
+        headers,
+        withheld.as_ref(),
+        access,
+        user_messages,
+        &terms,
+        refusal.is_none() || wants_mentions,
+    )
+    .await;
     let schema = match refusal {
-        None => {
-            let notes = semantic_notes(state).await;
-            // Read per request and kept out of the shared cache: the
-            // question and the caller's terms are this chat's own.
-            let query_words = if state.config.ai_relevant_tables {
-                data_map::question_words(user_messages, &terms)
-            } else {
-                std::collections::HashSet::new()
-            };
-            // A caller without `query:read` gets `None` here, which drops
-            // every range and sample (`data_map` lists tables and columns
-            // only) and skips the shared cache, so such a caller costs one
-            // rebuild of the map per turn.
-            let withheld = if access == MapAccess::Full {
-                withheld.as_ref()
-            } else {
-                None
-            };
-            // `GOV-7` D6: the map is built for the caller's table access
-            // BEFORE anything reaches the model. A store that cannot say
-            // which roles may read what hides every table (fail closed) —
-            // the map still renders, with none of its tables in it.
-            let access = match principal {
-                // SEC-68: a role-less service identity is not a wildcard
-                // admin. `for_principal` answers zero tables for it, keeps a
-                // genuine `*:*` admin at `All`, and degrades to `All` only
-                // for a non-empty role set with no Postgres pool.
-                Some(principal) => {
-                    crate::table_access::for_principal(state.pg.as_deref(), principal)
-                        .await
-                        .unwrap_or_else(|_| crate::table_access::TableAccess::none())
-                }
-                None => crate::table_access::TableAccess::none(),
-            };
-            // `SEC-20`, plan 97: the closing line of the map names registry
-            // datasets, which another tenant's upload is one of. The reach is
-            // the request's own (`X-Tenant`); a reach that cannot be resolved
-            // covers nothing.
-            let reach = match principal {
-                Some(principal) => tools::data::RegistryReach::of(state, principal, headers)
-                    .await
-                    .unwrap_or_else(|_| tools::data::RegistryReach::nothing(state)),
-                None => tools::data::RegistryReach::nothing(state),
-            };
-            data_map::data_map(
-                &state.data_map_cache,
-                &state.clickhouse,
-                withheld,
-                &notes,
-                &query_words,
-                state.config.ai_relevant_tables,
-                &access,
-                Some(&reach),
-            )
-            .await
-        }
+        None => pieces
+            .as_ref()
+            .map(|(pieces, words)| {
+                data_map::assemble_for(pieces, words, state.config.ai_relevant_tables)
+            })
+            .unwrap_or_default(),
         Some(reason) => format!("(withheld: {reason})"),
     };
     let base = if is_build {
@@ -727,7 +881,21 @@ async fn system_prompt(
         rules.push_str(prompt::DISTINCT_COUNT_RULES);
     }
     let words = prompt::user_words_section(&terms);
-    let ctx_line = page_context_line(context);
+    let mentioned = match (&pieces, principal) {
+        (Some((pieces, _)), Some(principal)) => {
+            mentioned_tables_context(
+                state,
+                principal,
+                headers,
+                context.raw,
+                context.mentions,
+                pieces,
+            )
+            .await
+        }
+        _ => String::new(),
+    };
+    let ctx_line = page_context_line(&format!("{}{}", context.raw, mentioned));
     (if schema.is_empty() {
         format!(
             "{base}{rules}\n\nDATA MAP: unavailable right now (ClickHouse did not answer). Use describe_mart and run_sql to explore."
@@ -932,12 +1100,15 @@ async fn prepare_chat(
     // plan 17: `sql_help` was read above, before this, so the SQL help rules
     // stay in the prompt while the tool is taken out of an Explain turn.
     let tools = without_tool_in_explain(tools, recent_user.last().copied());
-    let sys = system_prompt(
+    let sys = system_prompt_with_mentions(
         state,
         principal,
         headers,
         is_build,
-        parsed.context.as_deref().unwrap_or_default(),
+        &PageContext {
+            raw: parsed.context.as_deref().unwrap_or_default(),
+            mentions: &parsed.mentions,
+        },
         &recent_user,
         asking,
         sql_help,
@@ -5306,5 +5477,243 @@ mod tests {
 
         let full_perms = holding("catalog:read, query:read");
         assert_eq!(data_map_access(Some(&full_perms)), MapAccess::Full);
+    }
+
+    // ── AI-26: a table mentioned in the chat ───────────────────────────────
+
+    const ORDERS_FULL: &str = "- serving.orders (5 rows)\n    order_id UInt32 — the order id\n    amount Float64 — the order total\n";
+
+    /// Two tenants, one owning the shared catalog. `state_with_pool` reads
+    /// its database URL from the same test pool, so the cache is cacheable
+    /// and the map a mention reads can be seeded without `ClickHouse`.
+    async fn seed_two_tenants(
+        pool: &lakehouse_store::PgPool,
+        catalog: uuid::Uuid,
+        other: uuid::Uuid,
+    ) {
+        for (id, name, slug) in [
+            (catalog, "Catalog owner", "catalog-owner"),
+            (other, "Other tenant", "other-tenant"),
+        ] {
+            sqlx::query(
+                "INSERT INTO tenant (id, name, slug, plan, residency) \
+                 VALUES ($1, $2, $3, 'Standard', 'US')",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(slug)
+            .execute(pool)
+            .await
+            .expect("a tenant row");
+        }
+    }
+
+    fn tenant_member(id: u128, tenant: uuid::Uuid) -> Principal {
+        Principal {
+            tenant_ids: vec![tenant],
+            ..analyst(id)
+        }
+    }
+
+    /// Seed the map's own rendered entries, so a mention reads exactly the
+    /// name and described columns the data map holds.
+    async fn seed_mention_tables(state: &AppState, tables: Vec<(&str, &str)>) {
+        state
+            .data_map_cache
+            .seed_pieces_for_test(data_map::Pieces::from_test_tables(
+                tables
+                    .into_iter()
+                    .map(|(key, full)| (key.to_owned(), full.to_owned()))
+                    .collect(),
+            ))
+            .await;
+    }
+
+    fn body_with_mentions(keys: &[&str]) -> ChatBody {
+        ChatBody {
+            messages: vec![IncomingMessage {
+                role: "user".to_owned(),
+                content: FIXED_QUESTION.to_owned(),
+            }],
+            mentions: keys
+                .iter()
+                .map(|key| Mention {
+                    kind: "table".to_owned(),
+                    key: (*key).to_owned(),
+                })
+                .collect(),
+            ..ChatBody::default()
+        }
+    }
+
+    /// The system message `prepare_chat` hands the model. This is the seam
+    /// the mention is observable at: no model call, no tool dispatch.
+    async fn system_message(state: &AppState, who: &Principal, body: ChatBody) -> String {
+        let prepared = prepare_chat(state, Some(who), &axum::http::HeaderMap::new(), body)
+            .await
+            .map_err(|_| "a valid body")
+            .expect("a prepared chat");
+        prepared.messages[0]
+            .content
+            .clone()
+            .expect("a system message")
+    }
+
+    /// Only the client's page-context text, not the instruction tail the
+    /// prompt adds below it.
+    fn mentioned_page_context(system: &str) -> String {
+        let (_, rest) = system
+            .split_once("CURRENT PAGE CONTEXT: ")
+            .expect("a page context");
+        rest.split_once("\nTailor your help")
+            .expect("the page-context tail")
+            .0
+            .to_owned()
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn mention_of_a_readable_table_adds_its_name_and_columns_to_the_system_message(
+        pool: lakehouse_store::PgPool,
+    ) {
+        let (catalog, other) = (uuid::Uuid::from_u128(101), uuid::Uuid::from_u128(102));
+        seed_two_tenants(&pool, catalog, other).await;
+        let catalog_id = catalog.to_string();
+        let state = state_with_pool(&pool, &[("CATALOG_TENANT_ID", &catalog_id)]);
+        seed_mention_tables(&state, vec![("serving.orders", ORDERS_FULL)]).await;
+        let owner = tenant_member(11, catalog);
+        let with = system_message(&state, &owner, body_with_mentions(&["serving.orders"])).await;
+        let without = system_message(&state, &owner, body_with_mentions(&[])).await;
+        assert!(with.contains("CURRENT PAGE CONTEXT:"), "{with}");
+        assert!(with.contains(ORDERS_FULL), "{with}");
+        assert!(!without.contains("CURRENT PAGE CONTEXT:"), "{without}");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn mention_of_a_table_out_of_the_callers_reach_adds_nothing_to_the_system_message(
+        pool: lakehouse_store::PgPool,
+    ) {
+        let (catalog, other) = (uuid::Uuid::from_u128(201), uuid::Uuid::from_u128(202));
+        seed_two_tenants(&pool, catalog, other).await;
+        let catalog_id = catalog.to_string();
+        let state = state_with_pool(&pool, &[("CATALOG_TENANT_ID", &catalog_id)]);
+        seed_mention_tables(&state, vec![("serving.orders", ORDERS_FULL)]).await;
+        let stranger = tenant_member(21, other);
+        let with = system_message(&state, &stranger, body_with_mentions(&["serving.orders"])).await;
+        let without = system_message(&state, &stranger, body_with_mentions(&[])).await;
+        assert_eq!(with, without, "a refused mention leaves no trace");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_sixth_mention_is_ignored(pool: lakehouse_store::PgPool) {
+        let (catalog, other) = (uuid::Uuid::from_u128(301), uuid::Uuid::from_u128(302));
+        seed_two_tenants(&pool, catalog, other).await;
+        let catalog_id = catalog.to_string();
+        let state = state_with_pool(&pool, &[("CATALOG_TENANT_ID", &catalog_id)]);
+        let keys: Vec<String> = (1..=6).map(|i| format!("serving.t{i}")).collect();
+        let fulls: Vec<String> = (1..=6)
+            .map(|i| format!("- serving.t{i} ({i} rows)\n    col_{i} UInt32 — column {i}\n"))
+            .collect();
+        let pairs: Vec<(&str, &str)> = keys
+            .iter()
+            .zip(&fulls)
+            .map(|(key, full)| (key.as_str(), full.as_str()))
+            .collect();
+        seed_mention_tables(&state, pairs).await;
+        let owner = tenant_member(31, catalog);
+        let body = ChatBody {
+            mentions: keys
+                .iter()
+                .map(|key| Mention {
+                    kind: "table".to_owned(),
+                    key: key.clone(),
+                })
+                .collect(),
+            ..body_with_mentions(&[])
+        };
+        let context = mentioned_page_context(&system_message(&state, &owner, body).await);
+        for i in 1..=5 {
+            assert!(
+                context.contains(&fulls[i - 1]),
+                "mention {i} is kept: {context}"
+            );
+        }
+        assert!(
+            !context.contains(&fulls[5]),
+            "the sixth mention is dropped: {context}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn mention_cap_drops_whole_entries_from_the_end_until_the_page_context_fits(
+        pool: lakehouse_store::PgPool,
+    ) {
+        let (catalog, other) = (uuid::Uuid::from_u128(401), uuid::Uuid::from_u128(402));
+        seed_two_tenants(&pool, catalog, other).await;
+        let catalog_id = catalog.to_string();
+        let state = state_with_pool(&pool, &[("CATALOG_TENANT_ID", &catalog_id)]);
+        let long = "v".repeat(2_000);
+        let keys: Vec<String> = (1..=3).map(|i| format!("serving.long{i}")).collect();
+        let fulls: Vec<String> = (1..=3)
+            .map(|i| format!("- serving.long{i} ({i} rows)\n    col_{i} String — {long}\n"))
+            .collect();
+        let pairs: Vec<(&str, &str)> = keys
+            .iter()
+            .zip(&fulls)
+            .map(|(key, full)| (key.as_str(), full.as_str()))
+            .collect();
+        seed_mention_tables(&state, pairs).await;
+        let owner = tenant_member(41, catalog);
+        let mut body = body_with_mentions(&["serving.long1", "serving.long2", "serving.long3"]);
+        body.context = Some("short context".to_owned());
+        let context = mentioned_page_context(&system_message(&state, &owner, body).await);
+        assert!(
+            context.chars().count() <= PAGE_CONTEXT_MAX_CHARS,
+            "{context}"
+        );
+        assert!(
+            context.contains(&fulls[0]),
+            "the first mention is kept whole"
+        );
+        assert!(
+            context.contains(&fulls[1]),
+            "the second mention is kept whole"
+        );
+        assert!(
+            !context.contains(&fulls[2]),
+            "the last mention gives way whole"
+        );
+        assert!(
+            !context.contains("col_3 String"),
+            "no part of the last mention is kept"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn mention_no_field_leaves_the_chat_body_unchanged(pool: lakehouse_store::PgPool) {
+        let (catalog, other) = (uuid::Uuid::from_u128(501), uuid::Uuid::from_u128(502));
+        seed_two_tenants(&pool, catalog, other).await;
+        let catalog_id = catalog.to_string();
+        let state = state_with_pool(&pool, &[("CATALOG_TENANT_ID", &catalog_id)]);
+        seed_mention_tables(&state, vec![("serving.orders", ORDERS_FULL)]).await;
+        let owner = tenant_member(51, catalog);
+        let parsed: ChatBody = serde_json::from_value(json!({
+            "messages": [{ "role": "user", "content": FIXED_QUESTION }],
+            "context": "short context"
+        }))
+        .expect("a body with no mentions field");
+        assert!(parsed.mentions.is_empty());
+        let with_empty = ChatBody {
+            mentions: Vec::new(),
+            ..body_with_mentions(&[])
+        };
+        let with_empty = ChatBody {
+            context: Some("short context".to_owned()),
+            ..with_empty
+        };
+        assert_eq!(
+            system_message(&state, &owner, parsed).await,
+            system_message(&state, &owner, with_empty).await,
+            "an absent field and an empty list render the same bytes"
+        );
     }
 }
