@@ -13,7 +13,7 @@ lakehouse-core = { path = "../lakehouse-core" }
 # breaking changes between patch-adjacent tags on the `StorageFactory` seam
 # this crate depends on directly.
 iceberg = "=0.10.1"
-iceberg-catalog-rest = "=0.10.1"
+iceberg-catalog-rest = "=0.11.0"
 # S3 backend for the `StorageFactory` this crate implements itself — see
 # `storage.rs`. Never a vendor SDK (`aws-sdk-s3`), never RustFS/MinIO admin
 # APIs: only the plain S3 API surface `object_store::aws` speaks.
