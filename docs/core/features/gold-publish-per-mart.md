@@ -70,8 +70,10 @@ that changes who can read the data.
   raise the limit.
 - A decimal column is published as a decimal of the same precision and scale.
   A decimal wider than 38 digits is refused, and the refusal names the column.
-- The open copy is current only after the publish that follows a pipeline
-  run.
+- How closely the open copy follows ClickHouse is the table's own sync
+  setting (`DATA-66`): "On every update" (after its pipeline and within 15
+  seconds of an outside change), "On a schedule", or "Manual only". A
+  failed sync leaves the previous copy in place, and the card says so.
 - If the system cannot tell when a table last changed, the page says "Not
   measured" and the table is published on every run.
 - Masking is applied when the copy is made. Later policy changes do not

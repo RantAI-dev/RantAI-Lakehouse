@@ -292,6 +292,42 @@ impl Schedule {
         };
         OffsetDateTime::from_unix_timestamp(next.as_second()).map_err(|_| ScheduleError::NoRunTime)
     }
+
+    /// The latest run time at or before `now`, in `zone` (`DATA-66` D8:
+    /// "which slot was this publication last due at?").
+    ///
+    /// Walks [`Schedule::next_run_after`] from shortly before `now` — two
+    /// hours for an hourly schedule, two days for a daily one, thirty-two
+    /// days for weekly/monthly — so the walk is a handful of steps and DST
+    /// behaviour is exactly [`next_run_after`]'s, not a second rule.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`Schedule::next_run_after`], plus
+    /// [`ScheduleError::NoRunTime`] when no run time falls at or before
+    /// `now` (not expected inside the windows above).
+    pub fn last_run_at_or_before(
+        self,
+        zone: &str,
+        now: OffsetDateTime,
+    ) -> Result<OffsetDateTime, ScheduleError> {
+        let window_seconds = match self {
+            Self::Hourly { .. } => 2 * 60 * 60,
+            Self::Daily { .. } => 2 * 24 * 60 * 60,
+            Self::Weekly { .. } | Self::Monthly { .. } => 32 * 24 * 60 * 60,
+        };
+        let mut last = self.next_run_after(zone, now - time::Duration::seconds(window_seconds))?;
+        if last > now {
+            return Err(ScheduleError::NoRunTime);
+        }
+        loop {
+            let next = self.next_run_after(zone, last)?;
+            if next > now {
+                return Ok(last);
+            }
+            last = next;
+        }
+    }
 }
 
 /// Whether `zone` is in the time zone database. The routes use it to refuse an
@@ -635,6 +671,73 @@ mod tests {
         );
         assert_eq!(local_date("UTC", now).as_deref(), Some("2026-10-18"));
         assert_eq!(local_date("Mars/Olympus", now), None);
+    }
+
+    /// `DATA-66` D8: the watcher asks "which slot was this publication
+    /// last due at?", not "when is the next one". An hourly schedule at
+    /// :15 read at 10:14 has its latest slot at 09:15 — 10:15 is still
+    /// ahead.
+    #[test]
+    fn the_latest_slot_of_an_hourly_schedule_is_the_previous_hour() {
+        let s = Schedule::Hourly { minute: 15 };
+        let at = s
+            .last_run_at_or_before("UTC", utc("2026-10-19T10:14:00Z"))
+            .unwrap();
+        assert_eq!(
+            at.format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            "2026-10-19T09:15:00Z"
+        );
+        // Exactly on the slot is at or before `now`.
+        let at = s
+            .last_run_at_or_before("UTC", utc("2026-10-19T10:15:00Z"))
+            .unwrap();
+        assert_eq!(
+            at.format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            "2026-10-19T10:15:00Z"
+        );
+    }
+
+    /// The slot is read on the publication's own clock, not UTC: 04:00 in
+    /// Jakarta is 21:00Z the day before.
+    #[test]
+    fn the_latest_slot_of_a_daily_schedule_uses_the_zones_clock() {
+        let s = Schedule::Daily { hour: 4, minute: 0 };
+        let at = s
+            .last_run_at_or_before("Asia/Jakarta", utc("2026-10-19T06:00:00Z"))
+            .unwrap();
+        assert_eq!(
+            at.format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            "2026-10-18T21:00:00Z"
+        );
+    }
+
+    /// A daily time inside the spring-forward gap agrees with what
+    /// `next_run_after` produced for that day: the slot runs when the gap
+    /// ends (03:00 local), and the walk does not invent a second rule.
+    #[test]
+    fn the_latest_slot_of_a_daily_time_in_a_dst_gap_agrees_with_next_run_after() {
+        // 2026-03-08 is the US spring-forward day: 02:00 EST becomes
+        // 03:00 EDT, so 02:30 does not exist.
+        let s = Schedule::Daily {
+            hour: 2,
+            minute: 30,
+        };
+        let expected = s
+            .next_run_after("America/New_York", utc("2026-03-07T12:00:00Z"))
+            .unwrap();
+        let at = s
+            .last_run_at_or_before("America/New_York", utc("2026-03-08T12:00:00Z"))
+            .unwrap();
+        assert_eq!(at, expected);
+        // 07:00Z is 03:00 EDT, the instant the gap ends.
+        assert_eq!(
+            at.format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            "2026-03-08T07:00:00Z"
+        );
     }
 
     #[test]

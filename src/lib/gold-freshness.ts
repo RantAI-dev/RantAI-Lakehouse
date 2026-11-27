@@ -24,3 +24,21 @@ export function publicationLabel(pub: GoldPublication): string {
   if (!pub.enabled) return "Off"
   return `On · ${freshnessLine(pub)}`
 }
+
+/**
+ * `DATA-66` D2: the three sync modes, in the one place the card and the
+ * All published marts page both read. The API's values are the keys; a
+ * value this console does not know is shown as it came, never as a
+ * guessed "On every update".
+ */
+export const SYNC_MODE_LABELS: Record<string, string> = {
+  on_update: "On every update",
+  scheduled: "On a schedule",
+  manual: "Manual only",
+}
+
+/** The label for a sync mode (`DATA-66`); an unknown one is shown as sent. */
+export function syncModeLabel(mode: string | null | undefined): string {
+  if (!mode) return SYNC_MODE_LABELS.on_update
+  return SYNC_MODE_LABELS[mode] ?? mode
+}

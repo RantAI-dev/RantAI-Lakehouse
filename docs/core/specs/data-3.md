@@ -8,6 +8,9 @@
 | Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 | Blocked by | `DATA-4`, and a new ADR that replaces ADR 0010's direction |
 
+> **Killed on 2026-11-27 by the product owner: not needed.** See `DATA-66`
+> ([spec](data-66.md)) for what replaced it.
+
 ## Why
 
 Today a Gold table is written to ClickHouse, and an open-format copy is made

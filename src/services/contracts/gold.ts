@@ -195,6 +195,23 @@ export type GoldPublicationFailure = {
   reason: string
 }
 
+/**
+ * DATA-66: how a switched-on publication follows ClickHouse. The API
+ * returns exactly these strings; widened per this repo's
+ * `"a" | "b" | string` convention so a future mode types without a
+ * console change.
+ */
+export type GoldSyncMode = "on_update" | "scheduled" | "manual" | string
+
+/**
+ * DATA-66 D5: the slot of a "On a schedule" publication. Hourly names a
+ * minute of the hour; daily names a wall-clock time in the publication's
+ * `timeZone`.
+ */
+export type GoldSyncSchedule =
+  | { kind: "hourly"; minute: number }
+  | { kind: "daily"; hour: number; minute: number }
+
 export type GoldPublication = {
   mart: string
   zone?: GoldZone
@@ -212,6 +229,28 @@ export type GoldPublication = {
   trim?: GoldTrimSummary | null
   /** The latest-copy table's name, what it holds, its newest run (DATA-6). */
   latestCopy: GoldLatestCopy | null
+  /** DATA-66: how closely the copy follows ClickHouse. */
+  syncMode: GoldSyncMode
+  /** The slot, when `syncMode` is `scheduled`; `null` otherwise. */
+  schedule: GoldSyncSchedule | null
+  /** The IANA zone the slot is read in; `null` unless scheduled. */
+  timeZone: string | null
+  /**
+   * DATA-66 D8: when the next slot runs, RFC 3339; `null` unless the
+   * publication is `scheduled` AND switched on.
+   */
+  nextSyncAt: string | null
+}
+
+/**
+ * The optional `sync` part of a publication `PUT` (DATA-66 D2/D5). Absent
+ * means "leave the stored setting alone", so a switch toggle never
+ * resets a schedule.
+ */
+export type GoldSyncSetting = {
+  syncMode: GoldSyncMode
+  schedule?: GoldSyncSchedule
+  timeZone?: string
 }
 
 export interface GoldService {
@@ -221,5 +260,11 @@ export interface GoldService {
   listExportRuns(mart: string, signal?: AbortSignal, zone?: GoldZone): Promise<GoldExportRun[]>
   getConsumers(mart: string, signal?: AbortSignal, zone?: GoldZone): Promise<GoldConsumers>
   getPublication(mart: string, signal?: AbortSignal, zone?: GoldZone): Promise<GoldPublication>
-  setPublication(mart: string, enabled: boolean, signal?: AbortSignal, zone?: GoldZone): Promise<GoldPublication>
+  setPublication(
+    mart: string,
+    enabled: boolean,
+    signal?: AbortSignal,
+    zone?: GoldZone,
+    sync?: GoldSyncSetting
+  ): Promise<GoldPublication>
 }

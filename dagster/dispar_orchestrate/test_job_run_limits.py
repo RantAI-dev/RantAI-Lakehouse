@@ -57,6 +57,7 @@ from dispar_orchestrate import (
     discover,
     file_ingest,
     gold_export,
+    iceberg_sync,
     ingest_factory,
     maintenance,
     replication_metrics,
@@ -103,6 +104,12 @@ _JOB_SPECS = (
     _JobSpec(assets, "bronze_ingest_job", "DAGSTER_RUN_LIMIT_BRONZE_INGEST_JOB_SECONDS", 21_600),
     _JobSpec(file_ingest, "file_ingest_job", "DAGSTER_RUN_LIMIT_FILE_INGEST_JOB_SECONDS", 21_600),
     _JobSpec(cdc_apply, "cdc_apply_job", "DAGSTER_RUN_LIMIT_CDC_APPLY_JOB_SECONDS", 21_600),
+    _JobSpec(
+        iceberg_sync,
+        "iceberg_sync_job",
+        "DAGSTER_RUN_LIMIT_ICEBERG_SYNC_JOB_SECONDS",
+        3_600,
+    ),
 )
 
 # The one variable the authored jobs share: they are built per pipeline

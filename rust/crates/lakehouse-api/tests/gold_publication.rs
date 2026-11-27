@@ -36,6 +36,8 @@ use tower::ServiceExt;
 use common::{
     TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
 };
+use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// ONE `ClickHouse` per test binary, shared by every test: these tests
 /// seed and read `serving.*` marts, and one container per binary is far
@@ -1522,4 +1524,578 @@ async fn a_refused_publish_and_a_name_that_is_not_a_mart_record_no_run() {
         0,
         "a name that is not a table is not a publish (DATA-56 D23)"
     );
+}
+
+// ── DATA-66: the sync setting over the real routes ─────────────────────
+
+/// DATA-66 T2: a PUT that carries the mode saves it, the detail GET
+/// reports it with a measured `nextSyncAt`, and a later PUT that sends
+/// only `{enabled:false}` (the pre-DATA-66 console's body) leaves the
+/// schedule exactly where it was.
+#[tokio::test]
+async fn put_scheduled_then_enabled_only_keeps_the_schedule() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "sync_schedule_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/sync_schedule_mart/publication",
+        Some(&cookie),
+        Some(serde_json::json!({
+            "enabled": true,
+            "syncMode": "scheduled",
+            "schedule": { "kind": "daily", "hour": 4, "minute": 0 },
+            "timeZone": "Asia/Jakarta",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["syncMode"], "scheduled", "{body}");
+    assert_eq!(body["schedule"]["kind"], "daily", "{body}");
+    assert_eq!(body["schedule"]["hour"], 4, "{body}");
+    assert_eq!(body["schedule"]["minute"], 0, "{body}");
+    assert_eq!(body["timeZone"], "Asia/Jakarta", "{body}");
+    assert!(
+        body["nextSyncAt"].is_string(),
+        "a scheduled, enabled publication has a next sync time: {body}"
+    );
+
+    // The pre-DATA-66 body: only `enabled`.
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/sync_schedule_mart/publication",
+        Some(&cookie),
+        Some(serde_json::json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["enabled"], Value::Bool(false), "{body}");
+    assert_eq!(
+        body["syncMode"], "scheduled",
+        "an enabled-only PUT keeps a scheduled setting: {body}"
+    );
+    assert_eq!(body["timeZone"], "Asia/Jakarta", "{body}");
+    assert!(
+        body["nextSyncAt"].is_null(),
+        "a switched-off publication has no next sync: {body}"
+    );
+
+    // The detail GET reports the same stored setting.
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/sync_schedule_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["syncMode"], "scheduled", "{body}");
+    assert_eq!(body["schedule"]["kind"], "daily", "{body}");
+    assert_eq!(body["timeZone"], "Asia/Jakarta", "{body}");
+}
+
+/// DATA-66 D4: a mart with no publication row answers `on_update` — the
+/// mode a table gets when it is switched on — and no schedule.
+#[tokio::test]
+async fn detail_of_a_never_enabled_mart_answers_on_update() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "sync_default_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:read").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/sync_default_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["syncMode"], "on_update", "{body}");
+    assert!(body["schedule"].is_null(), "{body}");
+    assert!(body["timeZone"].is_null(), "{body}");
+    assert!(body["nextSyncAt"].is_null(), "{body}");
+}
+
+/// DATA-66 T2: scheduled without a time zone is the fixed 400 sentence
+/// (never a 422 from a body extractor, never an upstream string).
+#[tokio::test]
+async fn put_scheduled_without_a_time_zone_is_a_fixed_400() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "sync_no_zone_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/sync_no_zone_mart/publication",
+        Some(&cookie),
+        Some(serde_json::json!({
+            "enabled": true,
+            "syncMode": "scheduled",
+            "schedule": { "kind": "daily", "hour": 4, "minute": 0 },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"], "a scheduled sync needs a schedule and a time zone",
+        "{body}"
+    );
+}
+
+/// DATA-66 review R1: a refused PUT writes nothing. The sync body is
+/// validated before the first write, so the 400 for `scheduled` without a
+/// time zone cannot have stored `enabled` on the way: a mart with no row
+/// still has none (`updatedAt` is the row's own stamp), and a stored
+/// disabled row is still disabled and still `on_update`.
+#[tokio::test]
+async fn a_refused_put_leaves_a_disabled_row_disabled_and_a_missing_row_missing() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "sync_refused_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+    let refused = serde_json::json!({
+        "enabled": true,
+        "syncMode": "scheduled",
+        "schedule": { "kind": "daily", "hour": 4, "minute": 0 },
+    });
+
+    // A missing row: the refused PUT must not create one.
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/sync_refused_mart/publication",
+        Some(&cookie),
+        Some(refused.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/sync_refused_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["enabled"], Value::Bool(false), "{body}");
+    assert!(
+        body["updatedAt"].is_null(),
+        "the refused PUT created no row: {body}"
+    );
+    assert_eq!(body["syncMode"], "on_update", "{body}");
+
+    // A stored disabled row: the refused PUT must leave it exactly there.
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/sync_refused_mart/publication",
+        Some(&cookie),
+        Some(serde_json::json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/sync_refused_mart/publication",
+        Some(&cookie),
+        Some(refused),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/sync_refused_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["enabled"],
+        Value::Bool(false),
+        "a refused PUT left `enabled` unset: {body}"
+    );
+    assert_eq!(body["syncMode"], "on_update", "{body}");
+}
+
+/// DATA-66 D5: Weekly/Monthly are refused with the fixed sentence, and
+/// an unknown IANA zone with its own — both 400s from this handler.
+#[tokio::test]
+async fn put_weekly_and_an_unknown_zone_are_fixed_400s() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "sync_weekly_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/sync_weekly_mart/publication",
+        Some(&cookie),
+        Some(serde_json::json!({
+            "enabled": true,
+            "syncMode": "scheduled",
+            "schedule": { "kind": "weekly", "weekday": 1, "hour": 8, "minute": 0 },
+            "timeZone": "UTC",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"], "schedule kind must be hourly or daily",
+        "{body}"
+    );
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/sync_weekly_mart/publication",
+        Some(&cookie),
+        Some(serde_json::json!({
+            "enabled": true,
+            "syncMode": "scheduled",
+            "schedule": { "kind": "hourly", "minute": 15 },
+            "timeZone": "Mars/Olympus",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "unknown time zone", "{body}");
+}
+
+/// DATA-66: a mode that cannot have a schedule refuses one; an unknown
+/// mode is a fixed 400 too. Both leave the stored row at its default.
+#[tokio::test]
+async fn put_manual_with_a_schedule_and_an_unknown_mode_are_fixed_400s() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "sync_bad_mode_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/sync_bad_mode_mart/publication",
+        Some(&cookie),
+        Some(serde_json::json!({
+            "enabled": true,
+            "syncMode": "manual",
+            "schedule": { "kind": "hourly", "minute": 15 },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"], "only a scheduled sync has a schedule and a time zone",
+        "{body}"
+    );
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/sync_bad_mode_mart/publication",
+        Some(&cookie),
+        Some(serde_json::json!({ "enabled": true, "syncMode": "eventually" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"], "unknown sync mode: expected on_update, scheduled or manual",
+        "{body}"
+    );
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/sync_bad_mode_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["syncMode"], "on_update",
+        "a refused PUT stores nothing: {body}"
+    );
+}
+
+/// DATA-66: the scheduler's list carries every enabled publication's
+/// mode, and the console's all-marts page reads it from there.
+#[tokio::test]
+async fn publications_list_reports_each_marts_sync_mode() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "sync_listed_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/sync_listed_mart/publication",
+        Some(&cookie),
+        Some(serde_json::json!({
+            "enabled": true,
+            "syncMode": "scheduled",
+            "schedule": { "kind": "hourly", "minute": 15 },
+            "timeZone": "UTC",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/publications",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let item = &body["publications"][0];
+    assert_eq!(item["mart"], "sync_listed_mart", "{body}");
+    assert_eq!(item["syncMode"], "scheduled", "{body}");
+    assert_eq!(item["schedule"]["kind"], "hourly", "{body}");
+    assert_eq!(item["schedule"]["minute"], 15, "{body}");
+    assert_eq!(item["timeZone"], "UTC", "{body}");
+    assert!(item["nextSyncAt"].is_string(), "{body}");
+}
+
+// ── DATA-66 T4: POST /api/gold/export/{mart}/after-write ──────────────
+
+/// The shared `ClickHouse` plus a `wiremock` Dagster at `dagster_url`,
+/// so the after-write route's launch (or its absence) is observable.
+async fn spin_up_with_dagster_and_clickhouse(dagster_url: String) -> (TestApp, ChClient) {
+    let (ch_url, _container) = shared_clickhouse().await;
+    let mut overrides = HashMap::new();
+    overrides.insert("CH_URL".to_owned(), ch_url.clone());
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    overrides.insert("DAGSTER_URL".to_owned(), dagster_url);
+    let app = spin_up_with_env(&overrides).await;
+    let ch = ChClient::new(ch_url.clone(), "default".to_owned(), String::new());
+    (app, ch)
+}
+
+/// DATA-66 D7: an `on_update` publication is synced through ONE
+/// `launchRun` of `iceberg_sync_job`, carrying the run config (zone,
+/// mart, `pipeline` trigger) and both D6 tags.
+#[tokio::test]
+async fn after_write_launches_one_on_update_sync_with_its_config_and_tags() {
+    let dagster = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "launchRun": {
+                "__typename": "LaunchRunSuccess",
+                "run": { "runId": "run-sync-1" },
+            } }
+        })))
+        .expect(1)
+        .mount(&dagster)
+        .await;
+    let (app, ch) = spin_up_with_dagster_and_clickhouse(format!("{}/graphql", dagster.uri())).await;
+    seed_mart(&ch, "after_write_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    // `on_update` is the mode a switched-on mart gets (D4).
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/after_write_mart/publication",
+        Some(&cookie),
+        Some(serde_json::json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["syncMode"], "on_update", "{body}");
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/after_write_mart/after-write?zone=gold",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["launched"], serde_json::Value::Bool(true), "{body}");
+    assert!(body["reason"].is_null(), "{body}");
+    assert_eq!(body["runId"], "run-sync-1", "{body}");
+
+    let requests = dagster.received_requests().await.expect("the mock records");
+    assert_eq!(requests.len(), 1, "exactly one launch");
+    let sent = String::from_utf8_lossy(&requests[0].body).into_owned();
+    assert!(sent.contains("iceberg_sync_job"), "{sent}");
+    assert!(sent.contains("iceberg_sync_target"), "{sent}");
+    assert!(sent.contains("\"zone\":\"gold\""), "{sent}");
+    assert!(sent.contains("\"mart\":\"after_write_mart\""), "{sent}");
+    assert!(sent.contains("\"trigger\":\"pipeline\""), "{sent}");
+    assert!(sent.contains("lakehouse/iceberg-sync-target"), "{sent}");
+    assert!(sent.contains("gold.after_write_mart"), "{sent}");
+    assert!(sent.contains("lakehouse/iceberg-sync-trigger"), "{sent}");
+}
+
+/// DATA-66 D7/D10: scheduled, manual and switched-off publications start
+/// nothing, and the answer says which. No request reaches Dagster at all.
+#[tokio::test]
+async fn after_write_launches_nothing_for_scheduled_manual_or_switched_off() {
+    let dagster = MockServer::start().await;
+    let (app, ch) = spin_up_with_dagster_and_clickhouse(format!("{}/graphql", dagster.uri())).await;
+    seed_mart(&ch, "after_write_idle").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/after_write_idle/after-write",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["launched"], serde_json::Value::Bool(false), "{body}");
+    assert_eq!(body["reason"], "publishing_off", "{body}");
+    assert!(body["runId"].is_null(), "{body}");
+
+    for (setting, reason) in [
+        (
+            serde_json::json!({ "enabled": true, "syncMode": "manual" }),
+            "manual",
+        ),
+        (
+            serde_json::json!({
+                "enabled": true,
+                "syncMode": "scheduled",
+                "schedule": { "kind": "hourly", "minute": 15 },
+                "timeZone": "UTC",
+            }),
+            "scheduled",
+        ),
+    ] {
+        let (status, body) = send(
+            &sessions.app.router,
+            "PUT",
+            "/api/gold/export/after_write_idle/publication",
+            Some(&cookie),
+            Some(setting),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = send(
+            &sessions.app.router,
+            "POST",
+            "/api/gold/export/after_write_idle/after-write",
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["launched"], serde_json::Value::Bool(false), "{body}");
+        assert_eq!(body["reason"], reason, "{body}");
+    }
+
+    let requests = dagster.received_requests().await.expect("the mock records");
+    assert!(
+        requests.is_empty(),
+        "no mode but on_update may reach the orchestrator: {requests:?}"
+    );
+}
+
+/// DATA-66 D11: a refused launch is `200 not_started`, and the
+/// orchestrator's own text never reaches the answer (`SEC-11`).
+#[tokio::test]
+async fn after_write_answers_not_started_and_never_the_upstream_text() {
+    let dagster = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "launchRun": {
+                "__typename": "PythonError",
+                "message": "upstream-secret-text-9f2",
+                "className": "DagsterUserCodeUnreachableError",
+            } }
+        })))
+        .mount(&dagster)
+        .await;
+    let (app, ch) = spin_up_with_dagster_and_clickhouse(format!("{}/graphql", dagster.uri())).await;
+    seed_mart(&ch, "after_write_refused").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/after_write_refused/publication",
+        Some(&cookie),
+        Some(serde_json::json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/after_write_refused/after-write",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["launched"], serde_json::Value::Bool(false), "{body}");
+    assert_eq!(body["reason"], "not_started", "{body}");
+    assert!(
+        !body.to_string().contains("upstream-secret-text-9f2"),
+        "the orchestrator's text must not reach the answer: {body}"
+    );
+}
+
+/// DATA-66 D11: an orchestrator that cannot be reached is the same
+/// `200 not_started` — the `ClickHouse` write already happened, and the
+/// watcher retries it.
+#[tokio::test]
+async fn after_write_answers_not_started_for_an_unreachable_orchestrator() {
+    let (app, ch) =
+        spin_up_with_dagster_and_clickhouse("http://127.0.0.1:1/graphql".to_owned()).await;
+    seed_mart(&ch, "after_write_unreachable").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/after_write_unreachable/publication",
+        Some(&cookie),
+        Some(serde_json::json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/after_write_unreachable/after-write",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["launched"], serde_json::Value::Bool(false), "{body}");
+    assert_eq!(body["reason"], "not_started", "{body}");
 }

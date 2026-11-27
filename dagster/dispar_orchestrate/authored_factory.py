@@ -132,6 +132,7 @@ from dagster import (
 from dispar_orchestrate import op_metadata
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, _ch_exec, _ch_query_json
 from dispar_orchestrate.file_ingest import JOB_NAME as FILE_INGEST_JOB
+from dispar_orchestrate.iceberg_sync import request_iceberg_sync
 from dispar_orchestrate.incremental_write import IncrementalConfig, write_incrementally
 from dispar_orchestrate.ingest_factory import job_tags
 
@@ -759,6 +760,11 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
                 metadata={"rows": written, **materialization.metadata()},
             )
         )
+        # DATA-66 D7/D3: the write is done, so ask the API to sync this one
+        # table now if its publication says so. The helper never raises, so
+        # no sync status, timeout or HTTP error can fail this pipeline's
+        # write; a lost ask is picked up by the watcher's `change` key.
+        request_iceberg_sync(target_zone, target_table, context.log)
         return {"rows": written, "skipped_verbs": skipped_verbs}
 
     return _run

@@ -50,7 +50,7 @@ from dagster import (
     op,
 )
 
-from dispar_orchestrate import authored_factory
+from dispar_orchestrate import authored_factory, iceberg_sync
 from dispar_orchestrate.incremental_write import IncrementalConfig, MaterializationResult
 from dispar_orchestrate.authored_factory import (
     DAGSTER_LOCATION,
@@ -310,6 +310,93 @@ class BronzeSourceTest(unittest.TestCase):
             **{"sourceZone": "bronze", "sourceTable": "g3a_orders", "targetZone": "silver"}
         )
         self.assertTrue([s for s in self._statements(calls) if "silver.`orders_clean`" in s])
+
+
+class AuthoredSyncAskTest(unittest.TestCase):
+    """`DATA-66` T6/D7/D3: after the write and its materialization, the op
+    asks the API to sync this one table — and nothing that ask does may
+    fail the pipeline. The compile call is stubbed (`_compile_passthrough`)
+    so the only HTTP request under test is the ask itself."""
+
+    def _run(self, target_zone: str, target_table: str, post: Any) -> Any:
+        pipeline = _ready_pipeline(
+            targetZone=target_zone, targetTable=target_table
+        )
+        run_fn = authored_factory._op_for_pipeline(pipeline)
+        counts = iter([[{"n": "0"}], [{"n": "3"}]])
+        cfg = mock.Mock(api_url="http://api.invalid:8080", run_token="tok")
+        with mock.patch.object(authored_factory, "_ch_exec"), \
+             mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts)), \
+             mock.patch.object(
+                 authored_factory.ClickHouseTarget,
+                 "from_env",
+                 return_value=ClickHouseTarget("http://ch", "default", ""),
+             ), \
+             _compile_passthrough(), \
+             mock.patch.object(
+                 iceberg_sync.GoldExportConfig, "from_env", return_value=cfg
+             ), \
+             mock.patch.object(iceberg_sync.requests, "post", side_effect=post) as mocked_post:
+            result = run_fn(build_op_context())
+        return result, mocked_post
+
+    def test_a_gold_target_asks_with_zone_serving_and_returns_its_result(self) -> None:
+        after = mock.Mock(ok=True, status_code=200)
+        result, mocked_post = self._run("serving", "orders_clean", lambda *a, **k: after)
+        self.assertEqual(result["rows"], 3)
+        mocked_post.assert_called_once()
+        url = mocked_post.call_args.args[0]
+        self.assertEqual(
+            url,
+            "http://api.invalid:8080/api/gold/export/orders_clean/after-write",
+        )
+        self.assertEqual(mocked_post.call_args.kwargs["params"], {"zone": "serving"})
+
+    def test_a_silver_target_asks_with_zone_silver(self) -> None:
+        after = mock.Mock(ok=True, status_code=200)
+        _, mocked_post = self._run("silver", "orders", lambda *a, **k: after)
+        self.assertEqual(mocked_post.call_args.kwargs["params"], {"zone": "silver"})
+
+    def test_a_connection_error_does_not_fail_the_op(self) -> None:
+        def post(*args: Any, **kwargs: Any) -> Any:
+            raise requests.ConnectionError("connection refused")
+
+        result, _ = self._run("serving", "orders_clean", post)
+        self.assertEqual(result["rows"], 3)
+
+    def test_a_500_answer_does_not_fail_the_op(self) -> None:
+        after = mock.Mock(ok=False, status_code=500)
+        after.json.return_value = {"error": "upstream text"}
+        result, _ = self._run("serving", "orders_clean", lambda *a, **k: after)
+        self.assertEqual(result["rows"], 3)
+
+    def test_a_timeout_does_not_fail_the_op(self) -> None:
+        def post(*args: Any, **kwargs: Any) -> Any:
+            raise requests.Timeout("timed out")
+
+        result, _ = self._run("serving", "orders_clean", post)
+        self.assertEqual(result["rows"], 3)
+
+    def test_no_post_when_the_run_token_is_unset(self) -> None:
+        pipeline = _ready_pipeline(targetZone="serving", targetTable="orders_clean")
+        run_fn = authored_factory._op_for_pipeline(pipeline)
+        counts = iter([[{"n": "0"}], [{"n": "3"}]])
+        cfg = mock.Mock(api_url="http://api.invalid:8080", run_token="")
+        with mock.patch.object(authored_factory, "_ch_exec"), \
+             mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts)), \
+             mock.patch.object(
+                 authored_factory.ClickHouseTarget,
+                 "from_env",
+                 return_value=ClickHouseTarget("http://ch", "default", ""),
+             ), \
+             _compile_passthrough(), \
+             mock.patch.object(
+                 iceberg_sync.GoldExportConfig, "from_env", return_value=cfg
+             ), \
+             mock.patch.object(iceberg_sync.requests, "post") as mocked_post:
+            result = run_fn(build_op_context())
+        mocked_post.assert_not_called()
+        self.assertEqual(result["rows"], 3)
 
 
 class CompileSqlTest(unittest.TestCase):
