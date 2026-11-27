@@ -189,10 +189,21 @@ pub(crate) async fn snapshot(ch: &ChClient, board: &str, principal: &Principal) 
     let _ = snapshot_version(ch, board, Some(principal), None).await;
 }
 
-/// [`snapshot`] for a change made with no signed-in person attached (the
-/// assistant's tools outside a session): recorded as the assistant.
+/// The assistant's board tools write a version through this, not [`snapshot`]
+/// (`AI-21`): the version is labelled as the assistant's change, so its undo
+/// can tell it from a person's edit. With no signed-in person attached, the
+/// author is recorded as the assistant.
 pub(crate) async fn snapshot_as(ch: &ChClient, board: &str, principal: Option<&Principal>) {
-    let _ = snapshot_version(ch, board, principal, None).await;
+    let author = principal.map_or_else(
+        || Author {
+            id: String::new(),
+            name: "Assistant".to_owned(),
+        },
+        author_of,
+    );
+    if let Err(err) = versions::record_by_assistant(ch, board, &author).await {
+        let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &err);
+    }
 }
 
 async fn snapshot_version(
@@ -647,8 +658,29 @@ pub async fn revert(
     // refused first, whatever the request says.
     crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Edit).await?;
     let body: RevertBody = parse(&body)?;
-    let id = body.board.trim();
-    if id.is_empty() || body.version == 0 {
+    let label = format!("Restored v{}", body.version);
+    restore_version(&state, &principal, body.board.trim(), body.version, &label).await
+}
+
+/// Write version `number` of dashboard `board` back as a new version labelled
+/// `label`: the whole of [`revert`] after its permission and body checks. The
+/// assistant's undo calls it too (`AI-21`), so every check it makes is the
+/// console's.
+///
+/// # Errors
+///
+/// As [`revert`]: 400 without a board or a version, 404 for a dashboard the
+/// caller cannot read or a version that is not kept, 422 with a sentence naming
+/// the first thing that no longer holds (nothing is written then), 503 when the
+/// store is unreachable.
+pub(crate) async fn restore_version(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+    number: u32,
+    label: &str,
+) -> ApiResult<ApiJson<Value>> {
+    if id.is_empty() || number == 0 {
         return Err(ApiError::BadRequest("board and version are required.".to_owned()).into());
     }
     if id == store::DEFAULT_BOARD_ID {
@@ -658,18 +690,18 @@ pub async fn revert(
     }
     let ch = &state.clickhouse;
     // BI-19 B1 review R5: the resolved viewer, so a restricted dashboard is a 404.
-    let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
+    let scope = crate::routes::dashboard_access::scope_for_write(state, principal).await?;
     require_board(ch, id, &scope.viewer).await?;
     // BI-19 B2 (plan D8): going back is an edit.
-    crate::routes::dashboard_access::require_board_level(&state, &scope, id, Level::Edit).await?;
-    let Some(stored) = versions::load(ch, id, body.version)
+    crate::routes::dashboard_access::require_board_level(state, &scope, id, Level::Edit).await?;
+    let Some(stored) = versions::load(ch, id, number)
         .await
         .map_err(|err| classify_ch_error(&err))?
     else {
         return Err(ApiError::NotFound("That version is not kept any more.".to_owned()).into());
     };
-    let time = crate::routes::settings::time_context(&state).await?;
-    let plan = prepare_revert(ch, &stored, id, body.version, &time).await?;
+    let time = crate::routes::settings::time_context(state).await?;
+    let plan = prepare_revert(ch, &stored, id, number, &time).await?;
     // Past this line nothing is refused for the content's sake; a failing
     // write is a store failure and the same request can be sent again.
     // A chart that was in the trash comes out of it here: the new row has the
@@ -704,11 +736,10 @@ pub async fn revert(
     .await
     .map_err(|err| classify_bi_error(&err))?;
     // R8: the version a revert writes says what it is.
-    let label = format!("Restored v{}", body.version);
-    let version = snapshot_version(ch, id, Some(&principal), Some(&label)).await;
+    let version = snapshot_version(ch, id, Some(principal), Some(label)).await;
     Ok(ApiJson(json!({
         "ok": true,
-        "restoredFrom": body.version,
+        "restoredFrom": number,
         "version": version,
         "chartsRemoved": plan.added_since.len(),
         "chartsRestored": plan.restored,

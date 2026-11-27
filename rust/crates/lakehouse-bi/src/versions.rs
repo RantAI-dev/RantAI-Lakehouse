@@ -30,6 +30,8 @@
 //! for good cannot, and the revert names it and leaves its tile out. Charts
 //! added since move to the trash.
 
+use std::collections::HashSet;
+
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ident::SqlLiteral;
 use serde::{Deserialize, Serialize};
@@ -43,6 +45,15 @@ use crate::store::{DEFAULT_BOARD_ID, LayoutMap, ensure_bi_table};
 
 /// Versions kept per dashboard.
 pub const KEEP: usize = 15;
+
+/// Label prefix of a version the assistant's board write made (`AI-21`). The
+/// author of such a version is the signed-in person, as for every change; the
+/// label is what tells the assistant's change from the person's own.
+pub const ASSISTANT_MARK: &str = "Assistant: ";
+
+/// Label prefix of the version an assistant undo writes, followed by the number
+/// of the version it undid (`Assistant undo of v6`).
+pub const ASSISTANT_UNDO_PREFIX: &str = "Assistant undo of v";
 
 /// Who made a change, as the history shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,6 +230,37 @@ pub async fn record(
     author: &Author,
     label: Option<&str>,
 ) -> Result<Option<u32>, ChError> {
+    write(ch, id, author, Labelling::Given(label)).await
+}
+
+/// [`record`] for a change the assistant's board tools made (`AI-21`). The
+/// author is still the signed-in person, so the label is what marks it: the
+/// version is labelled [`ASSISTANT_MARK`] and what changed against the one
+/// before it.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn record_by_assistant(
+    ch: &ChClient,
+    id: &str,
+    author: &Author,
+) -> Result<Option<u32>, ChError> {
+    write(ch, id, author, Labelling::Assistant).await
+}
+
+/// How [`write`] labels the version it writes.
+enum Labelling<'a> {
+    Given(Option<&'a str>),
+    Assistant,
+}
+
+async fn write(
+    ch: &ChClient,
+    id: &str,
+    author: &Author,
+    labelling: Labelling<'_>,
+) -> Result<Option<u32>, ChError> {
     // The built-in dashboard is code plus a saved layout; it keeps no history.
     if id == DEFAULT_BOARD_ID {
         return Ok(None);
@@ -243,6 +285,18 @@ pub async fn record(
     {
         return Ok(None);
     }
+    let label = match labelling {
+        Labelling::Given(label) => label.unwrap_or("").to_owned(),
+        Labelling::Assistant => {
+            let before: Option<BoardState> = last
+                .first()
+                .and_then(|r| serde_json::from_str(row_str(r, "state_json")).ok());
+            format!(
+                "{ASSISTANT_MARK}{}",
+                describe_change(before.as_ref(), &state)
+            )
+        }
+    };
     // The highest number ever used, tombstones included, so a number is never
     // given twice.
     let top = ch
@@ -263,7 +317,7 @@ pub async fn record(
             SqlLiteral::from(json),
             SqlLiteral::from(author.id.as_str()),
             SqlLiteral::from(author.name.as_str()),
-            SqlLiteral::from(label.unwrap_or("")),
+            SqlLiteral::from(label.as_str()),
         ),
         None,
     )
@@ -370,6 +424,189 @@ pub async fn load(ch: &ChClient, id: &str, version: u32) -> Result<Option<BoardS
     Ok(rows
         .first()
         .and_then(|r| serde_json::from_str::<BoardState>(row_str(r, "state_json")).ok()))
+}
+
+/// One kept version as the assistant's undo reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stamp {
+    /// Version number.
+    pub version: u32,
+    /// Principal id of the author (`Author::id`).
+    pub author_id: String,
+    /// The label the version was written with; empty for a plain save.
+    pub label: String,
+}
+
+/// The kept versions of dashboard `id`, newest first, without their content.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn stamps(ch: &ChClient, id: &str) -> Result<Vec<Stamp>, ChError> {
+    ensure_bi_table(ch).await?;
+    let rows = ch
+        .rows(
+            &format!(
+                "SELECT version, author_id, label FROM console.bi_board_version FINAL \
+                 WHERE board = {} AND is_deleted = 0 ORDER BY version DESC LIMIT {KEEP}",
+                SqlLiteral::from(id)
+            ),
+            None,
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| Stamp {
+            version: row_u32(r, "version"),
+            author_id: row_str(r, "author_id").to_owned(),
+            label: row_str(r, "label").to_owned(),
+        })
+        .collect())
+}
+
+/// Why [`undo_target`] found no assistant change to undo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoUndo {
+    /// The newest change that is not an earlier undo is not the requester's
+    /// assistant change: someone else's, the requester's own manual edit, or a
+    /// version from before the assistant could undo.
+    NotTheAssistants,
+    /// No kept version can be undone.
+    Nothing,
+}
+
+/// The version an assistant undo takes back, from `stamps` (newest first).
+///
+/// The walk skips the requester's earlier undos and the versions they named,
+/// so a second undo goes one assistant change further back rather than
+/// redoing the first. The first other version must carry [`ASSISTANT_MARK`]
+/// and be the requester's, or the walk stops: a change by anyone else, a
+/// manual edit, or an unmarked version is never undone.
+///
+/// # Errors
+///
+/// [`NoUndo::NotTheAssistants`] when the first other version is not the
+/// requester's assistant change, [`NoUndo::Nothing`] when no version is left.
+pub fn undo_target(stamps: &[Stamp], requester: &str) -> Result<u32, NoUndo> {
+    let mut undone: HashSet<u32> = HashSet::new();
+    for stamp in stamps {
+        if let Some(named) = stamp
+            .label
+            .strip_prefix(ASSISTANT_UNDO_PREFIX)
+            .and_then(|n| n.parse::<u32>().ok())
+        {
+            if stamp.author_id != requester {
+                return Err(NoUndo::NotTheAssistants);
+            }
+            undone.insert(named);
+            continue;
+        }
+        if undone.contains(&stamp.version) {
+            continue;
+        }
+        if stamp.author_id == requester && stamp.label.starts_with(ASSISTANT_MARK) {
+            return Ok(stamp.version);
+        }
+        return Err(NoUndo::NotTheAssistants);
+    }
+    Err(NoUndo::Nothing)
+}
+
+/// The version just before `version` in `stamps` (newest first): the one an
+/// undo of `version` goes back to. `None` when `version` is the oldest kept.
+#[must_use]
+pub fn version_before(stamps: &[Stamp], version: u32) -> Option<u32> {
+    stamps
+        .iter()
+        .skip_while(|s| s.version != version)
+        .nth(1)
+        .map(|s| s.version)
+}
+
+#[cfg(test)]
+mod undo_tests {
+    use super::*;
+
+    fn s(version: u32, author: &str, label: &str) -> Stamp {
+        Stamp {
+            version,
+            author_id: author.to_owned(),
+            label: label.to_owned(),
+        }
+    }
+
+    const ME: &str = "me";
+
+    #[test]
+    fn the_newest_assistant_change_by_the_requester_is_the_target() {
+        let stamps = [
+            s(3, ME, "Assistant: layout"),
+            s(2, ME, ""),
+            s(1, ME, "Created"),
+        ];
+        assert_eq!(undo_target(&stamps, ME), Ok(3));
+        assert_eq!(version_before(&stamps, 3), Some(2));
+    }
+
+    #[test]
+    fn undo_twice_goes_back_two_assistant_changes_not_a_redo() {
+        // v5 and v6 were the assistant's; the first undo wrote v7 (back to v5's
+        // state, from before v6), labelled for v6.
+        let after_first = [
+            s(7, ME, "Assistant undo of v6"),
+            s(6, ME, "Assistant: chart moved"),
+            s(5, ME, "Assistant: chart renamed"),
+            s(4, ME, ""),
+        ];
+        assert_eq!(undo_target(&after_first, ME), Ok(5));
+        assert_eq!(version_before(&after_first, 5), Some(4));
+    }
+
+    #[test]
+    fn the_requesters_own_manual_edit_above_an_assistant_change_blocks_undo() {
+        let stamps = [s(4, ME, ""), s(3, ME, "Assistant: layout")];
+        assert_eq!(undo_target(&stamps, ME), Err(NoUndo::NotTheAssistants));
+    }
+
+    #[test]
+    fn someone_elses_change_above_an_assistant_change_blocks_undo() {
+        let stamps = [s(4, "other", ""), s(3, ME, "Assistant: layout")];
+        assert_eq!(undo_target(&stamps, ME), Err(NoUndo::NotTheAssistants));
+    }
+
+    #[test]
+    fn an_undo_label_written_by_someone_else_blocks_undo() {
+        let stamps = [
+            s(4, "other", "Assistant undo of v3"),
+            s(3, ME, "Assistant: layout"),
+        ];
+        assert_eq!(undo_target(&stamps, ME), Err(NoUndo::NotTheAssistants));
+    }
+
+    #[test]
+    fn an_old_unmarked_version_is_refused() {
+        let stamps = [s(2, ME, ""), s(1, ME, "Created")];
+        assert_eq!(undo_target(&stamps, ME), Err(NoUndo::NotTheAssistants));
+    }
+
+    #[test]
+    fn an_assistant_change_by_another_principal_is_not_undone_by_this_requester() {
+        let stamps = [s(2, "other", "Assistant: layout")];
+        assert_eq!(undo_target(&stamps, ME), Err(NoUndo::NotTheAssistants));
+    }
+
+    #[test]
+    fn no_kept_version_means_nothing_to_undo() {
+        assert_eq!(undo_target(&[], ME), Err(NoUndo::Nothing));
+    }
+
+    #[test]
+    fn the_oldest_kept_version_has_no_version_to_go_back_to() {
+        let stamps = [s(2, ME, "Assistant: layout"), s(1, ME, "Created")];
+        assert_eq!(undo_target(&stamps, ME), Ok(2));
+        assert_eq!(version_before(&stamps, 1), None);
+        assert_eq!(version_before(&stamps[..1], 2), None);
+    }
 }
 
 /// Drop the history of dashboards removed for good.

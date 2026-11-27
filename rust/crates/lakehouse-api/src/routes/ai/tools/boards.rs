@@ -66,7 +66,7 @@ use super::dashboards::refused;
 use crate::routes::dashboard::{self, IdQuery};
 use crate::routes::dashboard_organise::{
     drop_tile, place_new_chart, require_board, require_chart_board, require_editable_chart,
-    snapshot,
+    snapshot_as,
 };
 use crate::state::AppState;
 
@@ -605,8 +605,8 @@ pub(super) async fn move_chart(
     // the recoverable shape.
     drop_tile(ch, &old_board, &id).await;
     place_new_chart(ch, &new_board, &id).await;
-    snapshot(ch, &old_board, principal).await;
-    snapshot(ch, &new_board, principal).await;
+    snapshot_as(ch, &old_board, Some(principal)).await;
+    snapshot_as(ch, &new_board, Some(principal)).await;
     json!({
         "ok": true,
         "id": id,

@@ -174,9 +174,15 @@ fn size(text: &str) -> (usize, usize) {
 /// Raised for `AI-11`'s three sharing tools (owner, 2026-11-26, via the
 /// Auditor): the schemas and the prompt's sharing rule moved the measured
 /// totals to 78,143 / 20,214 / 31,627, deltas +1,736 / +490 / +1,928.
-const ADMIN_BUILD_CEILING: usize = 78_143;
+///
+/// `AI-21` (owner, 2026-11-27): each variant may rise by 1,500 characters or
+/// less. Measured on the PR head against the previous ceilings: admin Build
+/// 79,106 (+963 against 78,143: the undo sentence and its tool entry, which
+/// the dashboard domain offers), admin Ask 20,214 (+0 against 20,214), viewer
+/// Build 31,658 (+31 against 31,627).
+const ADMIN_BUILD_CEILING: usize = 79_106;
 const ADMIN_ASK_CEILING: usize = 20_214;
-const VIEWER_BUILD_CEILING: usize = 31_627;
+const VIEWER_BUILD_CEILING: usize = 31_658;
 
 #[tokio::test]
 async fn the_chat_prompt_and_its_tools_stay_under_the_owner_target() {

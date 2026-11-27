@@ -68,6 +68,7 @@ pub(in crate::routes) use reports::{approval_args, report_audience};
 // AI-11 decision 6: the move_chart elevation fact, loaded before the gate.
 pub(in crate::routes) use boards::move_widens;
 mod tabs;
+mod undo;
 mod written;
 
 use axum::response::{IntoResponse, Response};
@@ -229,6 +230,8 @@ pub(in crate::routes) async fn run_tool(
         | "move_chart"
         | "set_board_view_filters"
         | "save_board_filters" => boards::run(state, principal, name, args).await,
+        // AI-21: the undo goes through the version history, not the board tools.
+        "undo_last_change" => undo::undo_last_change(state, principal, args).await,
         n if calc_fields::handles(n) => calc_fields::run(state, principal, name, args).await,
         "list_alert_rules" => alerts::list_alert_rules(state, principal).await,
         "create_alert_rule" => alerts::create_alert_rule(state, principal, args).await,

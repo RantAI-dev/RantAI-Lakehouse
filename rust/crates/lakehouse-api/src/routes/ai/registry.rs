@@ -1131,6 +1131,13 @@ fn rename_board_schema() -> Value {
             "required": ["id", "name"] } } })
 }
 
+fn undo_last_change_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "undo_last_change",
+        "description": "Take a dashboard back to how it was before the assistant's last change to it, through its version history. Each call undoes one more assistant change, going further back; an undo never redoes an earlier one. It covers the dashboard's content only: charts, layout, filters, tabs and theme. Metrics, calculated fields, parameters, alerts and cache rules are not in the history and cannot be undone here. It refuses when someone else changed the dashboard after the assistant, and for changes made before the assistant could undo. Charts added since then go to the trash.",
+        "parameters": { "type": "object", "properties": { "board": { "type": "string" } },
+            "required": ["board"] } } })
+}
+
 fn delete_board_schema() -> Value {
     json!({ "type": "function", "function": { "name": "delete_board",
         "description": "Delete a board (by id) and every chart on it. The built-in Main board refuses. Needs human approval before it runs; the approval message names the board and says its charts are deleted with it.",
@@ -2470,6 +2477,13 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::WriteHigh,
         permission: "dashboard:write",
     },
+    // AI-21: take the board back to the version before the assistant's last change.
+    ToolSpec {
+        name: "undo_last_change",
+        schema: undo_last_change_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
     ToolSpec {
         name: "arrange_board",
         schema: arrange_board_schema,
@@ -3184,6 +3198,7 @@ pub static DASHBOARD_SCOPED: &[(&str, Reach)] = &[
     ("delete_tab", Reach::Board("board")),
     ("rename_board", Reach::Board("id")),
     ("delete_board", Reach::Board("id")),
+    ("undo_last_change", Reach::Board("board")),
     ("arrange_board", Reach::Board("board")),
     ("move_chart", Reach::Chart("id")),
     ("save_board_filters", Reach::Board("board")),

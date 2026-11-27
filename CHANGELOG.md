@@ -9,6 +9,10 @@ once a first release is tagged.
 
 ## [Unreleased]
 
+### Added
+
+- The assistant undoes its last change to a dashboard in one step: "undo that" takes the board back to how it was before the assistant's last change, through the dashboard's version history (backlog `AI-21`). The undo is a confirm in chat, and charts added since that version go to the trash. It covers charts, layout, filters, tabs and the theme only; metrics, calculated fields, parameters, alerts and cache rules are not undone. It refuses when someone else changed the dashboard after the assistant, or when you made a manual edit since, and points to Versions in the dashboard menu. Versions written before this release carry no mark from the assistant and cannot be undone by it.
+
 ### Fixed
 
 - The assistant refuses a share or embed request that nobody else could approve, at once and with no approval waiting (backlog `AI-11`). A manager who asks for a public link or an embed change on a dashboard that has no other manager who can approve it now gets one sentence in the chat and nothing waits in Approvals. An approved request whose run then fails shows the reason in the chat, not only "action failed" (`AI-11`). "Who has access to this dashboard?" and its Indonesian forms reach the access tool (`AI-11`).

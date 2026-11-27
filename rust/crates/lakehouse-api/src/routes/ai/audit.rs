@@ -131,6 +131,8 @@ pub fn resource_for(
         // in the trail for a real write. `str_field` looks at the
         // result first, so an id the handler returned still wins.
         "create_board" | "rename_board" | "delete_board" => (Some("board"), str_field("id")),
+        // AI-21: the undo names the board it took back.
+        "undo_last_change" => (Some("board"), str_field("board")),
         // The tab tools change a board: the audit names the board, not the tab.
         "create_tab"
         | "rename_tab"
