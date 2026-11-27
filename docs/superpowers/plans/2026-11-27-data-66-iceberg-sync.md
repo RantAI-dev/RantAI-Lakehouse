@@ -489,4 +489,45 @@ Compose:
 
 ## Review
 
-(planner appends here)
+### Round 1 (planner, 2026-11-27, at `b5186beb1`)
+
+Read the whole diff against the plan and `AGENTS.md`. The design is built as
+planned: one job per table, the per-table tag limit, the after-write ask that
+never raises, the due rules in Rust, the retired sensor, the narrowed nightly
+run, and the routes in `POLICY_TABLE` and `route_auth.rs`. No BLOCKER.
+Re-run by the reviewer: `bun test` on the card, gold page, freshness and
+client tests, 63 pass / 0 fail. Rust and Dagster are *not verified* locally by
+the reviewer (no Dagster environment on this VM). CI runs both once the PR
+leaves draft, and that run decides the merge.
+
+- **R1 SHOULD-FIX (partial write on a refused PUT).** `set_publication`
+  (`routes/gold.rs`) calls `upsert_in_zone` first, then
+  `parse_sync_setting(...)?`. So a PUT `{enabled:true, syncMode:"scheduled"}`
+  with no time zone answers 400 *after* `enabled` was stored. Validate the
+  whole body before any write: parse the sync setting first, then upsert,
+  then set it. Add a handler test: a refused PUT leaves a disabled row
+  disabled (and a missing row missing).
+- **R2 SHOULD-FIX (a change in the same second is missed).**
+  `active_part_changes` reads `modification_time` in whole seconds.
+  `due_syncs` compares that with the newest run's `started_at` in
+  milliseconds (`*part_changed_at >= run.started_at`). Take a run that
+  starts at 10:00:00.500 and a write at 10:00:00.900. The write gets
+  modification time 10:00:00, which is less than 10:00:00.500, so the change
+  is never synced until the next change. Compare at the signal's own
+  precision: due when `part_changed_at >= run.started_at` with `started_at`
+  truncated to the whole second. The cost is at most one extra run per
+  signal, which the `ifChanged` fingerprint skips. Say so at the code, and
+  add the unit test for this case.
+- **R3 SHOULD-FIX (a saved schedule cannot be edited).** In
+  `open-format-card.tsx` `SyncSetting`, the editor opens only from
+  `onValueChange` to `"scheduled"`. When the stored mode is already
+  `scheduled`, choosing it again changes nothing, so there is no way to change
+  the hour or the zone short of switching modes. There is also no way to
+  leave the editor without saving. Add an "Edit schedule" button, shown when
+  the stored mode is `scheduled`, `canEdit` holds and the editor is closed.
+  Add a "Cancel" button in the editor that closes it with no request. Tests:
+  edit an existing daily schedule and save it (the PUT carries the new hour);
+  Cancel sends nothing.
+- **Noted, not a finding.** T9 is *not measured*
+  (`docs/plans/DATA-66-RESULT.md`), which is honest. The spec's p95 targets
+  stay open until measured at acceptance (`DATA-66-AC1`/`AC2`).
