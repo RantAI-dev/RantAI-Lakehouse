@@ -3298,8 +3298,10 @@ check that cannot fail is itself a failure. It parses with PyYAML, so the two pi
 | `actionlint .github/workflows/ci.yml` | the same three PRE-EXISTING shellcheck warnings as before this round (SC1007, SC2034, SC2155), now at lines 2071 and 2930 because this round added one comment line to that file; no new finding |
 
 **The signing path, verified locally with the cosign the pipeline installs.** The pinned
-`sigstore/cosign-installer@v4.1.2` installs **cosign v3.0.6** (its `cosign-release` default), so the
-wiring was checked against that binary, against a throwaway `registry:2` on `localhost:5000`:
+`sigstore/cosign-installer@v4.1.3` installs **cosign v3.1.4** (the version is named by the steps'
+`cosign-release` input, not left to the installer's default). The wiring below was checked on the
+v3.0.6 that installer's default provided at the time, against a throwaway `registry:2` on
+`localhost:5000`:
 
 - `COSIGN_PASSWORD="" cosign generate-key-pair` -> an ENCRYPTED key (`-----BEGIN ENCRYPTED SIGSTORE
   PRIVATE KEY-----`), no prompt;
