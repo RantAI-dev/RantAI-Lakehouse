@@ -279,10 +279,14 @@ function SyncSetting({
     }
   }
 
+  function startEditing() {
+    setDraft(syncDraft(publication))
+    setEditing(true)
+  }
+
   function pickMode(mode: string) {
     if (mode === "scheduled") {
-      setDraft(syncDraft(publication))
-      setEditing(true)
+      startEditing()
       return
     }
     setEditing(false)
@@ -332,6 +336,15 @@ function SyncSetting({
             ))}
           </SelectContent>
         </Select>
+        {/* DATA-66 review R3: choosing "On a schedule" again changes nothing
+            when the stored mode already is `scheduled`, so a saved schedule
+            had no way back into the editor. This opens it with the stored
+            slot and zone prefilled; `Cancel` below leaves without a write. */}
+        {publication.syncMode === "scheduled" && canEdit && !editing && (
+          <Button size="sm" variant="outline" onClick={startEditing}>
+            Edit schedule
+          </Button>
+        )}
       </div>
       {editing && (
         <div className="flex flex-wrap items-end gap-2" data-testid="sync-schedule-editor">
@@ -398,6 +411,9 @@ function SyncSetting({
           </div>
           <Button size="sm" variant="outline" disabled={!canEdit || saving} onClick={saveSchedule}>
             {saving ? "Saving…" : "Save schedule"}
+          </Button>
+          <Button size="sm" variant="ghost" disabled={saving} onClick={() => setEditing(false)}>
+            Cancel
           </Button>
         </div>
       )}

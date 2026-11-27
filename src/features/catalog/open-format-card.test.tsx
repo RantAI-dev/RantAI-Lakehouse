@@ -1014,6 +1014,57 @@ describe("OpenFormatCard", () => {
     })
   })
 
+  it("editing a saved daily schedule opens it prefilled and saves the new hour", async () => {
+    // DATA-66 review R3: with the stored mode already `scheduled`, choosing
+    // it again changes nothing, so the editor opens from "Edit schedule".
+    const calls = mockSyncCard({
+      ...publicationBody,
+      syncMode: "scheduled",
+      schedule: { kind: "daily", hour: 4, minute: 0 },
+      timeZone: "Asia/Jakarta",
+      nextSyncAt: "2026-11-28T21:00:00Z",
+    })
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await screen.findByTestId("sync-setting")
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit schedule" }))
+    const time = (await screen.findByLabelText("Time of day")) as HTMLInputElement
+    // The stored slot is prefilled.
+    expect(time.value).toBe("04:00")
+    fireEvent.change(time, { target: { value: "09:15" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save schedule" }))
+
+    await waitFor(() => {
+      const put = calls.find((c) => c.method === "PUT")
+      expect(put?.body).toMatchObject({
+        enabled: true,
+        syncMode: "scheduled",
+        schedule: { kind: "daily", hour: 9, minute: 15 },
+        timeZone: "Asia/Jakarta",
+      })
+    })
+  })
+
+  it("Cancel closes the schedule editor and sends nothing", async () => {
+    // DATA-66 review R3: leaving the editor without saving must not PUT.
+    const calls = mockSyncCard({
+      ...publicationBody,
+      syncMode: "scheduled",
+      schedule: { kind: "daily", hour: 4, minute: 0 },
+      timeZone: "Asia/Jakarta",
+      nextSyncAt: "2026-11-28T21:00:00Z",
+    })
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await screen.findByTestId("sync-setting")
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit schedule" }))
+    await screen.findByTestId("sync-schedule-editor")
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }))
+
+    await waitFor(() => expect(screen.queryByTestId("sync-schedule-editor")).toBeNull())
+    expect(calls.filter((c) => c.method === "PUT")).toHaveLength(0)
+  })
+
   it("shows the sync choice read-only without canEdit", async () => {
     mockSyncCard({ ...publicationBody, canEdit: false })
     render(<OpenFormatCard assetId="serving.mart_a" />)
