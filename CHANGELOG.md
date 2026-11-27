@@ -140,6 +140,7 @@ once a first release is tagged.
 - A scheduled agent run with no person behind it no longer reads classification rules, quality rules and drafts, join suggestions, dataset mart descriptions or the data map across organisations (backlog `SEC-76`).
 - A person can no longer create, run, change or schedule a data-quality rule on another organisation's upload table, or resolve an incident about one (backlog `SEC-80`).
 - **Failed sign-ins are limited per source (`SEC-75`; feature page `docs/core/features/login-protection-and-session-cleanup.md`).** The per-source 429 applies only when `TRUSTED_PROXIES` names an edge proxy that overwrites `X-Forwarded-For`: a caller that fails to sign in 50 times in 15 minutes from one address then has every further sign-in refused with a 429 and a `Retry-After` until the window ends, and the check runs before the password is checked, so a refusal costs no password check. With the default empty list every caller through the console shares one source, so no 429 is returned, while the first-row-plus-summary audit compaction still runs; the gate's 403 refusals are recorded the same way, per principal and route, and a 401 still writes nothing. A session's address is still not recorded (`SEC-82`).
+- A role rename refused because access rules name the role now names only the rules in the person's reach; the count still covers every rule (backlog `SEC-83`).
 
 ### Changed
 
