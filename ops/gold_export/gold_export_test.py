@@ -734,12 +734,16 @@ def _wait_for_dagster_run_success(run_id: str, label: str, timeout_s: int, inter
 
 
 def step_job_export_9_copies_and_trim_to_7() -> None:
-    """DATA-2 (T5): publish 9 changed copies through the job path:
+    """DATA-2 (T5) + DATA-66 (D9): publish 9 changed copies through the
+    per-table sync job path:
     1. Wait for Dagster webserver.
-    2. Enable publication for MART_NAME via PUT /api/gold/export/{mart}/publication.
-    3. In 9 cycles, mutate mart rows in ClickHouse, trigger gold_export_job via
-       POST /api/pipelines/gold_export_job/trigger, and poll Dagster GraphQL DAGSTER_URL
-       until run status is SUCCESS.
+    2. Enable publication for MART_NAME via PUT /api/gold/export/{mart}/publication
+       (defaults to syncMode: "on_update" under DATA-66).
+    3. In 9 cycles, mutate mart rows in ClickHouse, trigger the per-table
+       iceberg_sync_job via POST /api/gold/export/{mart}/after-write (DATA-66 D9:
+       gold_export_job now covers only GOLD_EXPORT_MARTS overrides with no
+       console setting, so console-enabled tables sync through iceberg_sync_job),
+       and poll Dagster GraphQL DAGSTER_URL until run status is SUCCESS.
     4. Assertions after 9 cycles:
        - 7 copies remain (the newest 7).
        - Query S3 object store: assert exactly 7 parquet files remain and no removed
@@ -782,18 +786,24 @@ def step_job_export_9_copies_and_trim_to_7() -> None:
             f"VALUES ('region-job-c{cycle}', {2000.0 + cycle}, {cycle * 5}, now())"
         )
 
-        # Trigger gold_export_job via lakehouse-api
-        trig_resp = API.post(f"{API_URL}/api/pipelines/gold_export_job/trigger", timeout=10)
+        # PR #742 CI fix (DATA-66 D9): console-enabled tables no longer run in
+        # the nightly gold_export_job fan-out; trigger the per-table
+        # iceberg_sync_job via after-write, which queues strictly per
+        # (zone, mart) behind any concurrent 15 s watcher run.
+        trig_resp = API.post(f"{API_URL}/api/gold/export/{MART_NAME}/after-write", timeout=10)
         if not trig_resp.ok:
             raise GoldExportFailure(
-                f"POST /api/pipelines/gold_export_job/trigger failed (cycle {cycle}): "
+                f"POST /api/gold/export/{MART_NAME}/after-write failed (cycle {cycle}): "
                 f"{trig_resp.status_code} {trig_resp.text}"
             )
-        run_id = trig_resp.json().get("id")
-        if not run_id:
-            raise GoldExportFailure(f"missing run id in trigger response: {trig_resp.json()}")
+        trig_body = trig_resp.json()
+        run_id = trig_body.get("runId")
+        if trig_body.get("launched") is not True or not run_id:
+            raise GoldExportFailure(
+                f"expected launched=true with runId from after-write (cycle {cycle}): {trig_body}"
+            )
 
-        _wait_for_dagster_run_success(run_id, f"gold_export_job cycle {cycle}", 90, interval_s=2.0)
+        _wait_for_dagster_run_success(run_id, f"iceberg_sync_job cycle {cycle}", 90, interval_s=2.0)
 
         current_files = get_s3_parquet_files(MART_NAME)
         new_files = [f for f in current_files if f not in known_files]
@@ -1312,6 +1322,20 @@ def step_switching_off_stops_both_tables() -> None:
         f"(region, total_sales, order_count, updated_at) "
         "VALUES ('region-switched-off', 9.0, 1, now())"
     )
+    # DATA-66: the per-table after-write hook refuses to launch when
+    # publishing is off, in addition to gold_export_job skipping the mart.
+    after_off = API.post(f"{API_URL}/api/gold/export/{MART_NAME}/after-write", timeout=10)
+    if not after_off.ok:
+        raise GoldExportFailure(
+            f"POST /api/gold/export/{MART_NAME}/after-write with publishing off failed: "
+            f"{after_off.status_code} {after_off.text}"
+        )
+    after_off_body = after_off.json()
+    if after_off_body.get("launched") is not False or after_off_body.get("reason") != "publishing_off":
+        raise GoldExportFailure(
+            f"expected after-write to decline with publishing_off, got: {after_off_body}"
+        )
+
     trig = API.post(f"{API_URL}/api/pipelines/gold_export_job/trigger", timeout=10)
     if not trig.ok:
         raise GoldExportFailure(
