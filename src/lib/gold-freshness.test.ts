@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { freshnessLine, publicationLabel } from "./gold-freshness"
+import { freshnessLine, publicationLabel, syncModeLabel } from "./gold-freshness"
 import type { GoldExportResult, GoldPublication } from "@/services/contracts/gold"
 
 // DATA-6 review R6: these three fields ship with the console. An optional
@@ -19,6 +19,10 @@ const basePublication: GoldPublication = {
   canEdit: true,
   trim: null,
   latestCopy: null,
+  syncMode: "on_update",
+  schedule: null,
+  timeZone: null,
+  nextSyncAt: null,
 }
 
 describe("gold-freshness", () => {
@@ -106,5 +110,15 @@ describe("the DATA-6 contract fields are required", () => {
     expect(publicationLatestCopy).toBe(true)
     expect(resultStamp).toBe(true)
     expect(resultLatestCopy).toBe(true)
+  })
+
+  // DATA-66: the one label map the card and the All published marts page
+  // share; an unknown mode is shown as sent, never as a guessed default.
+  it("labels each sync mode, and shows an unknown one as the API sent it", () => {
+    expect(syncModeLabel("on_update")).toBe("On every update")
+    expect(syncModeLabel("scheduled")).toBe("On a schedule")
+    expect(syncModeLabel("manual")).toBe("Manual only")
+    expect(syncModeLabel("eventually")).toBe("eventually")
+    expect(syncModeLabel(null)).toBe("On every update")
   })
 })

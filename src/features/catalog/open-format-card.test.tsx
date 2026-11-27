@@ -47,6 +47,46 @@ function mockApi(impl: (url: string) => Response, consumers?: unknown): void {
   }) as unknown as typeof fetch
 }
 
+/**
+ * `DATA-66`: a card whose publication `PUT` changes what the next `GET`
+ * answers, so a test can assert both the request body and the mode line
+ * after the save. Every other route answers as the card expects.
+ */
+function mockSyncCard(initial: Record<string, unknown>) {
+  const calls: { method?: string; url: string; body?: unknown }[] = []
+  let current = { ...initial }
+  global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input.toString()
+    if (url.includes("/consumers")) return jsonResponse(consumersRefusalBody)
+    if (url.includes("/publication")) {
+      if (init?.method === "PUT") {
+        const body = init.body ? JSON.parse(String(init.body)) : null
+        calls.push({ method: "PUT", url, body })
+        current = { ...current, ...(body as Record<string, unknown>) }
+        return jsonResponse(current)
+      }
+      return jsonResponse(current)
+    }
+    if (url.includes("/api/gold/exports")) return jsonResponse(emptyRunsBody)
+    if (url.includes("/api/gold/export/mart_a")) return mockReadBack()
+    throw new Error(`unexpected fetch: ${init?.method} ${url}`)
+  }) as unknown as typeof fetch
+  return calls
+}
+
+function pickOption(option: HTMLElement) {
+  fireEvent.pointerDown(option, { button: 0, pointerType: "mouse" })
+  fireEvent.mouseDown(option, { button: 0 })
+  fireEvent.pointerUp(option, { button: 0 })
+  fireEvent.mouseUp(option, { button: 0 })
+  fireEvent.click(option)
+}
+
+async function chooseSyncMode(label: string) {
+  fireEvent.click(screen.getByRole("combobox", { name: "Sync mode" }))
+  pickOption(await screen.findByRole("option", { name: label }))
+}
+
 const publicationBody: Record<string, unknown> = {
   mart: "mart_a",
   enabled: true,
@@ -56,6 +96,11 @@ const publicationBody: Record<string, unknown> = {
   changedSinceExport: false,
   lastFailure: null,
   canEdit: true,
+  // DATA-66: the sync setting the detail route always answers.
+  syncMode: "on_update",
+  schedule: null,
+  timeZone: null,
+  nextSyncAt: null,
 }
 
 const readBackBody = {
@@ -865,6 +910,119 @@ describe("OpenFormatCard", () => {
     expect(screen.queryByText("Latest copy only")).toBeNull()
     expect(screen.queryByText("Not written yet")).toBeNull()
     expect(screen.queryByTestId("latest-copy-failure")).toBeNull()
+  })
+
+  // ── DATA-66: the sync setting ─────────────────────────────────────────
+
+  it("says how an on_update table syncs", async () => {
+    mockSyncCard(publicationBody)
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() =>
+      expect(screen.getByTestId("sync-line").textContent).toBe(
+        "Synced after each pipeline write, and checked every 15 seconds for other changes.",
+      ),
+    )
+  })
+
+  it("picking Manual only saves at once and says so", async () => {
+    const calls = mockSyncCard(publicationBody)
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await screen.findByTestId("sync-setting")
+    await chooseSyncMode("Manual only")
+
+    await waitFor(() => {
+      const put = calls.find((c) => c.method === "PUT")
+      expect(put?.body).toEqual({ enabled: true, syncMode: "manual" })
+    })
+    await waitFor(() =>
+      expect(screen.getByTestId("sync-line").textContent).toBe(
+        "Synced only when you press Publish now.",
+      ),
+    )
+  })
+
+  it("picking On every update saves the mode alone", async () => {
+    const calls = mockSyncCard({ ...publicationBody, syncMode: "manual" })
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await screen.findByTestId("sync-setting")
+    await chooseSyncMode("On every update")
+    await waitFor(() => {
+      const put = calls.find((c) => c.method === "PUT")
+      expect(put?.body).toEqual({ enabled: true, syncMode: "on_update" })
+    })
+  })
+
+  it("shows the next sync and its zone for a scheduled table", async () => {
+    mockSyncCard({
+      ...publicationBody,
+      syncMode: "scheduled",
+      schedule: { kind: "daily", hour: 4, minute: 0 },
+      timeZone: "Asia/Jakarta",
+      nextSyncAt: "2026-11-28T21:00:00Z",
+    })
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => {
+      const line = screen.getByTestId("sync-line").textContent ?? ""
+      expect(line).toContain("Next sync:")
+      expect(line).toContain("Asia/Jakarta")
+    })
+  })
+
+  it("saving a daily schedule sends the kind, the time and the zone", async () => {
+    const calls = mockSyncCard(publicationBody)
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await screen.findByTestId("sync-setting")
+    await chooseSyncMode("On a schedule")
+
+    // D4: prefilled daily 04:00 in the browser's zone.
+    const time = (await screen.findByLabelText("Time of day")) as HTMLInputElement
+    expect(time.value).toBe("04:00")
+    fireEvent.change(time, { target: { value: "06:30" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save schedule" }))
+
+    await waitFor(() => {
+      const put = calls.find((c) => c.method === "PUT")
+      expect(put?.body).toMatchObject({
+        enabled: true,
+        syncMode: "scheduled",
+        schedule: { kind: "daily", hour: 6, minute: 30 },
+      })
+      expect(typeof (put?.body as Record<string, unknown>).timeZone).toBe("string")
+      expect(((put?.body as Record<string, unknown>).timeZone as string).length).toBeGreaterThan(0)
+    })
+  })
+
+  it("saving an hourly schedule sends the minute and the zone", async () => {
+    const calls = mockSyncCard(publicationBody)
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await screen.findByTestId("sync-setting")
+    await chooseSyncMode("On a schedule")
+
+    // The frequency picker switches the form from a time to a minute.
+    fireEvent.click(screen.getByRole("combobox", { name: "Frequency" }))
+    pickOption(await screen.findByRole("option", { name: "Hourly" }))
+    const minute = (await screen.findByLabelText("Minute")) as HTMLInputElement
+    fireEvent.change(minute, { target: { value: "30" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save schedule" }))
+
+    await waitFor(() => {
+      const put = calls.find((c) => c.method === "PUT")
+      expect(put?.body).toMatchObject({
+        syncMode: "scheduled",
+        schedule: { kind: "hourly", minute: 30 },
+      })
+    })
+  })
+
+  it("shows the sync choice read-only without canEdit", async () => {
+    mockSyncCard({ ...publicationBody, canEdit: false })
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    const select = await screen.findByRole("combobox", { name: "Sync mode" })
+    expect(
+      select.hasAttribute("disabled") ||
+        select.hasAttribute("data-disabled") ||
+        select.getAttribute("aria-disabled") === "true",
+    ).toBe(true)
   })
 
 })
