@@ -487,6 +487,64 @@ Compose:
   this plan, the spec's own "Today" column, and the historical
   2026-10-02 plan's record.
 
+### Handoff (round 1 fixes)
+
+Developer (DeepSeek V4.1 Flash, 2026-11-27), same branch
+`t3/realtime-iceberg-sync-settings`, on top of `970407615` (the review
+commit). Only R1, R2 and R3 were changed; nothing else was touched.
+
+#### Commits
+
+- `973f8a0b1` DATA-66 review R1: validate the sync body before any write
+  (`routes/gold.rs` parses the setting first; `tests/gold_publication.rs`
+  gains `a_refused_put_leaves_a_disabled_row_disabled_and_a_missing_row_missing`).
+- `f2e1bd949` DATA-66 review R2: compare the change signal at its own
+  precision (`iceberg_sync.rs`; the run start is truncated to the whole
+  second, the reason is at the code; unit test
+  `a_write_in_the_same_second_as_a_run_start_is_due`).
+- `be8b95af5` DATA-66 review R3: a saved schedule can be edited, and the
+  editor cancelled (`open-format-card.tsx` "Edit schedule" + "Cancel";
+  two tests in `open-format-card.test.tsx`).
+
+Each pushed to `origin/t3/realtime-iceberg-sync-settings`, never
+force-pushed; no pull request was opened, edited or merged. A fourth,
+docs-only commit carries this entry.
+
+#### Verification (final code commit `be8b95af5`, foreground)
+
+Rust, through `~/bin/cargo-locked`, shared
+`CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target`, no `cargo clean`:
+
+- `cd rust && cargo fmt --check` — pass.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings` — pass
+  (4m59s on R1; a 1.61s no-op re-check on the final commit).
+- `cargo test -p lakehouse-api --lib iceberg_sync` — **12 passed,
+  0 failed** (4,098 filtered out).
+- `cargo test -p lakehouse-api --test it gold_publication::` — **35
+  passed, 0 failed** (1,982 filtered out), the new R1 test included.
+
+TypeScript:
+
+- `bun run typecheck` — pass.
+- `bun run lint` — **13 warnings, 0 errors** (all pre-existing; none in
+  the two files this round touched).
+- `bun test src/features/catalog/open-format-card.test.tsx` — **40 pass,
+  0 fail, 101 expect() calls**, the two new R3 tests included.
+
+#### Not verified, and why (rule 7)
+
+- The **full workspace block was not re-run** in this fix round: the
+  checks above are scoped to what the three commits touched, per
+  AGENTS.md's "Keep build time down". The reviewer's own full run before
+  merge is still the one that decides.
+- `node_modules` was absent in this fresh worktree; the tests above ran
+  after `bun install --frozen-lockfile` (725 packages). No lockfile
+  change: `git status` before each commit showed only the files named
+  above.
+- The card test prints the pre-existing React `act(...)` warnings from
+  `SelectPopup` during any select interaction; they are not new and do
+  not fail the run.
+
 ## Review
 
 ### Round 1 (planner, 2026-11-27, at `b5186beb1`)
