@@ -4,10 +4,10 @@
 // `aria-required` (UX-4 decision 3), the animated example still sits inside
 // a `relative` containing block with only the textarea and the overlay, and
 // the send button stays disabled until something is typed.
-import { render, within } from "@testing-library/react"
-import { describe, expect, it, mock } from "bun:test"
+import { fireEvent, render, screen, within } from "@testing-library/react"
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 
-import { ChatComposer } from "./chat-composer"
+import { ChatComposer, MAX_TABLE_MENTIONS } from "./chat-composer"
 
 const base = {
   mode: "ask" as const,
@@ -46,5 +46,70 @@ describe("ChatComposer after the required marks were removed (UX-4)", () => {
     expect(input.getAttribute("aria-describedby")).toBeNull()
     expect(view.queryByText(/message is required/i)).toBeNull()
     expect(view.queryByText(/Required/)).toBeNull()
+  })
+})
+
+afterEach(() => mock.restore())
+
+/** Six tables the picker can offer, so the sixth pick can be refused. */
+const TABLES = Array.from({ length: 6 }, (_, i) => ({
+  id: `t${i + 1}`,
+  name: `Table ${i + 1}`,
+  type: "table",
+  tableKey: `serving.table_${i + 1}`,
+}))
+
+function stubCatalog(body: unknown, status = 200) {
+  return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
+    if (String(input).startsWith("/api/catalog")) {
+      return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
+    }
+    return new Response("not stubbed", { status: 404 })
+  }) as unknown as typeof fetch)
+}
+
+async function openPicker() {
+  fireEvent.change(screen.getByLabelText("Message AI Copilot"), { target: { value: "@" } })
+  return screen.findByRole("dialog", { name: "Mention a table" })
+}
+
+describe("ChatComposer table mentions (AI-26)", () => {
+  it("opens the catalog picker when the person types @", async () => {
+    stubCatalog({ assets: TABLES.slice(0, 1), namespaces: [] })
+    render(<ChatComposer {...base} />)
+    expect(screen.queryByRole("dialog", { name: "Mention a table" })).toBeNull()
+
+    const picker = await openPicker()
+    expect(within(picker).getByLabelText("Search tables")).toBeTruthy()
+  })
+
+  it("refuses a sixth pick and sends only the first five mentions", async () => {
+    stubCatalog({ assets: TABLES, namespaces: [] })
+    const onSend = mock()
+    render(<ChatComposer {...base} onSend={onSend} />)
+    const picker = await openPicker()
+    fireEvent.change(within(picker).getByLabelText("Search tables"), { target: { value: "table" } })
+    for (const table of TABLES) {
+      fireEvent.click(await within(picker).findByRole("button", { name: `Mention ${table.name}` }))
+    }
+
+    expect(screen.getAllByRole("button", { name: /^Remove mention of / })).toHaveLength(MAX_TABLE_MENTIONS)
+    fireEvent.change(screen.getByLabelText("Message AI Copilot"), { target: { value: "What columns do they have?" } })
+    fireEvent.click(screen.getByRole("button", { name: "Send" }))
+    expect(onSend).toHaveBeenCalledWith("What columns do they have?", TABLES.slice(0, MAX_TABLE_MENTIONS).map((t) => ({
+      kind: "table",
+      key: t.tableKey,
+    })))
+  })
+
+  it("says so and offers no tables when the catalog search is refused", async () => {
+    stubCatalog({ supported: false, reason: "The tenant search index is not available." })
+    render(<ChatComposer {...base} />)
+    const picker = await openPicker()
+    fireEvent.change(within(picker).getByLabelText("Search tables"), { target: { value: "orders" } })
+
+    expect(await within(picker).findByRole("alert")).toBeTruthy()
+    expect(within(picker).getByText(/tenant search index is not available/)).toBeTruthy()
+    expect(within(picker).queryByRole("button", { name: /^Mention / })).toBeNull()
   })
 })

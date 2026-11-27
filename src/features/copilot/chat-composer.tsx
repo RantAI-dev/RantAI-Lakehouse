@@ -7,9 +7,92 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Popover, PopoverContent, PopoverDescription, PopoverHeader, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
 import { useSlidingIndicator } from "@/hooks/use-sliding-indicator";
+import { useService } from "@/hooks/use-service";
 import { cn } from "@/lib/utils";
-import type { Mode } from "./use-copilot";
+import { assetService, type Asset } from "@/services";
+import type { Mode, TableMention } from "./use-copilot";
 import { capsForMode } from "./capabilities";
+
+/** The chat body takes only five mentions; the composer stops at the same cap. */
+export const MAX_TABLE_MENTIONS = 5;
+
+type ChosenTable = { name: string; key: string };
+
+/**
+ * The catalog search behind `@`. Only a search with a term is sent: the
+ * tenant refusal `supported: false` is surfaced for a term (`clients/assets`)
+ * and swallowed for a plain list, so a picker that listed everything could
+ * not say honestly that search is unavailable (AI-26 decision 1).
+ */
+function MentionResults({
+  term, atLimit, onPick,
+}: {
+  term: string;
+  atLimit: boolean;
+  onPick: (asset: Asset) => void;
+}) {
+  const search = useService((signal) => assetService.searchAssets(term, 10, signal), [term]);
+  if (search.status === "loading") return <p className="px-1 text-xs text-muted-foreground">Searching the catalog…</p>;
+  if (search.status === "error") {
+    return (
+      <p role="alert" className="px-1 text-xs text-amber-700 dark:text-amber-400">
+        {search.error.status === 200
+          ? `Catalog search is unavailable: ${search.error.message}`
+          : "The catalog could not be searched. Try again."}
+      </p>
+    );
+  }
+  const tables = search.data.assets.filter((a) => a.type === "table" || a.type === "iceberg-table");
+  if (!tables.length) return <p className="px-1 text-xs text-muted-foreground">No tables matched “{term}”.</p>;
+  return (
+    <div className="flex flex-col gap-0.5">
+      {tables.map((a) => (
+        <button
+          key={a.id}
+          type="button"
+          disabled={atLimit}
+          aria-label={`Mention ${a.name}`}
+          onClick={() => onPick(a)}
+          className="flex items-center justify-between gap-2 rounded-md px-1.5 py-1 text-left text-sm hover:bg-muted disabled:opacity-50"
+        >
+          <span className="min-w-0 truncate">{a.name}</span>
+          <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">{a.tableKey ?? a.id}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** The `@` picker: a term field, the matching tables, and the five-pick cap. */
+function MentionPicker({
+  atLimit, onPick, onClose,
+}: {
+  atLimit: boolean;
+  onPick: (asset: Asset) => void;
+  onClose: () => void;
+}) {
+  const [term, setTerm] = React.useState("");
+  return (
+    <div role="dialog" aria-label="Mention a table" className="mx-1 flex flex-col gap-1.5 rounded-lg border border-border bg-popover p-2 text-popover-foreground shadow-md">
+      <div className="flex items-center gap-1">
+        <input
+          aria-label="Search tables"
+          value={term}
+          onChange={(e) => setTerm(e.target.value)}
+          placeholder="Search tables by name…"
+          className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
+        />
+        <button type="button" aria-label="Close table picker" onClick={onClose} className="px-1 text-xs text-muted-foreground hover:text-foreground">×</button>
+      </div>
+      {term.trim() ? (
+        <MentionResults term={term.trim()} atLimit={atLimit} onPick={onPick} />
+      ) : (
+        <p className="px-1 text-xs text-muted-foreground">Type a table name to search the catalog.</p>
+      )}
+      {atLimit ? <p className="px-1 text-xs text-muted-foreground">A message can mention at most five tables.</p> : null}
+    </div>
+  );
+}
 
 /** The "Tools" menu — pick the (menu-facing) CAPABILITIES the agent may use. */
 export function ToolsMenu({
@@ -126,7 +209,7 @@ export function ChatComposer({
   ref?: React.Ref<ChatComposerHandle>;
   mode: Mode;
   setMode: (m: Mode) => void;
-  onSend: (text: string) => void;
+  onSend: (text: string, mentions?: TableMention[]) => void;
   /** Stop the answer in flight; the send button becomes Stop while busy. */
   onStop?: () => void;
   busy: boolean;
@@ -169,6 +252,8 @@ export function ChatComposer({
   const [ownInput, setOwnInput] = React.useState("");
   const input = value ?? ownInput;
   const setInput = onValueChange ?? setOwnInput;
+  const [pickerOpen, setPickerOpen] = React.useState(false);
+  const [mentions, setMentions] = React.useState<ChosenTable[]>([]);
   const area = React.useRef<HTMLTextAreaElement>(null);
   // Micro-interaction audit 2026-11-14 (emil; WEB-17 "Ask why"): text put in from elsewhere arrives with
   // a short cue, the box's edge lighting up and easing back, so the eye goes to it before Enter.
@@ -207,8 +292,10 @@ export function ChatComposer({
   const submit = () => {
     const t = input.trim();
     if (!t || busy) return;
-    onSend(t);
+    onSend(t, mentions.map((m) => ({ kind: "table" as const, key: m.key })));
     setInput("");
+    setMentions([]);
+    setPickerOpen(false);
   };
 
   const glassCls = glass
@@ -268,7 +355,14 @@ export function ChatComposer({
           aria-required
           aria-label="Message AI Copilot"
           value={input}
-          onChange={(e) => setInput(e.target.value)}
+          onChange={(e) => {
+            const next = e.target.value;
+            setInput(next);
+            // The `@` is left in the text: it marks the mention in the
+            // question, while the picked table travels as a separate field.
+            const caret = e.currentTarget.selectionStart ?? next.length;
+            if (next[caret - 1] === "@") setPickerOpen(true);
+          }}
           onFocus={onFocus}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
@@ -300,6 +394,32 @@ export function ChatComposer({
           </div>
         ) : null}
       </div>
+      {mentions.length ? (
+        <div data-slot="mention-chips" className="flex flex-wrap gap-1 px-1 pb-1">
+          {mentions.map((m) => (
+            <button
+              key={m.key}
+              type="button"
+              aria-label={`Remove mention of ${m.name}`}
+              onClick={() => setMentions((prev) => prev.filter((x) => x.key !== m.key))}
+              className="rounded-full border border-border bg-muted px-2 py-0.5 text-[11px] hover:bg-accent"
+            >
+              @{m.name} ×
+            </button>
+          ))}
+        </div>
+      ) : null}
+      {pickerOpen ? (
+        <MentionPicker
+          atLimit={mentions.length >= MAX_TABLE_MENTIONS}
+          onClose={() => setPickerOpen(false)}
+          onPick={(asset) => {
+            if (mentions.length >= MAX_TABLE_MENTIONS) return;
+            const key = asset.tableKey ?? asset.id;
+            setMentions((prev) => prev.some((m) => m.key === key) ? prev : [...prev, { name: asset.name, key }]);
+          }}
+        />
+      ) : null}
       <div className="flex items-center gap-1.5 px-1 pb-0.5">
         <ModeToggle mode={mode} setMode={setMode} />
 

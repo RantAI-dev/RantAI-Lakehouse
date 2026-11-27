@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
 import { useAuth } from "@/features/auth/auth-provider"
+import { useCopilotSelect } from "@/features/copilot/use-copilot"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { requestableAccessPermissions } from "@/lib/access-requests"
 import { assetService } from "@/services"
@@ -62,6 +63,26 @@ export function AssetDetailPage() {
     { keepDataOnReload: true }
   )
   const { hasPermission } = useAuth()
+  const setPageContext = useCopilotSelect((c) => c.setPageContext)
+  // AI-26: the chat dock stays open on this page; name the table it is about
+  // the way the dashboard page names its board, and drop the context when
+  // this page is left so the next page does not inherit another table.
+  React.useEffect(() => {
+    if (state.status !== "success") return
+    const asset = state.data
+    const key = asset.tableKey ?? asset.id
+    setPageContext({
+      key: "asset-detail",
+      title: `Working on "${asset.name}"`,
+      hint: "Ask about this table's columns, lineage, quality or access.",
+      suggest: {
+        ask: ["Describe this dataset's columns", "Show this dataset's lineage"],
+        build: ["Create a chart from this dataset"],
+      },
+      system: `The user is on the page of the table "${asset.name}" (catalog key ${key}). Prefer describe_dataset / get_lineage / get_quality.`,
+    })
+    return () => setPageContext(null)
+  }, [state.status, state.data, setPageContext])
   // Read here, not in the Schema tab, so the header pill and the tab share one request.
   const meanings = useMeanings(state.status === "success" ? state.data : null)
   const [open, setOpen] = React.useState(false)

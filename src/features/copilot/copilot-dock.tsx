@@ -311,10 +311,10 @@ export function CopilotDock() {
         // Typing into the pill (focus came back to it on close) opens the dock with the text in it.
         if (compact && t) open();
       }}
-      onSend={(t) => {
+      onSend={(t, mentions) => {
         if (!showPanel) plan.current.intent = true;
         c.setExpanded(true);
-        c.send(t);
+        c.send(t, undefined, { mentions });
       }}
       busy={c.busy}
       rows={1}
