@@ -16,6 +16,7 @@
 #   SCOPE_FRONTEND        "true" if frontend changed
 #   SCOPE_DAGSTER         "true" if dagster changed
 #   SCOPE_STACK           "true" if stack/ops changed
+#   SCOPE_SITE            "true" if the Lakehouse site (site/**) changed (WEB-5 D12)
 #   SCOPE_DOCS_ONLY       "true" if docs only
 #   SCOPE_ALL             "true" if all jobs forced
 #   PUSH_PROVEN           "true" when a push was proven to repeat a passed
@@ -31,6 +32,7 @@
 #   CHANGES_RESULT        result of `changes` job
 #   REPO_LINTS_RESULT     result of `repo-lints` job
 #   FRONTEND_RESULT       result of `verify` job
+#   SITE_RESULT           result of `site` job (WEB-5 D12)
 #   RUST_FMT_RESULT       result of `fmt` job
 #   RUST_CLIPPY_RESULT    result of `clippy` job
 #   RUST_BUILD_RESULT     result of `build` job
@@ -96,6 +98,7 @@ run_gate() {
   local scope_frontend="${SCOPE_FRONTEND:-false}"
   local scope_dagster="${SCOPE_DAGSTER:-false}"
   local scope_stack="${SCOPE_STACK:-false}"
+  local scope_site="${SCOPE_SITE:-false}"
   local scope_docs_only="${SCOPE_DOCS_ONLY:-false}"
   local scope_all="${SCOPE_ALL:-false}"
   # OPS-24 D6: the proof excuses a gate only on the event `push`. Any other
@@ -118,6 +121,7 @@ run_gate() {
   echo "SCOPE_FRONTEND:       $scope_frontend"
   echo "SCOPE_DAGSTER:        $scope_dagster"
   echo "SCOPE_STACK:          $scope_stack"
+  echo "SCOPE_SITE:           $scope_site"
   echo "SCOPE_DOCS_ONLY:      $scope_docs_only"
   echo "SCOPE_ALL:            $scope_all"
   echo "PUSH_PROVEN:          $push_proven"
@@ -185,6 +189,13 @@ run_gate() {
   local req_frontend="false"
   if [ "$req_all" = "true" ] || [ "$scope_frontend" = "true" ]; then
     req_frontend="true"
+  fi
+
+  # WEB-5 D12: the site job is required exactly as `verify` is, on its own
+  # scope: a PR that touches only site/ must not merge with it skipped.
+  local req_site="false"
+  if [ "$req_all" = "true" ] || [ "$scope_site" = "true" ]; then
+    req_site="true"
   fi
 
   local req_rust="false"
@@ -319,6 +330,9 @@ run_gate() {
 
   # Frontend
   check_job "verify" "${FRONTEND_RESULT:-skipped}" "$req_frontend"
+
+  # Site
+  check_job "site" "${SITE_RESULT:-skipped}" "$req_site"
 
   # Rust fast feedback & tests
   check_job "fmt" "${RUST_FMT_RESULT:-skipped}" "$req_rust"

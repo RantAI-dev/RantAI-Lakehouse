@@ -1,0 +1,118 @@
+"use client";
+
+import * as React from "react";
+import { JOURNEY } from "@/lib/home-content";
+import { gaugeDepthAt, gaugeFraction, SLAB_DEPTHS, type Anchor, type DepthsRange } from "@/lib/depth-journey";
+import { measureJourney } from "@/lib/measure-journey";
+import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
+
+/** Every depth a chapter starts at, plus the three slabs: one tick each. */
+const TICKS = [...new Set([0, ...JOURNEY.map((c) => c.depth), ...SLAB_DEPTHS])].sort((a, b) => b - a);
+
+/**
+ * WEB-5 D14 S3: where the visitor is in the dive, the whole way down
+ * (O33: one descent, from the surface to the bottom at −400 m, on a
+ * square-root scale, `gaugeFraction`). O42: it reaches the bottom as the
+ * final call comes on screen and fades out over the next 60 % of a screen,
+ * as the final's night sea scrolls in.
+ * - Wide screens (1360 px and up): a thin scale on the left edge, 0 m at the top and the deepest
+ *   point at the bottom, with a tick for each chapter and a marker. Inside
+ *   the depths section it hides, because that section's own gauge stands in
+ *   the same place with the slabs' labels.
+ * - Narrower screens, phones included: a hairline under the top bar whose
+ *   fill is the depth. It does not crowd a 360 px bar, which is already
+ *   full with the wordmark, the language switch and the button.
+ * - WEB-5 review fix R8 (BLOCKER): the scale used to start at `md` (768 px)
+ *   and covered the sections' text up to about 1280 px; the 1120 px
+ *   column's text starts at x 97 at 1280 and x 137 at 1360 (measured), so
+ *   the scale starts at 1360 px. (It used to carry a reading in metres; the
+ *   owner asked for it to go on 2026-11-24, so the scale is now only the
+ *   line, the ticks and the marker.)
+ *
+ * The values are written through a CSS variable from a passive,
+ * rAF-throttled scroll listener (no React state per scroll event, D5).
+ * Under reduced motion the marker steps from chapter to chapter. It is
+ * decorative (`aria-hidden`): the chapters it marks are the section
+ * headings. Without JavaScript it is hidden (app/globals.css).
+ */
+export function DepthGauge() {
+  const rootRef = React.useRef<HTMLDivElement>(null);
+  const reduced = useReducedMotionSafe();
+
+  React.useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    let anchors: Anchor[] = [];
+    let depths: DepthsRange | null = null;
+    // O42: where the final call's night sea begins; the gauge fades out as it comes in.
+    let finalTop = Infinity;
+    let frame = 0;
+    let last = "";
+
+    const measure = () => {
+      // R9: the same measurement as the water, holding 0 m through the
+      // hero's pin because this reading is on screen over the hero.
+      ({ anchors, depths } = measureJourney({ holdSurfaceThroughHero: true }));
+      const final = document.getElementById("final");
+      finalTop = final ? final.getBoundingClientRect().top + window.scrollY : Infinity;
+      paint();
+    };
+    const paint = () => {
+      frame = 0;
+      const y = window.scrollY;
+      const depth = gaugeDepthAt(y, anchors, depths, reduced);
+      const inDepths = depths !== null && y >= depths.top - window.innerHeight * 0.25 && y <= depths.top + depths.span;
+      const f = gaugeFraction(depth);
+      // O42: the marker has reached the bottom as the final call comes on
+      // screen; it fades out while the night sea scrolls in (no climb to 0 m).
+      const vh = window.innerHeight;
+      const fade = Math.min(1, Math.max(0, (y - (finalTop - vh)) / (0.6 * vh)));
+      const opacity = (1 - fade).toFixed(2);
+      const key = `${f.toFixed(3)}|${inDepths}|${opacity}`;
+      if (key === last) return;
+      last = key;
+      root.style.opacity = opacity;
+      root.style.setProperty("--lk-gauge-f", f.toFixed(4));
+      root.toggleAttribute("data-in-depths", inDepths);
+    };
+    const onScroll = () => {
+      if (!frame) frame = requestAnimationFrame(paint);
+    };
+
+    measure();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("resize", measure);
+    const ro = new ResizeObserver(measure);
+    ro.observe(document.body);
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      window.removeEventListener("scroll", onScroll);
+      window.removeEventListener("resize", measure);
+      ro.disconnect();
+    };
+  }, [reduced]);
+
+  return (
+    <div ref={rootRef} aria-hidden="true" className="lk-gauge pointer-events-none">
+      {/* Wide screens: the scale on the left edge (R8: from 1360 px). */}
+      <div className="lk-gauge-scale fixed top-[18%] bottom-[14%] left-8 z-40 hidden w-28 min-[1360px]:block">
+        <span className="absolute top-0 left-[7px] h-full w-px bg-gradient-to-b from-[#E8F4FF]/45 via-[#E8F4FF]/25 to-[#E8F4FF]/10" />
+        {TICKS.map((d) => (
+          <span
+            key={d}
+            className="absolute left-[3px] block h-px w-[9px] bg-[#E8F4FF]/40"
+            style={{ top: `${gaugeFraction(d) * 100}%` }}
+          />
+        ))}
+        <span className="lk-gauge-marker absolute left-[3px] flex -translate-y-1/2 items-center gap-2.5">
+          <span className="block size-[9px] rounded-full bg-[#44A6FA] shadow-[0_0_12px_3px_rgba(68,166,250,0.6)]" />
+        </span>
+      </div>
+      {/* Below 1360 px: a hairline under the top bar. */}
+      <div className="lk-gauge-line fixed inset-x-0 top-16 z-40 h-4 min-[1360px]:hidden">
+        <span className="absolute inset-x-0 top-0 h-px bg-[#E8F4FF]/10" />
+        <span className="lk-gauge-fill absolute top-0 left-0 h-px w-full origin-left bg-[#44A6FA]/80" />
+      </div>
+    </div>
+  );
+}

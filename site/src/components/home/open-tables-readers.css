@@ -1,0 +1,425 @@
+/* "One table, many readers" (components/home/open-tables-readers.tsx), the Open tables picture the
+   owner chose on 2026-11-24 (WEB-5).
+   Flat and borderless: the panel's own surface, one raised fill at most, badges as soft fills,
+   glow only on hover. Monospace only inside <code> (SQL, column names, file paths). */
+
+@property --lk-otr-t {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0;
+}
+
+.lk-otr {
+  --lk-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --otr-text: #e8f4ff;
+  --otr-lake: #8fcbff;
+  position: relative;
+  height: 100%;
+  container-type: inline-size;
+  background: var(--lk-n-surface);
+  color: rgba(232, 244, 255, 0.85);
+  font-size: 13px;
+  line-height: 20px;
+}
+.lk-otr p,
+.lk-otr li {
+  font-size: inherit;
+  line-height: inherit;
+}
+.lk-otr .lk-otr-code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 18px;
+}
+.lk-otr-type {
+  color: rgba(232, 244, 255, 0.5);
+}
+.lk-otr-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 500;
+  color: rgba(232, 244, 255, 0.55);
+}
+.lk-otr-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(232, 244, 255, 0.08);
+  color: rgba(232, 244, 255, 0.6);
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.lk-otr-badge-blue {
+  background: rgba(68, 166, 250, 0.15);
+  color: var(--otr-lake);
+}
+/* An engine's mark: lake blue at rest, its brand colour on hover. */
+.lk-otr-mark {
+  display: inline-grid;
+  place-items: center;
+  flex-shrink: 0;
+  color: var(--otr-lake);
+  transition: color 0.2s ease;
+}
+
+/* ---- A: one table, many readers ----------------------------------------------------------- */
+.lk-otr-a-body {
+  display: flex;
+  height: 100%;
+  flex-direction: column;
+  padding: 0 16px;
+}
+.lk-otr-a-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  justify-content: center;
+  gap: 14px;
+  padding: 20px 0;
+}
+.lk-otr-a-sql {
+  align-self: center;
+  color: rgba(232, 244, 255, 0.6);
+  text-align: center;
+}
+.lk-otr-a-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-areas:
+    "tl tr"
+    "card card"
+    "bl br";
+}
+.lk-otr-a-eng[data-side="tl"] {
+  grid-area: tl;
+}
+.lk-otr-a-eng[data-side="tr"] {
+  grid-area: tr;
+}
+.lk-otr-a-eng[data-side="bl"] {
+  grid-area: bl;
+}
+.lk-otr-a-eng[data-side="br"] {
+  grid-area: br;
+}
+.lk-otr-a-card {
+  grid-area: card;
+}
+/* Phones: two engines above the table, two below, each with a short wire to it. */
+.lk-otr-a-eng {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  border-radius: 14px;
+  cursor: default;
+}
+.lk-otr-a-eng[data-side="bl"],
+.lk-otr-a-eng[data-side="br"] {
+  flex-direction: column-reverse;
+}
+.lk-otr-a-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: 12px;
+  text-align: center;
+  transition: background-color 0.2s ease, transform 0.25s var(--lk-ease);
+}
+.lk-otr-a-who {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.lk-otr-a-name {
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 500;
+  color: var(--otr-text);
+}
+.lk-otr-a-ans {
+  font-size: 15px;
+  line-height: 22px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: rgba(232, 244, 255, 0.75);
+  transition: opacity 0.35s ease, transform 0.35s var(--lk-ease), color 0.3s ease;
+}
+/* Settled by default; the loop hides an answer until its engine has asked. */
+.lk-otr-a[data-armed] .lk-otr-a-ans:not([data-on]) {
+  opacity: 0;
+  transform: translateY(4px);
+}
+.lk-otr-a-ans[data-flash],
+.lk-otr-a[data-together] .lk-otr-a-ans {
+  color: var(--otr-lake);
+}
+/* The wire grows to fill its cell, so it always reaches the table whatever the engine's height. */
+.lk-otr-a-line {
+  position: relative;
+  flex: 1;
+  width: 1px;
+  min-height: 18px;
+  background: rgba(143, 203, 255, 0.22);
+  transition: background-color 0.25s ease;
+}
+.lk-otr-a-eng[data-active] .lk-otr-a-line {
+  background: rgba(143, 203, 255, 0.6);
+}
+.lk-otr-a-eng[data-active] .lk-otr-mark,
+.lk-otr-a-eng:hover .lk-otr-mark {
+  color: var(--brand);
+}
+.lk-otr-a-eng:hover .lk-otr-a-node {
+  background: var(--lk-n-raised);
+  transform: translateY(-2px);
+}
+/* The pulse: toward the table with the query, back with the answer. */
+.lk-otr-a-dot {
+  position: absolute;
+  width: 5px;
+  height: 5px;
+  margin: -2px 0 0 -2px;
+  border-radius: 999px;
+  background: var(--otr-lake);
+  box-shadow: 0 0 8px rgba(143, 203, 255, 0.8);
+  left: 50%;
+  top: calc(var(--lk-otr-t) * 100%);
+  animation: 0.8s var(--lk-ease) both;
+  animation-name: var(--otr-toward);
+}
+.lk-otr-a-dot[data-phase="a"] {
+  animation-name: var(--otr-away);
+}
+.lk-otr-a-eng[data-side="tl"],
+.lk-otr-a-eng[data-side="tr"] {
+  --otr-toward: lk-otr-fwd;
+  --otr-away: lk-otr-rev;
+}
+.lk-otr-a-eng[data-side="bl"],
+.lk-otr-a-eng[data-side="br"] {
+  --otr-toward: lk-otr-rev;
+  --otr-away: lk-otr-fwd;
+}
+@keyframes lk-otr-fwd {
+  from {
+    --lk-otr-t: 0;
+    opacity: 0;
+  }
+  20% {
+    opacity: 1;
+  }
+  80% {
+    opacity: 1;
+  }
+  to {
+    --lk-otr-t: 1;
+    opacity: 0;
+  }
+}
+@keyframes lk-otr-rev {
+  from {
+    --lk-otr-t: 1;
+    opacity: 0;
+  }
+  20% {
+    opacity: 1;
+  }
+  80% {
+    opacity: 1;
+  }
+  to {
+    --lk-otr-t: 0;
+    opacity: 0;
+  }
+}
+/* The table: the one focal object. */
+.lk-otr-a-card {
+  justify-self: center;
+  width: min(100%, 15rem);
+  padding: 14px 16px 12px;
+  border-radius: 18px;
+  background: var(--lk-n-raised);
+}
+.lk-otr-a-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+.lk-otr .lk-otr-a-table {
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 600;
+  color: var(--otr-text);
+}
+.lk-otr-a-cols {
+  margin-top: 10px;
+  display: grid;
+  gap: 2px;
+}
+.lk-otr-a-cols li {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 1px 0 1px 12px;
+  color: rgba(232, 244, 255, 0.8);
+  transition: color 0.25s ease;
+}
+.lk-otr-a-cols li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 5px;
+  height: 5px;
+  margin-top: -2.5px;
+  border-radius: 999px;
+  background: var(--otr-lake);
+  opacity: 0;
+  transform: scale(0.4);
+  transition: opacity 0.25s ease, transform 0.25s var(--lk-ease);
+}
+.lk-otr-a-card[data-reading] li[data-hot] {
+  color: var(--otr-text);
+}
+.lk-otr-a-card[data-reading] li[data-hot]::before {
+  opacity: 1;
+  transform: none;
+}
+.lk-otr-a-caption {
+  display: inline-flex;
+  align-self: center;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 500;
+  color: rgba(232, 244, 255, 0.5);
+  transition: color 0.35s ease;
+}
+.lk-otr-a[data-together] .lk-otr-a-caption {
+  color: var(--otr-lake);
+}
+/* Your object storage: a quiet strip along the bottom, the table's files. */
+.lk-otr-a-store {
+  margin: 0 -16px;
+  padding: 12px 16px 14px;
+  background: var(--lk-n-bg);
+}
+.lk-otr-a-storelabel {
+  margin-bottom: 4px;
+}
+.lk-otr-a-files {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0 20px;
+}
+.lk-otr-a-files li {
+  color: rgba(232, 244, 255, 0.5);
+  transition: color 0.3s ease;
+  transition-delay: calc(var(--i) * 60ms);
+}
+.lk-otr-a-store[data-reading] .lk-otr-a-files li {
+  color: var(--otr-text);
+}
+
+/* Wider panels: engines left and right, wires straight into the table's sides. */
+@container (min-width: 34rem) {
+  .lk-otr-a-body {
+    padding: 0 24px;
+  }
+  .lk-otr-a-main {
+    padding: 24px 0 20px;
+  }
+  .lk-otr-a-store {
+    margin: 0 -24px;
+    padding: 14px 24px 16px;
+  }
+  .lk-otr-a-files {
+    grid-template-columns: repeat(2, max-content);
+  }
+  .lk-otr-a-grid {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 14rem) minmax(0, 1fr);
+    grid-template-areas:
+      "tl card tr"
+      "bl card br";
+    row-gap: 28px;
+  }
+  .lk-otr-a-card {
+    align-self: center;
+    width: 100%;
+  }
+  .lk-otr-a-eng,
+  .lk-otr-a-eng[data-side="bl"] {
+    flex-direction: row;
+  }
+  .lk-otr-a-eng[data-side="tr"],
+  .lk-otr-a-eng[data-side="br"] {
+    flex-direction: row-reverse;
+  }
+  .lk-otr-a-node {
+    align-items: flex-start;
+    text-align: left;
+  }
+  .lk-otr-a-eng[data-side="tr"] .lk-otr-a-node,
+  .lk-otr-a-eng[data-side="br"] .lk-otr-a-node {
+    align-items: flex-end;
+    text-align: right;
+  }
+  .lk-otr-a-eng[data-side="tr"] .lk-otr-a-who,
+  .lk-otr-a-eng[data-side="br"] .lk-otr-a-who {
+    flex-direction: row-reverse;
+  }
+  .lk-otr-a-line {
+    align-self: center;
+    min-width: 12px;
+    min-height: 0;
+    width: auto;
+    height: 1px;
+  }
+  .lk-otr-a-dot {
+    top: 50%;
+    left: calc(var(--lk-otr-t) * 100%);
+  }
+  .lk-otr-a-eng[data-side="tl"],
+  .lk-otr-a-eng[data-side="bl"] {
+    --otr-toward: lk-otr-fwd;
+    --otr-away: lk-otr-rev;
+  }
+  .lk-otr-a-eng[data-side="tr"],
+  .lk-otr-a-eng[data-side="br"] {
+    --otr-toward: lk-otr-rev;
+    --otr-away: lk-otr-fwd;
+  }
+}
+
+@keyframes lk-otr-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lk-otr *,
+  .lk-otr *::before,
+  .lk-otr *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* WEB-5 M10 (phone pass): readable text is at least 12 px below 1024 px. */
+@media (max-width: 1023.98px) {
+  .lk-otr-badge {
+    font-size: 12px;
+  }
+}

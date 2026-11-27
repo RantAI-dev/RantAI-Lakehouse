@@ -1,0 +1,82 @@
+{
+  "hero": {
+    "eyebrow": "Contact",
+    "title": "Tell us about\nyour data.",
+    "description": "Install help, a walkthrough, or a source to connect? A few lines will do."
+  },
+  "direct": {
+    "title": "Or reach us directly",
+    "email": "Email",
+    "source": "Public repository",
+    "follow": "Follow RantAI"
+  },
+  "form": {
+    "label": "Contact form",
+    "name": "Name",
+    "namePlaceholder": "Your name",
+    "email": "Email",
+    "emailPlaceholder": "you@example.com",
+    "company": "Company",
+    "optional": "Optional",
+    "topic": "What is it about?",
+    "topics": {
+      "install": "Install on your servers",
+      "walkthrough": "Product walkthrough",
+      "connectors": "Connectors and sources",
+      "other": "Something else"
+    },
+    "message": "Message",
+    "messagePlaceholder": "Your sources, your data, or the question you have in mind",
+    "send": "Send message",
+    "note": "Sending opens your email app with the message ready to go. Nothing is sent from this page.",
+    "opening": "Opening your email app…",
+    "fallback": "Nothing opened? Write to {email}.",
+    "copy": "Copy address",
+    "copied": "Copied",
+    "copyFailed": "Selected: press Ctrl+C or ⌘C",
+    "required": "Please fill this in",
+    "invalidEmail": "Enter a valid email address",
+    "subject": "RantAI Lakehouse · {topic} · {name}",
+    "bodyName": "Name",
+    "bodyEmail": "Email",
+    "bodyCompany": "Company"
+  },
+  "faq": {
+    "eyebrow": "FAQ",
+    "title": "Questions we\noften hear.",
+    "items": [
+      {
+        "q": "What is RantAI Lakehouse?",
+        "a": "One lakehouse with dashboards built in. It brings your databases, files, streams and business apps into one place, keeps the data in open Apache Iceberg tables, and lets you ask for answers in plain language or write SQL in Query Studio."
+      },
+      {
+        "q": "Is it open source?",
+        "a": "Yes. The code is public on GitHub under the AGPL-3.0 license, so you can read every line and run it yourself."
+      },
+      {
+        "q": "Can it run on our own servers?",
+        "a": "Yes. It runs on your own infrastructure with Docker Compose, the object storage and the table catalog included, so your data stays on your servers. If you would rather we run it for you, talk to us."
+      },
+      {
+        "q": "What can it connect to?",
+        "a": "Databases (PostgreSQL, MySQL, SQL Server and MongoDB), Kafka streams, REST APIs, uploaded files (CSV, TSV, Excel, Parquet, JSON, JSON Lines, Avro, and gzip or zip archives) and eight business apps: Salesforce, ServiceNow, Google Analytics 4, HubSpot, Zendesk, Confluence, Dynamics 365 and SharePoint. PostgreSQL also has live change capture."
+      },
+      {
+        "q": "What do Bronze, Silver and Gold mean?",
+        "a": "They are the three depths your data moves through. Bronze keeps every source raw, as it came, in Apache Iceberg tables. Silver is that data cleaned and joined by pipelines and watched by quality checks. Gold is curated tables built for your business questions, which refresh themselves within the lag you set."
+      },
+      {
+        "q": "Can the assistant change data without a person approving it?",
+        "a": "Not for anything risky. The assistant works with the console's own tools: it answers questions, builds charts and dashboards, and runs pipelines. Anything risky, such as pausing a pipeline, waits for a person to approve it, and the person who asked cannot approve their own request."
+      },
+      {
+        "q": "Where is our data kept?",
+        "a": "On the servers you install it on. Raw data lands in Apache Iceberg tables, an open format that any engine reading Iceberg can read, and Gold tables can be published as open tables too."
+      },
+      {
+        "q": "How do we install it?",
+        "a": "From the public repository, with Docker Compose: clone it, generate the settings file, and start the stack. The steps are in the Quickstart section of the README, which “Install it” at the top of every page links to."
+      }
+    ]
+  }
+}

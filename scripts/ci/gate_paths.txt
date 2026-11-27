@@ -117,6 +117,8 @@ path src/lib/dashboard-specs.ts governance,alerts
 path public/geo/* governance,alerts
 path src/* none
 path public/* none
+# The WEB-5 static site is its own package; no gate mounts, imports or runs it.
+path site/* none
 path package.json none
 path bun.lock none
 path bunfig.toml none

@@ -19,10 +19,9 @@ function subscribe(onChange: () => void): () => void {
  * `false` for the server and for the hydration pass and the real value right
  * after, so the markup always matches and the page then adapts.
  *
- * Shared, not in `features/landing` where it started (WEB-15 review
- * BLOCKER 1): the console image leaves `src/features/landing` out
- * (`.dockerignore`, WEB-2), so the sign-in page could not import it from
- * there and the image's build failed.
+ * Shared, in `src/hooks`, because the sign-in page needs it (WEB-15 review
+ * BLOCKER 1). It started in the console's landing page, which WEB-5 moved
+ * to its own package (`site/`).
  */
 export function useReducedMotionSafe(): boolean {
   return React.useSyncExternalStore(
