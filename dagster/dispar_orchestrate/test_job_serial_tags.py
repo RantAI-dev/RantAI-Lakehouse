@@ -62,6 +62,25 @@ from dispar_orchestrate.definitions import defs
 # The tag the run queue reads, owned by the module that puts it on a job.
 SERIAL_TAG = ingest_factory.SERIAL_TAG
 
+# `DATA-66` D6: the per-table sync tag. Its rule is one run per VALUE
+# (`<zone>.<mart>`), so two tables sync in parallel while two syncs of one
+# table queue.
+SYNC_TAG = "lakehouse/iceberg-sync-target"
+
+# Every rule the instance config carries, in the order the file lists them.
+EXPECTED_LIMITS = [
+    {
+        "key": SERIAL_TAG,
+        "value": {"applyLimitPerUniqueValue": True},
+        "limit": 1,
+    },
+    {
+        "key": SYNC_TAG,
+        "value": {"applyLimitPerUniqueValue": True},
+        "limit": 1,
+    },
+]
+
 # The instance config this code location ships, and the file that holds it.
 DAGSTER_DIR = Path(__file__).resolve().parents[1]
 INSTANCE_CONFIG = DAGSTER_DIR / "dagster.yaml"
@@ -170,13 +189,7 @@ def test_the_instance_config_file_really_parses(postgres_env) -> None:
     ref = InstanceRef.from_dir(str(DAGSTER_DIR))
     runs = ref.settings["concurrency"]["runs"]
     assert runs["max_concurrent_runs"] == GLOBAL_RUN_LIMIT
-    assert runs["tag_concurrency_limits"] == [
-        {
-            "key": SERIAL_TAG,
-            "value": {"applyLimitPerUniqueValue": True},
-            "limit": 1,
-        }
-    ]
+    assert runs["tag_concurrency_limits"] == EXPECTED_LIMITS
 
 
 def test_the_run_queue_the_daemon_reads_holds_the_serial_rule(
@@ -206,10 +219,11 @@ def test_the_run_queue_the_daemon_reads_holds_the_serial_rule(
         assert run_queue.max_concurrent_runs == GLOBAL_RUN_LIMIT
         assert list(run_queue.tag_concurrency_limits) == [
             {
-                "key": SERIAL_TAG,
-                "limit": 1,
-                "value": {"applyLimitPerUniqueValue": True},
+                "key": limit["key"],
+                "limit": limit["limit"],
+                "value": limit["value"],
             }
+            for limit in EXPECTED_LIMITS
         ]
     finally:
         instance.dispose()
@@ -220,13 +234,7 @@ def test_the_raw_instance_config_carries_the_serial_rule() -> None:
     reads, not only in the object parsed out of it."""
     runs = yaml.safe_load(INSTANCE_CONFIG.read_text())["concurrency"]["runs"]
     assert runs["max_concurrent_runs"] == GLOBAL_RUN_LIMIT
-    assert runs["tag_concurrency_limits"] == [
-        {
-            "key": SERIAL_TAG,
-            "value": {"applyLimitPerUniqueValue": True},
-            "limit": 1,
-        }
-    ]
+    assert runs["tag_concurrency_limits"] == EXPECTED_LIMITS
 
 
 def test_a_second_run_of_the_same_serial_job_waits_in_the_queue(serial_counter) -> None:
@@ -235,6 +243,21 @@ def test_a_second_run_of_the_same_serial_job_waits_in_the_queue(serial_counter) 
 
 def test_a_run_of_another_serial_job_is_not_blocked(serial_counter) -> None:
     assert serial_counter.is_blocked(_Run({SERIAL_TAG: "gold_export_job"})) is False
+
+
+def test_a_second_sync_of_the_same_table_waits_and_another_table_does_not() -> None:
+    """`DATA-66` D6: the per-table rule is what replaces a serial entry
+    for `iceberg_sync_job`. A second run of the SAME table waits; a run of
+    a different table starts beside it."""
+    limits = yaml.safe_load(INSTANCE_CONFIG.read_text())["concurrency"]["runs"]["tag_concurrency_limits"]
+    counter = TagConcurrencyLimitsCounter(
+        limits, [_Run({SYNC_TAG: "gold.orders"})]
+    )
+    assert counter.is_blocked(_Run({SYNC_TAG: "gold.orders"})) is True
+    assert counter.is_blocked(_Run({SYNC_TAG: "gold.sales"})) is False
+    assert counter.is_blocked(_Run({SYNC_TAG: "silver.orders"})) is False
+    # A serial job is unaffected by the sync rule.
+    assert counter.is_blocked(_Run({SERIAL_TAG: "gold_export_job"})) is False
 
 
 def test_a_run_without_the_serial_tag_is_not_blocked(serial_counter) -> None:

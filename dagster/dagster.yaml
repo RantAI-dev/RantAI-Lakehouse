@@ -83,3 +83,11 @@ concurrency:
         value:
           applyLimitPerUniqueValue: true
         limit: 1
+      # DATA-66 D6: one Iceberg sync run per table at a time. The value is
+      # the table's Iceberg name (`<zone>.<mart>`, set by the API and the
+      # sensor), so two tables sync in parallel while a second sync of one
+      # table waits in the queue instead of being dropped.
+      - key: lakehouse/iceberg-sync-target
+        value:
+          applyLimitPerUniqueValue: true
+        limit: 1

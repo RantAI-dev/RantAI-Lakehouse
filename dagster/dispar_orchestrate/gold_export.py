@@ -34,17 +34,16 @@ logs the count. The console now sees one mapped step per mart named
 `export_gold_mart[<key>]` where it previously saw the single
 `run_gold_export` step.
 
-# Which marts run (gold-publish-per-mart plan T5, DATA-1)
+# Which marts run (gold-publish-per-mart plan T5, DATA-1; DATA-66 D9)
 
-Before this change the mart list came only from `GOLD_EXPORT_MARTS`
-(default `gold_export_smoke`) — a build-time constant no operator could
-change without redeploying, and one that ignored everything the console's
-per-mart switches said. Now `list_gold_marts` unions two sources, the
-API's enabled publications (`GET /api/gold/publications`, what the
-console's switches write — the database is the source of truth) and the
-env override (an operator's escape hatch, default empty), deduplicated
-by mart name; two DISTINCT marts that would collapse into one Dagster
-step key are still refused. Every scheduled POST sends `ifChanged=true`, so a mart whose ClickHouse
+The mart list comes only from `GOLD_EXPORT_MARTS` (an operator's escape
+hatch, default empty) — and, since `DATA-66`, only for entries that are
+NOT an enabled console publication. A table switched on in the console
+follows its own sync mode ("On every update", "On a schedule", "Manual
+only"; `iceberg_sync.py`), so the nightly run does not export it behind
+that choice's back (feature page decision 12). Two DISTINCT env marts
+that would collapse into one Dagster step key are refused. Every
+scheduled POST sends `ifChanged=true`, so a mart whose `ClickHouse`
 content fingerprint (row count, wrapping 64-bit sum of cityHash64(*), and
 schema hash from system.columns) matches the fingerprint recorded on its last
 successful export comes back `{skipped: true}` (DATA-10). Background merges
@@ -52,8 +51,8 @@ successful export comes back `{skipped: true}` (DATA-10). Background merges
 TABLES` alter part modification times without changing table contents; the
 content fingerprint distinguishes genuine data changes from storage churn,
 preventing spurious re-exports — recorded as `skipped_verbs=["unchanged"]`
-with no `AssetMaterialization`, since nothing was written — and the empty union
-runs a zero-step job that still succeeds, which is the honest shape of
+with no `AssetMaterialization`, since nothing was written — and the empty
+list runs a zero-step job that still succeeds, which is the honest shape of
 "nothing is published."
 
 # Copy retention and trimming (DATA-2)
@@ -83,20 +82,14 @@ from typing import Any
 import requests
 from dagster import (
     AssetMaterialization,
-    DagsterRunStatus,
     DefaultScheduleStatus,
-    DefaultSensorStatus,
     Definitions,
     DynamicOut,
     DynamicOutput,
     Failure,
-    RunRequest,
-    RunStatusSensorContext,
     ScheduleDefinition,
-    SkipReason,
     job,
     op,
-    run_status_sensor,
 )
 
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, _ch_exec, record_maintenance_run
@@ -482,44 +475,59 @@ class PublicationMarts(list[str]):
     ),
 )
 def list_gold_marts(context) -> Any:
-    """Yield one `DynamicOutput` per mart to export this run: every
-    publication switched on in the console (`GET /api/gold/publications`)
-    unioned with the `GOLD_EXPORT_MARTS` override, deduplicated by exact
-    mart name — a mart listed in both places is one step, not two.
+    """Yield one `DynamicOutput` per mart the nightly run still owns:
+    the `GOLD_EXPORT_MARTS` override, minus every entry that is an
+    enabled console publication in the Gold zone.
 
-    Two DISTINCT marts that sanitize to the same Dagster mapping key are
-    refused with a non-retryable `Failure` naming both and where each
-    came from -- they would otherwise collapse into one mapped step
-    doing two marts' work, which is a failure mode only the fan-out can
-    detect."""
+    `DATA-66` D9 (feature page decision 12): a table switched on in the
+    console follows its own sync mode — "On every update" through the
+    watcher and the pipeline hook, "On a schedule" through the watcher,
+    "Manual only" through the button — so exporting it here as well
+    would ignore that choice. The list still reads
+    `GET /api/gold/publications` so a failed fetch fails the run
+    (retryable) instead of silently exporting a console table; a Silver
+    publication does not hide the Gold entry of the same bare name.
+
+    Two DISTINCT env marts that sanitize to the same Dagster mapping key
+    are refused with a non-retryable `Failure` naming both -- they would
+    otherwise collapse into one mapped step doing two marts' work, which
+    is a failure mode only the fan-out can detect."""
     cfg = GoldExportConfig.from_env()
     enabled = _enabled_publication_marts(cfg)
     context.log.info(
         f"enabled publications: {enabled}; GOLD_EXPORT_MARTS override: {cfg.marts}"
     )
     publication_targets = (
-        enabled.targets if isinstance(enabled, PublicationMarts) else None
+        enabled.targets
+        if isinstance(enabled, PublicationMarts)
+        else [MartExportTarget(mart) for mart in enabled]
     )
-    if publication_targets is None:
-        publication_targets = [MartExportTarget(mart) for mart in enabled]
-    seen_names: set[tuple[str, str]] = set()
+    enabled_gold = {
+        target.mart for target in publication_targets if target.zone == ZONE_GOLD
+    }
+    seen_names: set[str] = set()
     seen_keys: dict[str, str] = {}
-    sources = [("publication setting", target) for target in publication_targets]
     # The env override is an operator escape hatch for Gold marts; it has
     # no zone syntax, exactly as before DATA-65.
-    sources += [("GOLD_EXPORT_MARTS", MartExportTarget(mart)) for mart in cfg.marts]
-    for source, target in sources:
-        if (target.zone, target.mart) in seen_names:
+    for mart in cfg.marts:
+        if mart in enabled_gold:
+            context.log.info(
+                f"GOLD_EXPORT_MARTS entry {mart!r} is an enabled console "
+                "publication; its sync mode decides, not this run"
+            )
             continue
+        if mart in seen_names:
+            continue
+        target = MartExportTarget(mart)
         key = target.mapping_key
         if key in seen_keys:
             raise Failure(
-                f"two Gold marts map to the same Dagster step key {key!r}: "
-                f"{seen_keys[key]!r} and {target.iceberg_table!r} ({source}) -- "
-                "rename one so each mart maps to a unique step",
+                f"two GOLD_EXPORT_MARTS entries map to the same Dagster step "
+                f"key {key!r}: {seen_keys[key]!r} and {target.iceberg_table!r} "
+                "-- rename one so each mart maps to a unique step",
                 allow_retries=False,
             )
-        seen_names.add((target.zone, target.mart))
+        seen_names.add(mart)
         seen_keys[key] = target.iceberg_table
         yield DynamicOutput(target, mapping_key=key)
 
@@ -1223,58 +1231,34 @@ def gold_export_job() -> None:
 # unset, no identity is seeded and `_headers` returns `{}` — the schedule
 # below is still registered and every run fails loudly (`401`/`503`),
 # which is the honest, visible failure mode, not a silent one.
-# PR slice C review C-S1: each authored pipeline SUCCESS launches one
-# all-marts `gold_export_job` run. With T4's `ifChanged=true` in place,
-# unchanged marts cost one cheap check each and are skipped (no duplicate
-# copy); a mart is skipped when its `max(modification_time)` last moved
-# strictly before its last successful export (PR slice B review B1).
-# Dagster's `run_key=<upstream run id>` prevents a single pipeline
-# success from launching two Gold runs. The nightly 04:00 schedule is
-# the safety net, not the only trigger; with all marts already published
-# by the sensor, the nightly run produces mainly skips.
+# `DATA-66` D9 retired the after-authored sensor that used to launch an
+# all-marts run here: a pipeline's own table is now asked for by its
+# write (`iceberg_sync.py::request_iceberg_sync` from the authored op),
+# and every other switched-on table follows its own sync mode through
+# the `iceberg_sync_sensor`. This 04:00 schedule therefore covers only
+# the `GOLD_EXPORT_MARTS` entries that are NOT console publications
+# (`list_gold_marts`), plus its `ifChanged=true` skip for the rest.
 #
-# `monitored_jobs=None` (watch every job in this code location) with a
-# filter in the body: only `authored__<id>` jobs (the same prefix
-# `authored_factory.py` gives them at code-load time) trigger; all other
-# jobs — `gold_export_job` itself, maintenance, backup, alerts, capacity,
-# agent, ingest — yield `SkipReason` so the sensor tick stays green.
+# Auth (gold-publish-per-mart plan T1): `POST /api/gold/export/{mart}`'s
+# `Policy::RequiresAuth` floor is enforced by `auth_gate` BEFORE the
+# handler (and `check_export_token`'s own `x-run-token` check) ever runs,
+# so a real credential is required — `_headers` sends the shared token two
+# ways, exactly like `alerts_run.py`: `Authorization: Bearer
+# <GOLD_EXPORT_RUN_TOKEN>` clears the floor via the `gold-export-scheduler`
+# identity that `lakehouse-api::main::bootstrap_gold_export_service`
+# idempotently mints from the same env value at API boot, and
+# `x-run-token: <GOLD_EXPORT_RUN_TOKEN>` satisfies `check_export_token`'s
+# token branch, which is what actually gates the export. With the token
+# unset, no identity is seeded and `_headers` returns `{}` — the schedule
+# below is still registered and every run fails loudly (`401`/`503`),
+# which is the honest, visible failure mode, not a silent one.
 #
-# `default_status=RUNNING`: a sensor that ships STOPPED silently never
-# fires, and from the outside, a stopped sensor looks identical to a
+# `default_status=RUNNING`: a schedule that ships STOPPED silently never
+# fires, and from the outside, a stopped schedule looks identical to a
 # healthy one (the same reasoning every other schedule/sensor in this
 # code location documents). With `GOLD_EXPORT_RUN_TOKEN` unset the
 # scheduled POST would still fail — but that is a loud, visible failure
 # whose run entry in the Dagster UI is the signal, not a silent one.
-
-
-def evaluate_authored_success(context: RunStatusSensorContext):
-    """The sensor body, split out from the decorator so unit tests can
-    drive it with a `RunStatusSensorContext` stub — the same pattern
-    `pipeline_events.py::evaluate_finished_run` uses (plan 1f)."""
-    job_name = context.dagster_run.job_name
-    if not job_name.startswith("authored__"):
-        yield SkipReason(
-            f"skipped {job_name!r}: sensor only fires on authored-pipeline jobs"
-        )
-        return
-    yield RunRequest(run_key=context.dagster_run.run_id)
-
-
-@run_status_sensor(
-    run_status=DagsterRunStatus.SUCCESS,
-    monitored_jobs=None,
-    request_job=gold_export_job,
-    default_status=DefaultSensorStatus.RUNNING,
-    name="gold_export_after_authored_sensor",
-)
-def gold_export_after_authored_sensor(
-    context: RunStatusSensorContext,
-):
-    """gold-publish-per-mart plan T6: after an authored pipeline succeeds,
-    triggers `gold_export_job` so the nightly cadence is the safety net,
-    not the only trigger. With T4's `ifChanged=true` in place, unchanged
-    marts cost one cheap check each."""
-    yield from evaluate_authored_success(context)
 
 
 gold_export_schedule = ScheduleDefinition(
