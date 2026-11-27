@@ -90,10 +90,11 @@ answers 404 (not found).
   (ADR 0012) and in the "Tools" menu of the composer, in the capability
   names rather than the tool names.
 - Attaching a file to a chat.
-- The assistant making a dashboard public or embeddable, changing who can
-  see one, or emailing anyone outside the company. There is no tool for it
-  today; it is `AI-11`, which is planned and blocked by `BI-19`, `BI-26`
-  and `DEC-8`.
+- Changing who can see a dashboard, or emailing anyone outside the
+  company. Making a dashboard public or embeddable is offered through the
+  assistant now (`AI-11`): the public link waits for a person's approval,
+  ending one is a confirm in the chat, and the assistant never grants
+  permissions.
 - Grounding the assistant in documents. There is no vector store in the
   product; the assistant is a tool-calling agent over its registry.
 - Scheduled or headless runs for the ordinary user. The digital employees

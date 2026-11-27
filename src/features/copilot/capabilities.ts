@@ -38,6 +38,9 @@ export const CAPABILITIES: Capability[] = [
       // offers it here; enabling, the filter modes and the withdrawal are
       // writes and live in the Dashboard Builder.
       "get_embed_snippet",
+      // AI-11: who can see a dashboard is a read, so Ask mode offers it here;
+      // the link writes live in the Dashboard Builder.
+      "list_dashboard_access",
       // BI-18 D review round 1, SHOULD-FIX 2: listing the reports one may read is a question.
       "list_reports",
       // AI-2 AC1: "show only 2026" narrows the person's own view of the page
@@ -91,6 +94,13 @@ export const CAPABILITIES: Capability[] = [
       // Query Data for Ask mode too). None of them signs or shows a token: the
       // customer's server does, with the embedding secret.
       "enable_embed", "set_embed_filter_modes", "withdraw_embed_tokens", "get_embed_snippet",
+      // AI-11: sharing a dashboard with the world. Making or re-expiring the
+      // public link waits in Approvals and ending it needs the chat's Confirm;
+      // both live here (the composer sends this list as the allowlist, see
+      // BI-8 R1). Saying who can see a dashboard is a read, on Query Data for
+      // Ask mode too. No tool here changes the access rules — Share > People
+      // does, and the server's guard test pins that absence.
+      "create_public_link", "revoke_public_link", "list_dashboard_access",
       // BI-18 part D (T4): written reports with live charts, and dashboard templates. Writing
       // a report and starting from a template wait for the Confirm button; deleting either
       // waits in Approvals. Listing templates is a read, but needs `dashboard:write` like

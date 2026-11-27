@@ -69,6 +69,7 @@ mod ai_export_tools;
 mod ai_lineage_chart_tool;
 mod ai_next_step;
 mod ai_prompt_size;
+mod ai_public_link;
 mod ai_report_tools;
 mod ai_sessions;
 mod ai_sql_help;
