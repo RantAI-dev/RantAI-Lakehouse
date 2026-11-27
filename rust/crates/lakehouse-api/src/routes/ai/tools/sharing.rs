@@ -38,6 +38,10 @@ use time::format_description::well_known::Rfc3339;
 use super::api_result_to_value;
 use crate::state::AppState;
 
+/// `AI-11`: the refusal when nobody other than the requester could
+/// approve and run the link, so no approval row is written.
+pub(super) const NO_OTHER_APPROVER: &str = "Only another manager of this dashboard can approve this, and it has none; make the link yourself in Share.";
+
 /// The tool's own bound for `days` (`AI-11` decision 1): the route allows one
 /// hour to a year, the assistant may ask for 1 to 30 days. Its own sentence,
 /// because the route's expiry sentence would name bounds the schema never
@@ -154,7 +158,14 @@ pub(super) async fn check_before_create(
     if !enabled {
         return Err(json!({ "error": crate::routes::public_links::SWITCHED_OFF }));
     }
-    Ok(())
+    super::require_another_approver(
+        state,
+        principal,
+        "create_public_link",
+        args,
+        NO_OTHER_APPROVER,
+    )
+    .await
 }
 
 /// `create_public_link {board, days?}`: make the dashboard's public link, or

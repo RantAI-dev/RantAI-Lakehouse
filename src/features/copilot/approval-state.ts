@@ -25,6 +25,25 @@ export function approvalStateOf(status: string, lastStepLabel?: string): Approva
   return "pending";
 }
 
+/**
+ * The sentence a failed approved call returned (`AI-11`). The
+ * decide route stores the tool's own result as the last step's detail, JSON
+ * whose `error` is one of the tool's fixed sentences; the chat shows it, so
+ * the person is told why, not only that the action failed. Any other shape
+ * gives no sentence and the card keeps its generic line.
+ */
+export function approvalErrorOf(lastStepLabel?: string, detail?: string): string | undefined {
+  if (lastStepLabel !== "Executed after approval" || !detail) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(detail);
+    if (parsed === null || typeof parsed !== "object") return undefined;
+    const error = (parsed as { error?: unknown }).error;
+    return typeof error === "string" && error.length > 0 ? error : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export const APPROVAL_STATE_TEXT: Record<ApprovalState, { badge: string; line: string }> = {
   pending: {
     badge: "pending approval",

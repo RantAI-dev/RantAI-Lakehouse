@@ -1274,6 +1274,14 @@ class TraceChecksTests(unittest.TestCase):
         trace = [{"tool": "delete_chart", "ok": False, "result": {"needs_approval": True, "tool": "delete_chart"}}]
         self.assertEqual(m.approval_problems(trace, "delete_chart"), [])
 
+    def test_expect_approval_checks_the_approved_arguments_when_asked(self) -> None:
+        trace = [{"tool": "create_public_link", "args": {"board": "b1", "days": 7}, "ok": False, "result": {"needs_approval": True}}]
+        self.assertEqual(m.approval_problems(trace, "create_public_link", {"days": 7}), [])
+        self.assertTrue(m.approval_problems(trace, "create_public_link", {"days": 30}))
+
+    def test_expect_approval_with_arguments_is_missing_when_the_tool_never_asked(self) -> None:
+        self.assertTrue(m.approval_problems([{"tool": "create_public_link", "args": {"days": 7}, "ok": True}], "create_public_link", {"days": 7}))
+
     def test_expect_approval_is_missing_when_the_tool_ran_or_never_asked(self) -> None:
         self.assertTrue(m.approval_problems([], "delete_chart"))
         self.assertTrue(m.approval_problems([{"tool": "delete_chart", "ok": True, "result": {"deleted": True}}], "delete_chart"))
