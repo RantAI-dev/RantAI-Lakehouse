@@ -9,6 +9,10 @@ once a first release is tagged.
 
 ## [Unreleased]
 
+### Added
+
+- Iceberg sync per table, with its own cadence (backlog `DATA-66`; feature page `docs/core/features/iceberg-sync-per-table.md`; migration `0162`). A Silver or Gold table switched on for open-format publishing now chooses how closely the copy follows ClickHouse: **On every update** (right after its own pipeline writes, and within 15 seconds of a change made outside a pipeline), **On a schedule** (hourly at a chosen minute, or daily at a chosen time in a time zone, with the next sync time on the card), or **Manual only** (only "Publish now"). Each table syncs in its own run, so one table no longer waits behind all the others, and a second sync of the same table queues instead of being dropped. A failed sync never fails or undoes the ClickHouse write: the card says "Last publish failed", and an "On every update" table retries every five minutes. The nightly 04:00 run now exports only `GOLD_EXPORT_MARTS` entries that are not switched on in the console, so a table with no console setting behaves exactly as before.
+
 ### Fixed
 
 - The assistant refuses a share or embed request that nobody else could approve, at once and with no approval waiting (backlog `AI-11`). A manager who asks for a public link or an embed change on a dashboard that has no other manager who can approve it now gets one sentence in the chat and nothing waits in Approvals. An approved request whose run then fails shows the reason in the chat, not only "action failed" (`AI-11`). "Who has access to this dashboard?" and its Indonesian forms reach the access tool (`AI-11`).

@@ -201,3 +201,199 @@ async fn list_enabled_returns_both_zones_and_zone_queries_filter(pool: PgPool) -
     );
     Ok(())
 }
+
+// ── DATA-66: the sync setting ─────────────────────────────────────────
+
+/// DATA-66 D4: a row written without a mode (the pre-`0162` shape, and
+/// every row `upsert_in_zone` creates) reads as `on_update` with no
+/// schedule — the nearest thing to today's "after each pipeline".
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_row_written_without_a_mode_reads_as_on_update(pool: PgPool) -> sqlx::Result<()> {
+    let actor = Uuid::new_v4();
+    let stored = gold_publication::upsert(&pool, "sync_default", true, actor)
+        .await
+        .expect("the insert succeeds");
+    assert_eq!(stored.sync_mode, gold_publication::SyncMode::OnUpdate);
+    assert_eq!(stored.schedule, None, "no schedule on the default mode");
+    assert_eq!(stored.time_zone, None, "no time zone on the default mode");
+    Ok(())
+}
+
+/// A scheduled setting round-trips through both readers: the enum, the
+/// stored day/minute, and the IANA zone come back exactly as written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_scheduled_setting_round_trips(pool: PgPool) -> sqlx::Result<()> {
+    use lakehouse_store::report_schedule::Schedule;
+
+    let actor = Uuid::new_v4();
+    gold_publication::upsert(&pool, "sync_scheduled", true, actor)
+        .await
+        .expect("the insert succeeds");
+    let setting = gold_publication::SyncSetting {
+        mode: gold_publication::SyncMode::Scheduled,
+        schedule: Some(Schedule::Daily { hour: 4, minute: 0 }),
+        time_zone: Some("Asia/Jakarta".to_owned()),
+    };
+    let updated =
+        gold_publication::set_sync_in_zone(&pool, "gold", "sync_scheduled", &setting, actor)
+            .await
+            .expect("the setting write succeeds")
+            .expect("the row exists");
+
+    assert_eq!(updated.sync_mode, gold_publication::SyncMode::Scheduled);
+    assert_eq!(
+        updated.schedule,
+        Some(gold_publication::SyncSchedule::Daily { hour: 4, minute: 0 })
+    );
+    assert_eq!(updated.time_zone.as_deref(), Some("Asia/Jakarta"));
+
+    let got = gold_publication::get(&pool, "sync_scheduled")
+        .await
+        .expect("the read succeeds")
+        .expect("the row exists");
+    assert_eq!(got, updated);
+    Ok(())
+}
+
+/// DATA-66: flipping the switch on or off must not reset a schedule —
+/// the setting has its own writer, and `upsert_in_zone` keeps its old
+/// column set on conflict.
+#[sqlx::test(migrations = "../../migrations")]
+async fn upsert_in_zone_keeps_a_scheduled_setting(pool: PgPool) -> sqlx::Result<()> {
+    use lakehouse_store::report_schedule::Schedule;
+
+    let actor = Uuid::new_v4();
+    gold_publication::upsert(&pool, "sync_kept", true, actor)
+        .await
+        .expect("the insert succeeds");
+    gold_publication::set_sync_in_zone(
+        &pool,
+        "gold",
+        "sync_kept",
+        &gold_publication::SyncSetting {
+            mode: gold_publication::SyncMode::Scheduled,
+            schedule: Some(Schedule::Hourly { minute: 15 }),
+            time_zone: Some("UTC".to_owned()),
+        },
+        actor,
+    )
+    .await
+    .expect("the setting write succeeds");
+
+    let flipped = gold_publication::upsert(&pool, "sync_kept", false, Uuid::new_v4())
+        .await
+        .expect("the flip succeeds");
+    assert!(!flipped.enabled);
+    assert_eq!(flipped.sync_mode, gold_publication::SyncMode::Scheduled);
+    assert_eq!(
+        flipped.schedule,
+        Some(gold_publication::SyncSchedule::Hourly { minute: 15 })
+    );
+    assert_eq!(flipped.time_zone.as_deref(), Some("UTC"));
+    Ok(())
+}
+
+/// `0162`'s table CHECK refuses a `scheduled` row without a minute,
+/// whatever writer made it: the API's validator and the storage layer
+/// agree (fail closed at both).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_table_check_refuses_scheduled_without_a_minute(pool: PgPool) -> sqlx::Result<()> {
+    let actor = Uuid::new_v4();
+    let refused = sqlx::query(
+        "INSERT INTO gold_publication \
+         (zone, mart, enabled, updated_by, sync_mode, sync_schedule_kind, sync_hour, sync_time_zone) \
+         VALUES ('gold', 'raw_scheduled', true, $1, 'scheduled', 'daily', 4, 'UTC')",
+    )
+    .bind(actor)
+    .execute(&pool)
+    .await;
+    assert!(
+        refused.is_err(),
+        "a scheduled row without a minute must violate the table CHECK"
+    );
+    let rows: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM gold_publication WHERE mart = 'raw_scheduled'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(rows.0, 0, "the refused insert wrote no row");
+    Ok(())
+}
+
+/// `set_sync_in_zone` on a row that was never switched on answers `None`:
+/// there is no setting to change, and the route's own 404 is the answer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_sync_in_zone_answers_none_for_a_missing_row(pool: PgPool) -> sqlx::Result<()> {
+    let setting = gold_publication::SyncSetting {
+        mode: gold_publication::SyncMode::Manual,
+        schedule: None,
+        time_zone: None,
+    };
+    let got = gold_publication::set_sync_in_zone(
+        &pool,
+        "gold",
+        "never_switched_on",
+        &setting,
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("the update itself succeeds");
+    assert!(got.is_none());
+    Ok(())
+}
+
+/// Weekly/Monthly schedules and an unknown IANA zone are refused with
+/// the fixed validation sentence the API maps to 400 — and nothing is
+/// written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_sync_in_zone_refuses_weekly_and_an_unknown_zone(pool: PgPool) -> sqlx::Result<()> {
+    use lakehouse_store::StoreError;
+    use lakehouse_store::report_schedule::Schedule;
+
+    let actor = Uuid::new_v4();
+    gold_publication::upsert(&pool, "sync_refused", true, actor)
+        .await
+        .expect("the insert succeeds");
+
+    let weekly = gold_publication::set_sync_in_zone(
+        &pool,
+        "gold",
+        "sync_refused",
+        &gold_publication::SyncSetting {
+            mode: gold_publication::SyncMode::Scheduled,
+            schedule: Some(Schedule::Weekly {
+                weekday: 1,
+                hour: 8,
+                minute: 0,
+            }),
+            time_zone: Some("UTC".to_owned()),
+        },
+        actor,
+    )
+    .await;
+    assert!(
+        matches!(weekly, Err(StoreError::Validation(message)) if message == "schedule kind must be hourly or daily")
+    );
+
+    let unknown_zone = gold_publication::set_sync_in_zone(
+        &pool,
+        "gold",
+        "sync_refused",
+        &gold_publication::SyncSetting {
+            mode: gold_publication::SyncMode::Scheduled,
+            schedule: Some(Schedule::Hourly { minute: 5 }),
+            time_zone: Some("Mars/Olympus".to_owned()),
+        },
+        actor,
+    )
+    .await;
+    assert!(
+        matches!(unknown_zone, Err(StoreError::Validation(message)) if message == "unknown time zone")
+    );
+
+    let got = gold_publication::get(&pool, "sync_refused")
+        .await
+        .expect("the read succeeds")
+        .expect("the row exists");
+    assert_eq!(got.sync_mode, gold_publication::SyncMode::OnUpdate);
+    Ok(())
+}

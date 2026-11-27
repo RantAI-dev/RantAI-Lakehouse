@@ -131,6 +131,7 @@ mod gold_publication;
 mod governance_policy_tenant_reach;
 mod home_layout;
 mod iceberg_door;
+mod iceberg_sync;
 mod identity_deactivate;
 mod identity_roles;
 mod identity_table_access;

@@ -271,6 +271,11 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("POST", "/api/alerts/test", Coverage::Excluded { reason: EX_TEST_BUTTON }),
     ("POST", "/api/alerts/run", Coverage::Excluded { reason: EX_ALERT_SCHEDULER }),
     ("POST", "/api/gold/export/{mart}", Coverage::Central { action: "gold.export", resource_kind: "gold_mart", id_param: IdParam::Path("mart") }),
+    // DATA-66 D7: the authored pipeline's after-write ask launches a sync
+    // run and changes no data itself; the run's own export is audited as
+    // `gold.export` when it posts the export route (Decision 1's machine
+    // callback).
+    ("POST", "/api/gold/export/{mart}/after-write", Coverage::Excluded { reason: EX_MACHINE }),
     ("PUT", "/api/gold/export/{mart}/publication", Coverage::Handler { action: "gold.publication_set", resource_kind: "gold_mart" }),
     ("POST", "/api/query/run", Coverage::Handler { action: "query.run", resource_kind: "query_history" }),
     ("POST", "/api/query/estimate", Coverage::Excluded { reason: EX_READ_LIKE }),

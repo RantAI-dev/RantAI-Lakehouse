@@ -24,10 +24,10 @@ The fan-out tests drive the rebuilt `gold_export_job` end-to-end via
 the events Dagster emits so a failed mart is its own failed step and an
 HTTP error still records a `maintenance_run` failure row.
 
-The sensor tests (gold-publish-per-mart plan T6) verify that an authored
-pipeline's SUCCESS yields one `RunRequest` for `gold_export_job`, while
-non-authored jobs (`gold_export_job` itself, maintenance, alerts, etc.)
-yield nothing.
+`DATA-66` retired the after-authored sensor (its job is now the authored
+op's own ask plus `iceberg_sync_sensor`), so the fan-out here exports
+only `GOLD_EXPORT_MARTS` entries that are not an enabled console
+publication.
 """
 
 from __future__ import annotations
@@ -54,7 +54,6 @@ from dispar_orchestrate.gold_export import (
     InvalidOrphanMinAgeError,
     INVALID_ORPHAN_MIN_AGE_REASON,
     _headers,
-    evaluate_authored_success,
     gold_export_job,
     gold_export_schedule,
     parse_gold_keep_copies,
@@ -394,31 +393,42 @@ class GoldExportFanOutTest(unittest.TestCase):
             e.step_key for e in result.all_events if e.event_type_value == "STEP_SUCCESS"
         })
 
-    def test_enabled_publications_and_the_env_override_union_deduplicated(self) -> None:
-        """The scheduled mart list is the UNION of the publications the
-        console enabled and `GOLD_EXPORT_MARTS`, deduplicated by exact
-        mart name — a mart listed in both places is one step, not two."""
+    def test_an_env_mart_that_is_an_enabled_publication_is_not_exported(self) -> None:
+        """`DATA-66` D9 (feature page decision 12): a table switched on in
+        the console follows its own sync mode, so the nightly run must not
+        export it behind that choice's back. The env list is exported only
+        for entries that are NOT an enabled Gold publication; a Silver
+        publication of the same bare name does not hide the Gold entry."""
         from dispar_orchestrate import gold_export
 
-        cfg = mock.Mock(marts=["mart_b", "mart_env_only"], ch=None)
+        cfg = mock.Mock(marts=["mart_b", "mart_env_only", "mart_silver_too"], ch=None)
         exported: list[str] = []
 
         def fake_export(_cfg, mart):
             exported.append(mart)
             return {"rowsExported": 1}
 
+        enabled = gold_export.PublicationMarts(
+            ["mart_a", "mart_b", "mart_silver_too"],
+            [
+                gold_export.MartExportTarget("mart_a", "gold"),
+                gold_export.MartExportTarget("mart_b", "gold"),
+                gold_export.MartExportTarget("mart_silver_too", "silver"),
+            ],
+        )
         with mock.patch.object(gold_export.GoldExportConfig, "from_env", return_value=cfg), \
                 mock.patch.object(
-                    gold_export,
-                    "_enabled_publication_marts",
-                    return_value=["mart_a", "mart_b"],
+                    gold_export, "_enabled_publication_marts", return_value=enabled
                 ), \
                 mock.patch.object(gold_export, "export_one_mart", side_effect=fake_export), \
                 mock.patch.object(gold_export, "record_maintenance_run"):
             result = gold_export_job.execute_in_process(raise_on_error=False)
 
         self.assertTrue(result.success)
-        self.assertEqual(sorted(exported), ["mart_a", "mart_b", "mart_env_only"])
+        # mart_b is a Gold console publication -> dropped; mart_a has no env
+        # entry -> not exported by this run; the Silver publication of
+        # `mart_silver_too` does not hide the Gold env entry.
+        self.assertEqual(sorted(exported), ["mart_env_only", "mart_silver_too"])
 
     def test_a_skipped_mart_records_unchanged_and_emits_no_materialization(
         self,
@@ -508,65 +518,6 @@ class GoldExportFanOutTest(unittest.TestCase):
         self.assertEqual(
             mocked_record.call_args.kwargs["skipped_verbs"], ["already_running"]
         )
-
-
-class GoldExportAfterAuthoredSensorTests(unittest.TestCase):
-    """gold-publish-per-mart plan T6: `gold_export_after_authored_sensor`
-    fires after an authored pipeline succeeds, triggering `gold_export_job`
-    so the nightly cadence is the safety net, not the only trigger. With
-    T4's `ifChanged=true` in place, unchanged marts cost one cheap check
-    each. The sensor must NOT fire on `gold_export_job` itself or on
-    maintenance, backup, alerts, capacity, agent, or ingest jobs.
-
-    The tests drive `evaluate_authored_success` directly (the split-out
-    body, same pattern `pipeline_events.py::evaluate_finished_run` uses
-    for plan 1f) with a duck-typed context stand-in — no real sensor
-    context or `DagsterInstance` needed."""
-
-    class _FakeRun:
-        def __init__(self, run_id: str, job_name: str) -> None:
-            self.run_id = run_id
-            self.job_name = job_name
-
-    class _FakeContext:
-        def __init__(self, run_id: str, job_name: str) -> None:
-            self.dagster_run = GoldExportAfterAuthoredSensorTests._FakeRun(
-                run_id, job_name
-            )
-
-    def test_an_authored_pipeline_success_yields_one_run_request_with_the_triggering_run_as_key(
-        self,
-    ) -> None:
-        """The happy path: an `authored__pl_foo` job succeeds. The sensor
-        yields one `RunRequest(run_key=<upstream run id>)` — Dagster's
-        own dedup keeps a re-firing upstream success from launching
-        `gold_export_job` twice for the same upstream run."""
-        ctx = self._FakeContext(job_name="authored__pl_foo", run_id="upstream-abc")
-        results = list(evaluate_authored_success(ctx))
-        run_requests = [r for r in results if isinstance(r, RunRequest)]
-        self.assertEqual(len(run_requests), 1)
-        self.assertEqual(run_requests[0].run_key, "upstream-abc")
-
-    def test_gold_export_job_itself_yields_nothing(self) -> None:
-        """`gold_export_job`'s own success must never trigger another
-        `gold_export_job` run — that would be an infinite chain."""
-        ctx = self._FakeContext(job_name="gold_export_job", run_id="gold-run-1")
-        results = list(evaluate_authored_success(ctx))
-        run_requests = [r for r in results if isinstance(r, RunRequest)]
-        self.assertEqual(run_requests, [])
-
-    def test_a_non_authored_job_yields_nothing(self) -> None:
-        """Every non-authored job — maintenance, alerts, capacity, agent,
-        ingest, backup — must be a no-op. Only `authored__<id>` jobs
-        trigger the export. The test drives a single representative
-        non-authored name; the `startswith("authored__")` check covers
-        all of them uniformly."""
-        ctx = self._FakeContext(job_name="bronze_maintenance_job", run_id="mt-1")
-        results = list(evaluate_authored_success(ctx))
-        run_requests = [r for r in results if isinstance(r, RunRequest)]
-        self.assertEqual(run_requests, [])
-
-
 
 
 class GoldKeepCopiesParsingTests(unittest.TestCase):
@@ -1053,7 +1004,14 @@ class GoldZoneSchedulingTests(unittest.TestCase):
             gold_export.export_one_mart(_cfg(), "orders")
         self.assertEqual(post.call_args.kwargs["params"], {"ifChanged": "true"})
 
-    def test_silver_and_gold_publications_get_distinct_mapped_steps(self) -> None:
+    def test_console_publications_get_no_mapped_step_at_all(self) -> None:
+        """`DATA-66` D9 replaced the old per-zone union: a Silver or Gold
+        table switched on in the console follows its sync mode, so the
+        nightly job exports neither. Before DATA-66 this test asserted the
+        two mapped steps; the behavior it pinned is gone by decision
+        (feature page decision 12), and `test_both_zones_of_the_same_bare_
+        mart_are_kept` still pins that the two zones are read as distinct
+        publications."""
         from dispar_orchestrate import gold_export
 
         cfg = mock.Mock(marts=[], ch=None)
@@ -1064,28 +1022,18 @@ class GoldZoneSchedulingTests(unittest.TestCase):
                 gold_export.MartExportTarget("orders", "gold"),
             ],
         )
-        exported: list[tuple[str, str]] = []
-
-        def fake_export(_cfg, mart, zone=gold_export.DEFAULT_ZONE):
-            exported.append((mart, zone))
-            return {"rowsExported": 2}
-
         with mock.patch.object(gold_export.GoldExportConfig, "from_env", return_value=cfg), \
                 mock.patch.object(gold_export, "_enabled_publication_marts", return_value=publications), \
-                mock.patch.object(gold_export, "export_one_mart", side_effect=fake_export), \
-                mock.patch.object(gold_export, "record_maintenance_run") as mocked_record:
+                mock.patch.object(gold_export, "export_one_mart") as mocked_export, \
+                mock.patch.object(gold_export, "record_maintenance_run"):
             result = gold_export_job.execute_in_process(raise_on_error=False)
 
         self.assertTrue(result.success)
         step_keys = {e.step_key for e in result.all_events if e.event_type_value == "STEP_SUCCESS"}
-        self.assertIn("export_gold_mart[orders]", step_keys)
-        self.assertIn("export_gold_mart[silver__orders]", step_keys)
         self.assertEqual(
-            sorted(exported), [("orders", "gold"), ("orders", "silver")]
+            {key for key in step_keys if key.startswith("export_gold_mart[")}, set()
         )
-        tables = [c.kwargs.get("table_name") for c in mocked_record.call_args_list]
-        self.assertIn("gold.orders", tables)
-        self.assertIn("silver.orders", tables)
+        mocked_export.assert_not_called()
 
     def test_a_silver_trim_targets_the_silver_namespace(self) -> None:
         from unittest.mock import MagicMock

@@ -192,6 +192,7 @@ estimate (S, M, L), which the base has no field for.
 | `BI-59` | Feature | The Dashboards page as home and table: one search, one New menu (dashboard, report, from a template, import), one ⋯ menu; a Recent row of four picture cards; one sortable list of dashboards, reports and templates with a type filter and a folder picker, one badge style and the same ⋯ on every row; bulk move, favourite and trash; a Gallery view of picture cards grouped by folder (pictures drawn from chart definitions, no query). **Blocked by `BI-18` part D (#528)**. Spec `bi-59.md`, page `dashboards-page.md` | Dashboards | P1 | Building |  | Owner QA 2026-11-14: page busy, 11 controls, badges disagree; mockup C chosen, B's gallery as a second view |
 | `BI-61` | Feature | The dashboard page as a focused reader: a calm header (breadcrumb, title, one facts line; Edit, Share and ⋯), the ⋯ menu grouped (View, Get a copy, Manage) with auto-refresh as one submenu, tabs and filters as borderless chips on one row, tiles without border or badge (actions and freshness in the tile ⋯ and on hover), edit as a mode, and Comments and Details sharing the AI Copilot's one side panel. **Blocked by `BI-18` part D (#528)**. Spec `bi-61.md`, page `dashboard-reader.md` | Dashboards | P1 | In Acceptance | #541 | Owner QA 2026-11-14: page busy; mockup A chosen |
 | `BI-62` | Feature | The report editor as a document (owner chose mockup D): the title is the first line and text is written straight on the page; `/` menu and Markdown shortcuts for headings, lists, quote, divider and charts; bold, italic and links inside sentences; ⋮⋮ and Alt+↑/↓ to move blocks; charts from live previews (a Charts tab in the one side panel, drag or click) at text or wide width; autosave instead of Save; the reader and the PDF match the editor; the assistant writes and describes charts in the page as drafts to accept or discard. Spec `docs/core/specs/bi-62.md`, page `docs/core/features/report-editor.md`. **Blocked by `BI-61`** (the side panel tabs) and `BI-18` part D (#528). | Dashboards | P2 | In Acceptance | #545, #603 | Owner QA 2026-11-15: report editor felt like a form; mockup D chosen |
+| `DATA-66` | Feature | Iceberg sync per table: a Silver or Gold table switched on for publishing chooses "On every update" (synced right after its pipeline writes, and within a 15-second check for changes made outside a pipeline, retried after a failure), "On a schedule" (hourly or daily, in a time zone) or "Manual only". Set on the open-format card, stored in Postgres, in the API. A failed sync never fails the ClickHouse write. Replaces the all-tables run after any pipeline and the nightly run for console tables. Product owner, 2026-11-27 (with `DATA-3` killed) | Build | P1 | Building |  | [spec](specs/data-66.md); `features/iceberg-sync-per-table.md`; `superpowers/plans/2026-11-27-data-66-iceberg-sync.md` |
 
 ## Next (P2)
 
@@ -480,7 +481,7 @@ estimate (S, M, L), which the base has no field for.
 | `BLD-6` | Task | `lag_pipelines_without_readers` (the batched reader check from `BLD-5`) copies the SQL predicate of `count_lag_pipelines_reading`, and its doc says the two "cannot drift". Share the predicate, or add a store test that runs both on the same fixture, and correct the comment (AGENTS.md rule 1). Found in PR #234 review round 1, SHOULD-FIX 1 | Build | P3 | Done | #280 | `rust/crates/lakehouse-store/src/pipelines.rs` |
 | `SRC-5` | Feature | Real connection test for batch MongoDB, Kafka and SFTP sources | Data | P3 | Idea |  | `connector_probe.rs` |
 | `DOC-2` | Task | Step-by-step user guide checked against a running console. The planner writes it, later, and the landing page links to it (product owner, 2026-10-30). The guide (every label read from the source) and the footer link merged 2026-10-31; the walk-through on a running console is left | Docs | P3 | In Progress | #286 | `reference/user-guide.md` |
-| `DATA-3` | Feature | Store Gold in open format first; serve from a fast copy. **Blocked by `DATA-4`** and a new ADR that replaces ADR 0010's direction | Build | P3 | Planned |  | ADR 0010; [spec](specs/data-3.md) |
+| `DATA-3` | Feature | Store Gold in open format first; serve from a fast copy. Killed 2026-11-27 by the product owner: not needed. ClickHouse stays the primary store for Silver (`silver.*`) and Gold (`serving.*`); the open-format copy is kept current instead by `DATA-66` (per-table Iceberg sync: on every update, scheduled, or manual). The draft ADR 0019 and plan (#623) were closed unmerged | Build | P3 | Killed | #623 (closed) | ADR 0010; [spec](specs/data-3.md) |
 | `DATA-4` | Feature | Publish Silver in open format. | Build | P3 | Planned |  | `features/gold-publish-per-mart.md`; [spec](specs/data-4.md) |
 | `DATA-5` | Task | Measure outside readers of published tables. Option B (product owner, 2026-10-31; ADR 0016): outside tools read through `/api/iceberg` with an `iceberg:read` service identity, and every table load is counted | Build | P3 | Done | #292, #293 | `routes::gold::consumers` |
 | `DATA-32` | Task | A typo that matches only a table's name (not a column or a tag) gets no "approximate match" label in catalog search, while a column or tag typo does: `matchedOn` is null when the name is the best field (`rust/crates/lakehouse-api/src/routes/catalog_search.rs`; cause found by reading, not run). Found in the `DATA-11` pre-check, 2026-10-23; the product owner accepted `DATA-11` with this as an exception | Data | P3 | Done | #300 | `features/catalog-search.md` (`DATA-11-AC` row 5) |
@@ -572,7 +573,6 @@ parity), built after it.
 | `BI-16` | In Acceptance | — | `AI-5` (per chart type as it lands) |
 | `BI-17` | In Acceptance | — | `AI-8` |
 | `BLD-1` | Building | — | `REL-6` |
-| `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Decided | — | `AI-11` |
 | `AI-11` | In Acceptance | — | — |
 | `AI-13` | In Acceptance | — | — |
@@ -580,7 +580,6 @@ parity), built after it.
 | `AI-5` | Released | `BI-16` (per chart type as it lands) | — |
 | `AI-8` | Released | `BI-17` | — |
 | `AI-9` | Released | `BI-18` (templates part) | — |
-| `DATA-3` | Planned | `DATA-4` | — |
 | `REL-6` | Blocked | `BLD-1` | — |
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
@@ -600,6 +599,7 @@ set by the product owner and are left empty until they are.
 | `SRC-45` | 2026-11-19 | 2026-11-19 (#597) | |
 | `SRC-46` | 2026-11-19 | 2026-11-20 (#607) | |
 | `AI-28` | 2026-11-20 | 2026-11-20 (#624) | |
+| `DATA-66` | 2026-11-27 | | |
 | `AI-29` | 2026-11-20 | 2026-11-20 (#634) | |
 | `AI-30` | 2026-11-20 | 2026-11-20 (#634) | |
 | `AI-31` | 2026-11-20 | 2026-11-20 (#634) | |
@@ -951,6 +951,7 @@ rejected** with the date.
 | `DEC-21` | Dropping a table from the console (QA `LH-DATA-15-06`, `TC-1731`) | Decided: a table made by an upload can be dropped from the console, with the 7-day restore. Work: `DATA-55` | 2026-11-12 |
 | `DEC-22` | What a re-upload runs (QA `LH-DATA-19-02`) | Decided: the pipelines downstream of the ones that read the uploaded table run too. Work: `BLD-14` | 2026-11-12 |
 | `DEC-23` | Ten files uploaded at once: the checklist or the limit (QA `LH-DATA-17-01`) | Decided: the checklist is reworded to the limit of `SEC-17` decision 6 (four parts move at a time); done in `features/upload-big-files-and-more-formats.md` | 2026-11-12 |
+| `DATA-3` | Store Gold in open format first; serve from a fast copy | Killed by the product owner: not needed. ClickHouse stays primary for Silver and Gold; the Iceberg copy is kept current per table by `DATA-66`. PR #623 closed | 2026-11-27 |
 
 ## Specs
 
@@ -1061,7 +1062,8 @@ builds it (`AGENTS.md`).
 | [`DATA-2`](specs/data-2.md) | Keep the last copies of a published Gold table | Next | M |
 | [`DATA-6`](specs/data-6.md) | A latest-copy-only table for outside readers | Next | S |
 | [`DATA-4`](specs/data-4.md) | Publish Silver in open format | Later | M |
-| [`DATA-3`](specs/data-3.md) | Store Gold in open format first | Later | L |
+| [`DATA-66`](specs/data-66.md) | Iceberg sync per table: on every update, on a schedule, or by hand | Now | M |
+| [`DATA-3`](specs/data-3.md) | Store Gold in open format first (Killed 2026-11-27; see `DATA-66`) | — | L |
 
 ### Query Studio
 
