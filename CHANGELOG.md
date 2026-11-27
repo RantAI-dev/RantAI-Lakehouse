@@ -9,6 +9,10 @@ once a first release is tagged.
 
 ## [Unreleased]
 
+### Added
+
+- Iceberg sync per table, with its own cadence (backlog `DATA-66`; feature page `docs/core/features/iceberg-sync-per-table.md`; migration `0162`). A Silver or Gold table switched on for open-format publishing now chooses how closely the copy follows ClickHouse: **On every update** (right after its own pipeline writes, and within 15 seconds of a change made outside a pipeline), **On a schedule** (hourly at a chosen minute, or daily at a chosen time in a time zone, with the next sync time on the card), or **Manual only** (only "Publish now"). Each table syncs in its own run, so one table no longer waits behind all the others, and a second sync of the same table queues instead of being dropped. A failed sync never fails or undoes the ClickHouse write: the card says "Last publish failed", and an "On every update" table retries every five minutes. The nightly 04:00 run now exports only `GOLD_EXPORT_MARTS` entries that are not switched on in the console, so a table with no console setting behaves exactly as before.
+
 ### Fixed
 
 - Embeds look right on the host page (backlog `BI-64`, from `BI-26-AC2` and `AC5`). With `background=transparent` the frame is transparent: the root layout's `body` background was what stayed opaque, and it is now cleared (with `html`) while the option is on; tiles keep their cards. The height posted to the host page now includes the 8 px padding, so the frame no longer scrolls by 16 px. A year (an integer from 1000 to 9999) in a column named `year`, `tahun`, `yr`, or ending `_year` / `_tahun` prints as "2020", not "2,020", in raw tables and table tiles, in the console too; an explicit thousands setting still wins.
