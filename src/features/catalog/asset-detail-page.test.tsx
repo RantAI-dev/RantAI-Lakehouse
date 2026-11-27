@@ -17,7 +17,10 @@ mock.module("next/navigation", () => ({
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
+import * as React from "react"
 import { AuthProvider } from "@/features/auth/auth-provider"
+import { CopilotProvider, useCopilot } from "@/features/copilot/use-copilot"
+import type { PageContext } from "@/features/copilot/page-context"
 import type { AssetDetail } from "@/services/contracts/assets"
 import { AssetDetailPage } from "./asset-detail-page"
 
@@ -316,6 +319,45 @@ describe("AssetDetailPage row count (QA LH-DATA-15-07)", () => {
     await waitFor(() => expect(screen.getByText("720")).toBeTruthy())
     const rows = screen.getByText("Rows").parentElement as HTMLElement
     expect(rows.textContent).not.toContain("—")
+  })
+})
+
+describe("AssetDetailPage Copilot page context (AI-26)", () => {
+  const observed: { current: PageContext | null } = { current: null }
+  const currentContext = (): PageContext | null => observed.current
+
+  function ContextSpy() {
+    const ctx = useCopilot().pageContext
+    React.useEffect(() => {
+      observed.current = ctx
+    }, [ctx])
+    return null
+  }
+
+  function Harness({ showPage }: { showPage: boolean }) {
+    return (
+      <CopilotProvider>
+        <AuthProvider>
+          {showPage ? <AssetDetailPage /> : null}
+          <ContextSpy />
+        </AuthProvider>
+      </CopilotProvider>
+    )
+  }
+
+  it("sets this table as the chat's page context and clears the override on unmount", async () => {
+    observed.current = null
+    stubApi({ tableKey: "silver.orders" })
+    const view = render(<Harness showPage />)
+    await waitFor(() => expect(currentContext()?.key).toBe("asset-detail"))
+    expect(currentContext()?.system).toContain("Orders Silver")
+    expect(currentContext()?.system).toContain("silver.orders")
+
+    // Keep the observer mounted: `setPageContext(null)` drops the override,
+    // so the chat falls back to the route's own context, not to this table.
+    view.rerender(<Harness showPage={false} />)
+    await waitFor(() => expect(currentContext()?.key).toBe("data"))
+    expect(currentContext()?.system).not.toContain("Orders Silver")
   })
 })
 

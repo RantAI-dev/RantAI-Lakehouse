@@ -17,6 +17,8 @@ import { approvalStateOf } from "./approval-state";
 
 export type Mode = "ask" | "build";
 export type DockPosition = "bottom" | "right";
+/** One table the person pointed the chat at with `@` (`AI-26`). */
+export type TableMention = { kind: "table"; key: string };
 export type Msg = {
   /** Stable React key; older saved sessions get one when loaded. */
   id?: string;
@@ -428,7 +430,7 @@ function useCopilotState() {
    * conversation's own mode as it is (`BI-62` D8: the report editor's
    * drafts are always Ask, whatever the panel is set to).
    */
-  const send = React.useCallback(async (text: string, history?: Msg[], options?: { continuation?: boolean; mode?: Mode }) => {
+  const send = React.useCallback(async (text: string, history?: Msg[], options?: { continuation?: boolean; mode?: Mode; mentions?: TableMention[] }) => {
     const q = text.trim();
     if (!q || busy) return;
     // A typed message starts a new chain; a continuation belongs to the
@@ -460,6 +462,8 @@ function useCopilotState() {
           context: pageContextRef.current?.system,
           view: pageContextRef.current?.view,
           messages: chatHistory(next),
+          // AI-26: an older request with no picks carries no field at all.
+          ...(options?.mentions?.length ? { mentions: options.mentions } : {}),
         }),
       });
       if (!res.ok) throw new Error(chatErrorText(await res.json().catch(() => null)));
