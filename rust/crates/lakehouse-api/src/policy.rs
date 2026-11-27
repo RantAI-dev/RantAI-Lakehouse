@@ -582,6 +582,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // Switching off flips a flag only; no route under /api/gold ever
     // drops Iceberg data.
     ("GET", "/api/gold/publications",              Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
+    // DATA-66 D10: the watcher's due list. The same SEC-66 read grant as
+    // `publications` PLUS `check_export_token` in the handler, which is
+    // what admits the scheduler's service identity and shared token.
+    ("GET", "/api/gold/sync-due",                  Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
     ("GET",  "/api/gold/export/{mart}/publication", Policy::RequiresAnyPermission(&["gold:read", "gold:export"])),
     ("PUT",  "/api/gold/export/{mart}/publication", Policy::RequiresPermission("gold:export")),
 
@@ -2038,12 +2042,13 @@ mod tests {
     fn gold_read_routes_refuse_a_dashboard_viewer_and_accept_both_gold_grants() {
         use lakehouse_auth::PermissionSet;
 
-        const GOLD_GETS: [&str; 5] = [
+        const GOLD_GETS: [&str; 6] = [
             "/api/gold/export/{mart}",
             "/api/gold/exports",
             "/api/gold/export/{mart}/consumers",
             "/api/gold/publications",
             "/api/gold/export/{mart}/publication",
+            "/api/gold/sync-due",
         ];
         let viewer = PermissionSet::parse("dashboard:read");
         let reader = PermissionSet::parse("gold:read");

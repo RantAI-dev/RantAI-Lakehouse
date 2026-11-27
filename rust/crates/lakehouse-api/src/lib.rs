@@ -38,6 +38,7 @@ pub mod gold_export_history;
 pub mod gold_latest_copy;
 pub mod gold_lock;
 pub mod health;
+pub mod iceberg_sync;
 pub mod in_place;
 pub mod internal_hosts;
 pub mod json;

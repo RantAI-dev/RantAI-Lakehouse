@@ -1712,6 +1712,64 @@ pub async fn publications(
     Ok(ApiJson(json!({ "publications": publications })))
 }
 
+/// `GET /api/gold/sync-due` — the watcher's door (`DATA-66` D8): which
+/// enabled publications should sync now, each with the deterministic
+/// `runKey` Dagster's `iceberg_sync_sensor` turns into one `RunRequest`.
+///
+/// The rules live in [`crate::iceberg_sync::due_syncs`], not here: this
+/// handler only reads the enabled rows (Postgres), one `system.parts`
+/// change signal and one newest-run read (`ClickHouse`), and passes them
+/// on. The part read is the cheap M4 signal; the run the sensor starts
+/// still sends `ifChanged=true`, so the content fingerprint makes the
+/// exact decision.
+///
+/// The floor is the SEC-66 read grant (`gold:read`, or the wider
+/// `gold:export`) in `POLICY_TABLE` PLUS [`check_export_token`] in the
+/// handler (`DATA-66` D10): the same two-layer shape as `publications`,
+/// through the same shared-token and service-identity paths the
+/// scheduler uses.
+///
+/// # Errors
+///
+/// Returns 401/503 from [`check_export_token`], 503 when Postgres is not
+/// configured ([`pool`]), or a classified store/`ClickHouse` failure
+/// (`SEC-11`: never the upstream text).
+pub async fn sync_due(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ExportQuery>,
+    principal: Option<Extension<Principal>>,
+) -> ApiResult<ApiJson<Value>> {
+    let header_token = headers.get("x-run-token").and_then(|v| v.to_str().ok());
+    check_export_token(
+        state.config.gold_export_run_token.as_deref(),
+        header_token,
+        query.token.as_deref(),
+        principal.as_ref().map(|Extension(p)| p),
+    )?;
+
+    let pool = pool(&state)?;
+    let enabled = lakehouse_store::gold_publication::list_enabled(pool)
+        .await
+        .map_err(ApiError::from)?;
+    let publications: Vec<crate::iceberg_sync::DuePublication> = enabled
+        .iter()
+        .map(crate::iceberg_sync::DuePublication::from_publication)
+        .collect();
+    let now = time::OffsetDateTime::now_utc();
+    let changes = crate::iceberg_sync::active_part_changes(
+        &state.clickhouse,
+        &state.config.gold_source_schema,
+    )
+    .await
+    .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
+    let newest_runs = crate::iceberg_sync::newest_runs(&state.clickhouse)
+        .await
+        .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
+    let due = crate::iceberg_sync::due_syncs(now, &publications, &changes, &newest_runs);
+    Ok(ApiJson(json!({ "due": due })))
+}
+
 /// `GET /api/gold/export/{mart}/publication` — one mart's publication
 /// state: the stored switch, the two measured freshness facts, and
 /// `lastFailure` when the mart's newest run failed (`DATA-49`, QA

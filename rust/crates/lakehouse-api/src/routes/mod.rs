@@ -1510,6 +1510,9 @@ pub fn router(state: AppState) -> Router {
         // list of enabled marts, and the per-mart switch the asset page
         // flips. POLICY_TABLE mirrors both paths below.
         .route("/api/gold/publications", get(gold::publications))
+        // DATA-66 D8: the watcher's once-per-15-s question — which
+        // publications are due now. POLICY_TABLE mirrors the path below.
+        .route("/api/gold/sync-due", get(gold::sync_due))
         .route(
             "/api/gold/export/{mart}/publication",
             get(gold::publication).put(gold::set_publication),

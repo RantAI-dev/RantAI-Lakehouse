@@ -1942,6 +1942,8 @@ async fn sec66_read_routes_refuse_a_dashboard_viewer_and_accept_the_new_read_gra
         "/api/gold/export/mart_x/consumers",
         "/api/gold/publications",
         "/api/gold/export/mart_x/publication",
+        // DATA-66 D8/D10: the watcher's due list.
+        "/api/gold/sync-due",
     ];
     // WEB-4 retired `GET /api/agents/runs` (list); only the detail route is
     // mounted, so the SEC-66 read gate is checked on that one path.
@@ -1975,6 +1977,10 @@ async fn sec66_read_routes_refuse_a_dashboard_viewer_and_accept_the_new_read_gra
         (gold_gets[2], "gold:read", "a gold:read holder"),
         (gold_gets[3], "gold:read", "a gold:read holder"),
         (gold_gets[4], "gold:export", "a gold:export holder"),
+        // DATA-66 D10: the watcher's handler guard is `check_export_token`,
+        // so `gold:export` is the permission that clears it (the
+        // scheduler's own path is the service identity / run token).
+        (gold_gets[5], "gold:export", "a gold:export holder"),
         (agent_gets[0], "agent:read", "an agent:read holder"),
     ] {
         let user_id = create_principal_with_permissions(&pool, permissions).await;
