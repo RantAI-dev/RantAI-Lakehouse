@@ -291,7 +291,11 @@ def _headers(cfg: GoldExportConfig) -> dict[str, str]:
 
 
 def export_one_mart(
-    cfg: GoldExportConfig, mart: str, zone: str = DEFAULT_ZONE
+    cfg: GoldExportConfig,
+    mart: str,
+    zone: str = DEFAULT_ZONE,
+    *,
+    require_enabled: bool = False,
 ) -> dict[str, Any]:
     """`ifChanged=true` (gold-publish-per-mart plan T4): the API skips
     the export — 200 `{skipped: true, reason: ...}`, nothing written,
@@ -303,10 +307,17 @@ def export_one_mart(
     DATA-65: a Silver export adds `zone=silver` to the query. Gold sends
     exactly the old `{ifChanged: true}` params, so no existing URL test or
     deployment changes.
+
+    DATA-66 (PR #742 CI fix): `require_enabled=True` sends
+    `requireEnabled=true` so a queued `iceberg_sync_job` run skips
+    honestly if publishing was switched off or moved to `manual` while it
+    waited in the queue.
     """
     params = {"ifChanged": "true"}
     if zone != DEFAULT_ZONE:
         params["zone"] = zone
+    if require_enabled:
+        params["requireEnabled"] = "true"
     resp = requests.post(
         f"{cfg.api_url}/api/gold/export/{mart}",
         params=params,
@@ -397,6 +408,7 @@ class MartExportTarget:
 
     mart: str
     zone: str = DEFAULT_ZONE
+    require_enabled: bool = False
 
     @classmethod
     def from_input(cls, value: Any) -> "MartExportTarget":
@@ -407,8 +419,9 @@ class MartExportTarget:
         if isinstance(value, dict):
             mart = value.get("mart")
             zone = value.get("zone", DEFAULT_ZONE)
+            require_enabled = bool(value.get("require_enabled", False))
             if isinstance(mart, str) and isinstance(zone, str):
-                return cls(mart, zone)
+                return cls(mart, zone, require_enabled=require_enabled)
         raise Failure(
             f"not a Gold export target: {value!r}", allow_retries=False
         )
@@ -569,8 +582,14 @@ def export_gold_mart(context, mart: Any) -> dict[str, Any]:
     cfg = GoldExportConfig.from_env()
     try:
         # A Gold export keeps the exact two-argument call its tests and
-        # callers have always made; only Silver adds the zone argument.
-        body = export_one_mart(cfg, mart) if zone == DEFAULT_ZONE else export_one_mart(cfg, mart, zone)
+        # callers have always made; only Silver adds the zone argument,
+        # and `iceberg_sync_job` sets `require_enabled=True` (PR #742 CI fix).
+        if target.require_enabled:
+            body = export_one_mart(cfg, mart, zone, require_enabled=True)
+        elif zone == DEFAULT_ZONE:
+            body = export_one_mart(cfg, mart)
+        else:
+            body = export_one_mart(cfg, mart, zone)
     except requests.HTTPError as exc:
         # PR slice C review C-B1: HTTP 409 — the API's single-flight lock
         # (an export of this mart is already running) — is a skip, not a
@@ -612,12 +631,14 @@ def export_gold_mart(context, mart: Any) -> dict[str, Any]:
     # honest ledger of "looked, nothing to do" -- but no
     # `AssetMaterialization`, because nothing was written to Iceberg.
     if body.get("skipped") is True:
-        context.log.info(f"skipped {mart!r}: {body.get('reason')}")
+        reason = body.get("reason")
+        verb = reason if reason in ("publishing_off", "manual") else "unchanged"
+        context.log.info(f"skipped {mart!r}: {reason}")
         record_maintenance_run(
             table_name=target.iceberg_table,
             dry_run_metrics={},
             applied_metrics={},
-            skipped_verbs=["unchanged"],
+            skipped_verbs=[verb],
             target=cfg.ch,
         )
         return body

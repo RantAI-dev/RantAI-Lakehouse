@@ -147,6 +147,13 @@ pub struct ExportQuery {
     /// DATA-65: which publication zone this request addresses. `None`
     /// means Gold, so every pre-DATA-65 URL is unchanged.
     zone: Option<String>,
+    /// DATA-66 (PR #742 CI fix): `?requireEnabled=true` is sent by
+    /// `iceberg_sync_job` so a run that waited in the queue after an
+    /// administrator switched publishing off — or moved the table to
+    /// `manual` — skips honestly instead of publishing behind that choice's
+    /// back. Manual "Publish now" and `GOLD_EXPORT_MARTS` runs omit it.
+    #[serde(rename = "requireEnabled")]
+    require_enabled: Option<String>,
 }
 
 /// DATA-65: parse an optional `?zone=` into a [`PublishZone`], with a
@@ -445,6 +452,36 @@ async fn gated_source_table(
     Ok(source_table)
 }
 
+/// DATA-66 (PR #742 CI fix): when an automatic `iceberg_sync_job` run sends
+/// `?requireEnabled=true`, verify the live publication row is still enabled
+/// and not `manual` so a run queued before publishing was turned off exits
+/// as a clean skip instead of publishing behind that choice's back.
+///
+/// # Errors
+///
+/// Returns `503` if `Postgres` is not configured or a classified database
+/// error if the publication lookup fails.
+async fn automatic_export_skip(
+    state: &AppState,
+    query: &ExportQuery,
+    zone: PublishZone,
+    mart: &Ident,
+) -> Result<Option<Value>, ApiError> {
+    if query.require_enabled.as_deref() != Some("true") {
+        return Ok(None);
+    }
+    let pool = pool(state)?;
+    let publication =
+        lakehouse_store::gold_publication::get_in_zone(pool, zone.namespace_name(), mart.as_str())
+            .await?;
+    let reason = match publication.as_ref() {
+        None | Some(GoldPublication { enabled: false, .. }) => Some("publishing_off"),
+        Some(row) if row.sync_mode == SyncMode::Manual => Some("manual"),
+        Some(_) => None,
+    };
+    Ok(reason.map(|r| json!({ "skipped": true, "reason": r })))
+}
+
 /// `POST /api/gold/export/{mart}` — run the export.
 ///
 /// # Skip: `?ifChanged=true` (DATA-1 task 4, DATA-10)
@@ -543,6 +580,10 @@ pub async fn export(
     // the export actually reads.
     let actor = gold_export_gate_actor(principal.as_ref().map(|Extension(p)| p), &headers);
     let source_table = gated_source_table(&state, mart_ident.as_str(), actor, zone).await?;
+
+    if let Some(body) = automatic_export_skip(&state, &query, zone, &mart_ident).await? {
+        return Ok(ApiJson(body));
+    }
 
     let triggered_by = triggered_by(principal.as_ref().map(|Extension(p)| p));
 

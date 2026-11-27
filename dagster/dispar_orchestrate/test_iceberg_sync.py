@@ -212,6 +212,24 @@ class IcebergSyncJobTests(unittest.TestCase):
         self.assertEqual(target.mart, "orders")
         self.assertEqual(target.zone, "silver")
         self.assertEqual(target.iceberg_table, "silver.orders")
+        self.assertTrue(target.require_enabled)
+
+    def test_require_enabled_export_sends_the_query_guard(self) -> None:
+        from dispar_orchestrate import gold_export
+
+        with mock.patch.object(
+            gold_export.requests,
+            "post",
+            return_value=_answer({"skipped": True, "reason": "publishing_off"}),
+        ) as mocked_post:
+            body = gold_export.export_one_mart(
+                _cfg(), "orders", "gold", require_enabled=True
+            )
+        self.assertEqual(body, {"skipped": True, "reason": "publishing_off"})
+        self.assertEqual(
+            mocked_post.call_args.kwargs["params"],
+            {"ifChanged": "true", "requireEnabled": "true"},
+        )
 
 
 class RequestIcebergSyncTests(unittest.TestCase):

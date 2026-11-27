@@ -128,7 +128,10 @@ def iceberg_sync_target(context) -> MartExportTarget:
             f"unknown sync trigger {trigger!r}: expected one of {', '.join(TRIGGERS)}",
             allow_retries=False,
         )
-    target = MartExportTarget(mart, zone)
+    # PR #742 CI fix (DATA-66): automatic per-table runs must re-check that
+    # publishing is still enabled (and not `manual`) at execution time, in
+    # case an administrator switched publishing off while the run sat queued.
+    target = MartExportTarget(mart, zone, require_enabled=True)
     context.log.info(f"syncing {target.iceberg_table} ({trigger})")
     return target
 

@@ -176,3 +176,86 @@ async fn a_disabled_publication_is_not_due_and_a_dashboard_viewer_is_refused() {
     let (status, _) = get(&app.router, "/api/gold/sync-due", &viewer_cookie).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+/// PR #742 CI fix (`DATA-66`): an automatic `iceberg_sync_job` run sends
+/// `?requireEnabled=true` so a run queued before publishing was switched
+/// off (or changed to `manual`) skips cleanly without exporting.
+#[tokio::test]
+async fn require_enabled_export_skips_when_publishing_is_off_or_manual() {
+    const TOKEN: &str = "iceberg-sync-require-enabled-token";
+    let engine = engine().await;
+    let mut overrides = HashMap::new();
+    overrides.insert("CH_URL".to_owned(), engine.uri());
+    overrides.insert("GOLD_EXPORT_RUN_TOKEN".to_owned(), TOKEN.to_owned());
+    overrides.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        "11111111-1111-4111-8111-000000000001".to_owned(),
+    );
+    let app = spin_up_with_env(&overrides).await;
+    crate::gold_export_auth::seed_gold_export_service_credential(&app.pool, TOKEN).await;
+    lakehouse_store::gold_publication::upsert_in_zone(
+        &app.pool,
+        "gold",
+        "disabled_mart",
+        false,
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("seed disabled publication");
+    lakehouse_store::gold_publication::upsert_in_zone(
+        &app.pool,
+        "gold",
+        "manual_mart",
+        true,
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("seed manual publication");
+    lakehouse_store::gold_publication::set_sync_in_zone(
+        &app.pool,
+        "gold",
+        "manual_mart",
+        &lakehouse_store::gold_publication::SyncSetting {
+            mode: lakehouse_store::gold_publication::SyncMode::Manual,
+            schedule: None,
+            time_zone: None,
+        },
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("set manual sync mode")
+    .expect("row exists");
+
+    for (mart, expected_reason) in [
+        ("disabled_mart", "publishing_off"),
+        ("never_configured_mart", "publishing_off"),
+        ("manual_mart", "manual"),
+    ] {
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/gold/export/{mart}?ifChanged=true&requireEnabled=true"
+                    ))
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .header("x-run-token", TOKEN)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router answers");
+        assert_eq!(response.status(), StatusCode::OK, "mart={mart}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            body,
+            json!({ "skipped": true, "reason": expected_reason }),
+            "mart={mart}"
+        );
+    }
+}
