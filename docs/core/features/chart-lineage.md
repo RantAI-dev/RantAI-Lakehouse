@@ -48,6 +48,7 @@ changed.
 - Only recorded steps are drawn; a table loaded outside the platform has no source shown.
 - Build times come from the engine's query log, kept for half a year; an older build shows "not recorded".
 - Used by is limited to 200 charts per table.
+- Built-in tiles carry no chart id in the page context, so "where does this number come from?" on one gets table-level lineage only (`AI-11`).
 
 ## Asking the assistant
 
