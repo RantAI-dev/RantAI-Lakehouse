@@ -109,7 +109,7 @@ subtle = "2"
 # is already compiled into this workspace through `object_store`/`rustls`.
 # Exactly one backend must stay selected -- selecting both would link two
 # providers and fail to build.
-jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+jsonwebtoken = { version = "12", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 # `lakehouse-api::next_run` (WS4 item G2) is the first workstream to land
 # this dependency -- WS5 also needs cron-next-occurrence computation and
 # reuses this same entry rather than adding a second one (programme rule:
