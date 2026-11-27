@@ -235,6 +235,22 @@ quoted requests come from the specs.
 
 Exceptions, each with an owner and a date:
 
+## Page context (`AI-14`) acceptance checklist
+
+Run on staging, on a dashboard open in the console; a step not performed
+is never Pass. The page sends what is on screen to the assistant, and the
+server cuts that context at `PAGE_CONTEXT_MAX_CHARS` = 6,000 characters,
+at the 6,000th character (`routes/ai/mod.rs`). Ids start at `AI-14-AC2`:
+the spec's `AI-14-AC1` names the visible tab with its filters.
+
+| ID | Do this | Expect | Result |
+| --- | --- | --- | --- |
+| `AI-14-AC2` | With a filter active on the dashboard, ask the assistant which filter is on | The answer names the filters on screen |  |
+| `AI-14-AC3` | With the filter-row grain control set, ask the assistant about the dashboard's time grain | The answer names the grain on the screen |  |
+| `AI-14-AC4` | On a board with tabs, open the second tab and ask which tab is open | The answer names the visible tab |  |
+| `AI-14-AC5` | On a chart whose SQL takes parameters, set the values on screen and ask what values the chart shows | The answer names the parameter values from the screen |  |
+| `AI-14-AC6` | On a board whose page context runs past the server's cut, ask about something on the screen | The board still answers; the context the server sent is the first 6,000 characters |  |
+
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
