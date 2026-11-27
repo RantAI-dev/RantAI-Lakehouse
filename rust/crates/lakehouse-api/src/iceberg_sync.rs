@@ -162,7 +162,8 @@ pub struct DueSync {
 /// - `manual`: never due.
 /// - `on_update`: not due without an active part. Due with trigger
 ///   `change` when there is no newest run, or the part time is at or
-///   after its start; otherwise due with `retry` when that newest run
+///   after its start (both at the signal's whole-second precision, R2);
+///   otherwise due with `retry` when that newest run
 ///   failed and at least [`RETRY_BACKOFF_SECONDS`] have passed since it
 ///   finished.
 /// - `scheduled`: due at the latest slot at or before `now` when the
@@ -198,9 +199,25 @@ pub fn due_syncs(
                     continue;
                 };
                 let newest = newest_runs.get(&key);
+                // DATA-66 review R2: `active_part_changes` reads
+                // `modification_time` in WHOLE seconds, so the signal
+                // cannot tell 10:00:00.500 from 10:00:00.900. Comparing
+                // that second with a millisecond `started_at` missed a
+                // write made in the same second a run started (a run at
+                // .500 and a write at .900 both read 10:00:00, and
+                // 10:00:00 < 10:00:00.500). Truncate the run's start to
+                // the signal's own precision instead: the cost is at most
+                // one extra run per signal, which the export's `ifChanged`
+                // fingerprint skips without writing.
                 let changed_is_new = match newest {
                     None => true,
-                    Some(run) => *part_changed_at >= run.started_at,
+                    Some(run) => {
+                        let started_at = run
+                            .started_at
+                            .replace_millisecond(0)
+                            .unwrap_or(run.started_at);
+                        *part_changed_at >= started_at
+                    }
                 };
                 if changed_is_new {
                     due.push(DueSync {
@@ -521,6 +538,29 @@ mod tests {
             &runs,
         );
         assert_eq!(older, Vec::<DueSync>::new(), "an unchanged table waits");
+    }
+
+    #[test]
+    fn a_write_in_the_same_second_as_a_run_start_is_due() {
+        // DATA-66 review R2: a run starting at 10:00:00.500 and a write at
+        // 10:00:00.900. `active_part_changes` gives the write the whole
+        // second 10:00:00, so a millisecond comparison would call it old
+        // and the change would wait for the next write.
+        let row = publication(SyncMode::OnUpdate);
+        let runs = newest(
+            "success",
+            "2026-11-27T10:00:00.500Z",
+            "2026-11-27T10:00:05Z",
+        );
+        let due = due_syncs(
+            utc("2026-11-27T10:00:10Z"),
+            &[row],
+            &changes("2026-11-27T10:00:00Z"),
+            &runs,
+        );
+        assert_eq!(due.len(), 1, "the write in the run's own second is due");
+        assert_eq!(due[0].trigger, TRIGGER_CHANGE);
+        assert_eq!(due[0].run_key, "change:gold:orders:1795773600");
     }
 
     #[test]
