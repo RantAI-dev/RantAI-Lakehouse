@@ -44,6 +44,10 @@ const PERSONAL_NOT_SHAREABLE: &str =
 /// year; the assistant may ask for 1 to 30 days).
 const DAYS_REFUSED: &str = "The link can be made for 1 to 30 days.";
 
+/// `AI-11`: the refusal when nobody other than the requester can
+/// both decide the approval and run it as its approver.
+const NO_OTHER_APPROVER: &str = "Only another manager of this dashboard can approve this, and it has none; make the link yourself in Share.";
+
 /// The dashboards the stand-in holds: `(id, embed_enabled)`; the personal
 /// board `b_own` gets its owner per test.
 const BOARDS: [&str; 3] = ["b1", "b2", "b_own"];
@@ -357,6 +361,10 @@ fn seconds_until(text: &str) -> i64 {
 /// (who also manages the board) approves, and the tool runs as them.
 async fn make_link(app: &TestApp, boards: &[&str], days: Option<i64>) -> Value {
     let (user, cookie) = manager(app, boards).await;
+    // `AI-11`: the approval exists only because somebody other
+    // than the requester can decide it and run it, so the approver (who also
+    // manages the boards) exists before the ask.
+    let approver_cookie = approver(app, boards, &[user]).await;
     let mut args = json!({ "board": boards[0] });
     if let Some(days) = days {
         args["days"] = json!(days);
@@ -366,7 +374,7 @@ async fn make_link(app: &TestApp, boards: &[&str], days: Option<i64>) -> Value {
         .as_str()
         .unwrap_or_else(|| panic!("no approval: {asked}"))
         .to_owned();
-    let (status, decided) = decide(app, &approver(app, boards, &[user]).await, &approval_id).await;
+    let (status, decided) = decide(app, &approver_cookie, &approval_id).await;
     assert_eq!(status, StatusCode::OK, "{decided}");
     assert_eq!(decided["executed"], json!(true), "{decided}");
     decided
@@ -377,7 +385,11 @@ async fn make_link(app: &TestApp, boards: &[&str], days: Option<i64>) -> Value {
 #[tokio::test]
 async fn a_manager_create_public_link_waits_for_approval_and_makes_no_link_before_it() {
     let (app, _ch) = app("0").await;
-    let (_user, cookie) = manager(&app, &["b1"]).await;
+    let (user, cookie) = manager(&app, &["b1"]).await;
+    // `AI-11`: this is the positive control for the refusal —
+    // with a second manager who holds the approval permission, the approval
+    // is created as before.
+    let _approver_cookie = approver(&app, &["b1"], &[user]).await;
     let asked = call(
         &app,
         &cookie,
@@ -399,9 +411,68 @@ async fn a_manager_create_public_link_waits_for_approval_and_makes_no_link_befor
 }
 
 #[tokio::test]
+async fn a_create_public_link_nobody_else_can_approve_is_refused_and_makes_no_approval_row() {
+    // The requester manages `b1` through their rule alone: nobody else holds
+    // a manage rule on it, so the request is refused here, with the fixed
+    // sentence, and no approval waits for a person who could never run it
+    // (`AI-11`).
+    let (app, _ch) = app("0").await;
+    let (user, cookie) = manager(&app, &["b1"]).await;
+    // The seeded Platform Admin holds `*:*`, so it could decide and run the
+    // call; deactivating every other account leaves the requester alone, which
+    // is the case this test is about (`AI-11`).
+    sqlx::query("UPDATE app_user SET status = 'inactive' WHERE id <> $1")
+        .bind(user)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let body = call(
+        &app,
+        &cookie,
+        "create_public_link",
+        json!({ "board": "b1" }),
+        "build",
+    )
+    .await;
+    assert_eq!(body["result"]["error"], json!(NO_OTHER_APPROVER), "{body}");
+    assert_eq!(body["outcome"], "failed", "{body}");
+    assert_eq!(approvals_for(&app, "create_public_link").await, 0);
+    assert!(!live_link_exists(&app, "b1").await);
+}
+
+#[tokio::test]
+async fn an_approver_who_cannot_manage_the_board_does_not_make_a_request_creatable() {
+    // `AI-11`: the approval route lets an `agent:approve` holder decide, but
+    // the approved call runs through the board's manage guard as that person.
+    // An approver without manage on `b1` could never run it, so the request is
+    // refused here with no approval row.
+    let (app, _ch) = app("0").await;
+    let (user, cookie) = manager(&app, &["b1"]).await;
+    sqlx::query("UPDATE app_user SET status = 'inactive' WHERE id <> $1")
+        .bind(user)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let _outsider = create_principal_with_permissions(&app.pool, "agent:approve").await;
+    let body = call(
+        &app,
+        &cookie,
+        "create_public_link",
+        json!({ "board": "b1" }),
+        "build",
+    )
+    .await;
+    assert_eq!(body["result"]["error"], json!(NO_OTHER_APPROVER), "{body}");
+    assert_eq!(approvals_for(&app, "create_public_link").await, 0);
+}
+
+#[tokio::test]
 async fn an_approved_create_public_link_opens_a_link_for_thirty_days_and_names_its_address() {
     let (app, _ch) = app("0").await;
     let (user, cookie) = manager(&app, &["b1"]).await;
+    // The approver exists before the ask, so the request is creatable
+    // (`AI-11`).
+    let approver_cookie = approver(&app, &["b1"], &[user]).await;
     let asked = call(
         &app,
         &cookie,
@@ -424,8 +495,7 @@ async fn an_approved_create_public_link_opens_a_link_for_thirty_days_and_names_i
         Some("b1".to_owned())
     );
 
-    let (_status, decided) =
-        decide(&app, &approver(&app, &["b1"], &[user]).await, &approval_id).await;
+    let (_status, decided) = decide(&app, &approver_cookie, &approval_id).await;
     assert_eq!(decided["executed"], json!(true), "{decided}");
 
     let shown = decided["result"]["url"].as_str().unwrap_or_default();
@@ -450,6 +520,9 @@ async fn a_live_link_keeps_its_address_and_only_moves_the_expiry_when_days_names
     let (app, _ch) = app("0").await;
     make_link(&app, &["b1"], None).await;
     let (user, cookie) = manager(&app, &["b1"]).await;
+    // The approver exists before the ask, so the request is creatable
+    // (`AI-11`).
+    let approver_cookie = approver(&app, &["b1"], &[user]).await;
     let before = public_link(&app, &cookie, "b1").await;
     let token = before["link"]["token"]
         .as_str()
@@ -472,8 +545,7 @@ async fn a_live_link_keeps_its_address_and_only_moves_the_expiry_when_days_names
     // The card says it keeps the address this time, not that it makes a new link.
     let reason = approval_reason(&app, &approval_id).await;
     assert!(reason.contains("keeps its address"), "{reason}");
-    let (_status, decided) =
-        decide(&app, &approver(&app, &["b1"], &[user]).await, &approval_id).await;
+    let (_status, decided) = decide(&app, &approver_cookie, &approval_id).await;
     assert_eq!(decided["executed"], json!(true), "{decided}");
 
     let after = public_link(&app, &cookie, "b1").await;
@@ -540,6 +612,41 @@ async fn a_requester_without_manage_is_refused_and_no_approval_is_written() {
         assert_eq!(body["outcome"], "failed", "{body}");
         assert_eq!(approvals_for(&app, tool).await, 0, "{tool}");
     }
+    assert!(!live_link_exists(&app, "b1").await);
+}
+
+#[tokio::test]
+async fn an_approved_link_whose_replay_is_refused_returns_the_routes_sentence() {
+    // `AI-11`: the approved call runs as the approver, the route
+    // refuses it (public links were switched off after the request), and the
+    // result carries the route's own sentence, not only a generic failure.
+    let (app, _ch) = app("0").await;
+    let (user, cookie) = manager(&app, &["b1"]).await;
+    let approver_cookie = approver(&app, &["b1"], &[user]).await;
+    let asked = call(
+        &app,
+        &cookie,
+        "create_public_link",
+        json!({ "board": "b1" }),
+        "build",
+    )
+    .await;
+    let approval_id = asked["result"]["approval_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no approval: {asked}"))
+        .to_owned();
+    sqlx::query(
+        "INSERT INTO reporting_settings (singleton, time_zone, week_start, public_links_enabled) \
+         VALUES (TRUE, 'UTC', 'monday', FALSE) \
+         ON CONFLICT (singleton) DO UPDATE SET public_links_enabled = FALSE",
+    )
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    let (_status, decided) = decide(&app, &approver_cookie, &approval_id).await;
+    assert_eq!(decided["executed"], json!(true), "{decided}");
+    assert_eq!(decided["result"]["error"], json!(SWITCHED_OFF), "{decided}");
     assert!(!live_link_exists(&app, "b1").await);
 }
 

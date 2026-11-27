@@ -596,6 +596,19 @@ fn data_map_access(principal: Option<&Principal>) -> MapAccess {
     }
 }
 
+/// The optional rule blocks a chat's prompt carries, read from the tool list
+/// the chat offers (`AI-11`). Grouped so `system_prompt` keeps a short
+/// parameter list.
+#[derive(Clone, Copy)]
+struct OfferedRules {
+    /// `ask_user` is offered: the ask-back rules.
+    asking: bool,
+    /// `propose_sql` is offered: the SQL help rules.
+    sql_help: bool,
+    /// `get_lineage` is offered: the lineage rule, in Build.
+    lineage: bool,
+}
+
 /// The system prompt: the rules for the mode, the rules for asking (when
 /// `AI_ASK_BACK` is on and `asking`, that is, `ask_user` is in the chat's
 /// tool list), the DATA MAP (when the caller may read the shared catalog:
@@ -620,16 +633,27 @@ async fn system_prompt(
     is_build: bool,
     context: &str,
     user_messages: &[&str],
-    asking: bool,
-    sql_help: bool,
+    offered: OfferedRules,
 ) -> String {
+    let OfferedRules {
+        asking,
+        sql_help,
+        lineage,
+    } = offered;
     let latest_user = user_messages.last().copied().unwrap_or_default();
     // `BI-44` slice 3: a `bi-only` install has no lakehouse DATA MAP, and
     // the map builder below reads `ClickHouse` and Lakekeeper, which that
     // deployment never started. `full` mode never enters this helper, so
     // its prompt stays byte for byte what `AI-32` pinned.
     if state.config.is_bi_only() {
-        return bi_only_system_prompt(state, is_build, asking, sql_help, context, latest_user);
+        return bi_only_system_prompt(
+            state,
+            is_build,
+            offered.asking,
+            offered.sql_help,
+            context,
+            latest_user,
+        );
     }
     let withheld = withheld_by_policy(state).await;
     let terms = users_terms(state, principal).await;
@@ -725,6 +749,11 @@ async fn system_prompt(
     // the switch off the text is what it was before the block existed.
     if state.config.ai_semantic_layer {
         rules.push_str(prompt::DISTINCT_COUNT_RULES);
+    }
+    // `AI-13`: Build carries the lineage rule only where the tool
+    // is offered, so a viewer without `lineage:read` gets the prompt it had.
+    if is_build && lineage {
+        rules.push_str(prompt::LINEAGE_RULE);
     }
     let words = prompt::user_words_section(&terms);
     let ctx_line = page_context_line(context);
@@ -923,12 +952,16 @@ async fn prepare_chat(
     // The rules for asking are written only for a chat that can ask: one
     // whose tool list holds `ask_user`. The SQL help rules follow the same
     // rule for `propose_sql`.
-    let asking = tools
-        .iter()
-        .any(|t| t["function"]["name"].as_str() == Some(registry::ASK_USER));
-    let sql_help = tools
-        .iter()
-        .any(|t| t["function"]["name"].as_str() == Some(registry::PROPOSE_SQL));
+    let offers = |name: &str| {
+        tools
+            .iter()
+            .any(|t| t["function"]["name"].as_str() == Some(name))
+    };
+    let offered = OfferedRules {
+        asking: offers(registry::ASK_USER),
+        sql_help: offers(registry::PROPOSE_SQL),
+        lineage: offers("get_lineage"),
+    };
     // plan 17: `sql_help` was read above, before this, so the SQL help rules
     // stay in the prompt while the tool is taken out of an Explain turn.
     let tools = without_tool_in_explain(tools, recent_user.last().copied());
@@ -939,8 +972,7 @@ async fn prepare_chat(
         is_build,
         parsed.context.as_deref().unwrap_or_default(),
         &recent_user,
-        asking,
-        sql_help,
+        offered,
     )
     .await;
     let sys = with_permission_note(state, sys, perms, &recent_user);
@@ -3198,6 +3230,13 @@ mod tests {
 
     use super::*;
 
+    /// No optional rule block: the tool list offers none of the three.
+    const NO_RULES: OfferedRules = OfferedRules {
+        asking: false,
+        sql_help: false,
+        lineage: false,
+    };
+
     /// A state over the test database, with the semantic-layer switch set.
     fn state_with_switch(pool: &lakehouse_store::PgPool, switch: &str) -> AppState {
         let options = pool.connect_options();
@@ -3345,8 +3384,7 @@ mod tests {
             false,
             "",
             &[FIXED_QUESTION],
-            false,
-            false,
+            NO_RULES,
         )
         .await;
         assert_eq!(
@@ -3381,8 +3419,7 @@ mod tests {
             false,
             "",
             &[FIXED_QUESTION],
-            false,
-            false,
+            NO_RULES,
         )
         .await;
         assert!(
@@ -3421,8 +3458,7 @@ mod tests {
             false,
             "",
             &[FIXED_QUESTION],
-            false,
-            false,
+            NO_RULES,
         )
         .await;
         assert!(
@@ -3449,8 +3485,11 @@ mod tests {
                 false,
                 "",
                 &[FIXED_QUESTION],
-                asking,
-                false,
+                OfferedRules {
+                    asking,
+                    sql_help: false,
+                    lineage: false,
+                },
             )
             .await;
             assert_eq!(
@@ -3468,8 +3507,11 @@ mod tests {
                 true,
                 "",
                 &[FIXED_QUESTION],
-                asking,
-                false,
+                OfferedRules {
+                    asking,
+                    sql_help: false,
+                    lineage: false,
+                },
             )
             .await;
             assert_eq!(
@@ -3494,8 +3536,11 @@ mod tests {
             false,
             "",
             &[FIXED_QUESTION],
-            true,
-            false,
+            OfferedRules {
+                asking: true,
+                sql_help: false,
+                lineage: false,
+            },
         )
         .await;
         assert_eq!(
@@ -3529,8 +3574,11 @@ mod tests {
                 false,
                 "",
                 &[FIXED_QUESTION],
-                true,
-                false,
+                OfferedRules {
+                    asking: true,
+                    sql_help: false,
+                    lineage: false,
+                },
             )
             .await;
             assert_eq!(
@@ -3548,8 +3596,11 @@ mod tests {
                 true,
                 "",
                 &[FIXED_QUESTION],
-                true,
-                false,
+                OfferedRules {
+                    asking: true,
+                    sql_help: false,
+                    lineage: false,
+                },
             )
             .await;
             assert_eq!(
@@ -3578,8 +3629,7 @@ mod tests {
             false,
             "",
             &[FIXED_QUESTION],
-            false,
-            false,
+            NO_RULES,
         )
         .await;
         assert_eq!(
@@ -3598,8 +3648,7 @@ mod tests {
             true,
             "",
             &[FIXED_QUESTION],
-            false,
-            false,
+            NO_RULES,
         )
         .await;
         assert_eq!(
@@ -3660,8 +3709,11 @@ mod tests {
             false,
             "",
             &[FIXED_QUESTION],
-            true,
-            false,
+            OfferedRules {
+                asking: true,
+                sql_help: false,
+                lineage: false,
+            },
         )
         .await;
         assert_eq!(
@@ -3677,6 +3729,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_lineage_rule_reaches_build_only_where_the_tool_is_offered() {
+        // `AI-13`: admin Build offers `get_lineage`, so it gets the
+        // rule that names the connector; a Build turn that does not offer the
+        // tool keeps the prompt it had, and Ask is not changed by this block.
+        let state = state_with_ask_back_and_layer("false", "false");
+        let headers = axum::http::HeaderMap::new();
+        let with = system_prompt(
+            &state,
+            None,
+            &headers,
+            true,
+            "",
+            &[FIXED_QUESTION],
+            OfferedRules {
+                asking: false,
+                sql_help: false,
+                lineage: true,
+            },
+        )
+        .await;
+        let without = system_prompt(
+            &state,
+            None,
+            &headers,
+            true,
+            "",
+            &[FIXED_QUESTION],
+            NO_RULES,
+        )
+        .await;
+        assert!(with.contains(prompt::LINEAGE_RULE.trim_start()), "{with}");
+        assert!(
+            !without.contains("connector and refresh times"),
+            "{without}"
+        );
+        assert_eq!(with.replacen(prompt::LINEAGE_RULE, "", 1), without);
+    }
+
+    #[tokio::test]
     async fn a_chat_that_cannot_ask_is_not_told_to() {
         // The rules name a tool; a chat whose tool list lacks it (Query
         // Studio's allowlist, for one) must not be told to call it.
@@ -3689,8 +3780,7 @@ mod tests {
             false,
             "",
             &[FIXED_QUESTION],
-            false,
-            false,
+            NO_RULES,
         )
         .await;
         assert!(!text.contains("ask_user"), "{text}");
@@ -3765,8 +3855,7 @@ mod tests {
             false,
             "",
             &[FIXED_QUESTION],
-            false,
-            false,
+            NO_RULES,
         )
         .await;
         assert!(
@@ -4088,8 +4177,11 @@ mod tests {
             false,
             "",
             &[FIXED_QUESTION],
-            true,
-            false,
+            OfferedRules {
+                asking: true,
+                sql_help: false,
+                lineage: false,
+            },
         )
         .await;
         assert!(
@@ -4103,8 +4195,11 @@ mod tests {
             false,
             "",
             &[FIXED_QUESTION],
-            true,
-            false,
+            OfferedRules {
+                asking: true,
+                sql_help: false,
+                lineage: false,
+            },
         )
         .await;
         assert!(!his.contains("lodging"), "{his}");
@@ -4116,8 +4211,11 @@ mod tests {
             false,
             "",
             &[FIXED_QUESTION],
-            true,
-            false,
+            OfferedRules {
+                asking: true,
+                sql_help: false,
+                lineage: false,
+            },
         )
         .await;
         assert!(!nobody.contains("lodging"), "{nobody}");
@@ -4137,8 +4235,11 @@ mod tests {
             false,
             "",
             &[FIXED_QUESTION],
-            true,
-            false,
+            OfferedRules {
+                asking: true,
+                sql_help: false,
+                lineage: false,
+            },
         )
         .await;
         let map = text.find("\n\nDATA MAP\n").expect("a data map section");
@@ -4159,8 +4260,11 @@ mod tests {
             false,
             "",
             &[FIXED_QUESTION],
-            true,
-            false,
+            OfferedRules {
+                asking: true,
+                sql_help: false,
+                lineage: false,
+            },
         )
         .await;
         assert!(!text.contains("lodging"), "{text}");
@@ -4187,8 +4291,11 @@ mod tests {
             false,
             "",
             &[FIXED_QUESTION],
-            true,
-            false,
+            OfferedRules {
+                asking: true,
+                sql_help: false,
+                lineage: false,
+            },
         )
         .await;
         let words = text.split(WORDS_HEADER).nth(1).expect("a words section");
@@ -4240,8 +4347,11 @@ mod tests {
             false,
             "",
             &[FIXED_QUESTION],
-            true,
-            false,
+            OfferedRules {
+                asking: true,
+                sql_help: false,
+                lineage: false,
+            },
         )
         .await;
         assert!(!text.contains(WORDS_HEADER), "{text}");

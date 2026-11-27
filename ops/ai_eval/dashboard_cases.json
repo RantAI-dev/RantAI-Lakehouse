@@ -1181,7 +1181,7 @@
     "turns": [
       "Make the dashboard {board} public for a week."
     ],
-    "expect_approval": "create_public_link"
+    "expect_approval": {"tool": "create_public_link", "args_contains": {"days": 7}}
   },
   {
     "id": "dashboard_access_list",

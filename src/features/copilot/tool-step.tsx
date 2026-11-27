@@ -51,6 +51,8 @@ export type ToolStep = {
    * never saved into the conversation — the next open reads it again.
    */
   approvalState?: ApprovalState;
+  /** The sentence an approved call returned when it failed (`AI-11`); read from the run like `approvalState`. */
+  approvalError?: string;
 };
 
 export const TOOL_LABEL: Record<string, string> = {
@@ -279,6 +281,7 @@ function StepBody({ step }: { step: ToolStep }) {
         <p className="text-muted-foreground">
           {APPROVAL_STATE_TEXT[step.approvalState ?? "pending"].line}
         </p>
+        {step.approvalError ? <p className="text-muted-foreground">{step.approvalError}</p> : null}
         <Link
           href={approvalId ? `/governance/approvals?id=${encodeURIComponent(approvalId)}` : "/governance/approvals"}
           className="inline-flex items-center gap-1 font-medium text-amber-700 underline underline-offset-2 dark:text-amber-400"

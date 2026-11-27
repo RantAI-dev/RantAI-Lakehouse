@@ -138,6 +138,12 @@ their features' pages.
 - "Switch off the public link." `revoke_public_link` narrows access, so it
   asks for a confirm in the chat, not an approval (question 5 in
   `questions-for-owner.md`).
+- A request nobody else can approve is refused when it is made, with no
+  approval row (`AI-11`). "Nobody else" means no other active account that
+  holds the approval permission and manage on the dashboard, counted the
+  way the approval itself is checked. The refusal says so: "Only another
+  manager of this dashboard can approve this, and it has none; make the
+  link yourself in Share." The embed tools say "in Share > Embed."
 - "Who can see this dashboard?" `list_dashboard_access` reads the
   permissions, the public link's expiry (never its password) and the embed
   state. Only for someone with manage on the dashboard.
