@@ -1651,6 +1651,85 @@ async fn put_scheduled_without_a_time_zone_is_a_fixed_400() {
     );
 }
 
+/// DATA-66 review R1: a refused PUT writes nothing. The sync body is
+/// validated before the first write, so the 400 for `scheduled` without a
+/// time zone cannot have stored `enabled` on the way: a mart with no row
+/// still has none (`updatedAt` is the row's own stamp), and a stored
+/// disabled row is still disabled and still `on_update`.
+#[tokio::test]
+async fn a_refused_put_leaves_a_disabled_row_disabled_and_a_missing_row_missing() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "sync_refused_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+    let refused = serde_json::json!({
+        "enabled": true,
+        "syncMode": "scheduled",
+        "schedule": { "kind": "daily", "hour": 4, "minute": 0 },
+    });
+
+    // A missing row: the refused PUT must not create one.
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/sync_refused_mart/publication",
+        Some(&cookie),
+        Some(refused.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/sync_refused_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["enabled"], Value::Bool(false), "{body}");
+    assert!(
+        body["updatedAt"].is_null(),
+        "the refused PUT created no row: {body}"
+    );
+    assert_eq!(body["syncMode"], "on_update", "{body}");
+
+    // A stored disabled row: the refused PUT must leave it exactly there.
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/sync_refused_mart/publication",
+        Some(&cookie),
+        Some(serde_json::json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(
+        &sessions.app.router,
+        "PUT",
+        "/api/gold/export/sync_refused_mart/publication",
+        Some(&cookie),
+        Some(refused),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/sync_refused_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["enabled"],
+        Value::Bool(false),
+        "a refused PUT left `enabled` unset: {body}"
+    );
+    assert_eq!(body["syncMode"], "on_update", "{body}");
+}
+
 /// DATA-66 D5: Weekly/Monthly are refused with the fixed sentence, and
 /// an unknown IANA zone with its own — both 400s from this handler.
 #[tokio::test]

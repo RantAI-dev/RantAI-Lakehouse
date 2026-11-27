@@ -2086,6 +2086,21 @@ pub async fn set_publication(
         .into());
     }
 
+    // DATA-66 review R1: the whole body is validated BEFORE the first
+    // write. The upsert used to run first, so a PUT refused on its sync
+    // body (`scheduled` with no time zone) answered 400 after `enabled`
+    // was already stored — a refused request that half-succeeded. Parsing
+    // here means every 400 below leaves the stored row exactly as it was.
+    //
+    // DATA-66: a body WITHOUT `syncMode` leaves the stored setting alone
+    // (an old console sends only `enabled`); a body WITH it replaces the
+    // mode and the schedule together, so a mode can never be left with a
+    // schedule that belongs to another one.
+    let setting = body
+        .sync_mode
+        .as_deref()
+        .map(|raw_mode| parse_sync_setting(&body, raw_mode))
+        .transpose()?;
     let mut updated = lakehouse_store::gold_publication::upsert_in_zone(
         pool,
         zone.namespace_name(),
@@ -2095,12 +2110,7 @@ pub async fn set_publication(
     )
     .await
     .map_err(ApiError::from)?;
-    // DATA-66: a body WITHOUT `syncMode` leaves the stored setting alone
-    // (an old console sends only `enabled`); a body WITH it replaces the
-    // mode and the schedule together, so a mode can never be left with a
-    // schedule that belongs to another one.
-    if let Some(raw_mode) = body.sync_mode.as_deref() {
-        let setting = parse_sync_setting(&body, raw_mode)?;
+    if let Some(setting) = setting {
         let Some(with_sync) = lakehouse_store::gold_publication::set_sync_in_zone(
             pool,
             zone.namespace_name(),
