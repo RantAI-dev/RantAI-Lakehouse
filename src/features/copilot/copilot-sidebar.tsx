@@ -187,7 +187,7 @@ export function CopilotSidebar({ hasAssistant = true }: { readonly hasAssistant?
         <ChatComposer onStop={c.stop}
           mode={c.mode}
           setMode={c.setMode}
-          onSend={c.send}
+          onSend={(t, mentions) => c.send(t, undefined, { mentions })}
           busy={c.busy}
           rows={2}
           placeholder="Ask anything about your lakehouse data…"

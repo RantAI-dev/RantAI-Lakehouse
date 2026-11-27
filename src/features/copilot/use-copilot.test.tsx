@@ -303,6 +303,28 @@ describe("the dashboard on screen (AI-30)", () => {
   });
 });
 
+describe("table mentions in the chat body (AI-26)", () => {
+  it("sends the picked tables as mentions with the message", async () => {
+    const mentions = [
+      { kind: "table" as const, key: "serving.orders" },
+      { kind: "table" as const, key: "bronze.customers" },
+    ];
+    renderCopilot();
+    await act(async () => {
+      await copilot!.send("What columns do these tables have?", undefined, { mentions });
+    });
+    expect(JSON.parse(chatRequests[0].body).mentions).toEqual(mentions);
+  });
+
+  it("sends no mentions for a message with none", async () => {
+    renderCopilot();
+    await act(async () => {
+      await copilot!.send("Send this PDF.");
+    });
+    expect(JSON.parse(chatRequests[0].body).mentions).toBeUndefined();
+  });
+});
+
 describe("the Copilot goes on after the draft is confirmed (AI-15)", () => {
   it("sends the steps the request still has back as a message", async () => {
     renderCopilot();
