@@ -589,3 +589,12 @@ leaves draft, and that run decides the merge.
 - **Noted, not a finding.** T9 is *not measured*
   (`docs/plans/DATA-66-RESULT.md`), which is honest. The spec's p95 targets
   stay open until measured at acceptance (`DATA-66-AC1`/`AC2`).
+
+### Round 2 (planner, 2026-11-27, at `142b25aa9`)
+
+R1 (`973f8a0b1`), R2 (`f2e1bd949`) and R3 (`be8b95af5`) are fixed as asked,
+each cited at its fix site and covered by a new test. Closed. No open BLOCKER
+or SHOULD-FIX. Reviewer re-run: `bun test` on the card, gold page, freshness
+and client tests, 65 pass / 0 fail. Rust and Dagster: the PR leaves draft so
+that CI's full run (six nextest partitions, clippy, Dagster unit tests, gates)
+decides. Merge waits for that run to be green.
