@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test"
 
-import { APPROVAL_STATE_TEXT, approvalStateOf } from "./approval-state"
+import { APPROVAL_STATE_TEXT, approvalErrorOf, approvalStateOf } from "./approval-state"
 
 describe("approvalStateOf", () => {
   it("treats a waiting or running run as pending", () => {
@@ -40,5 +40,23 @@ describe("approvalStateOf", () => {
       expect(APPROVAL_STATE_TEXT[state].badge.length).toBeGreaterThan(0)
       expect(APPROVAL_STATE_TEXT[state].line.length).toBeGreaterThan(0)
     }
+  })
+})
+
+describe("approvalErrorOf", () => {
+  // AI-11: the sentence the tool returned, read from the step the
+  // decide route stored after an approved call ran.
+  it("returns the tool's own sentence when an executed call failed", () => {
+    const detail = JSON.stringify({ error: "Only another manager of this dashboard can approve this." })
+    expect(approvalErrorOf("Executed after approval", detail)).toBe(
+      "Only another manager of this dashboard can approve this."
+    )
+  })
+
+  it("gives no sentence for a call that never ran, or a detail without one", () => {
+    expect(approvalErrorOf("Not executed", JSON.stringify({ error: "x" }))).toBeUndefined()
+    expect(approvalErrorOf("Executed after approval", "not json")).toBeUndefined()
+    expect(approvalErrorOf("Executed after approval", JSON.stringify({ ok: true }))).toBeUndefined()
+    expect(approvalErrorOf("Executed after approval", "")).toBeUndefined()
   })
 })
