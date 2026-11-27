@@ -381,7 +381,111 @@ but the stack must start: T9's `up` counts as the real `up`). Use
 
 ## Handoff
 
-(developer appends here)
+Developer (DeepSeek V4.1 Flash, 2026-11-27), branch
+`t3/realtime-iceberg-sync-settings`, built on `958cd7808`.
+
+### Commits
+
+- `c04765678` DATA-66 T1: store the per-publication sync mode and schedule
+- `a35d7f70d` DATA-66 T2: read and write the sync setting over the publication routes
+- `f763b35aa` DATA-66 T3: the due-sync decision, its reads and GET /api/gold/sync-due
+- `9b0cbc3d7` DATA-66 T4: POST /api/gold/export/{mart}/after-write
+- `a8e003544` DATA-66 T5: the per-table sync job, its watcher, and the nightly run's new scope
+- `e72f0c5e0` DATA-66 T6: the authored op asks for its own table's sync after the write
+- `829092427` DATA-66 T7: the Sync setting on the publish card and the all-marts page
+- `bda7ed35a` DATA-66 T8: the customer-facing changelog and the old publish limit
+- `91edb72b4` DATA-66 T9: the latency measurement is not measured, and why
+
+All pushed to `origin/t3/realtime-iceberg-sync-settings`, never
+force-pushed; no pull request was opened, edited or merged.
+
+### Verification (final commit `91edb72b4`, foreground)
+
+Rust, through `~/bin/cargo-locked` with the shared
+`CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target` and no
+`cargo clean`:
+
+- `cd rust && cargo fmt --check` — pass.
+- `~/bin/cargo-locked clippy --workspace --all-targets --all-features -- -D warnings` — pass (finished in 6m54s).
+- `~/bin/cargo-locked test --workspace` — **8,841 passed, 0 failed, 38 ignored**, across 40 test-result groups (exit 0). This includes the new store tests (`gold_publication::` 12), the `iceberg_sync` unit tests (11), the route tests (`iceberg_sync::` 2, `gold_publication::after_write` 4, `route_auth::sec66` 1, `route_auth::the_after_write` 1), `routes::route_policy_tests::every_policy_table_entry` and `audit_coverage::` 30.
+
+TypeScript:
+
+- `bun run typecheck` — pass.
+- `bun run lint` — pass, **13 warnings, 0 errors** (all pre-existing; none in a file this branch touched).
+- `bun run test` — **5,518 pass, 1 skip, 1 fail**. The one failure is
+  `src/features/queries/query-studio-download.test.tsx > the elapsed time of a run > ticks every second while the run is in flight` (fake-timer). It is **pre-existing and not caused by this branch**: the same test fails in a detached worktree of `origin/main` at `509a02088` with this machine's `bun 1.4.2` (the repo pins `bun@1.3.12`). It needs a backlog item; no file this branch touched is involved. The four files this branch changed pass (`open-format-card`, `gold-exports-page`, `gold-freshness`, `gold.client`: 63 pass).
+
+Python (no Dagster venv existed on this VM, so one was created at
+`/tmp/opencode/dagster-venv` with Python 3.12, dagster 1.13.20 and this
+worktree's `dagster/pyproject.toml`; nothing under `/tmp/opencode` is in
+the repository):
+
+- `python3 ops/lint/check_intra_package_imports.py` — OK.
+- `python3 ops/lint/check_bare_iceberg_count.py` — OK.
+- `(cd dagster && /tmp/opencode/dagster-venv/bin/python -m pytest dispar_orchestrate -q)` — **2,870 passed, 1 skipped, 45 subtests**, exit 0 (21m30s).
+
+Compose:
+
+- `sh ops/init-env.sh` (wrote a local `.env`; ignored by git) then
+  `docker compose --profile '*' config --quiet` — exit 0.
+- **No `up`**: see T9 and `docs/plans/DATA-66-RESULT.md`.
+
+### Not verified, and why (rule 7)
+
+- **T9 measurement: not measured.** No `lakehouse-api` / `console` /
+  `dagster-code-location` image exists on this VM (all three are `build:`
+  services, and the API image is a release cargo build of the workspace);
+  `/` had 24 GB free at 96% used with no Docker build cache, so the image
+  build plus the running stack could not be proven to fit, and the
+  clean/target shortcuts that would make room are forbidden by AGENTS.md.
+  The 100,000-row pipeline and outside-`INSERT` runs are also the owner's
+  acceptance steps `DATA-66-AC1`/`AC2`, still not run.
+  `docs/plans/DATA-66-RESULT.md` says **not measured** and gives the exact
+  recipe. No number was estimated.
+- **Acceptance checklist `DATA-66-AC1`–`AC7`: not run** (owner's step).
+- **The compose stack was never started**, only validated with `config`.
+- The pre-existing TypeScript failure above is not fixed here (out of
+  scope; it has no backlog item yet, which the planner should add).
+
+### Notes for the reviewer (decisions taken inside a task's scope)
+
+- T1 stores the schedule as `SyncSchedule` (an owned
+  `Serialize` view of `report_schedule::Schedule` limited to hourly/daily)
+  on `GoldPublication`, because `Schedule` itself is not `Serialize` and
+  the contract only admits hourly/daily. `SyncSetting` keeps
+  `Option<Schedule>` as the plan writes it.
+- `set_sync_in_zone` also enforces the mode/schedule invariant
+  (`scheduled` ⇔ schedule + zone) and a known IANA zone with the same
+  fixed `StoreError::Validation` sentences, so the API's validator and
+  the migration's CHECK cannot drift.
+- T2's `publication_body` takes the whole stored row (`Option<&GoldPublication>`)
+  instead of `(enabled, updated_at)`, because it now needs the sync
+  fields. The `gold.publication_set` audit records
+  `syncMode`/`schedule`/`timeZone`.
+- T3 added `GET /api/gold/sync-due` to the SEC-66 policy test's array,
+  and the `route_auth` sec66 table pairs it with `gold:export` (the
+  handler guard is `check_export_token`, as D10 and T3 say).
+- T4's tests live in `tests/gold_publication.rs` (real Postgres +
+  ClickHouse + a wiremock Dagster) because that file already owns the
+  `Sessions`/`CATALOG_TENANT_ID` fixture; the "both ways" auth test is
+  in `tests/route_auth.rs`. `seed_gold_export_service_credential` in
+  `tests/gold_export_auth.rs` became `pub(crate)` so the second test
+  reuses it instead of copying it.
+- T5 `evaluate_sync_due` yields one `SkipReason` for an empty due list
+  (the check asks for it) and refuses an unknown trigger as well as an
+  unknown zone.
+- Three test expectations changed by design, each with the reason at the
+  site: `test_job_serial_tags.py` now expects both instance rules
+  (`lakehouse/serial` and `lakehouse/iceberg-sync-target`) and gains a
+  per-table counter test; `test_gold_export.py`'s zone-union test became
+  "no mapped step for console publications" because D9 removed that
+  union; `gold-exports-page.test.tsx`'s column indices moved by one for
+  the new Sync column.
+- T8's grep found no other current-behaviour doc claiming "after any
+  pipeline" or a nightly 04:00 for console tables; the remaining hits are
+  this plan, the spec's own "Today" column, and the historical
+  2026-10-02 plan's record.
 
 ## Review
 
