@@ -69,6 +69,8 @@ use lakehouse_core::ApiError;
 use lakehouse_core::ident::Ident;
 use lakehouse_core::secret::SecretValue;
 use lakehouse_iceberg::gold::PublishZone;
+use lakehouse_store::gold_publication::{GoldPublication, SyncMode, SyncSchedule, SyncSetting};
+use lakehouse_store::report_schedule::{Schedule, zone_is_known};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -1386,11 +1388,19 @@ async fn publication_body(
     state: &AppState,
     mart: &str,
     zone: PublishZone,
-    enabled: bool,
-    updated_at: Option<String>,
+    stored: Option<&GoldPublication>,
     can_edit: bool,
     actor: crate::routes::query::GateActor<'_>,
 ) -> Result<Value, ApiError> {
+    // DATA-66 D4: a mart with no row answers `on_update` — the mode a
+    // table gets when it is switched on — and an honest `null` for a
+    // schedule it does not have.
+    let enabled = stored.is_some_and(|row| row.enabled);
+    let updated_at = stored.map(|row| row.updated_at.clone());
+    let sync = PublicationSync::from_publication(stored);
+    // DATA-66 D8: "the next time this schedule runs" is a fact of the
+    // schedule, not of a run, so it is read here rather than stored.
+    let now = time::OffsetDateTime::now_utc();
     // `SEC-50` slice 2 T8 (M12): the gate is the export's own, so the two
     // paths cannot drift. Its answer is the table name the export reads;
     // this body reads through the fingerprint helpers, which take the
@@ -1436,7 +1446,7 @@ async fn publication_body(
         crate::gold_latest_copy::latest_copy_state_for_zone(&state.clickhouse, mart, zone)
             .await
             .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
-    Ok(json!({
+    let mut body = json!({
         "mart": mart,
         "zone": zone_name,
         "enabled": enabled,
@@ -1456,7 +1466,156 @@ async fn publication_body(
             "holds": latest_holds,
             "lastRun": latest_run,
         },
-    }))
+    });
+    if let Value::Object(map) = &mut body {
+        map.extend(sync.json_fields(enabled, now));
+    }
+    Ok(body)
+}
+
+/// DATA-66: the sync part of [`publication_body`] and of the scheduler's
+/// `GET /api/gold/publications` items, plus the `nextSyncAt` derived from
+/// it (D5, D8). One helper for both, so a mode, a schedule and a time
+/// zone cannot mean one thing on the card and another to the scheduler
+/// (AGENTS.md rule 4).
+struct PublicationSync {
+    mode: SyncMode,
+    schedule: Option<SyncSchedule>,
+    time_zone: Option<String>,
+}
+
+impl PublicationSync {
+    /// The setting a missing row answers (D4: `on_update`, no schedule).
+    fn from_publication(publication: Option<&GoldPublication>) -> Self {
+        publication.map_or_else(
+            || Self {
+                mode: SyncMode::OnUpdate,
+                schedule: None,
+                time_zone: None,
+            },
+            |row| Self {
+                mode: row.sync_mode,
+                schedule: row.schedule,
+                time_zone: row.time_zone.clone(),
+            },
+        )
+    }
+
+    /// The `syncMode`/`schedule`/`timeZone`/`nextSyncAt` keys both
+    /// responses carry. `schedule` and `timeZone` are `null` unless the
+    /// mode is `scheduled`; `nextSyncAt` is `null` unless the mode is
+    /// `scheduled` AND publishing is on (a switched-off row will not
+    /// sync). A next time that cannot be worked out is `null`, never a
+    /// guessed instant.
+    fn json_fields(
+        &self,
+        enabled: bool,
+        now: time::OffsetDateTime,
+    ) -> serde_json::Map<String, Value> {
+        let scheduled = self.mode == SyncMode::Scheduled;
+        let mut fields = serde_json::Map::new();
+        fields.insert("syncMode".to_owned(), json!(self.mode.as_str()));
+        fields.insert(
+            "schedule".to_owned(),
+            json!(if scheduled { self.schedule } else { None }),
+        );
+        fields.insert(
+            "timeZone".to_owned(),
+            json!(if scheduled {
+                self.time_zone.as_deref()
+            } else {
+                None
+            }),
+        );
+        fields.insert(
+            "nextSyncAt".to_owned(),
+            json!(self.next_sync_at(enabled, now)),
+        );
+        fields
+    }
+
+    /// `next_run_after(zone, now)` as RFC 3339, or `None` (D8).
+    fn next_sync_at(&self, enabled: bool, now: time::OffsetDateTime) -> Option<String> {
+        let (true, SyncMode::Scheduled, Some(schedule), Some(time_zone)) =
+            (enabled, self.mode, self.schedule, self.time_zone.as_deref())
+        else {
+            return None;
+        };
+        schedule
+            .to_schedule()
+            .next_run_after(time_zone, now)
+            .ok()
+            .and_then(|at| {
+                at.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            })
+    }
+}
+
+/// DATA-66 D5/D10: read the `syncMode`/`schedule`/`timeZone` of a `PUT`
+/// body into a [`SyncSetting`], with the fixed 400 sentences the feature
+/// page promises. Absent `syncMode` means "leave the stored setting
+/// alone" and is not parsed here.
+fn parse_sync_setting(body: &PublicationBody, raw_mode: &str) -> Result<SyncSetting, ApiError> {
+    let mode = SyncMode::parse(raw_mode).ok_or_else(|| {
+        ApiError::BadRequest(
+            "unknown sync mode: expected on_update, scheduled or manual".to_owned(),
+        )
+    })?;
+    match mode {
+        SyncMode::Scheduled => {
+            let Some(schedule) = body.schedule.as_ref() else {
+                return Err(ApiError::BadRequest(
+                    "a scheduled sync needs a schedule and a time zone".to_owned(),
+                ));
+            };
+            let part = |value: Option<i64>| {
+                value
+                    .and_then(|n| u8::try_from(n).ok())
+                    .ok_or_else(|| ApiError::BadRequest("that schedule is not valid".to_owned()))
+            };
+            let schedule = match schedule.kind.as_str() {
+                "hourly" => Schedule::Hourly {
+                    minute: part(schedule.minute)?,
+                },
+                "daily" => Schedule::Daily {
+                    hour: part(schedule.hour)?,
+                    minute: part(schedule.minute)?,
+                },
+                _ => {
+                    return Err(ApiError::BadRequest(
+                        "schedule kind must be hourly or daily".to_owned(),
+                    ));
+                }
+            };
+            schedule
+                .validate()
+                .map_err(|_| ApiError::BadRequest("that schedule is not valid".to_owned()))?;
+            let time_zone = body.time_zone.as_deref().ok_or_else(|| {
+                ApiError::BadRequest("a scheduled sync needs a schedule and a time zone".to_owned())
+            })?;
+            if !zone_is_known(time_zone) {
+                return Err(ApiError::BadRequest("unknown time zone".to_owned()));
+            }
+            Ok(SyncSetting {
+                mode,
+                schedule: Some(schedule),
+                time_zone: Some(time_zone.to_owned()),
+            })
+        }
+        SyncMode::OnUpdate | SyncMode::Manual => {
+            if body.schedule.is_some() || body.time_zone.is_some() {
+                return Err(ApiError::BadRequest(
+                    "only a scheduled sync has a schedule and a time zone".to_owned(),
+                ));
+            }
+            Ok(SyncSetting {
+                mode,
+                schedule: None,
+                time_zone: None,
+            })
+        }
+    }
 }
 
 /// The `lastFailure` field of [`publication_body`] (`DATA-49`, QA
@@ -1531,15 +1690,23 @@ pub async fn publications(
     let enabled = lakehouse_store::gold_publication::list_enabled(pool)
         .await
         .map_err(ApiError::from)?;
+    // DATA-66: each item carries how that publication syncs, so the
+    // scheduler can log it and the console's all-marts page can show it
+    // from one read. `nextSyncAt` is measured here, never stored.
+    let now = time::OffsetDateTime::now_utc();
     let publications: Vec<Value> = enabled
         .iter()
         .map(|p| {
-            json!({
+            let mut item = json!({
                 "zone": p.zone,
                 "mart": p.mart,
                 "enabled": p.enabled,
                 "updatedAt": p.updated_at
-            })
+            });
+            if let Value::Object(map) = &mut item {
+                map.extend(PublicationSync::from_publication(Some(p)).json_fields(p.enabled, now));
+            }
+            item
         })
         .collect();
     Ok(ApiJson(json!({ "publications": publications })))
@@ -1582,7 +1749,6 @@ pub async fn publication(
     )
     .await
     .map_err(ApiError::from)?;
-    let (enabled, updated_at) = stored.map_or((false, None), |p| (p.enabled, Some(p.updated_at)));
     let can_edit = principal
         .as_ref()
         .is_some_and(|Extension(p)| p.has("gold:export"));
@@ -1594,8 +1760,7 @@ pub async fn publication(
         &state,
         mart_ident.as_str(),
         zone,
-        enabled,
-        updated_at,
+        stored.as_ref(),
         can_edit,
         actor,
     )
@@ -1605,11 +1770,35 @@ pub async fn publication(
 
 /// Body of `PUT /api/gold/export/{mart}/publication`.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PublicationBody {
     /// Whether the scheduler should keep this mart's Iceberg copy fresh.
     /// `false` only flips the flag — the existing Iceberg table is never
     /// dropped by this feature (DATA-1 decision table).
     enabled: bool,
+    /// DATA-66 D2: `on_update`, `scheduled` or `manual`. Absent means
+    /// "leave the stored setting alone", so a pre-DATA-66 console that
+    /// sends only `enabled` cannot reset a schedule.
+    sync_mode: Option<String>,
+    /// DATA-66 D5: the slot, required when `syncMode` is `scheduled`.
+    schedule: Option<ScheduleBody>,
+    /// DATA-66 D5: the IANA zone the slot is read in, required when
+    /// `syncMode` is `scheduled`.
+    time_zone: Option<String>,
+}
+
+/// The `schedule` object of a `PUT` body (DATA-66 D5):
+/// `{"kind":"hourly","minute":15}` or
+/// `{"kind":"daily","hour":4,"minute":0}`. Kept loose (strings and
+/// `i64`s) so an unknown kind or an out-of-range value is this module's
+/// fixed 400 sentence, not a serde 422.
+#[derive(Debug, Deserialize)]
+pub struct ScheduleBody {
+    kind: String,
+    #[serde(default)]
+    hour: Option<i64>,
+    #[serde(default)]
+    minute: Option<i64>,
 }
 
 /// Best-effort audit row for a successful toggle, following
@@ -1620,7 +1809,7 @@ async fn record_publication_audit(
     state: &AppState,
     principal: &Principal,
     mart: &str,
-    enabled: bool,
+    publication: &GoldPublication,
 ) {
     let event = NewAuditEvent {
         principal_id: Some(principal.id.uuid().to_string()),
@@ -1629,7 +1818,15 @@ async fn record_publication_audit(
         action: "gold.publication_set".to_owned(),
         resource_kind: Some("gold_mart".to_owned()),
         resource_id: Some(mart.to_owned()),
-        args: Some(json!({ "enabled": enabled })),
+        // DATA-66: the audit row records the mode and the schedule the
+        // PUT left behind, so a schedule change is as visible as an
+        // on/off flip (the read responses' shape, camelCase).
+        args: Some(json!({
+            "enabled": publication.enabled,
+            "syncMode": publication.sync_mode.as_str(),
+            "schedule": publication.schedule,
+            "timeZone": &publication.time_zone,
+        })),
         outcome: "executed".to_owned(),
         detail: None,
         run_id: None,
@@ -1640,10 +1837,18 @@ async fn record_publication_audit(
 }
 
 /// `PUT /api/gold/export/{mart}/publication` — switch one mart's
-/// publishing on or off. `POLICY_TABLE` floors this route at
+/// publishing on or off, and (DATA-66) choose how closely it follows
+/// `ClickHouse`. `POLICY_TABLE` floors this route at
 /// `RequiresPermission("gold:export")`, so the handler never re-checks
 /// the permission (fail closed at the gate); it needs the principal only
 /// to record who flipped the switch.
+///
+/// DATA-66 D2/D4: `syncMode` is optional. Absent, the stored mode and
+/// schedule are left alone, so an old console's `{enabled: true}` can
+/// never reset a schedule. Present, it replaces the whole setting:
+/// `scheduled` needs a `schedule` and a known `timeZone`, and
+/// `on_update`/`manual` must send neither. The audit row records the
+/// mode and the schedule the write left behind.
 ///
 /// Returns 404 when `serving.{mart}` does not exist — measured against
 /// `system.tables`, not assumed — so a typo cannot silently enable
@@ -1689,7 +1894,7 @@ pub async fn set_publication(
         .into());
     }
 
-    let updated = lakehouse_store::gold_publication::upsert_in_zone(
+    let mut updated = lakehouse_store::gold_publication::upsert_in_zone(
         pool,
         zone.namespace_name(),
         mart_ident.as_str(),
@@ -1698,14 +1903,41 @@ pub async fn set_publication(
     )
     .await
     .map_err(ApiError::from)?;
-    record_publication_audit(&state, &principal, mart_ident.as_str(), body.enabled).await;
+    // DATA-66: a body WITHOUT `syncMode` leaves the stored setting alone
+    // (an old console sends only `enabled`); a body WITH it replaces the
+    // mode and the schedule together, so a mode can never be left with a
+    // schedule that belongs to another one.
+    if let Some(raw_mode) = body.sync_mode.as_deref() {
+        let setting = parse_sync_setting(&body, raw_mode)?;
+        let Some(with_sync) = lakehouse_store::gold_publication::set_sync_in_zone(
+            pool,
+            zone.namespace_name(),
+            mart_ident.as_str(),
+            &setting,
+            principal.id.uuid(),
+        )
+        .await
+        .map_err(ApiError::from)?
+        else {
+            // The upsert above wrote the row, so this is unreachable; a
+            // 404 keeps the route honest rather than pretending a setting
+            // was stored somewhere.
+            return Err(ApiError::NotFound(format!(
+                "mart {:?} does not exist in {}",
+                mart_ident.as_str(),
+                zone.source_ch_schema(&state.config.gold_source_schema)
+            ))
+            .into());
+        };
+        updated = with_sync;
+    }
+    record_publication_audit(&state, &principal, mart_ident.as_str(), &updated).await;
 
     let body = publication_body(
         &state,
         mart_ident.as_str(),
         zone,
-        updated.enabled,
-        Some(updated.updated_at),
+        Some(&updated),
         true,
         // `SEC-50` slice 2 T8: the response body reads the mart, so it is
         // gated as the person who flipped the switch (the handler holds
