@@ -24,8 +24,8 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{
-    TestApp, audit_rows, create_principal_with_permissions, session_cookie_for_seeded_user,
-    session_cookie_for_user, spin_up, spin_up_with_env,
+    CATALOG_TENANT, TestApp, audit_rows, create_principal_with_permissions,
+    session_cookie_for_seeded_user, session_cookie_for_user, spin_up, spin_up_with_env,
 };
 
 /// The seeded organisations (`0002_seed_identity.sql`). `sari` belongs to
@@ -511,4 +511,617 @@ async fn an_administrator_in_both_organisations_moves_the_agent_and_it_is_audite
     assert_eq!(rows[0]["args"]["old_tenant_id"].as_str(), Some(RETAIL));
     assert_eq!(rows[0]["args"]["new_tenant_id"].as_str(), Some(LOGISTICS));
     assert_eq!(rows[0]["principal_kind"].as_str(), Some("user"));
+}
+
+// ── SEC-76 follow-up (adm-147): the agents a person may see, and the replay ──
+
+/// The bearer and `x-run-token` the scheduler presents (`AGENT_RUN_TOKEN`).
+const RUN_TOKEN: &str = "secret-run-token";
+
+/// Agents the visibility tests insert, one per organisation shape.
+const RETAIL_AGENT: &str = "emp-s76-retail";
+const LOGISTICS_AGENT: &str = "emp-s76-logistics";
+const UNASSIGNED_AGENT: &str = "emp-s76-unassigned";
+const CATALOG_AGENT: &str = "emp-s76-catalog";
+
+/// Seeds the scheduler's service identity the way production's bootstrap does
+/// (`agent:manage` only, no organisation), with `RUN_TOKEN` as its credential.
+/// The test router does not run the bootstrap, so a test that presents the
+/// token as a bearer must seed it.
+async fn seed_run_service(pool: &PgPool) {
+    let identity = lakehouse_store::identity::create_service_identity(
+        pool,
+        &lakehouse_store::identity::CreateServiceIdentityInput {
+            name: "test-agent-run-service".to_owned(),
+            scopes: vec!["agent:manage".to_owned()],
+            environment: "test".to_owned(),
+        },
+    )
+    .await
+    .expect("create the scheduler's service identity");
+    lakehouse_auth::service_token::ensure_service_credential(
+        pool,
+        identity.id.parse().expect("a UUID service identity id"),
+        &lakehouse_auth::Secret::new(RUN_TOKEN.to_owned()),
+    )
+    .await
+    .expect("store the scheduler's credential");
+}
+
+/// A `GET` to `uri` with `headers`, through the router.
+async fn get_with(
+    app: &axum::Router,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> axum::http::Response<Body> {
+    let mut builder = Request::builder().method("GET").uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    app.clone()
+        .oneshot(builder.body(Body::empty()).expect("build request"))
+        .await
+        .expect("router never fails a request outright")
+}
+
+/// The `id` of every employee or approval in a JSON array response.
+fn listed_ids(body: &Value) -> Vec<String> {
+    body.as_array()
+        .expect("the list is a JSON array")
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// A runnable build-mode agent in `tenant` (or none) whose ceiling is
+/// `connector:manage`, so a run can ask to delete a connector.
+async fn insert_connector_agent(pool: &PgPool, id: &str, tenant: Option<&str>) {
+    sqlx::query(
+        "INSERT INTO agent_employee (id, name, purpose, autonomy, status, prompt, mode, \
+         permissions, tenant_id, read_roles) VALUES ($1, $2, 'test purpose', 'L1', 'ready', \
+         'Hapus konektor yang tidak dipakai.', 'build', 'connector:manage', $3::uuid, \
+         ARRAY['Analyst']::text[])",
+    )
+    .bind(id)
+    .bind(format!("tenant-test-{id}"))
+    .bind(tenant)
+    .execute(pool)
+    .await
+    .expect("insert a connector agent");
+}
+
+/// Runs `employee` once on the scheduler's token, with a completion that asks
+/// to delete `connector`. The write waits for a decision, so the run stops and
+/// the pending approval it created is returned.
+async fn run_waiting_on_a_delete(
+    app: &TestApp,
+    llm: &MockServer,
+    employee: &str,
+    connector: &str,
+) -> String {
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "delete_connector",
+                            "arguments": json!({ "id": connector }).to_string(),
+                        },
+                    }],
+                }
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(llm)
+        .await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "sari@meridian.example").await;
+    let resp = run_employee(&app.router, employee, &cookie, Some(RUN_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::OK, "the run starts");
+    approval_of(&app.pool, employee).await
+}
+
+/// The pending approval a run of `employee` is waiting on.
+async fn approval_of(pool: &PgPool, employee: &str) -> String {
+    sqlx::query_scalar("SELECT id FROM approval_item WHERE employee_id = $1 AND status = 'pending'")
+        .bind(employee)
+        .fetch_one(pool)
+        .await
+        .expect("the run left one pending approval")
+}
+
+/// Inserts a pending `delete_connector` approval for `employee` directly in the
+/// store, with the run it belongs to. For a refusal that happens before any
+/// replay, where a headless run cannot start the approval (a run of an agent
+/// with no organisation is refused first).
+async fn pending_delete_for(pool: &PgPool, employee: &str, connector: &str) -> (String, String) {
+    let run_id = format!("run-s76-{}", Uuid::new_v4());
+    lakehouse_store::agents::create_run(pool, &run_id, employee, "schedule", "test agent")
+        .await
+        .expect("create the run");
+    let approval_id = lakehouse_store::agents::create_linked_approval(
+        pool,
+        lakehouse_store::agents::LinkedApprovalRequest {
+            employee_id: employee,
+            employee_name: "test agent",
+            run_id: &run_id,
+            tool: "delete_connector",
+            resource: Some(connector),
+            reason: "test reason",
+            risk: "test risk",
+            redacted_args: &json!({ "id": connector }),
+            requested_by: None,
+        },
+    )
+    .await
+    .expect("create the approval");
+    (approval_id, run_id)
+}
+
+/// Inserts a pending `delete_connector` approval on the copilot's own run, the
+/// way the interactive copilot leaves one: the run is waiting on the approval
+/// and its last step holds the stored call, so a decision can replay it.
+async fn copilot_delete_waiting(pool: &PgPool, connector: &str) -> String {
+    let run_id = format!("run-s76-copilot-{}", Uuid::new_v4());
+    let copilot = lakehouse_store::agents::COPILOT_EMPLOYEE_ID;
+    lakehouse_store::agents::create_run(pool, &run_id, copilot, "copilot", "test copilot")
+        .await
+        .expect("create the copilot's run");
+    lakehouse_store::agents::append_run_step(
+        pool,
+        &run_id,
+        lakehouse_store::agents::RunStep {
+            id: "step-1".to_owned(),
+            label: "Waiting for approval".to_owned(),
+            status: "waiting".to_owned(),
+            detail: json!({ "tool": "delete_connector", "args": { "id": connector } }).to_string(),
+        },
+    )
+    .await
+    .expect("store the copilot's tool call");
+    lakehouse_store::agents::mark_run_waiting_approval(pool, &run_id)
+        .await
+        .expect("mark the copilot's run waiting");
+    lakehouse_store::agents::create_linked_approval(
+        pool,
+        lakehouse_store::agents::LinkedApprovalRequest {
+            employee_id: copilot,
+            employee_name: "Copilot",
+            run_id: &run_id,
+            tool: "delete_connector",
+            resource: Some(connector),
+            reason: "test reason",
+            risk: "test risk",
+            redacted_args: &json!({ "id": connector }),
+            requested_by: None,
+        },
+    )
+    .await
+    .expect("create the copilot's approval")
+}
+
+/// `POST /api/agents/approvals/{id}/decide` with `decision`, as the cookie holder.
+async fn decide(
+    app: &axum::Router,
+    approval: &str,
+    cookie: &str,
+    decision: &str,
+) -> axum::http::Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/agents/approvals/{approval}/decide"))
+                .header("content-type", "application/json")
+                .header("cookie", cookie)
+                .body(Body::from(json!({ "decision": decision }).to_string()))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright")
+}
+
+async fn approval_status(pool: &PgPool, approval: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM approval_item WHERE id = $1")
+        .bind(approval)
+        .fetch_one(pool)
+        .await
+        .expect("read the approval's status")
+}
+
+/// How many `refused` audit rows name this approval.
+async fn refused_decisions(pool: &PgPool, approval: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM audit_event \
+         WHERE resource_kind = 'approval' AND resource_id = $1 AND outcome = 'refused'",
+    )
+    .bind(approval)
+    .fetch_one(pool)
+    .await
+    .expect("count the refused decisions")
+}
+
+async fn connector_exists(pool: &PgPool, connector: &str) -> bool {
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM connector WHERE id = $1")
+        .bind(connector)
+        .fetch_one(pool)
+        .await
+        .expect("count the connector");
+    count == 1
+}
+
+/// Two organisations and an agent in neither: the list holds the caller's own
+/// organisation's agents, and no other.
+#[tokio::test]
+async fn a_person_sees_only_the_agents_of_their_organisation_in_the_list() {
+    let app = spin_up().await;
+    insert_employee(&app.pool, RETAIL_AGENT, Some(RETAIL)).await;
+    insert_employee(&app.pool, LOGISTICS_AGENT, Some(LOGISTICS)).await;
+    insert_employee(&app.pool, UNASSIGNED_AGENT, None).await;
+    let cookie = principal_in(&app.pool, "query:read", &[RETAIL]).await;
+
+    let resp = get_with(
+        &app.router,
+        "/api/agents/employees",
+        &[("cookie", cookie.as_str())],
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ids = listed_ids(&json_body(resp).await);
+    assert!(ids.contains(&RETAIL_AGENT.to_owned()), "{ids:?}");
+    assert!(!ids.contains(&LOGISTICS_AGENT.to_owned()), "{ids:?}");
+    assert!(!ids.contains(&UNASSIGNED_AGENT.to_owned()), "{ids:?}");
+}
+
+/// The detail of an agent outside the caller's organisation is the answer for
+/// an unknown agent (404), never 403, and the agent with no organisation is
+/// the same.
+#[tokio::test]
+async fn a_person_gets_not_found_for_an_agent_outside_their_organisation() {
+    let app = spin_up().await;
+    insert_employee(&app.pool, RETAIL_AGENT, Some(RETAIL)).await;
+    insert_employee(&app.pool, LOGISTICS_AGENT, Some(LOGISTICS)).await;
+    insert_employee(&app.pool, UNASSIGNED_AGENT, None).await;
+    let cookie = principal_in(&app.pool, "query:read", &[RETAIL]).await;
+
+    for agent in [LOGISTICS_AGENT, UNASSIGNED_AGENT] {
+        let resp = get_with(
+            &app.router,
+            &format!("/api/agents/employees/{agent}"),
+            &[("cookie", cookie.as_str())],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{agent}");
+    }
+    let own = get_with(
+        &app.router,
+        &format!("/api/agents/employees/{RETAIL_AGENT}"),
+        &[("cookie", cookie.as_str())],
+    )
+    .await;
+    assert_eq!(own.status(), StatusCode::OK);
+}
+
+/// An unrestricted caller sees every agent, the one with no organisation too.
+#[tokio::test]
+async fn an_unrestricted_person_sees_every_agent_including_one_with_no_organisation() {
+    let app = spin_up().await;
+    insert_employee(&app.pool, RETAIL_AGENT, Some(RETAIL)).await;
+    insert_employee(&app.pool, LOGISTICS_AGENT, Some(LOGISTICS)).await;
+    insert_employee(&app.pool, UNASSIGNED_AGENT, None).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "fajar@meridian.example").await;
+
+    let resp = get_with(
+        &app.router,
+        "/api/agents/employees",
+        &[("cookie", cookie.as_str())],
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ids = listed_ids(&json_body(resp).await);
+    for agent in [RETAIL_AGENT, LOGISTICS_AGENT, UNASSIGNED_AGENT] {
+        assert!(
+            ids.contains(&agent.to_owned()),
+            "{agent} is listed: {ids:?}"
+        );
+    }
+}
+
+/// Dagster's schedule factory sends the run token as a bearer and as
+/// `x-run-token`, and must still see every agent, the one with no organisation
+/// too, or it would stop scheduling them.
+#[tokio::test]
+async fn the_scheduler_token_lists_every_agent() {
+    let llm = MockServer::start().await;
+    let app = spin_up_with_llm(&llm.uri(), Some(RUN_TOKEN)).await;
+    seed_run_service(&app.pool).await;
+    insert_employee(&app.pool, RETAIL_AGENT, Some(RETAIL)).await;
+    insert_employee(&app.pool, LOGISTICS_AGENT, Some(LOGISTICS)).await;
+    insert_employee(&app.pool, UNASSIGNED_AGENT, None).await;
+
+    let resp = get_with(
+        &app.router,
+        "/api/agents/employees",
+        &[
+            ("authorization", "Bearer secret-run-token"),
+            ("x-run-token", RUN_TOKEN),
+        ],
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ids = listed_ids(&json_body(resp).await);
+    for agent in [RETAIL_AGENT, LOGISTICS_AGENT, UNASSIGNED_AGENT] {
+        assert!(
+            ids.contains(&agent.to_owned()),
+            "{agent} is listed: {ids:?}"
+        );
+    }
+}
+
+/// The same bearer without the `x-run-token` header is an ordinary service
+/// principal with no organisation, so it lists none of these agents.
+#[tokio::test]
+async fn a_bearer_without_the_run_token_header_is_filtered_like_any_service_principal() {
+    let llm = MockServer::start().await;
+    let app = spin_up_with_llm(&llm.uri(), Some(RUN_TOKEN)).await;
+    seed_run_service(&app.pool).await;
+    insert_employee(&app.pool, RETAIL_AGENT, Some(RETAIL)).await;
+    insert_employee(&app.pool, LOGISTICS_AGENT, Some(LOGISTICS)).await;
+    insert_employee(&app.pool, UNASSIGNED_AGENT, None).await;
+
+    let resp = get_with(
+        &app.router,
+        "/api/agents/employees",
+        &[("authorization", "Bearer secret-run-token")],
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ids = listed_ids(&json_body(resp).await);
+    for agent in [RETAIL_AGENT, LOGISTICS_AGENT, UNASSIGNED_AGENT] {
+        assert!(
+            !ids.contains(&agent.to_owned()),
+            "{agent} is hidden: {ids:?}"
+        );
+    }
+}
+
+/// An approver in Retail cannot decide a Logistics agent's call: 404, the
+/// approval stays pending, the connector is untouched, and the refusal is
+/// audited once.
+#[tokio::test]
+async fn an_approver_outside_the_agents_organisation_gets_not_found_and_decides_nothing() {
+    let llm = MockServer::start().await;
+    let app = spin_up_with_llm(&llm.uri(), Some(RUN_TOKEN)).await;
+    insert_connector_agent(&app.pool, LOGISTICS_AGENT, Some(LOGISTICS)).await;
+    seed_connector(&app.pool, LOGISTICS_CONNECTOR, LOGISTICS).await;
+    let approval = run_waiting_on_a_delete(&app, &llm, LOGISTICS_AGENT, LOGISTICS_CONNECTOR).await;
+    let cookie = principal_in(
+        &app.pool,
+        "agent:approve, connector:manage, query:read",
+        &[RETAIL],
+    )
+    .await;
+
+    let resp = decide(&app.router, &approval, &cookie, "approved").await;
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(approval_status(&app.pool, &approval).await, "pending");
+    assert!(connector_exists(&app.pool, LOGISTICS_CONNECTOR).await);
+    assert_eq!(refused_decisions(&app.pool, &approval).await, 1);
+}
+
+/// SEC-76, decision 3, end to end: an approver who belongs to both Logistics
+/// and Retail decides two calls that a Logistics agent made. The replay runs
+/// with `tenant_ids == [Logistics]` only (`approval_replay_principal`), so the
+/// Logistics connector is deleted, and the Retail connector, which the approver
+/// may reach, is not. The approver's own permission (`connector:manage`) and
+/// roles are the ones the replay keeps, so the deletion runs at all. Roles are
+/// asserted directly in the `routes::agents` unit tests.
+#[tokio::test]
+async fn an_approver_in_the_agents_organisation_replays_the_call_there() {
+    let llm = MockServer::start().await;
+    let app = spin_up_with_llm(&llm.uri(), Some(RUN_TOKEN)).await;
+    insert_connector_agent(&app.pool, LOGISTICS_AGENT, Some(LOGISTICS)).await;
+    seed_connector(&app.pool, LOGISTICS_CONNECTOR, LOGISTICS).await;
+    seed_connector(&app.pool, RETAIL_CONNECTOR, RETAIL).await;
+    let cookie = principal_in(
+        &app.pool,
+        "agent:approve, connector:manage, query:read",
+        &[LOGISTICS, RETAIL],
+    )
+    .await;
+
+    // The Logistics agent's own connector: the replay runs in Logistics and
+    // deletes it.
+    let approval = run_waiting_on_a_delete(&app, &llm, LOGISTICS_AGENT, LOGISTICS_CONNECTOR).await;
+    let resp = decide(&app.router, &approval, &cookie, "approved").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["executed"], json!(true), "{body}");
+    assert!(!connector_exists(&app.pool, LOGISTICS_CONNECTOR).await);
+
+    // The same Logistics agent asks to delete Retail's connector. The approver
+    // reaches Retail, but the replay does not: the call fails and nothing is
+    // deleted. Before the replay narrowed to the agent's organisation, this
+    // call deleted it.
+    let approval = run_waiting_on_a_delete(&app, &llm, LOGISTICS_AGENT, RETAIL_CONNECTOR).await;
+    let resp = decide(&app.router, &approval, &cookie, "approved").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert!(body["result"]["error"].is_string(), "{body}");
+    assert!(connector_exists(&app.pool, RETAIL_CONNECTOR).await);
+}
+
+/// The replay runs as the agent in the agent's organisation only. The approver
+/// belongs to both organisations, but the call names Retail's connector, which
+/// the replay cannot reach, so it is not deleted. Had the replay kept the
+/// approver's two organisations, Retail's connector would be deleted.
+#[tokio::test]
+async fn a_replayed_call_cannot_reach_another_organisation_the_approver_belongs_to() {
+    let llm = MockServer::start().await;
+    let app = spin_up_with_llm(&llm.uri(), Some(RUN_TOKEN)).await;
+    insert_connector_agent(&app.pool, LOGISTICS_AGENT, Some(LOGISTICS)).await;
+    seed_connector(&app.pool, RETAIL_CONNECTOR, RETAIL).await;
+    let approval = run_waiting_on_a_delete(&app, &llm, LOGISTICS_AGENT, RETAIL_CONNECTOR).await;
+    let cookie = principal_in(
+        &app.pool,
+        "agent:approve, connector:manage, query:read",
+        &[RETAIL, LOGISTICS],
+    )
+    .await;
+
+    let resp = decide(&app.router, &approval, &cookie, "approved").await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert!(body["result"]["error"].is_string(), "{body}");
+    assert!(connector_exists(&app.pool, RETAIL_CONNECTOR).await);
+}
+
+/// An agent with no organisation cannot have its call approved, even by an
+/// unrestricted approver: 409 with the fixed sentence, the approval stays
+/// pending, nothing executes, and the refusal is audited once.
+#[tokio::test]
+async fn an_approval_for_an_agent_with_no_organisation_is_a_conflict_and_stays_pending() {
+    let app = spin_up().await;
+    insert_connector_agent(&app.pool, UNASSIGNED_AGENT, None).await;
+    seed_connector(&app.pool, LOGISTICS_CONNECTOR, LOGISTICS).await;
+    let (approval, _run) =
+        pending_delete_for(&app.pool, UNASSIGNED_AGENT, LOGISTICS_CONNECTOR).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "fajar@meridian.example").await;
+
+    let resp = decide(&app.router, &approval, &cookie, "approved").await;
+
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = json_body(resp).await;
+    assert_eq!(body["error"].as_str(), Some(NO_ORGANISATION));
+    assert_eq!(approval_status(&app.pool, &approval).await, "pending");
+    assert!(connector_exists(&app.pool, LOGISTICS_CONNECTOR).await);
+    assert_eq!(refused_decisions(&app.pool, &approval).await, 1);
+}
+
+/// The approvals list holds the caller's organisation's agents' approvals only,
+/// and none for an agent with no organisation.
+#[tokio::test]
+async fn the_approvals_list_shows_only_the_callers_organisation() {
+    let app = spin_up().await;
+    insert_connector_agent(&app.pool, RETAIL_AGENT, Some(RETAIL)).await;
+    insert_connector_agent(&app.pool, LOGISTICS_AGENT, Some(LOGISTICS)).await;
+    insert_connector_agent(&app.pool, UNASSIGNED_AGENT, None).await;
+    let (retail, _) = pending_delete_for(&app.pool, RETAIL_AGENT, RETAIL_CONNECTOR).await;
+    let (logistics, _) = pending_delete_for(&app.pool, LOGISTICS_AGENT, LOGISTICS_CONNECTOR).await;
+    let (unassigned, _) =
+        pending_delete_for(&app.pool, UNASSIGNED_AGENT, LOGISTICS_CONNECTOR).await;
+    let cookie = principal_in(&app.pool, "agent:approve", &[RETAIL]).await;
+
+    let resp = get_with(
+        &app.router,
+        "/api/agents/approvals",
+        &[("cookie", cookie.as_str())],
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ids = listed_ids(&json_body(resp).await);
+    assert!(ids.contains(&retail), "{ids:?}");
+    assert!(!ids.contains(&logistics), "{ids:?}");
+    assert!(!ids.contains(&unassigned), "{ids:?}");
+
+    // An unrestricted caller sees every approval, the one of the agent with no
+    // organisation included (SEC-76, decision 4).
+    let admin = session_cookie_for_seeded_user(&app.pool, "fajar@meridian.example").await;
+    let resp = get_with(
+        &app.router,
+        "/api/agents/approvals",
+        &[("cookie", admin.as_str())],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ids = listed_ids(&json_body(resp).await);
+    for approval in [&retail, &logistics, &unassigned] {
+        assert!(ids.contains(approval), "{approval} is listed: {ids:?}");
+    }
+}
+
+/// Run detail is narrowed through the run's agent. The caller is a member of
+/// the catalog's organisation (so the shared catalog rule passes) and holds
+/// `agent:read`, but not Logistics, so Logistics' run is not found.
+#[tokio::test]
+async fn the_run_detail_of_an_agent_outside_the_callers_organisation_is_not_found() {
+    let app = spin_up_with_env(&HashMap::from([(
+        "CATALOG_TENANT_ID".to_owned(),
+        CATALOG_TENANT.to_owned(),
+    )]))
+    .await;
+    insert_connector_agent(&app.pool, LOGISTICS_AGENT, Some(LOGISTICS)).await;
+    let (_approval, run) =
+        pending_delete_for(&app.pool, LOGISTICS_AGENT, LOGISTICS_CONNECTOR).await;
+    let cookie = principal_in(&app.pool, "agent:read", &[CATALOG_TENANT]).await;
+
+    let resp = get_with(
+        &app.router,
+        &format!("/api/agents/runs/{run}"),
+        &[("cookie", cookie.as_str())],
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// The positive control for the run detail: a run of an agent in the caller's
+/// own organisation is shown.
+#[tokio::test]
+async fn the_run_detail_of_an_agent_in_the_callers_organisation_is_shown() {
+    let app = spin_up_with_env(&HashMap::from([(
+        "CATALOG_TENANT_ID".to_owned(),
+        CATALOG_TENANT.to_owned(),
+    )]))
+    .await;
+    insert_connector_agent(&app.pool, CATALOG_AGENT, Some(CATALOG_TENANT)).await;
+    let (_approval, run) = pending_delete_for(&app.pool, CATALOG_AGENT, RETAIL_CONNECTOR).await;
+    let cookie = principal_in(&app.pool, "agent:read", &[CATALOG_TENANT]).await;
+
+    let resp = get_with(
+        &app.router,
+        &format!("/api/agents/runs/{run}"),
+        &[("cookie", cookie.as_str())],
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// SEC-76, decision 3 exemption (revision item 2): on a two-organisation
+/// install the copilot has no organisation, and its approval is decided and
+/// replayed as before. An approver in Retail gets 200 and the call executes;
+/// the organisation rule that gives a 409 for an agent with no organisation does
+/// not reach the copilot.
+#[tokio::test]
+async fn a_copilot_approval_is_decided_and_replayed_as_before_on_a_two_organisation_install() {
+    let app = spin_up().await;
+    seed_connector(&app.pool, RETAIL_CONNECTOR, RETAIL).await;
+    let approval = copilot_delete_waiting(&app.pool, RETAIL_CONNECTOR).await;
+    let cookie = principal_in(
+        &app.pool,
+        "agent:approve, connector:manage, query:read",
+        &[RETAIL],
+    )
+    .await;
+
+    let resp = decide(&app.router, &approval, &cookie, "approved").await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["executed"], json!(true), "{body}");
+    assert_eq!(approval_status(&app.pool, &approval).await, "approved");
+    assert!(!connector_exists(&app.pool, RETAIL_CONNECTOR).await);
 }

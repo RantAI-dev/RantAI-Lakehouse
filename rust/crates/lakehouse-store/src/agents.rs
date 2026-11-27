@@ -358,9 +358,28 @@ const FULL_EMPLOYEE_COLUMNS: &str = "id, name, purpose, owner, autonomy, status,
 ///
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_employees(pool: &PgPool) -> Result<Vec<DigitalEmployee>, StoreError> {
-    let sql = format!("SELECT {EMPLOYEE_COLUMNS} FROM agent_employee ORDER BY created_at DESC");
+    list_employees_in(pool, None).await
+}
+
+/// [`list_employees`] narrowed to the agents in `tenants` (`SEC-76`, decision
+/// 1). `None` lists every agent, one with no organisation included. `Some`
+/// lists only the agents whose `tenant_id` is in the list, so an agent with no
+/// organisation never appears in a narrowed list. The filter runs in SQL.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn list_employees_in(
+    pool: &PgPool,
+    tenants: Option<&[Uuid]>,
+) -> Result<Vec<DigitalEmployee>, StoreError> {
+    let sql = format!(
+        "SELECT {EMPLOYEE_COLUMNS} FROM agent_employee \
+         WHERE ($1::uuid[] IS NULL OR tenant_id = ANY($1)) ORDER BY created_at DESC"
+    );
     // safe: only the constant `EMPLOYEE_COLUMNS` is formatted in; values are bound.
     let rows: Vec<EmployeeListRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(tenants.map(<[Uuid]>::to_vec))
         .fetch_all(pool)
         .await?;
     Ok(rows
@@ -399,10 +418,30 @@ pub async fn get_employee_with_metrics(
     pool: &PgPool,
     id: &str,
 ) -> Result<Option<DigitalEmployee>, StoreError> {
-    let sql = format!("SELECT {FULL_EMPLOYEE_COLUMNS} FROM agent_employee WHERE id = $1");
+    get_employee_with_metrics_in(pool, id, None).await
+}
+
+/// [`get_employee_with_metrics`] for an agent in `tenants` only (`SEC-76`,
+/// decision 1): `None` finds any agent, `Some` finds the agent only if its
+/// `tenant_id` is in the list, so an agent with no organisation is not found
+/// by a narrowed read. The filter runs in SQL.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn get_employee_with_metrics_in(
+    pool: &PgPool,
+    id: &str,
+    tenants: Option<&[Uuid]>,
+) -> Result<Option<DigitalEmployee>, StoreError> {
+    let sql = format!(
+        "SELECT {FULL_EMPLOYEE_COLUMNS} FROM agent_employee WHERE id = $1 \
+         AND ($2::uuid[] IS NULL OR tenant_id = ANY($2))"
+    );
     // safe: only the constant `FULL_EMPLOYEE_COLUMNS` is formatted in; values are bound.
     Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
+        .bind(tenants.map(<[Uuid]>::to_vec))
         .fetch_optional(pool)
         .await?)
 }
@@ -932,10 +971,30 @@ pub async fn list_runs(
 ///
 /// Returns [`StoreError::Database`] if a query fails.
 pub async fn get_run(pool: &PgPool, id: &str) -> Result<Option<AgentRun>, StoreError> {
-    let sql = format!("SELECT {RUN_COLUMNS} FROM agent_run WHERE id = $1");
+    get_run_in(pool, id, None).await
+}
+
+/// [`get_run`] for a run whose agent is in `tenants` (`SEC-76`, decision 4):
+/// `None` finds any run, `Some` finds the run only if the agent that ran it is
+/// in the list. The filter runs in SQL, in the same query as the lookup.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn get_run_in(
+    pool: &PgPool,
+    id: &str,
+    tenants: Option<&[Uuid]>,
+) -> Result<Option<AgentRun>, StoreError> {
+    let sql = format!(
+        "SELECT {RUN_COLUMNS} FROM agent_run WHERE id = $1 AND ($2::uuid[] IS NULL OR EXISTS (\
+         SELECT 1 FROM agent_employee e WHERE e.id = agent_run.employee_id \
+         AND e.tenant_id = ANY($2)))"
+    );
     // safe: only the constant `RUN_COLUMNS` is formatted in; values are bound.
     let row: Option<RunRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
+        .bind(tenants.map(<[Uuid]>::to_vec))
         .fetch_optional(pool)
         .await?;
     match row {
@@ -1133,14 +1192,33 @@ pub async fn list_approvals(
     pool: &PgPool,
     employee_id: Option<&str>,
 ) -> Result<Vec<ApprovalItem>, StoreError> {
+    list_approvals_in(pool, employee_id, None).await
+}
+
+/// [`list_approvals`] narrowed to the agents in `tenants` (`SEC-76`, decision
+/// 4). A `tool_call` approval is listed only when its agent is in `tenants`;
+/// an `access` approval has no agent and is listed as before. `None` applies no
+/// narrowing. The filter runs in SQL.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn list_approvals_in(
+    pool: &PgPool,
+    employee_id: Option<&str>,
+    tenants: Option<&[Uuid]>,
+) -> Result<Vec<ApprovalItem>, StoreError> {
     let sql = format!(
         "SELECT {APPROVAL_COLUMNS_QUALIFIED} {APPROVAL_AUDIT_JOIN} WHERE ($1::text IS NULL OR \
-         a.employee_id = $1) ORDER BY a.requested_at DESC"
+         a.employee_id = $1) AND ($2::uuid[] IS NULL OR a.kind <> 'tool_call' OR EXISTS (\
+         SELECT 1 FROM agent_employee e WHERE e.id = a.employee_id AND e.tenant_id = ANY($2))) \
+         ORDER BY a.requested_at DESC"
     );
     // safe: only the constants `APPROVAL_COLUMNS_QUALIFIED`, `APPROVAL_AUDIT_JOIN` are formatted
     // in; values are bound.
     let rows: Vec<ApprovalRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(employee_id)
+        .bind(tenants.map(<[Uuid]>::to_vec))
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(ApprovalItem::from).collect())
