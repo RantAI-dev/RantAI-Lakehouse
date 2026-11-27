@@ -12,7 +12,7 @@ lakehouse-core = { path = "../lakehouse-core" }
 # one place). `=0.10.1` (exact), not `0.10`, because 0.10.x has already shown
 # breaking changes between patch-adjacent tags on the `StorageFactory` seam
 # this crate depends on directly.
-iceberg = "=0.10.1"
+iceberg = "=0.11.0"
 iceberg-catalog-rest = "=0.10.1"
 # S3 backend for the `StorageFactory` this crate implements itself — see
 # `storage.rs`. Never a vendor SDK (`aws-sdk-s3`), never RustFS/MinIO admin
