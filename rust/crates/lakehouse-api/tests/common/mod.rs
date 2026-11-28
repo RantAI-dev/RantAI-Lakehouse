@@ -561,6 +561,19 @@ pub async fn in_the_catalog_tenant(pool: &PgPool, user: Uuid) {
     .expect("add the membership");
 }
 
+/// Puts `user` in the tenant `tenant` (a seeded tenant id), so an organisation
+/// check (SEC-76) sees the person as a member of it.
+pub async fn in_tenant(pool: &PgPool, user: Uuid, tenant: &str) {
+    sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(user)
+    .bind(tenant.parse::<Uuid>().expect("a seeded tenant id"))
+    .execute(pool)
+    .await
+    .expect("add the membership");
+}
+
 /// `SEC-50` slice 2 M11: makes the deployment hold no tenant of the seeded
 /// ones, so the tenant gate changes nothing (D2) and a test that is about
 /// its own rule keeps it.

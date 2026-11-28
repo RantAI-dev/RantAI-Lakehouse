@@ -680,6 +680,9 @@ async fn a_scheduled_runs_approval_has_no_requester_and_any_approver_may_decide_
         "dashboard:write, dashboard:read, agent:approve",
     )
     .await;
+    // SEC-76, decision 3: an approver outside the agent's organisation gets 404,
+    // so the approver belongs to it. The intent above is unchanged.
+    common::in_tenant(&app.pool, approver_id, RETAIL_TENANT).await;
     let cookie = session_cookie_for_user(&app.pool, approver_id).await;
     let decided = decide_approval(
         &app.router,
