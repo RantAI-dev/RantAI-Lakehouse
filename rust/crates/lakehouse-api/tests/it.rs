@@ -78,6 +78,7 @@ mod ai_tool;
 mod ai_written_tools;
 mod alert_targets_hidden;
 mod alert_test_route;
+mod assistant_connector_flow;
 mod assistant_settings_route;
 mod audit_compaction;
 mod audit_coverage;
