@@ -174,7 +174,12 @@ fn size(text: &str) -> (usize, usize) {
 /// Raised for `AI-11`'s three sharing tools (owner, 2026-11-26, via the
 /// Auditor): the schemas and the prompt's sharing rule moved the measured
 /// totals to 78,143 / 20,214 / 31,627, deltas +1,736 / +490 / +1,928.
-const ADMIN_BUILD_CEILING: usize = 78_143;
+///
+/// Raised for `AI-16`'s connector-flow rule (owner decision 4, 2026-11-27,
+/// via the Auditor): the new `set_ingest_spec` description and connector flow
+/// rule moved the measured totals to 78,799 / 20,214 / 31,419, deltas
+/// +669 / +0 / +0.
+const ADMIN_BUILD_CEILING: usize = 78_799;
 const ADMIN_ASK_CEILING: usize = 20_214;
 const VIEWER_BUILD_CEILING: usize = 31_627;
 

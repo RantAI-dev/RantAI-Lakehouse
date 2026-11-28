@@ -1732,7 +1732,7 @@ fn get_ingest_spec_schema() -> Value {
 
 fn set_ingest_spec_schema() -> Value {
     json!({ "type": "function", "function": { "name": "set_ingest_spec",
-        "description": "Set what a connector ingests into Bronze. Call get_ingest_spec and discover_source first. adapter and dial must match the connector's type; each source object names a source table (or endpoint, file) and the Bronze table it lands in. When you send a connector's source objects again (for example to add a table), keep each object's loadMode, primaryKey and excludedColumns exactly as get_ingest_spec returned them: an object sent without a loadMode goes back to replace, and one sent without excludedColumns loads every column again. Example for a Postgres table: adapter \"sql\", ingestMode \"batch\", sourceObjects [{\"name\":\"public.orders\",\"target\":\"orders\"}], scheduleCron \"0 * * * *\". The server validates the dial and refuses internal addresses. This tool never carries a credential, so it cannot change where a connector points (adapter, host, port, database, endpoint, bucket, base URL or brokers): such a change is refused with a conflict and is made in the console, where the credentials are entered again.",
+        "description": "Set what a connector ingests into Bronze. To build a connector: create_connector, then this tool with sourceObjects, then discover_source to check the tables, then get_ingest_spec, then run_ingest. This tool replaces sourceObjects, so to add a table call get_ingest_spec and resend the existing objects plus the new one. adapter and dial must match the connector's type; each source object names a source table (or endpoint, file) and the Bronze table it lands in. When you send a connector's source objects again (for example to add a table), keep each object's loadMode, primaryKey and excludedColumns exactly as get_ingest_spec returned them: an object sent without a loadMode goes back to replace, and one sent without excludedColumns loads every column again. Example for a Postgres table: adapter \"sql\", ingestMode \"batch\", sourceObjects [{\"name\":\"public.orders\",\"target\":\"orders\"}], scheduleCron \"0 * * * *\". The server validates the dial and refuses internal addresses. This tool never carries a credential, so it cannot change where a connector points (adapter, host, port, database, endpoint, bucket, base URL or brokers): such a change is refused with a conflict and is made in the console, where the credentials are entered again.",
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string", "description": "connector id" },
             "adapter": { "type": "string", "enum": ["sql", "cdc", "files", "rest", "sheets", "mongodb", "kafka", "sftp", "saas"] },
@@ -3643,6 +3643,32 @@ mod tests {
             assert!(
                 description.contains(clause),
                 "set_board_view_filters must say: {clause}"
+            );
+        }
+    }
+
+    /// `AI-16` decision 2: the old description told the model to call
+    /// `get_ingest_spec` and `discover_source` before `set_ingest_spec`, the
+    /// reverse of the order the tool actually needs, and it hid that this tool
+    /// replaces `sourceObjects` wholesale instead of adding to them.
+    #[test]
+    fn set_ingest_spec_description_names_the_call_order_and_replacement() {
+        let schema = (find("set_ingest_spec").expect("registered tool").schema)();
+        let description = schema["function"]["description"]
+            .as_str()
+            .expect("set_ingest_spec has a description");
+        assert!(
+            !description.contains("Call get_ingest_spec and discover_source first"),
+            "set_ingest_spec must not reverse the call order: {description}"
+        );
+        for clause in [
+            "create_connector, then this tool with sourceObjects, then discover_source",
+            "then get_ingest_spec, then run_ingest",
+            "This tool replaces sourceObjects, so to add a table call get_ingest_spec and resend the existing objects plus the new one",
+        ] {
+            assert!(
+                description.contains(clause),
+                "set_ingest_spec must say: {clause}"
             );
         }
     }
