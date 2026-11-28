@@ -1230,5 +1230,109 @@
       "list_dashboard_access"
     ],
     "expect_refusal": true
+  },
+  {
+    "id": "ai16_connect_postgres_and_load_orders",
+    "mode": "build",
+    "confirm": true,
+    "note": "AI-16 decision 1: measure the whole discover -> spec -> run flow from one prompt. Setup creates the connector so the harness can fill {connector}; pg-src.test is a reserved test hostname, not a real host, and no secret value is in the prompt.",
+    "setup": [
+      {
+        "name": "connector",
+        "method": "POST",
+        "path": "/api/connectors",
+        "body": {
+          "name": "Eval AI16 Connector Orders",
+          "type": "PostgreSQL",
+          "direction": "source",
+          "host": "pg-src.test",
+          "credential": {"source": "env", "primary": "password"},
+          "environment": "production",
+          "tenant": "meridian",
+          "tenantId": "11111111-1111-4111-8111-000000000001"
+        },
+        "id_at": "id"
+      }
+    ],
+    "turns": [
+      "Connect the Postgres at pg-src.test and load table orders into connector {connector}."
+    ],
+    "expect_tool": {
+      "name": "run_ingest",
+      "args_contains": {"id": "{connector}"}
+    },
+    "facts": [
+      {"label": "bronze table", "kind": "text", "values": ["orders"]}
+    ],
+    "expect_state": [
+      {"path": "/api/connectors/{connector}/ingest-spec", "list": "sourceObjects", "where": {"target": "orders"}, "count": 1, "scope": "all"}
+    ]
+  },
+  {
+    "id": "ai16_add_customers_table_to_connector",
+    "mode": "build",
+    "confirm": true,
+    "note": "AI-16 decision 1: set_ingest_spec on an existing connector. Setup creates the connector so the harness can fill {connector}; no credential value is sent.",
+    "setup": [
+      {
+        "name": "connector",
+        "method": "POST",
+        "path": "/api/connectors",
+        "body": {
+          "name": "Eval AI16 Connector Customers",
+          "type": "PostgreSQL",
+          "direction": "source",
+          "host": "pg-src.test",
+          "credential": {"source": "env", "primary": "password"},
+          "environment": "production",
+          "tenant": "meridian",
+          "tenantId": "11111111-1111-4111-8111-000000000001"
+        },
+        "id_at": "id"
+      }
+    ],
+    "turns": [
+      "Add the customers table to connector {connector}."
+    ],
+    "expect_tool": {
+      "name": "set_ingest_spec",
+      "args_contains": {"id": "{connector}"}
+    },
+    "facts": [
+      {"label": "table", "kind": "text", "values": ["customers"]}
+    ],
+    "expect_state": [
+      {"path": "/api/connectors/{connector}/ingest-spec", "list": "sourceObjects", "where": {"target": "customers"}, "count": 1, "scope": "all"}
+    ]
+  },
+  {
+    "id": "ai16_why_did_the_last_load_fail",
+    "mode": "ask",
+    "note": "AI-16 decision 1: a read/explanation case. The assistant must look at the connector's recent ingest runs, not invent a reason; setup creates the connector so the harness can fill {connector}.",
+    "setup": [
+      {
+        "name": "connector",
+        "method": "POST",
+        "path": "/api/connectors",
+        "body": {
+          "name": "Eval AI16 Connector Failed Load",
+          "type": "PostgreSQL",
+          "direction": "source",
+          "host": "pg-src.test",
+          "credential": {"source": "env", "primary": "password"},
+          "environment": "production",
+          "tenant": "meridian",
+          "tenantId": "11111111-1111-4111-8111-000000000001"
+        },
+        "id_at": "id"
+      }
+    ],
+    "turns": [
+      "Why did the last load of connector {connector} fail?"
+    ],
+    "expect_tool": {
+      "name": "list_ingest_runs",
+      "args_contains": {"id": "{connector}"}
+    }
   }
 ]
