@@ -573,8 +573,15 @@ async fn set_dashboard_theme(
         return json!({ "error": "give a theme (auto, light or dark), a font, or both." });
     }
     let bytes = Bytes::from(serde_json::to_vec(&Value::Object(body)).unwrap_or_default());
+    // PR #748 review BLOCKER 1: a theme change is the assistant's, so its version is labelled.
     let result = api_result_to_value(
-        dashboard::boards_update(State(state.clone()), Extension(principal.clone()), bytes).await,
+        dashboard::boards_update_saved_by(
+            state.clone(),
+            principal.clone(),
+            bytes,
+            dashboard::SavedBy::Assistant,
+        )
+        .await,
     )
     .await;
     if result.get("error").is_some() {

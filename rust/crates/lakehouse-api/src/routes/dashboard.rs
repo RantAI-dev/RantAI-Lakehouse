@@ -34,7 +34,7 @@ use crate::policy_engine::PolicyEngineObligations;
 use crate::routes::dashboard_access::{require_entitled, viewer_for};
 use crate::routes::dashboard_organise::{
     BOARD_NOT_FOUND, drop_tile, place_new_chart, require_board, require_chart_board,
-    require_editable_chart, snapshot, visible_live_chart_board,
+    require_editable_chart, snapshot, snapshot_as, visible_live_chart_board,
 };
 use crate::routes::support::{
     effective_chart, is_numeric_type, mart_columns, render_stored_spec, run_spec_sql, sources_for,
@@ -2096,16 +2096,41 @@ async fn file_in_folder(
 ///
 /// 400 when `id` is missing, when `"default"` is sent anything but a
 /// layout, or on a validation/`ClickHouse` failure.
+pub async fn boards_update(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    boards_update_saved_by(state, principal, body, SavedBy::Person).await
+}
+
+/// Who a board save is for (`PR #748 review BLOCKER 1`). A person's save is
+/// recorded as the person's own change. The assistant's tools save as the person
+/// they act for, and their version is labelled as the assistant's change, so
+/// `undo_last_change` can take it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SavedBy {
+    Person,
+    Assistant,
+}
+
+/// [`boards_update`] for a save made by `saved_by`: the same checks and writes,
+/// with the version it records labelled for the assistant when it is one.
+///
+/// # Errors
+///
+/// As [`boards_update`].
 #[allow(
     clippy::too_many_lines,
     reason = "one ordered pipeline (check everything, then write, then snapshot); the \
               BI-17 theme check pushed it one line over and splitting it would scatter \
               the order that keeps a bad save from leaving a board half-edited"
 )]
-pub async fn boards_update(
-    State(state): State<AppState>,
-    Extension(principal): Extension<Principal>,
+pub(crate) async fn boards_update_saved_by(
+    state: AppState,
+    principal: Principal,
     body: Bytes,
+    saved_by: SavedBy,
 ) -> ApiResult<ApiJson<Value>> {
     // BI-19 B2 (plan D8): a caller who holds less than `edit` everywhere is
     // refused first, whatever the request says.
@@ -2207,7 +2232,12 @@ pub async fn boards_update(
     // BI-18 part C, part 2: one version per request that changed the content.
     let changes_content = parsed.changes_content();
     if changes_content {
-        snapshot(ch, &id, &principal).await;
+        match saved_by {
+            // PR #748 review BLOCKER 1: the assistant's save is labelled as its
+            // change, so the history can tell it from a person's edit.
+            SavedBy::Person => snapshot(ch, &id, &principal).await,
+            SavedBy::Assistant => snapshot_as(ch, &id, Some(&principal)).await,
+        }
     }
     // SEC-12. Merged into whichever response below is returned, so a body
     // that also sets `embed` still reports them.

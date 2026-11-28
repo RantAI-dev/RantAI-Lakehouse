@@ -778,6 +778,11 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
         "rename_board" => format!("Renames dashboard {} to \"{}\".", s("id"), s("name")),
         "arrange_board" | "save_board_filters" => board_layout_summary(spec.name, args),
         "move_chart" => format!("Moves chart {} to dashboard {}.", s("id"), s("board")),
+        // AI-21: the card says what goes back and what the undo sends to the trash.
+        "undo_last_change" => format!(
+            "Takes dashboard {} back to how it was before the assistant's last change to it. Charts added since then go to the trash; metrics, parameters and alerts are not changed.",
+            s("board")
+        ),
         // BI-26 slice 2 D9: the Confirm card's text for the one embed write
         // that only narrows access.
         "withdraw_embed_tokens" => format!(

@@ -417,6 +417,26 @@
     ]
   },
   {
+    "id": "board_undo_last_change",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Board Undo"}, "id_at": "board.id"}
+    ],
+    "turns": ["Undo your last change to board {board}."],
+    "expect_tool": {"name": "undo_last_change", "args_contains": {"board": "{board}"}},
+    "expect_state": [
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}"}, "count": 1}
+    ]
+  },
+  {
+    "id": "board_undo_metric_refused",
+    "mode": "build",
+    "setup": [],
+    "turns": ["Undo the metric I made."],
+    "expect_no_tool": ["undo_last_change"]
+  },
+  {
     "id": "board_delete_approval",
     "mode": "build",
     "setup": [

@@ -145,7 +145,9 @@ pub fn resource_for(
         // board the call named (the link's own token is never a resource).
         | "create_public_link"
         | "revoke_public_link"
-        | "list_dashboard_access" => (Some("board"), str_field("board")),
+        | "list_dashboard_access"
+        // AI-21: the undo takes back a board's content, recorded under the board it named.
+        | "undo_last_change" => (Some("board"), str_field("board")),
         // The look tools (`BI-17` part A) read `chart` and `board`, not `id`
         // (merge of main into phase 3: the table was main's, written before
         // they existed).

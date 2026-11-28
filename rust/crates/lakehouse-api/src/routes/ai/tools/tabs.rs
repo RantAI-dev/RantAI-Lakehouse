@@ -18,9 +18,7 @@
 //! The database's text never reaches the model: a failed save is the route's
 //! own fixed sentence.
 
-use axum::Extension;
 use axum::body::Bytes;
-use axum::extract::State;
 use lakehouse_auth::Principal;
 use lakehouse_bi::layout::{self, Tab};
 use lakehouse_bi::store::{self, Board};
@@ -99,8 +97,15 @@ async fn save((state, principal): Who<'_>, board: &str, changes: Value, ok: Valu
     let mut body = changes;
     body["id"] = json!(board);
     let bytes = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
+    // PR #748 review BLOCKER 1: a tab change is the assistant's, so its version is labelled.
     let result = api_result_to_value(
-        dashboard::boards_update(State(state.clone()), Extension(principal.clone()), bytes).await,
+        dashboard::boards_update_saved_by(
+            state.clone(),
+            principal.clone(),
+            bytes,
+            dashboard::SavedBy::Assistant,
+        )
+        .await,
     )
     .await;
     if result.get("error").is_some() {

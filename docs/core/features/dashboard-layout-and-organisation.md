@@ -11,9 +11,10 @@
 
 A dashboard is one long page. It cannot be split into tabs or sections,
 its tiles do not stack on a phone, and copying one drops its filters (and
-fails on the built-in board). Nothing can be undone: a changed or deleted
-dashboard or chart is gone. Every dashboard starts empty, and finding one
-means the browse page.
+fails on the built-in board). A changed dashboard can be restored from
+Versions in the dashboard menu (the last 15 are kept). A deleted dashboard
+or chart goes to the trash for 30 days. Every dashboard starts empty, and
+finding one means the browse page.
 
 ## What the user can do when this is done
 

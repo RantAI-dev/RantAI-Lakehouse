@@ -45,9 +45,9 @@ grain answers from the chart's own grain or not at all.
 
 ## Not included
 
-- **Undo** of any of the above. Boards have no version history yet; the
-  feature page records it as an unmet target and the backlog rows waits
-  for `BI-18` (version history part).
+- **Undo** of a metric, a calculated field, a parameter, an alert or a
+  cache rule. The version history keeps board content only, so these
+  cannot be taken back in one step (`AI-21`).
 - Renaming, deleting or saving default filters on the built-in "Main"
   board. The console refuses each, and the assistant gets the same
   refusal as a plain message.
@@ -183,17 +183,24 @@ assistant to describe only what that line lists.
 | 9 | `AI-2` is two tools, not one: `set_board_view_filters` changes only the person's view (the active filters in the address, nothing saved) by default, and `save_board_filters` saves the board's default only on an explicit request, through Confirm. A single tool that saved by default would change the dashboard for everyone without a second prompt | — | Owner, 2026-10-15 |
 | 10 | "Undo in one step" is not built. Boards have no version history yet, so the assistant cannot undo a rename, a deletion, an arrange, a move or a saved-filters change. It is written as an unmet target, and the backlog gains a row that waits for `BI-18` (version history part) | — | Owner, 2026-10-15 |
 | 11 | "Linked filters" named in `docs/core/specs/ai-2.md` are not in the `BI-18` code at `7a092caf`. The feature page says so and leaves the row unmet; no code for it | Planner default | Owner to confirm at QA |
+| 12 | Undo in one step is built (`AI-21`, see `docs/core/specs/ai-21.md`). Each assistant board write is labelled in the version history, and undo takes back the newest assistant change not already undone. A change by someone else, or the person's own edit, above it blocks the undo. Versions written before this release carry no label and cannot be undone | Owner, 2026-11-27 | Owner to confirm at QA |
 
 ## Limits to tell a customer
 
 - **Layout: last write wins.** A board's layout is replaced whole by the
-  next write. There is no undo and no version history.
+  next write. The assistant's undo takes it back to an earlier version
+  (see the undo limit below).
 - The built-in **Main** board cannot be renamed, deleted, or given
   default filters.
 - **View filters live in the address.** They belong to the person
   looking, not to the board. The board's saved default stays; **Reset**
   returns to it; **Save as default** (an editor) writes it for everyone.
-- **Undo is not built.** It waits for `BI-18` (version history part).
+- **Undo covers board content only** (charts, layout, filters, tabs and
+  the theme), and only the assistant's own changes made since this
+  release. A change by someone else after the assistant's, or the
+  person's own manual edit, is refused: use Versions in the dashboard
+  menu. Versions written before this release carry no mark and cannot be
+  undone by the assistant. The last 15 versions are kept.
 - "Linked filters" named in `docs/core/specs/ai-2.md` are not in the
   `BI-18` code at the base the planner read. The feature page says so
   and leaves the row unmet; no code for it.

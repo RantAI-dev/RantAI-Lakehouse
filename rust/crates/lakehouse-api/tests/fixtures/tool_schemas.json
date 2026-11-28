@@ -3086,6 +3086,24 @@
   {
     "type": "function",
     "function": {
+      "name": "undo_last_change",
+      "description": "Take a dashboard back to how it was before the assistant's last change to it, through its version history. Each call undoes one more assistant change, going further back; an undo never redoes an earlier one. It covers the dashboard's content only: charts, layout, filters, tabs and theme. Metrics, calculated fields, parameters, alerts and cache rules are not in the history and cannot be undone here. It refuses when someone else changed the dashboard after the assistant, and for changes made before the assistant could undo. Charts added since then go to the trash.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "board"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "arrange_board",
       "description": "Place chart tiles on a board's 12-column grid. Send only the tiles that change. It refuses a chart that is not on the board, a box that does not fit the 12-column grid, and a width or height below 1. The board's saved layout is replaced whole; last write wins.",
       "parameters": {
