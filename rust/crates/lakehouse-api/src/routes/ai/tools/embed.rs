@@ -98,6 +98,9 @@ async fn enable_embed(
     };
     let body = json!({ "id": board.id, "embed": true, "embedOrigins": merged });
     let result = api_result_to_value(
+        // PR #748 review BLOCKER 1: embed settings are not board content (AI-21 decision 3),
+        // so this save stays on the person route and its version is not labelled as the
+        // assistant's. An undo of an assistant change refuses past it.
         crate::routes::dashboard::boards_update(
             State(state.clone()),
             axum::Extension(principal.clone()),
@@ -183,6 +186,9 @@ async fn withdraw_embed_tokens(
     };
     let body = json!({ "id": board.id, "embedRevokeAll": true });
     let result = api_result_to_value(
+        // PR #748 review BLOCKER 1: embed settings are not board content (AI-21 decision 3),
+        // so this save stays on the person route and its version is not labelled as the
+        // assistant's. An undo of an assistant change refuses past it.
         crate::routes::dashboard::boards_update(
             State(state.clone()),
             axum::Extension(principal.clone()),

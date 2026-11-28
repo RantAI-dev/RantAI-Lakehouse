@@ -160,10 +160,12 @@ pub(super) async fn rename_board(
         return json!({ "error": "name is required" });
     }
     api_result_to_value(
-        dashboard::boards_update(
-            State(state.clone()),
-            Extension(principal.clone()),
+        // PR #748 review BLOCKER 1: the assistant's save is labelled as its change.
+        dashboard::boards_update_saved_by(
+            state.clone(),
+            principal.clone(),
             encode_body(&json!({ "id": id, "name": name })),
+            dashboard::SavedBy::Assistant,
         )
         .await,
     )
@@ -326,10 +328,12 @@ pub(super) async fn arrange_board(
     let layout = settle_layout(&tabs, &layout, &moved);
 
     api_result_to_value(
-        dashboard::boards_update(
-            State(state.clone()),
-            Extension(principal.clone()),
+        // PR #748 review BLOCKER 1: the assistant's save is labelled as its change.
+        dashboard::boards_update_saved_by(
+            state.clone(),
+            principal.clone(),
             encode_body(&json!({ "id": board, "layout": Value::Object(layout_to_json(&layout)) })),
+            dashboard::SavedBy::Assistant,
         )
         .await,
     )
@@ -712,10 +716,12 @@ pub(super) async fn save_board_filters(
         return json!({ "error": msg });
     }
     api_result_to_value(
-        dashboard::boards_update(
-            State(state.clone()),
-            Extension(principal.clone()),
+        // PR #748 review BLOCKER 1: the assistant's save is labelled as its change.
+        dashboard::boards_update_saved_by(
+            state.clone(),
+            principal.clone(),
             encode_body(&json!({ "id": id, "filters": parsed })),
+            dashboard::SavedBy::Assistant,
         )
         .await,
     )
@@ -1438,6 +1444,111 @@ mod tests {
         .await;
         assert_eq!(reply["ok"], json!(true), "{reply}");
         assert_eq!(version_inserts(&sent(&server).await, "b1"), 1);
+    }
+
+    /// The version an assistant board change records, counted in the statements
+    /// sent to `ClickHouse`: one labelled `Assistant: ` (`PR #748 review BLOCKER 1`).
+    fn labelled_by_assistant(sent: &[String], board: &str) -> usize {
+        sent.iter()
+            .filter(|s| {
+                s.contains("INSERT INTO console.bi_board_version")
+                    && s.contains(&format!("VALUES ('{board}'"))
+                    && s.contains("'Assistant: ")
+            })
+            .count()
+    }
+
+    /// `PR #748 review BLOCKER 1`: a layout the assistant arranges is recorded as
+    /// the assistant's change, so `undo_last_change` can take it back.
+    #[tokio::test]
+    async fn the_assistant_layout_change_is_recorded_as_its_change() {
+        let server = MockServer::start().await;
+        let state = state_on(&server, false).await;
+        let reply = run(
+            &state,
+            Some(&person()),
+            "arrange_board",
+            &args_of(&json!({ "board": "b1", "tiles": { "c3": tile(0, 0, 12, 2) } })),
+        )
+        .await;
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+        let sent = sent(&server).await;
+        assert_eq!(version_inserts(&sent, "b1"), 1, "{sent:#?}");
+        assert_eq!(labelled_by_assistant(&sent, "b1"), 1, "{sent:#?}");
+    }
+
+    /// `PR #748 review BLOCKER 1`: a rename the assistant makes is recorded as the
+    /// assistant's change.
+    #[tokio::test]
+    async fn the_assistant_rename_is_recorded_as_its_change() {
+        let server = MockServer::start().await;
+        let state = state_on(&server, false).await;
+        let reply = run(
+            &state,
+            Some(&person()),
+            "rename_board",
+            &args_of(&json!({ "id": "b1", "name": "Renamed" })),
+        )
+        .await;
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+        let sent = sent(&server).await;
+        assert_eq!(labelled_by_assistant(&sent, "b1"), 1, "{sent:#?}");
+    }
+
+    /// `PR #748 review BLOCKER 1`: a tab the assistant adds is recorded as the
+    /// assistant's change, so `undo_last_change` can take it back.
+    #[tokio::test]
+    async fn the_assistant_tab_change_is_recorded_as_its_change() {
+        let server = MockServer::start().await;
+        let state = state_on(&server, false).await;
+        let reply = super::super::tabs::run(
+            &state,
+            Some(&person()),
+            "create_tab",
+            &args_of(&json!({ "board": "b1", "title": "Maps" })),
+        )
+        .await;
+        assert!(reply.get("error").is_none(), "{reply}");
+        let sent = sent(&server).await;
+        assert_eq!(version_inserts(&sent, "b1"), 1, "{sent:#?}");
+        assert_eq!(labelled_by_assistant(&sent, "b1"), 1, "{sent:#?}");
+    }
+
+    /// `PR #748 review BLOCKER 1`: a theme the assistant sets is recorded as the
+    /// assistant's change, so `undo_last_change` can take it back.
+    #[tokio::test]
+    async fn the_assistant_theme_change_is_recorded_as_its_change() {
+        let server = MockServer::start().await;
+        let state = state_on(&server, false).await;
+        let reply = super::super::look::run(
+            &state,
+            Some(&person()),
+            "set_dashboard_theme",
+            &args_of(&json!({ "board": "b1", "theme": "dark" })),
+        )
+        .await;
+        assert!(reply.get("error").is_none(), "{reply}");
+        let sent = sent(&server).await;
+        assert_eq!(version_inserts(&sent, "b1"), 1, "{sent:#?}");
+        assert_eq!(labelled_by_assistant(&sent, "b1"), 1, "{sent:#?}");
+    }
+
+    /// `PR #748 review BLOCKER 1`: a save a person makes on the console route is
+    /// still recorded as that person's change, not labelled as the assistant's.
+    #[tokio::test]
+    async fn a_person_saving_on_the_console_route_is_not_recorded_as_the_assistants() {
+        let server = MockServer::start().await;
+        let state = state_on(&server, false).await;
+        let result = dashboard::boards_update(
+            State(state.clone()),
+            Extension(person()),
+            encode_body(&json!({ "id": "b1", "name": "By hand" })),
+        )
+        .await;
+        assert!(result.is_ok(), "the console save should succeed");
+        let sent = sent(&server).await;
+        assert_eq!(version_inserts(&sent, "b1"), 1, "{sent:#?}");
+        assert_eq!(labelled_by_assistant(&sent, "b1"), 0, "{sent:#?}");
     }
 
     /// `move_chart` puts the chart on the target board, takes its tile off the
