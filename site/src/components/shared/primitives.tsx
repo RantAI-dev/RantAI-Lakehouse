@@ -1,0 +1,130 @@
+import * as React from "react";
+import { cn } from "@/lib/utils";
+
+/**
+ * Small layout and button primitives shared by the landing sections. They
+ * hold the page's measurements so no section re-decides them: a 1120 px
+ * column with a 24 px gutter (16 px on phones), per plan §4.
+ */
+
+export function Container({
+  className,
+  children,
+  ...rest
+}: React.HTMLAttributes<HTMLDivElement>) {
+  return (
+    <div className={cn("mx-auto w-full max-w-[1120px] px-4 md:px-6", className)} {...rest}>
+      {children}
+    </div>
+  );
+}
+
+export function Eyebrow({
+  className,
+  children,
+  ...rest
+}: React.HTMLAttributes<HTMLParagraphElement>) {
+  return (
+    <p
+      className={cn(
+        "text-[12px] leading-4 font-medium tracking-[0.22em] text-[#44A6FA] uppercase",
+        className,
+      )}
+      {...rest}
+    >
+      {children}
+    </p>
+  );
+}
+
+type CtaProps = React.AnchorHTMLAttributes<HTMLAnchorElement> & {
+  variant?: "solid" | "ghost";
+  size?: "md" | "sm";
+};
+
+/**
+ * A real `<a>` (plan §2.8): works without JavaScript and with a keyboard.
+ * WEB-5 D18: a link to another site always carries `rel="noopener
+ * noreferrer"`, whatever the caller passes. Pressing it settles it back
+ * down (DESIGN.md §3: no button stays still when clicked).
+ */
+export function CtaLink({ variant = "solid", size = "md", className, children, rel, ...rest }: CtaProps) {
+  const external = typeof rest.href === "string" && /^https?:\/\//.test(rest.href);
+  return (
+    <a
+      rel={external ? "noopener noreferrer" : rel}
+      className={cn(
+        "group relative inline-flex items-center justify-center gap-2 rounded-full font-medium whitespace-nowrap transition-[transform,background-color,box-shadow,border-color] duration-200 ease-out active:translate-y-0 active:scale-[0.98] active:duration-100 motion-reduce:transition-none motion-reduce:hover:translate-y-0",
+        // "sm" is only the top bar's button: rantai-page's PillLink there is text-sm.
+        size === "md" ? "h-12 px-7 text-[15px]" : "h-9 px-4 text-sm",
+        variant === "solid"
+          ? "bg-[var(--lk-primary)] text-white shadow-[0_0_0_0_rgba(68,166,250,0)] hover:-translate-y-0.5 hover:bg-[var(--lk-primary-hover)] active:bg-[var(--lk-primary-press)] hover:shadow-[0_10px_40px_-8px_rgba(68,166,250,0.7)]"
+          : "border border-[#E8F4FF]/35 text-[#E8F4FF] hover:-translate-y-0.5 hover:border-[#E8F4FF]/70 hover:bg-[#E8F4FF]/10",
+        className,
+      )}
+      {...rest}
+    >
+      {children}
+    </a>
+  );
+}
+
+/**
+ * Big Inter Tight title (bold, tight-tracked; the tracking lives in `.lk-display`). Size and line height travel together as one class
+ * string. In the console, `tailwind-merge` dropped a `leading-*` that
+ * preceded a later `text-[size]`, so overriding the size alone reset the
+ * line height to the 48 px h1 rule and stacked the lines. The site's `cn`
+ * does not merge (WEB-5 T5), and callers override sizes only at a
+ * breakpoint (`max-md:`), which never conflicts with these.
+ */
+const HEADING_SIZE = {
+  xl: "text-[clamp(3.5rem,7vw,5.75rem)] leading-[1]",
+  lg: "text-[clamp(2.5rem,5.4vw,4.5rem)] leading-[1.02]",
+  md: "text-[clamp(2.1rem,4vw,3.25rem)] leading-[1.04]",
+  sm: "text-[clamp(1.75rem,2.8vw,2.25rem)] leading-[1.06]",
+} as const;
+
+export function DisplayHeading({
+  as: Tag = "h2",
+  size = "lg",
+  className,
+  children,
+  ...rest
+}: {
+  as?: "h1" | "h2";
+  size?: keyof typeof HEADING_SIZE;
+  className?: string;
+  children: React.ReactNode;
+} & React.HTMLAttributes<HTMLHeadingElement>) {
+  return (
+    <Tag
+      className={cn(
+        "lk-display text-balance text-[#E8F4FF]",
+        HEADING_SIZE[size],
+        className,
+      )}
+      {...rest}
+    >
+      {children}
+    </Tag>
+  );
+}
+
+export function LeadText({
+  className,
+  children,
+}: {
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <p
+      className={cn(
+        "text-[17px] leading-[1.6] text-pretty text-[#E8F4FF]/80 md:text-[19px] md:leading-[1.6]",
+        className,
+      )}
+    >
+      {children}
+    </p>
+  );
+}

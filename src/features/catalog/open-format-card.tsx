@@ -7,6 +7,14 @@ import { Copyable } from "@/components/copyable"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import {
   Table,
@@ -18,7 +26,7 @@ import {
 } from "@/components/ui/table"
 import { useService, useServiceAction, type ServiceState } from "@/hooks/use-service"
 import { formatDateTime } from "@/lib/format"
-import { freshnessLine } from "@/lib/gold-freshness"
+import { freshnessLine, SYNC_MODE_LABELS } from "@/lib/gold-freshness"
 import { READERS_SHOWN, consumerLine, consumerState } from "@/lib/gold-consumers"
 import { fmtMeasured } from "@/lib/measured"
 import { goldService } from "@/services"
@@ -28,9 +36,12 @@ import type {
   GoldLatestCopyHolds,
   GoldPublication,
   GoldReadBack,
+  GoldSyncSchedule,
+  GoldSyncSetting,
   GoldTrimSummary,
   GoldZone,
 } from "@/services/contracts/gold"
+import { TimeZoneSelect, browserTimeZone } from "@/components/patterns/time-zone-select"
 // Shared with the asset "Connect" dialog: both name the mart the Gold export
 // routes use, not the `serving.`-prefixed catalog id.
 import { martFromAssetId as trimmedMart } from "./asset-connect-snippets"
@@ -202,6 +213,222 @@ function ReadersValue({ state }: { state: ServiceState<GoldConsumers> }) {
   )
 }
 
+/** `DATA-66` D5: the editor's own state, prefilled from the stored slot. */
+type SyncDraft = {
+  kind: "hourly" | "daily"
+  hour: number
+  minute: number
+  timeZone: string
+}
+
+/**
+ * `DATA-66` D4: when "On a schedule" is first picked, pre-fill daily
+ * 04:00 (today's nightly time) in the browser's zone, falling back to
+ * `UTC` when the runtime cannot say. An existing schedule keeps its own
+ * slot and zone, so opening the editor never rewrites it by accident.
+ */
+function syncDraft(publication: GoldPublication): SyncDraft {
+  const timeZone =
+    publication.timeZone ?? browserTimeZone() ?? "UTC"
+  if (publication.schedule?.kind === "hourly") {
+    return { kind: "hourly", hour: 4, minute: publication.schedule.minute, timeZone }
+  }
+  if (publication.schedule?.kind === "daily") {
+    return {
+      kind: "daily",
+      hour: publication.schedule.hour,
+      minute: publication.schedule.minute,
+      timeZone,
+    }
+  }
+  return { kind: "daily", hour: 4, minute: 0, timeZone }
+}
+
+/**
+ * `DATA-66` D2/D8: the "Sync" row of the publish card, with the editor for
+ * "On a schedule". The two one-click modes save at once; the scheduled
+ * editor prefills per D4 and saves the mode, the slot and the IANA zone in
+ * one PUT. Every mode line is the feature page's own sentence, so the
+ * card cannot promise a cadence the API does not run.
+ */
+function SyncSetting({
+  mart,
+  zone,
+  publication,
+  canEdit,
+  onSaved,
+}: {
+  mart: string
+  zone: GoldZone
+  publication: GoldPublication
+  canEdit: boolean
+  onSaved: () => void
+}) {
+  const [editing, setEditing] = React.useState(false)
+  const [draft, setDraft] = React.useState<SyncDraft>(() => syncDraft(publication))
+  const save = useServiceAction((signal, sync: GoldSyncSetting) =>
+    goldService.setPublication(mart, true, signal, zone, sync)
+  )
+  const saving = save.status === "pending"
+
+  async function persist(sync: GoldSyncSetting) {
+    const result = await save.run(sync)
+    if (result !== null) {
+      setEditing(false)
+      onSaved()
+    }
+  }
+
+  function startEditing() {
+    setDraft(syncDraft(publication))
+    setEditing(true)
+  }
+
+  function pickMode(mode: string) {
+    if (mode === "scheduled") {
+      startEditing()
+      return
+    }
+    setEditing(false)
+    void persist({ syncMode: mode })
+  }
+
+  const mode = editing ? "scheduled" : publication.syncMode
+  const line =
+    mode === "manual"
+      ? "Synced only when you press Publish now."
+      : mode === "scheduled"
+        ? publication.nextSyncAt
+          ? `Next sync: ${formatDateTime(publication.nextSyncAt)} (${publication.timeZone ?? "UTC"}).`
+          : "No next sync yet."
+        : "Synced after each pipeline write, and checked every 15 seconds for other changes."
+
+  function saveSchedule() {
+    const schedule: GoldSyncSchedule =
+      draft.kind === "hourly"
+        ? { kind: "hourly", minute: draft.minute }
+        : { kind: "daily", hour: draft.hour, minute: draft.minute }
+    void persist({ syncMode: "scheduled", schedule, timeZone: draft.timeZone })
+  }
+
+  const pad = (n: number) => String(n).padStart(2, "0")
+
+  return (
+    <div className="flex flex-col gap-2" data-testid="sync-setting">
+      <div className="flex flex-wrap items-center gap-2 text-sm">
+        <span className="text-muted-foreground">Sync</span>
+        <Select
+          value={mode}
+          items={SYNC_MODE_LABELS}
+          onValueChange={(next) => {
+            if (next) pickMode(next)
+          }}
+          disabled={!canEdit || saving}
+        >
+          <SelectTrigger size="sm" aria-label="Sync mode">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {Object.entries(SYNC_MODE_LABELS).map(([value, label]) => (
+              <SelectItem key={value} value={value}>
+                {label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {/* DATA-66 review R3: choosing "On a schedule" again changes nothing
+            when the stored mode already is `scheduled`, so a saved schedule
+            had no way back into the editor. This opens it with the stored
+            slot and zone prefilled; `Cancel` below leaves without a write. */}
+        {publication.syncMode === "scheduled" && canEdit && !editing && (
+          <Button size="sm" variant="outline" onClick={startEditing}>
+            Edit schedule
+          </Button>
+        )}
+      </div>
+      {editing && (
+        <div className="flex flex-wrap items-end gap-2" data-testid="sync-schedule-editor">
+          <Select
+            value={draft.kind}
+            items={{ hourly: "Hourly", daily: "Daily" }}
+            onValueChange={(next) => {
+              if (next === "hourly" || next === "daily") setDraft({ ...draft, kind: next })
+            }}
+            disabled={!canEdit || saving}
+          >
+            <SelectTrigger size="sm" aria-label="Frequency">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="hourly">Hourly</SelectItem>
+              <SelectItem value="daily">Daily</SelectItem>
+            </SelectContent>
+          </Select>
+          {draft.kind === "hourly" ? (
+            <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+              Minute
+              <Input
+                type="number"
+                min={0}
+                max={59}
+                aria-label="Minute"
+                className="w-20"
+                value={draft.minute}
+                disabled={!canEdit || saving}
+                onChange={(e) => {
+                  const minute = Number(e.target.value)
+                  if (Number.isInteger(minute) && minute >= 0 && minute <= 59) {
+                    setDraft({ ...draft, minute })
+                  }
+                }}
+              />
+            </label>
+          ) : (
+            <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+              Time
+              <Input
+                type="time"
+                aria-label="Time of day"
+                className="w-28"
+                value={`${pad(draft.hour)}:${pad(draft.minute)}`}
+                disabled={!canEdit || saving}
+                onChange={(e) => {
+                  const [hour, minute] = e.target.value.split(":").map(Number)
+                  if (Number.isInteger(hour) && Number.isInteger(minute)) {
+                    setDraft({ ...draft, hour, minute })
+                  }
+                }}
+              />
+            </label>
+          )}
+          <div className="w-56">
+            <TimeZoneSelect
+              id="sync-time-zone"
+              value={draft.timeZone}
+              onValueChange={(timeZone) => setDraft({ ...draft, timeZone })}
+              disabled={!canEdit || saving}
+            />
+          </div>
+          <Button size="sm" variant="outline" disabled={!canEdit || saving} onClick={saveSchedule}>
+            {saving ? "Saving…" : "Save schedule"}
+          </Button>
+          <Button size="sm" variant="ghost" disabled={saving} onClick={() => setEditing(false)}>
+            Cancel
+          </Button>
+        </div>
+      )}
+      <p className="text-xs text-muted-foreground" data-testid="sync-line">
+        {line}
+      </p>
+      {save.status === "error" && (
+        <p role="alert" className="text-sm text-destructive">
+          {save.error.message}
+        </p>
+      )}
+    </div>
+  )
+}
+
 export function OpenFormatCard({ assetId }: { assetId: string }) {
   // DATA-65: a Silver asset publishes to the `silver` Iceberg namespace;
   // every other asset (Gold `serving.*`) keeps the old gold behavior.
@@ -301,6 +528,18 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
             {line}
           </span>
         </div>
+        {/* DATA-66: with publishing on, the table's own sync choice. It is
+            shown read-only without `canEdit`, with the same explanation
+            the switch carries above. */}
+        {enabled && (
+          <SyncSetting
+            mart={mart}
+            zone={zone}
+            publication={p}
+            canEdit={canEdit}
+            onSaved={() => pub.reload()}
+          />
+        )}
         {/* QA LH-DATA-1-01 (DATA-49): what failed, when, and where the last good
             copy stands — so "Last publish failed" is actionable without opening
             the history. The failure's own sentence is the API's. */}

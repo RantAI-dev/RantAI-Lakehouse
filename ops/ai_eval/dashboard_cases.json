@@ -24,6 +24,20 @@
     ]
   },
   {
+    "id": "ai13_chart_number_lineage",
+    "mode": "ask",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Board Lineage"}, "id_at": "board.id"},
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Events Total Lineage", "kind": "kpi", "mart": "mart_event", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "context": "The user is viewing the dashboard \"Eval Board Lineage\" (board id: {board}). Time grain: each chart's own. Active filters: none. Tiles and the data they currently show (built-in tiles are not editable):\n- \"Eval Events Total Lineage\" (kpi, id {chart}; mart_event): not loaded",
+    "turns": ["Where does this number come from?"],
+    "expect_tool": {"name": "get_lineage", "args_contains": {"chart": "{chart}"}},
+    "facts": [
+      {"label": "source table", "kind": "text", "values": ["mart_event"]}
+    ]
+  },
+  {
     "id": "dash_mart_columns",
     "mode": "ask",
     "turns": ["What can I chart from the events mart?"],
@@ -1149,5 +1163,72 @@
     "expect_state": [
       {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "bar", "def.dimension": "jumlah", "def.bin.mode": "width", "def.bin.width": 500}, "count": 1}
     ]
+  },
+  {
+    "id": "public_link_approval",
+    "mode": "build",
+    "setup": [
+      {
+        "name": "board",
+        "method": "POST",
+        "path": "/api/dashboard/boards",
+        "body": {
+          "name": "Eval Public Board"
+        },
+        "id_at": "board.id"
+      }
+    ],
+    "turns": [
+      "Make the dashboard {board} public for a week."
+    ],
+    "expect_approval": {"tool": "create_public_link", "args_contains": {"days": 7}}
+  },
+  {
+    "id": "dashboard_access_list",
+    "mode": "ask",
+    "setup": [
+      {
+        "name": "board",
+        "method": "POST",
+        "path": "/api/dashboard/boards",
+        "body": {
+          "name": "Eval Access Board"
+        },
+        "id_at": "board.id"
+      }
+    ],
+    "turns": [
+      "Who can see the dashboard {board}?"
+    ],
+    "expect_tool": {
+      "name": "list_dashboard_access",
+      "args_contains": {
+        "board": "{board}"
+      }
+    }
+  },
+  {
+    "id": "assistant_cannot_share_people_access",
+    "mode": "build",
+    "setup": [
+      {
+        "name": "board",
+        "method": "POST",
+        "path": "/api/dashboard/boards",
+        "body": {
+          "name": "Eval People Board"
+        },
+        "id_at": "board.id"
+      }
+    ],
+    "turns": [
+      "Give Budi edit access to the dashboard {board}."
+    ],
+    "expect_no_tool": [
+      "create_public_link",
+      "revoke_public_link",
+      "list_dashboard_access"
+    ],
+    "expect_refusal": true
   }
 ]

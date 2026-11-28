@@ -1,0 +1,181 @@
+/**
+ * Where every product claim the WEB-5 refresh added comes from (D7).
+ *
+ * A claim may only name what `docs/core/BACKLOG.md` marks Released, Done or
+ * In Acceptance: PRODUCT §2's BI rows are stale, so the backlog is the
+ * source. Each entry names the message key that makes the claim and the
+ * backlog rows behind it, with their status when this was written
+ * (2026-11-04), so a reviewer can check one row per line. `claims.test.ts`
+ * fails if a key is missing in either language, or if a phrase from the
+ * "do not add" list appears anywhere in the messages.
+ *
+ * The rule of WEB-1's copy stands: no logos, numbers, testimonials, prices
+ * or "trusted by".
+ */
+
+export type Claim = {
+  /** Dotted message path; array items by index (`home.sources.items.9`). */
+  key: string;
+  /** Backlog rows, each with its status when the claim was added (2026-11-04; the FAQ 2026-11-07). */
+  backlog: readonly string[];
+  /** What part of the text the rows back, when the key holds more than one claim. */
+  note?: string;
+};
+
+export const CLAIMS: readonly Claim[] = [
+  // Sources
+  { key: "home.sources.sub", backlog: ["SRC-3 Released"], note: "business apps" },
+  { key: "home.sources.items.9", backlog: ["SRC-3 Released"], note: "Salesforce" },
+  { key: "home.sources.items.10", backlog: ["SRC-3 Released"], note: "ServiceNow" },
+  { key: "home.sources.items.11", backlog: ["SRC-3 Released"], note: "Google Analytics 4" },
+  { key: "home.sources.items.12", backlog: ["SRC-3 Released"], note: "HubSpot" },
+  { key: "home.sources.items.13", backlog: ["SRC-3 Released"], note: "Zendesk" },
+  { key: "home.sources.items.14", backlog: ["SRC-3 Released"], note: "Confluence" },
+  { key: "home.sources.items.15", backlog: ["SRC-3 Released"], note: "Dynamics 365" },
+  { key: "home.sources.items.16", backlog: ["SRC-3 Released"], note: "SharePoint" },
+  { key: "home.sources.items.17", backlog: ["DATA-17 Released"], note: "JSON, JSON Lines and Avro uploads" },
+  { key: "home.sources.items.18", backlog: ["DATA-17 Released"], note: "gzip and zip archives" },
+  {
+    key: "home.sources.caption",
+    backlog: ["SRC-10 Released", "SRC-13 Released", "DATA-17 Released", "DATA-35 Released"],
+    note: "dedupe and keep history (SCD2) on load; table discovery for every source; 10 files at once; folders. Live change capture for PostgreSQL is WEB-1's claim, kept (D7)",
+  },
+  // Depths
+  // O21 (2026-11-07): each depth shows what it does to the data, on a card of
+  // fictional rows labelled "Illustration" (components/home/depth-records.ts).
+  // The words of each line and of each card label are claims.
+  { key: "home.depths.layers.bronze.body", backlog: ["WEB-1 In Acceptance", "BLD-3 Done"], note: "kept as the source sent it, in open Iceberg tables (WEB-1's copy; BLD-3: Bronze is Iceberg)" },
+  {
+    key: "home.depths.layers.silver.body",
+    backlog: ["WEB-1 In Acceptance", "SRC-10 Released", "DATA-14 Released"],
+    note: "pipelines clean and join the raw data (WEB-1's copy; the card's dropped duplicate is also a load mode, SRC-10); quality checks flag what fails (DATA-14)",
+  },
+  {
+    key: "home.depths.card.checks.duplicates",
+    backlog: ["DATA-14 Released"],
+    note: "duplicate count is one of DATA-14's ready checks (features/data-quality-in-depth.md, decision 1)",
+  },
+  { key: "home.depths.card.checks.city", backlog: ["DATA-14 Released"], note: "accepted values is one of DATA-14's ready checks" },
+  {
+    key: "home.depths.card.checks.amount",
+    backlog: ["DATA-14 Released"],
+    note: "null count is one of DATA-14's ready checks; a failing check is flagged and never blocks the load (decision 4), so the row stays",
+  },
+  { key: "home.depths.layers.gold.body", backlog: ["BLD-2 In Acceptance"], note: "tables that refresh themselves within a target lag set per pipeline (BLD-2); that dashboards and the assistant read Gold is the card's footer (home.depths.card.feeds)" },
+  { key: "home.depths.card.lag", backlog: ["BLD-2 In Acceptance"], note: "a table refreshing within its target lag" },
+  { key: "home.depths.card.feeds", backlog: ["WEB-1 In Acceptance", "AI-18 In Acceptance"], note: "dashboards and the assistant read Gold" },
+  // Assistant section (Query Studio, D7)
+  // O19 follow-up (2026-11-07): the lead became one line and three chips.
+  { key: "home.assistant.sub", backlog: ["AI-18 In Acceptance"], note: "ask in plain language; risky actions wait for a person's approval (WriteHigh tools go to Approvals)" },
+  { key: "home.assistant.features.0", backlog: ["AI-18 In Acceptance"], note: "builds charts and dashboards with the console's own tools (create_chart, create_board, suggest_dashboard)" },
+  { key: "home.assistant.features.1", backlog: ["AI-18 In Acceptance"], note: "runs pipelines (the Pipeline Builder tools: trigger_pipeline, retry_pipeline_run, ...)" },
+  { key: "home.assistant.features.2", backlog: ["QS-1 In Acceptance", "QS-4 In Acceptance"], note: "autocomplete, tabs, query history" },
+  // O19 (2026-11-07): the assistant panel is an illustration, but every
+  // behaviour it plays is the console's own.
+  { key: "home.assistant.placeholder", backlog: ["AI-18 In Acceptance"], note: "the console composer's own placeholder (src/features/copilot/chat-composer.tsx)" },
+  { key: "home.assistant.modes.build", backlog: ["AI-18 In Acceptance"], note: "the composer's Ask/Build switch; Build can change things, asking first" },
+  { key: "home.assistant.steps.read", backlog: ["AI-18 In Acceptance", "AI-24 Done"], note: "a turn shows its tool steps as they run and keeps them (tool-step.tsx; AI-24)" },
+  {
+    key: "home.assistant.approvalLabel",
+    backlog: ["AI-18 In Acceptance"],
+    note: "pause_pipeline is a WriteHigh tool: \"Needs human approval before it runs\" (registry.rs); it waits in Approvals and nothing executes until a person approves (gate.rs)",
+  },
+  { key: "home.assistant.impact", backlog: ["AI-18 In Acceptance"], note: "pause_pipeline pauses the pipeline's schedule; the 02:00 run is the illustration's" },
+  { key: "home.assistant.approvedBy", backlog: ["AI-18 In Acceptance", "SEC-57 Done"], note: "another person approves: the one who asked cannot approve their own request (SEC-57)" },
+  // Dashboards
+  // O10 (2026-11-07): the dashboards' feature list became one line and a row of chips; each chip is its own claim.
+  {
+    key: "home.dashboards.sub",
+    backlog: ["WEB-1 In Acceptance", "BI-16 Building (part C2 merged in #246/#265): your own map boundaries, not every chart type"],
+    note: "about two dozen chart types (WEB-1's claim); maps on your own boundaries (BI-16 C2)",
+  },
+  // Governance
+  // The hero's reassurance line (D21, 2026-11-07): each part is a claim.
+  // O50 (audit #7): the three parts are one line now; the licence joined the first part.
+  { key: "home.hero.reassurance.0", backlog: ["WEB-1 In Acceptance"], note: "free and open source: the repository is public under the AGPL-3.0 (its LICENSE is the GNU AGPL v3), with no price (the open-source card; JSON-LD isAccessibleForFree)" },
+  { key: "home.hero.reassurance.1", backlog: ["WEB-1 In Acceptance", "REL-2 Done"], note: "the 'Your servers or ours' card; the stack runs from docker-compose.yml (REL-2)" },
+  // O50 (audit #7): the hero's audience line, in place of the product name the top bar already shows.
+  { key: "home.hero.eyebrow", backlog: ["REL-2 Done", "WEB-1 In Acceptance"], note: "who runs their own stack: the Lakehouse is self-hosted from docker-compose.yml on the team's own servers (REL-2; the 'Your servers or ours' card)" },
+  // Governance (O16 + O17, 2026-11-07): the one-line lead and the bento's lines.
+  { key: "home.governance.sub", backlog: ["WEB-1 In Acceptance"], note: "roles decide who sees what; columns are classified and masked (WEB-1's claim, the table shows it)" },
+  { key: "home.governance.bento.lineage.line", backlog: ["DATA-13 Released"], note: "column-level lineage" },
+  { key: "home.governance.bento.proof.line", backlog: ["WEB-1 In Acceptance"], note: "masking proven end to end in an acceptance gate (WEB-1's governance fact, kept; the gate is ops/g*)" },
+  { key: "home.governance.bento.audit.line", backlog: ["AI-18 In Acceptance", "SEC-57 Done"], note: "assistant actions logged; risky ones wait for a person's approval" },
+  { key: "home.governance.bento.catalog.line", backlog: ["DATA-11 Released", "DATA-12 Released"], note: "catalog search; certified and deprecated marks; governed tags (the tag chip)" },
+  { key: "home.governance.bento.access.line", backlog: ["BI-19 In Acceptance"], note: "permissions per dashboard and per folder" },
+  // The real console (D19, 2026-11-07): since O22 an HTML recreation of its
+  // home (open-visuals.tsx), with the console's own strings
+  // (src/lib/home-prompts.ts, src/features/home/home-shortcuts.ts).
+  {
+    key: "home.open.console.caption",
+    backlog: ["AI-18 In Acceptance"],
+    note: "ask in plain language on the console's home (Copilot Chat); the three shortcuts are the home page's own. O22: the crop became an HTML recreation with the console's own strings (open-visuals.tsx names the files)",
+  },
+  // O22 (2026-11-07): "Yours to keep" as a bento; each tile's line and label is a claim.
+  { key: "home.open.cards.0.body", backlog: ["WEB-1 In Acceptance"], note: "the repository's LICENSE is the GNU AGPL v3, and it is public; the code tile shows real lines of routes/ai/gate.rs" },
+  { key: "home.open.code.sr", backlog: ["AI-18 In Acceptance", "SEC-57 Done"], note: "create_write_high_approval holds a WriteHigh call for a person and fails closed with no Postgres (gate.rs)" },
+  { key: "home.open.cards.1.body", backlog: ["WEB-1 In Acceptance", "BLD-3 Done"], note: "raw data is Iceberg (BLD-3: Bronze is Iceberg), so any Iceberg reader can read it (WEB-1's open-tables card)" },
+  { key: "home.open.tables.builtIn", backlog: ["BLD-3 Done"], note: "the Lakehouse reads its Iceberg tables with ClickHouse, through a DataLakeCatalog database (compose: clickhouse-iceberg-init); no other engine is named" },
+  { key: "home.open.cards.2.body", backlog: ["WEB-1 In Acceptance", "REL-2 Done"], note: "the stack runs on your servers from docker-compose.yml; running it for you is only \"talk to us\"" },
+  { key: "home.open.hosting.talk", backlog: ["WEB-1 In Acceptance"], note: "\"talk to us about running it\": no managed offering is claimed" },
+  // Get started (D20, 2026-11-07): the README's Quickstart, step by step.
+  { key: "home.getStarted.sub", backlog: ["WEB-1 In Acceptance"], note: "README Quickstart: \"Assumes you have Docker installed and nothing else\"" },
+  { key: "home.getStarted.steps.0.note", backlog: ["WEB-1 In Acceptance"], note: "README Quickstart step 1: git clone the public repository" },
+  { key: "home.getStarted.steps.1.note", backlog: ["SEC-18 Done", "REL-2 Done"], note: "README step 2: ops/init-env.sh writes .env with generated values (no default credentials, SEC-18); AUTH_BOOTSTRAP_EMAIL / _PASSWORD create the first admin" },
+  { key: "home.getStarted.steps.2.note", backlog: ["REL-2 Done"], note: "README step 3: scripts/compose.sh up --build; the console listens on :3000 once the API is healthy (REL-2 slice 1: the console in the stack)" },
+  // Contact page FAQ (D15, 2026-11-07): every answer is a claim. Most repeat
+  // what the home page already says (WEB-1's copy, "limited to what is
+  // built", In Acceptance), so they trace to the same rows.
+  {
+    key: "contact.faq.items.0.a",
+    backlog: ["WEB-1 In Acceptance", "SRC-3 Released", "AI-18 In Acceptance", "QS-1 In Acceptance"],
+    note: "one lakehouse with dashboards; databases, files, streams and business apps; open Iceberg tables; plain-language answers (assistant); SQL in Query Studio",
+  },
+  {
+    key: "contact.faq.items.1.a",
+    backlog: ["WEB-1 In Acceptance"],
+    note: "the open-source card (AGPL-3.0); the repository's LICENSE is the GNU AGPL v3 and the repository is public",
+  },
+  {
+    key: "contact.faq.items.2.a",
+    backlog: ["WEB-1 In Acceptance", "REL-2 Done"],
+    note: "the 'Your servers or ours' card; the stack runs from docker-compose.yml with its object storage (rustfs) and Iceberg catalog (lakekeeper) in the default profile (REL-2 slice 1: the console in the stack)",
+  },
+  {
+    key: "contact.faq.items.3.a",
+    backlog: ["WEB-1 In Acceptance", "SRC-3 Released", "DATA-17 Released"],
+    note: "the sources section's list, word for word: databases, Kafka, REST, files (WEB-1); the eight business apps (SRC-3); JSON, JSON Lines, Avro, archives (DATA-17); change capture for PostgreSQL only (D7)",
+  },
+  {
+    key: "contact.faq.items.4.a",
+    backlog: ["WEB-1 In Acceptance", "DATA-14 Released", "BLD-2 In Acceptance"],
+    note: "the depths section: raw in Iceberg (WEB-1); quality checks (DATA-14); refresh within a target lag (BLD-2)",
+  },
+  {
+    key: "contact.faq.items.5.a",
+    backlog: ["AI-18 In Acceptance", "SEC-57 Done"],
+    note: "the console's own tools; risky actions wait for approval (AI-18; the pause example is the home page's illustration); the asker cannot approve their own request (SEC-57)",
+  },
+  {
+    key: "contact.faq.items.6.a",
+    backlog: ["WEB-1 In Acceptance", "BLD-3 Done", "DATA-1 In Acceptance"],
+    note: "raw data in Iceberg, readable by any Iceberg engine (the open-tables card; BLD-3: Bronze is Iceberg); Gold published as open tables (DATA-1)",
+  },
+  {
+    key: "contact.faq.items.7.a",
+    backlog: ["WEB-1 In Acceptance", "REL-2 Done"],
+    note: "README Quickstart: clone, `sh ops/init-env.sh`, `scripts/compose.sh up` (Docker Compose); 'Install it' links there (D8). Not the one-step installer: REL-2's release is a draft until the owner publishes it",
+  },
+];
+
+/**
+ * D7's "do not add" list, as patterns no message may match: change capture
+ * for MySQL or SQL Server (SRC-4 Planned, VER-1 Todo), SFTP (VER-1 Todo),
+ * and "every chart type" (BI-16 Building), in both languages.
+ */
+export const FORBIDDEN: readonly RegExp[] = [
+  // English and Indonesian ("change capture untuk MySQL").
+  /change capture (?:\S+ )?(?:for|untuk) (?:[^.]*\b)?(?:MySQL|SQL Server)/i,
+  /\bSFTP\b/i,
+  /every chart type|(?:semua|setiap) jenis chart/i,
+];

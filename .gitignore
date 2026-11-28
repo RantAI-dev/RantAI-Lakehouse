@@ -23,12 +23,6 @@ pnpm-lock.yaml
 /.next/
 /out/
 
-# GitHub Pages landing export (`bun run build:landing`). The published
-# artifact is built by CI and served from Actions; it is never committed.
-/out-landing/
-/ops/landing-pages/.next/
-/ops/landing-pages/out/
-
 # production
 /build
 

@@ -1,0 +1,367 @@
+{
+  "hero": {
+    "eyebrow": "Untuk tim data yang mengelola sistemnya sendiri",
+    "headline": "Rumah bagi data Anda.",
+    "sub": "Satu lakehouse dengan dashboard bawaan. Tabel terbuka, tanya dengan bahasa sehari-hari.",
+    "subPhone": "Dashboard bawaan, tabel terbuka, dan jawaban dalam bahasa sehari-hari.",
+    "reassurance": [
+      "Gratis & open source (AGPL-3.0)",
+      "Jalan di server Anda"
+    ],
+    "reassurancePhone": ["Gratis", "Open source", "Jalan di server Anda"],
+    "scrollCue": "Gulir untuk menyelam",
+    "tod": { "day": "Siang", "night": "Malam", "label": "Mode siang" }
+  },
+  "sources": {
+    "headline": "Semua mengalir.",
+    "sub": "Database, file, stream, API, dan aplikasi bisnis, semuanya di satu tempat.",
+    "items": [
+      "PostgreSQL",
+      "MySQL",
+      "SQL Server",
+      "MongoDB",
+      "REST API",
+      "Kafka",
+      "File CSV dan TSV",
+      "Workbook Excel",
+      "File Parquet",
+      "Salesforce",
+      "ServiceNow",
+      "Google Analytics 4",
+      "HubSpot",
+      "Zendesk",
+      "Confluence",
+      "Dynamics 365",
+      "SharePoint",
+      "JSON, JSON Lines, Avro",
+      "Arsip gzip dan zip"
+    ],
+    "caption": "Change capture langsung untuk PostgreSQL. Dedupe atau simpan riwayat.",
+    "more": "+{count} lainnya"
+  },
+  "depths": {
+    "eyebrow": "Tiga kedalaman",
+    "headline": "Tiga kedalaman.",
+    "key": {
+      "bronze": "mentah",
+      "silver": "bersih",
+      "gold": "siap"
+    },
+    "layers": {
+      "bronze": {
+        "title": "Apa adanya.",
+        "body": "Disimpan apa adanya, di tabel Apache Iceberg terbuka."
+      },
+      "silver": {
+        "title": "Bersih dan teruji.",
+        "body": "Pipeline merapikan, pemeriksaan kualitas menandai."
+      },
+      "gold": {
+        "title": "Siap menjawab.",
+        "body": "Diperbarui sendiri dalam lag yang Anda tetapkan."
+      }
+    },
+    "card": {
+      "numberLocale": "id-ID",
+      "rows": "baris",
+      "cities": "kota",
+      "ofCount": "{shown} dari {total} {unit}",
+      "columns": {
+        "order": "Pesanan",
+        "city": "Kota",
+        "date": "Tanggal",
+        "amount": "Jumlah",
+        "orders": "Pesanan",
+        "revenue": "Pendapatan"
+      },
+      "empty": "kosong",
+      "legend": {
+        "spelling": "Ejaan beda",
+        "twice": "Masuk dua kali",
+        "empty": "Kosong"
+      },
+      "checks": {
+        "duplicates": "Tanpa duplikat",
+        "city": "Kota valid",
+        "amount": "1 jumlah kosong"
+      },
+      "total": "Total pendapatan",
+      "lag": "Dalam target lag",
+      "feeds": "Dipakai dashboard dan asisten",
+      "sr": {
+        "bronze": "Lima contoh baris pesanan dari file pesanan dan ekspor CRM, disimpan apa adanya. Satu pesanan masuk dua kali, Jakarta ditulis dengan tiga cara, tanggalnya memakai tiga format, dan satu jumlah kosong.",
+        "silver": "Baris yang sama dalam satu tabel Silver. Duplikatnya hilang, semua kota tertulis Jakarta atau Bandung, semua tanggal satu format, dan pemeriksaan kualitas menandai satu jumlah yang kosong.",
+        "gold": "Tabel Gold berisi pendapatan per kota dari baris-baris tadi, Jakarta lebih dulu lalu Bandung, dalam target lag-nya, siap untuk dashboard dan asisten."
+      }
+    }
+  },
+  "assistant": {
+    "headline": "Cukup tanya.",
+    "sub": "Tanya dengan bahasa biasa. Yang berisiko menunggu persetujuan manusia.",
+    "features": [
+      "Chart dan dashboard",
+      "Menjalankan pipeline",
+      "Query Studio: autocomplete, tab, riwayat"
+    ],
+    "name": "Asisten",
+    "placeholder": "Tanyakan apa saja tentang lakehouse Anda…",
+    "modes": {
+      "ask": "Ask",
+      "build": "Build"
+    },
+    "send": "Kirim",
+    "userOne": "Wilayah mana yang paling banyak pengunjungnya kuartal lalu?",
+    "steps": {
+      "read": "Membaca",
+      "group": "Mengelompokkan per wilayah",
+      "check": "Memeriksa pipeline",
+      "done": "2 langkah"
+    },
+    "answerOne": "Wilayah Utara paling banyak pengunjungnya kuartal lalu.",
+    "regions": {
+      "north": "Utara",
+      "south": "Selatan",
+      "east": "Timur",
+      "west": "Barat"
+    },
+    "unit": "kunjungan",
+    "numberLocale": "id-ID",
+    "userTwo": "Jeda pipeline penjualan malam.",
+    "approvalAction": "Jeda pipeline",
+    "impact": "Jadwal 02.00 malam ini berhenti",
+    "approvalLabel": "Menunggu persetujuan",
+    "reviewer": "Ditinjau Admin",
+    "approve": "Setujui",
+    "decline": "Tolak",
+    "approvedLabel": "Disetujui",
+    "approvedBy": "Disetujui Admin · baru saja",
+    "srDescription": "Ilustrasi asisten. Seseorang bertanya wilayah mana yang paling banyak pengunjungnya kuartal lalu; asisten membaca tabel Gold, mengelompokkannya per wilayah, dan menjawab dengan bar chart yang dipimpin Utara. Lalu ia meminta pipeline penjualan malam dijeda. Asisten tidak menjalankannya sendiri: ia menampilkan permintaan yang menunggu persetujuan, dan seorang admin menyetujuinya. Nama wilayah dan angkanya hanya ilustrasi."
+  },
+  "dashboards": {
+    "headline": "Jawaban jadi dashboard.",
+    "sub": "Sekitar dua lusin jenis chart, termasuk peta dengan batas wilayah Anda.",
+    "tiles": {
+      "line": {
+        "title": "Kunjungan dari waktu ke waktu",
+        "kind": "Line chart",
+        "aria": "Ilustrasi line chart",
+        "points": [
+          "Jan",
+          "Feb",
+          "Mar",
+          "Apr",
+          "Mei"
+        ]
+      },
+      "map": {
+        "title": "Kunjungan per wilayah",
+        "kind": "Peta",
+        "aria": "Ilustrasi peta titik Indonesia",
+        "islands": [
+          "Sumatra",
+          "Jawa",
+          "Kalimantan",
+          "Sulawesi",
+          "Bali & Nusa Tenggara",
+          "Maluku",
+          "Papua"
+        ]
+      },
+      "sankey": {
+        "title": "Asal kunjungan",
+        "kind": "Sankey",
+        "aria": "Ilustrasi diagram Sankey",
+        "from": [
+          "Pencarian",
+          "Media sosial",
+          "Langsung"
+        ],
+        "to": [
+          "Beranda",
+          "Dokumentasi",
+          "Blog"
+        ],
+        "total": "total"
+      },
+      "kpi": {
+        "title": "Kunjungan minggu ini",
+        "kind": "KPI",
+        "aria": "Ilustrasi tile KPI",
+        "delta": "+8,4% vs minggu lalu"
+      },
+      "calendar": {
+        "title": "Hari tersibuk",
+        "kind": "Calendar heatmap",
+        "aria": "Ilustrasi calendar heatmap",
+        "days": [
+          "Sen",
+          "Sel",
+          "Rab",
+          "Kam",
+          "Jum",
+          "Sab",
+          "Min"
+        ],
+        "week": "Minggu ke",
+        "unit": "kunjungan"
+      }
+    }
+  },
+  "governance": {
+    "headline": "Aman sejak awal.",
+    "sub": "Peran menentukan siapa melihat apa, sampai ke tiap kolom.",
+    "viewAs": "Lihat sebagai",
+    "roles": {
+      "analyst": "Analis",
+      "admin": "Admin"
+    },
+    "columns": {
+      "name": "Nama",
+      "email": "Email",
+      "city": "Kota",
+      "amount": "Jumlah"
+    },
+    "tableCaption": "Lima pelanggan fiktif. Sebagai analis, kolom nama dan email disamarkan; sebagai admin, keduanya tampil utuh.",
+    "status": {
+      "analyst": "Tampilan Analyst: nama dan email disamarkan",
+      "admin": "Tampilan Admin: semua kolom terlihat"
+    },
+    "policy": {
+      "analyst": "PII disamarkan untuk Analyst",
+      "admin": "Admin · akses penuh"
+    },
+    "pii": "PII",
+    "piiTip": "Data pribadi, disamarkan untuk peran tanpa akses",
+    "bento": {
+      "lineage": {
+        "title": "Lineage per kolom",
+        "line": "Lihat asal setiap kolom, dari mentah sampai terkurasi."
+      },
+      "proof": {
+        "title": "Masking teruji",
+        "line": "Diperiksa uji otomatis, ujung ke ujung.",
+        "badge": "Teruji menyeluruh"
+      },
+      "audit": {
+        "title": "Setiap aksi tercatat",
+        "line": "Aksi berisiko menunggu persetujuan orang.",
+        "rows": [
+          "Membuat chart “Kunjungan per wilayah”",
+          "Memperbarui revenue_by_city",
+          "Jeda pipeline sales_nightly"
+        ],
+        "awaiting": "Menunggu persetujuan",
+        "approved": "Disetujui"
+      },
+      "catalog": {
+        "title": "Katalog tepercaya",
+        "line": "Lihat mana yang certified atau deprecated.",
+        "query": "revenue",
+        "certified": "Certified",
+        "deprecated": "Deprecated",
+        "tag": "finance"
+      },
+      "access": {
+        "title": "Akses per folder",
+        "line": "Izin per dashboard dan per folder.",
+        "folders": [
+          "Sales",
+          "Finance"
+        ],
+        "dashboard": "Revenue",
+        "open": "Terbuka untuk Admin",
+        "closed": "Tertutup untuk Analyst"
+      }
+    },
+    "maskedTip": "Disamarkan oleh kebijakan untuk Analyst"
+  },
+  "open": {
+    "headline": "Milik Anda.",
+    "cards": [
+      {
+        "title": "Open source.",
+        "body": "AGPL-3.0. Baca setiap baris kodenya, jalankan sendiri."
+      },
+      {
+        "title": "Tabel terbuka.",
+        "body": "Di bawahnya Apache Iceberg, jadi engine Iceberg mana pun bisa membacanya."
+      },
+      {
+        "title": "Server Anda atau kami.",
+        "body": "Pasang di infrastruktur Anda, atau minta kami yang menjalankannya."
+      }
+    ],
+    "code": {
+      "license": "AGPL-3.0",
+      "sr": "Beberapa baris kode sumber Lakehouse sendiri: fungsi yang menahan aksi asisten yang berisiko sampai disetujui seseorang, dan menolaknya bila tak ada tempat menyimpan persetujuan itu."
+    },
+    "tables": {
+      "table": "orders",
+      "format": "Apache Iceberg",
+      "builtIn": "bawaan",
+      "sr": "Sebuah tabel Apache Iceberg di tengah, dibaca oleh ClickHouse yang dijalankan Lakehouse, dan oleh engine atau notebook lain yang membaca Iceberg.",
+      "storage": "Object storage Anda",
+      "sameAnswer": "Tabel sama, jawaban sama"
+    },
+    "hosting": {
+      "label": "Tempat berjalan",
+      "yours": "Server Anda",
+      "ours": "Kami jalankan",
+      "yourNetwork": "Jaringan Anda",
+      "inside": "Data Anda tetap di dalam",
+      "ranBy": "Dijalankan RantAI untuk Anda",
+      "insideOurs": "Sumber data Anda tersambung masuk",
+      "starting": "Memulai",
+      "started": "Berjalan",
+      "allStarted": "8 layanan berjalan",
+      "talk": "Bicarakan dengan kami soal menjalankannya untuk Anda",
+      "sourcesLabel": "Sumber data Anda",
+      "roles": {
+        "console": "aplikasi yang Anda pakai",
+        "api": "Rust, memeriksa tiap permintaan",
+        "postgres": "pengaturan dan riwayat",
+        "clickhouse": "query cepat",
+        "lakekeeper": "katalog Iceberg",
+        "rustfs": "file Anda",
+        "openfga": "siapa melihat apa",
+        "dagster": "menjalankan pipeline"
+      }
+    },
+    "console": {
+      "window": "Beranda",
+      "label": "Beranda konsol, dibuat ulang",
+      "caption": "Bertanya dengan bahasa biasa, atau mulai dari pintasan.",
+      "alt": "Beranda konsol RantAI Lakehouse, dibuat ulang: kotak untuk bertanya ke asisten, dengan Ask, Build, dan Tools, serta tiga pintasan: Connect a source, Create a pipeline, dan Build a dashboard."
+    }
+  },
+  "getStarted": {
+    "eyebrow": "Mulai",
+    "headline": "Jalan dalam tiga langkah.",
+    "sub": "Cukup Docker.",
+    "steps": [
+      {
+        "title": "Clone repository-nya",
+        "note": "Repository publik, lengkap dengan semua yang dibutuhkan stack-nya."
+      },
+      {
+        "title": "Atur konfigurasinya",
+        "note": "Menulis `.env` berisi secret yang dibuat otomatis. Isi `AUTH_BOOTSTRAP_EMAIL` dan `AUTH_BOOTSTRAP_PASSWORD` di sana untuk akun pertama Anda.",
+        "notePhone": "Membuat `.env` berisi secret. Isi email dan password admin pertama di sana."
+      },
+      {
+        "title": "Jalankan",
+        "note": "Lalu buka `http://localhost:3000`."
+      }
+    ],
+    "copy": "Salin",
+    "copied": "Tersalin",
+    "copyFailed": "Terpilih: tekan Ctrl+C atau ⌘C",
+    "more": "Panduan Quickstart lengkap"
+  },
+  "faq": {
+    "all": "Semua pertanyaan"
+  },
+  "final": {
+    "headline": "Masuklah. Datanya aman."
+  }
+}

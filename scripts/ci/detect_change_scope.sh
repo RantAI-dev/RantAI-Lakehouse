@@ -2,7 +2,7 @@
 # Detect change scope for CI pipeline.
 #
 # Classifies changed files into the scope categories the jobs use:
-#   rust, frontend, dagster, stack, docs_only, all
+#   rust, frontend, dagster, stack, site, docs_only, all
 # and into the gate groups a pull request has to run (OPS-25):
 #   storage, pipelines, cdc, ingest, saas, secrets, alerts, upload, governance
 # and writes the results to $GITHUB_OUTPUT.
@@ -77,6 +77,7 @@ rust=false
 frontend=false
 dagster=false
 stack=false
+site=false
 docs_only=true
 all=false
 push_full=false
@@ -229,7 +230,7 @@ emit_scope() {
   gate_groups="$(gate_groups_value)"
   echo "Scope detection result:"
   for line in "rust=${rust}" "frontend=${frontend}" "dagster=${dagster}" \
-              "stack=${stack}" "docs_only=${docs_only}" "all=${all}" \
+              "stack=${stack}" "site=${site}" "docs_only=${docs_only}" "all=${all}" \
               "push_full=${push_full}" "draft=${draft}" \
               "images_needed=${images_needed}"; do
     echo "  ${line}"
@@ -242,6 +243,7 @@ emit_scope() {
     echo "frontend=${frontend}"
     echo "dagster=${dagster}"
     echo "stack=${stack}"
+    echo "site=${site}"
     echo "docs_only=${docs_only}"
     echo "all=${all}"
     echo "push_full=${push_full}"
@@ -267,6 +269,7 @@ emit_all_outputs() {
   frontend=true
   dagster=true
   stack=true
+  site=true
   docs_only=false
   all=true
   # OPS-CI-FAST: everything runs, the images included.
@@ -509,6 +512,14 @@ while IFS= read -r file; do
     classified=true
   fi
 
+  # Site: site/** (WEB-5 D12). The Lakehouse site is its own package with its
+  # own job (`site`); it shares no code with the console, so it selects only
+  # that job.
+  if [[ "$file" == site/* ]]; then
+    site=true
+    classified=true
+  fi
+
   # Test fixtures: ops/fixtures/** is read across scopes by Rust tests (lakehouse-api
   # upload_parse.rs, routes/uploads.rs, tests/upload_routes.rs), frontend test
   # (src/lib/uploads.test.ts) and Dagster test (test_file_ingest.py). Must force all=true.
@@ -556,6 +567,7 @@ if [ "$all" = true ]; then
   frontend=true
   dagster=true
   stack=true
+  site=true
   docs_only=false
 fi
 

@@ -13,10 +13,12 @@ import { agentService, chatSessionService, chatTermService } from "@/services";
 import { isServiceError } from "@/services/errors";
 import { apiFetch } from "@/services/http";
 import { answerAsk, type AskAnswer } from "./answer-ask";
-import { approvalStateOf } from "./approval-state";
+import { approvalErrorOf, approvalStateOf } from "./approval-state";
 
 export type Mode = "ask" | "build";
 export type DockPosition = "bottom" | "right";
+/** One table the person pointed the chat at with `@` (`AI-26`). */
+export type TableMention = { kind: "table"; key: string };
 export type Msg = {
   /** Stable React key; older saved sessions get one when loaded. */
   id?: string;
@@ -209,6 +211,7 @@ function savedMessages(msgs: Msg[]): Msg[] {
     tools: m.tools?.map((s) => {
       const copy = { ...s };
       delete copy.approvalState;
+      delete copy.approvalError;
       return copy;
     }),
   }));
@@ -224,11 +227,18 @@ function savedMessages(msgs: Msg[]): Msg[] {
  */
 function tagApprovalStep(
   messages: Msg[],
-  run: { id: string; status: string; approvals?: { id: string }[]; steps?: { label: string }[] },
+  run: {
+    id: string;
+    status: string;
+    approvals?: { id: string }[];
+    steps?: { label: string; detail?: string }[];
+  },
 ): Msg[] {
   const approvalIds = new Set(run.approvals?.map((a) => a.id) ?? []);
   const steps = run.steps ?? [];
-  const state = approvalStateOf(run.status, steps[steps.length - 1]?.label);
+  const last = steps[steps.length - 1];
+  const state = approvalStateOf(run.status, last?.label);
+  const error = approvalErrorOf(last?.label, last?.detail);
   let changed = false;
   const next = messages.map((msg) => {
     if (!msg.tools) return msg;
@@ -238,9 +248,9 @@ function tagApprovalStep(
       const matches =
         (typeof result?.run_id === "string" && result.run_id === run.id) ||
         (typeof result?.approval_id === "string" && approvalIds.has(result.approval_id));
-      if (!matches || step.approvalState === state) return step;
+      if (!matches || (step.approvalState === state && step.approvalError === error)) return step;
       touched = true;
-      return { ...step, approvalState: state };
+      return { ...step, approvalState: state, approvalError: error };
     });
     if (!touched) return msg;
     changed = true;
@@ -428,7 +438,7 @@ function useCopilotState() {
    * conversation's own mode as it is (`BI-62` D8: the report editor's
    * drafts are always Ask, whatever the panel is set to).
    */
-  const send = React.useCallback(async (text: string, history?: Msg[], options?: { continuation?: boolean; mode?: Mode }) => {
+  const send = React.useCallback(async (text: string, history?: Msg[], options?: { continuation?: boolean; mode?: Mode; mentions?: TableMention[] }) => {
     const q = text.trim();
     if (!q || busy) return;
     // A typed message starts a new chain; a continuation belongs to the
@@ -460,6 +470,8 @@ function useCopilotState() {
           context: pageContextRef.current?.system,
           view: pageContextRef.current?.view,
           messages: chatHistory(next),
+          // AI-26: an older request with no picks carries no field at all.
+          ...(options?.mentions?.length ? { mentions: options.mentions } : {}),
         }),
       });
       if (!res.ok) throw new Error(chatErrorText(await res.json().catch(() => null)));

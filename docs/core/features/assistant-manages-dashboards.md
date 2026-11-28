@@ -224,16 +224,32 @@ quoted requests come from the specs.
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `AI-1-AC1` | Ask "rename this dashboard to 'Q3 Tourism' and move the Bali chart to the top" (the spec's quoted request) | The board is renamed and the named chart's tile is at the top of its grid | Not run |
-| `AI-1-AC2` | Ask to delete a board with charts, then reject the approval | Nothing on the board or its charts changes; the board is still there with all its charts | Not run |
-| `AI-1-AC3` | As a role without `dashboard:write`, ask to rename a board, delete a board, arrange tiles, move a chart, or save filters | A plain refusal naming the missing permission; nothing changes | Not run |
+| `AI-1-AC1` | Ask "rename this dashboard to 'Q3 Tourism' and move the Bali chart to the top" (the spec's quoted request) | The board is renamed and the named chart's tile is at the top of its grid | Pass — rename and arrange confirmed; after reload, board "Q3 Tourism" has the Bali tile on top |
+| `AI-1-AC2` | Ask to delete a board with charts, then reject the approval | Nothing on the board or its charts changes; the board is still there with all its charts | Pass — delete approval rejected; board and charts intact |
+| `AI-1-AC3` | As a role without `dashboard:write`, ask to rename a board, delete a board, arrange tiles, move a chart, or save filters | A plain refusal naming the missing permission; nothing changes | Pass — viewer refused five times, nothing changed; the owner accepts the wording |
 | `AI-2-AC1` | Ask "show only 2025 and only Bali" (the spec's quoted request) | The view's filters become a 2025 number filter and a Bali filter; the address carries them | Pass — Accepted by the AI owner, 2026-11-14 (staging `240d2e62`) |
 | `AI-2-AC2` | After the step above, open the same board as another viewer | The board's saved default is unchanged; the address carries only what that viewer set, if anything | Pass — Accepted by the AI owner, 2026-11-14 (staging `240d2e62`) |
-| `AI-20-AC1` | Open a dashboard with the filter-row grain control set to a value that is not the chart's own grain; ask the assistant about the dashboard's time grain | The answer names the override, not the chart's own grain | Not run |
+| `AI-20-AC1` | Open a dashboard with the filter-row grain control set to a value that is not the chart's own grain; ask the assistant about the dashboard's time grain | The answer names the override, not the chart's own grain | Pass — the Ask answer names the page's Week grain |
 
-**Accepted by:** __________ **Date:** ______ **Build:** ______
+**Accepted by:** product owner **Date:** 2026-11-26 **Build:** staging `bdcf863d0`
 
 Exceptions, each with an owner and a date:
+
+## Page context (`AI-14`) acceptance checklist
+
+Run on staging, on a dashboard open in the console; a step not performed
+is never Pass. The page sends what is on screen to the assistant, and the
+server cuts that context at `PAGE_CONTEXT_MAX_CHARS` = 6,000 characters,
+at the 6,000th character (`routes/ai/mod.rs`). Ids start at `AI-14-AC2`:
+the spec's `AI-14-AC1` names the visible tab with its filters.
+
+| ID | Do this | Expect | Result |
+| --- | --- | --- | --- |
+| `AI-14-AC2` | With a filter active on the dashboard, ask the assistant which filter is on | The answer names the filters on screen |  |
+| `AI-14-AC3` | With the filter-row grain control set, ask the assistant about the dashboard's time grain | The answer names the grain on the screen |  |
+| `AI-14-AC4` | On a board with tabs, open the second tab and ask which tab is open | The answer names the visible tab |  |
+| `AI-14-AC5` | On a chart whose SQL takes parameters, set the values on screen and ask what values the chart shows | The answer names the parameter values from the screen |  |
+| `AI-14-AC6` | On a board whose page context runs past the server's cut, ask about something on the screen | The board still answers; the context the server sent is the first 6,000 characters |  |
 
 ## After acceptance
 

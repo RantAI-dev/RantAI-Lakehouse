@@ -6,14 +6,20 @@
 | Backlog | `DATA-3` |
 | Kind | Feature |
 | Spec | `docs/core/specs/data-3.md` (every *(proposed)* number is signed under Decisions) |
-| Status | Planned |
+| Status | Killed (product owner, 2026-11-27) |
 | Priority | P3 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
-| Plan | Not written yet. **Blocked by `DATA-4`** and a new ADR. |
+| Plan | None. The draft plan and ADR 0019 (#623) were closed unmerged. |
 | Started | |
 | Shipped | |
 | Evidence | |
+
+> **Killed on 2026-11-27 by the product owner: not needed.** ClickHouse
+> stays the primary store for Silver and Gold. The open-format copy is kept
+> current instead, per table, by `DATA-66`
+> ([`iceberg-sync-per-table.md`](iceberg-sync-per-table.md)). This page is
+> kept as the record of what was considered.
 
 ## Problem
 

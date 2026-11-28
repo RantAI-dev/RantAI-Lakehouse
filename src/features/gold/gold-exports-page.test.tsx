@@ -55,6 +55,10 @@ function mockApi(consumers?: unknown): void {
         changedSinceExport: null,
         lastFailure: null,
         canEdit: true,
+        syncMode: "on_update",
+        schedule: null,
+        timeZone: null,
+        nextSyncAt: null,
       })
     }
     if (url.includes("/consumers")) {
@@ -122,6 +126,10 @@ describe("GoldExportsPage", () => {
           changedSinceExport: null,
           lastFailure: null,
           canEdit: true,
+          syncMode: "on_update",
+          schedule: null,
+          timeZone: null,
+          nextSyncAt: null,
         })
       }
       if (url.includes("/consumers")) return jsonResponse(consumersRefusalBody)
@@ -143,9 +151,11 @@ describe("GoldExportsPage", () => {
     render(<GoldExportsPage />)
     const row = (await screen.findByText("sales")).closest("tr") as HTMLTableRowElement
     const cells = row.querySelectorAll("td")
-    // Column order: mart, rows, enabled, last export, snapshot, history, consumers, actions.
-    await waitFor(() => expect(cells[3]?.textContent).toBe("Never exported"))
-    expect(cells[4]?.textContent).toBe("—")
+    // Column order: mart, rows, enabled, sync, last export, snapshot, history, consumers, actions.
+    // DATA-66: a switched-off publication has no sync mode to show.
+    await waitFor(() => expect(cells[3]?.textContent).toBe("—"))
+    await waitFor(() => expect(cells[4]?.textContent).toBe("Never exported"))
+    expect(cells[5]?.textContent).toBe("—")
   })
 
   it("shows a dash, not Never exported, when the read-back fails", async () => {
@@ -165,6 +175,10 @@ describe("GoldExportsPage", () => {
           changedSinceExport: null,
           lastFailure: null,
           canEdit: true,
+          syncMode: "on_update",
+          schedule: null,
+          timeZone: null,
+          nextSyncAt: null,
         })
       }
       if (url.includes("/consumers")) return jsonResponse(consumersRefusalBody)
@@ -181,6 +195,50 @@ describe("GoldExportsPage", () => {
     await waitFor(() => expect(screen.queryByText("Never exported")).toBeNull())
     const dashes = screen.getAllByText("—")
     expect(dashes.some((dash) => dash.className.includes("text-destructive"))).toBe(true)
+  })
+
+  it("shows each table's sync mode in the Sync column (DATA-66)", async () => {
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString()
+      if (url.includes("/api/dashboard/fields")) {
+        return jsonResponse({ marts: [{ name: "sales", rows: 42 }] })
+      }
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          mart: "sales",
+          enabled: true,
+          updatedAt: "2026-11-27T00:00:00Z",
+          lastChangedAt: "2026-11-27T03:30:00Z",
+          lastExportedAt: "2026-11-27T04:00:00Z",
+          changedSinceExport: false,
+          lastFailure: null,
+          canEdit: false,
+          syncMode: "scheduled",
+          schedule: { kind: "daily", hour: 4, minute: 0 },
+          timeZone: "Asia/Jakarta",
+          nextSyncAt: "2026-11-28T21:00:00Z",
+        })
+      }
+      if (url.includes("/consumers")) return jsonResponse(consumersRefusalBody)
+      if (url.includes("/api/gold/exports")) return jsonResponse({ mart: "sales", runs: [] })
+      if (url.includes("/api/gold/export/sales")) {
+        return jsonResponse({
+          namespace: "gold",
+          table: "sales",
+          published: true,
+          formatVersion: 2,
+          rowsInIceberg: 42,
+          snapshotId: { value: 1, measured: true },
+          exportedAt: "2026-11-27T04:00:00Z",
+        })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    }) as unknown as typeof fetch
+
+    render(<GoldExportsPage />)
+    const row = (await screen.findByText("sales")).closest("tr") as HTMLTableRowElement
+    const cells = row.querySelectorAll("td")
+    await waitFor(() => expect(cells[3]?.textContent).toBe("On a schedule"))
   })
 
   it("counts the tools that read the mart and names each one in the cell's tooltip", async () => {
@@ -226,9 +284,10 @@ describe("GoldExportsPage", () => {
     // row's own history column does show a "0" — that one is a count.)
     const row = screen.getByText("sales").closest("tr")
     const cells = row?.querySelectorAll("td") ?? []
-    // Column order: mart, rows, enabled, last export, snapshot,
-    // history, consumers, actions.
-    expect(cells[6]?.textContent).toBe("No reads in 7 days")
+    // Column order: mart, rows, enabled, sync, last export, snapshot,
+    // history, consumers, actions (the Sync column joined in DATA-66).
+    expect(cells[3]?.textContent).toBe("—")
+    expect(cells[7]?.textContent).toBe("No reads in 7 days")
   })
 
   // QA LH-DATA-1-01 (DATA-49), review round 1 R1: the page's own "Export now" left
@@ -255,6 +314,10 @@ describe("GoldExportsPage", () => {
           changedSinceExport: false,
           lastFailure: publications === 1 ? null : { failedAt: "2026-10-02T05:00:00Z", reason },
           canEdit: true,
+          syncMode: "on_update",
+          schedule: null,
+          timeZone: null,
+          nextSyncAt: null,
         })
       }
       if (url.includes("/consumers")) return jsonResponse(consumersRefusalBody)
@@ -301,13 +364,13 @@ describe("GoldExportsPage", () => {
     render(<GoldExportsPage />)
     const row = (await screen.findByText("sales")).closest("tr") as HTMLTableRowElement
     const cells = () => row.querySelectorAll("td")
-    // Column order: mart, rows, enabled, last export, snapshot, history, consumers, actions.
+    // Column order: mart, rows, enabled, sync, last export, snapshot, history, consumers, actions.
     await waitFor(() => expect(cells()[2]?.textContent).toBe("On · Up to date"))
-    expect(cells()[5]?.textContent).toBe("0")
+    expect(cells()[6]?.textContent).toBe("0")
 
     fireEvent.click(screen.getByRole("button", { name: "Export now" }))
     await waitFor(() => expect(posts).toBe(1))
     await waitFor(() => expect(cells()[2]?.textContent).toBe("On · Last publish failed"))
-    expect(cells()[5]?.textContent).toBe("1")
+    expect(cells()[6]?.textContent).toBe("1")
   })
 })

@@ -427,6 +427,118 @@ async fn retain_rows_in_reach(
     Ok(())
 }
 
+/// `SEC-83`: drops the policies whose condition binds a table the caller's
+/// reach does not cover, by the rule [`retain_rows_in_reach`] keeps for the
+/// rows of a table — another tenant's upload table is left out even for the
+/// tenant that owns the shared catalog. A policy whose `conditions` parse to
+/// no obligation binds no table, so it is on every list. A headless caller
+/// (`actor` of `None`) is not narrowed, the convention `quality_key_in_reach`
+/// keeps. The claims are read once for the distinct tables.
+///
+/// Shared with the role-rename refusal (`SEC-83` follow-up), whose 409 names
+/// only the rules in the caller's reach while its count stays every rule —
+/// the one reason this is `pub(crate)`.
+///
+/// # Errors
+///
+/// The 503 of [`crate::routes::query::reachable_names`] when the claims
+/// cannot be read; the response carries its fixed sentence, never the cause.
+pub(crate) async fn retain_policies_in_reach(
+    state: &AppState,
+    actor: Option<&Principal>,
+    headers: &HeaderMap,
+    policies: Vec<Policy>,
+) -> Result<Vec<Policy>, ApiError> {
+    let Some(principal) = actor else {
+        return Ok(policies);
+    };
+    let reach = crate::routes::query::resolve_reach(state, principal, headers).await?;
+    if reach == crate::routes::query::TenantReach::All {
+        return Ok(policies);
+    }
+    let table_of = |policy: &Policy| {
+        crate::policy_engine::PolicyCondition::parse_opt(policy.conditions.as_deref())
+            .map(|cond| cond.table)
+    };
+    let mut tables: Vec<String> = policies.iter().filter_map(table_of).collect();
+    tables.sort();
+    tables.dedup();
+    let reachable = crate::routes::query::reachable_names(state, reach, &tables).await?;
+    Ok(policies
+        .into_iter()
+        .filter(|policy| table_of(policy).is_none_or(|table| reachable.contains(&table)))
+        .collect())
+}
+
+/// `SEC-83`: the one sentence a policy's table that is not there and one
+/// the writer's reach hides both get, so neither answer says which tables
+/// exist. The quality writers' sentence (`crate::routes::quality::
+/// unreadable_table`) offers the three zones a quality rule can check; a
+/// policy may also bind a published gold table — the G8 acceptance gate
+/// (`ops/g8/g8_governance_test.py`) authors its Trino-leg policy on
+/// `gold.<mart>` — so the policy's sentence offers the fourth. Two
+/// constructors, not one shared: each caller offers the zones it actually
+/// accepts, and the quality text stays as it is.
+fn unreadable_policy_table(asset: &str) -> ApiError {
+    ApiError::BadRequest(format!(
+        "\"{asset}\" is not a table you can read. Pick the table as \
+         silver.<table>, serving.<table>, bronze.<table> or gold.<table>."
+    ))
+}
+
+/// `SEC-83`: whether the table a policy's condition binds is there, for the
+/// policy writers — [`crate::routes::quality::quality_table_present`] for
+/// the zones a quality rule can check (`silver`, `serving`, `bronze`, one
+/// source of truth), plus the `gold` zone a policy has always been able to
+/// bind and a quality rule cannot: the published Iceberg table, asked about
+/// with the same failing question the bronze arm asks
+/// (`crate::routes::catalog_source::iceberg_table_presence_in`), under the
+/// `gold` namespace the Gold export publishes into
+/// (`lakehouse_iceberg::gold::GOLD_NAMESPACE`). The G8 gate binds exactly
+/// such a policy, so the zone stays admissible; `SEC-83` keeps the check,
+/// not a prohibition. Any other zone is absent, as before — fail closed.
+///
+/// # Errors
+///
+/// [`ApiError::Unavailable`] (`503`) with the one sentence
+/// [`crate::routes::quality::quality_table_present`] answers an outage with,
+/// for a present zone that cannot be checked: a check that cannot be made
+/// is not a refusal, and presence is asked before the reach (`SEC-80`'s
+/// order) so the outage answers every name alike.
+async fn policy_table_present(state: &AppState, asset: &str) -> Result<bool, ApiError> {
+    let Some((zone, table)) = asset.trim().split_once('.') else {
+        return Ok(false);
+    };
+    match zone.to_lowercase().as_str() {
+        "silver" | "serving" | "bronze" => {
+            crate::routes::quality::quality_table_present(state, asset).await
+        }
+        "gold" => {
+            match crate::routes::catalog_source::iceberg_table_presence_in(
+                state,
+                lakehouse_iceberg::gold::GOLD_NAMESPACE,
+                table,
+            )
+            .await
+            {
+                Ok(present) => Ok(present),
+                // No query database: nothing can read a published table, so
+                // the gold name is absent — the bronze arm's reading.
+                Err(crate::routes::catalog_source::PresenceUnknown::NoQueryDatabase) => Ok(false),
+                Err(crate::routes::catalog_source::PresenceUnknown::Unanswered) => {
+                    // The same sentence `quality_table_present` answers an
+                    // outage with; the constructor stays there, so the two
+                    // callers that share it stay one check.
+                    Err(ApiError::Unavailable(
+                        "The table could not be checked. Try again.".to_owned(),
+                    ))
+                }
+            }
+        }
+        _ => Ok(false),
+    }
+}
+
 /// A fixed, classified message for a failed governance read. The raw
 /// upstream text used to be returned as `"Error: …"`: the Data Quality
 /// page and the copilot showed `DB::Exception: Database _silver_meta does
@@ -1628,13 +1740,27 @@ pub async fn row_filter_grammar() -> ApiResult<ApiJson<RowFilterGrammar>> {
 
 /// `GET /api/governance/policies` — every authored policy, each with the
 /// engine's verdict on whether it can be enforced (`SEC-61`) and the catalog
-/// asset it governs, where one can be named (`WEB-3` S3a-D1).
+/// asset it governs, where one can be named (`WEB-3` S3a-D1). A policy whose
+/// condition binds a table outside the caller's reach is left out
+/// (`SEC-83`; [`retain_policies_in_reach`]).
 ///
 /// # Errors
 ///
-/// 503 if no pool is configured; 500 on a database failure.
-pub async fn list_policies(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<PolicyView>>> {
+/// 503 if no pool is configured; 500 on a database failure; the 503 of the
+/// claims read when the caller's reach cannot be resolved.
+pub async fn list_policies(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Vec<PolicyView>>> {
     let policies = governance::list_policies(pool(&state)?).await?;
+    let policies = retain_policies_in_reach(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        &headers,
+        policies,
+    )
+    .await?;
     let ids = PolicyView::asset_ids(&state.clickhouse, &policies).await;
     Ok(ApiJson(
         policies
@@ -1720,14 +1846,37 @@ fn create_policy_body(body: Value) -> Result<CreatePolicyInput, ApiError> {
 /// # Errors
 ///
 /// 400 on a malformed body or an authored `conditions` blob with no real
-/// obligation; 409 if the name is taken; 503/500 as above.
+/// obligation; 400 with [`unreadable_policy_table`]'s one sentence for a
+/// condition naming a table that is not there or that the writer's reach
+/// does not cover (`SEC-83` — the answer never says which), and 503 when
+/// that table cannot be checked; 409 if the name is taken; 503/500 as above.
 pub async fn create_policy(
     State(state): State<AppState>,
+    actor: Option<&Principal>,
+    headers: &HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<PolicyView>)> {
     let body: Value = serde_json::from_slice(&body)
         .map_err(|err| ApiError::BadRequest(format!("invalid JSON: {err}")))?;
     let input = create_policy_body(body)?;
+    // `SEC-83`: a policy binds a table the writer must be able to read — the
+    // rule `ensure_rule_table_with` holds a quality rule to, plus the gold
+    // zone a policy has always been able to bind (`policy_table_present`).
+    // Presence is asked first, so an outage answers a name another tenant
+    // claimed and a name no table has alike; then the reach, and both
+    // refusals are the one `unreadable_policy_table` sentence. A policy that
+    // binds no table (`conditions` absent or prose) is not checked.
+    if let Some(conditions) = input.conditions.as_deref()
+        && let Some(cond) = crate::policy_engine::PolicyCondition::parse_opt(Some(conditions))
+    {
+        let present = policy_table_present(&state, &cond.table).await?;
+        if !crate::routes::quality::quality_key_in_reach(&state, actor, headers, &cond.table)
+            .await?
+            || !present
+        {
+            return Err(unreadable_policy_table(&cond.table).into());
+        }
+    }
     let created = governance::create_policy(pool(&state)?, &input).await?;
     let view = policy_view(&state, created).await;
     Ok((StatusCode::CREATED, ApiJson(view)))
@@ -1743,15 +1892,17 @@ pub async fn create_policy(
 pub async fn create_policy_route(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<PolicyView>)> {
-    let created = create_policy(State(state.clone()), body).await?;
+    let actor = principal.as_ref().map(|Extension(p)| p);
+    let created = create_policy(State(state.clone()), actor, &headers, body).await?;
     let policy = &created.1.0.policy;
     // A policy that binds no table is recorded on the policy itself
     // (`audit_policy_change`): it used to leave no row at all (`GOV-1`).
     audit_policy_change(
         &state,
-        principal.as_ref().map(|Extension(p)| p),
+        actor,
         policy,
         "policy.create",
         policy_definition_args(policy, json!({ "newStatus": policy.status })),
@@ -1832,10 +1983,13 @@ pub struct PolicyStatusBody {
 /// # Errors
 ///
 /// `400` for a malformed body or any other status; `404` when no policy
-/// has that id; 503/500 as above.
+/// has that id, and for a policy on a table outside the caller's reach
+/// (`SEC-83` — the same `404` for both, so the answer never says which);
+/// 503/500 as above.
 pub async fn set_policy_status(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     body: Bytes,
 ) -> ApiResult<ApiJson<PolicyView>> {
@@ -1852,6 +2006,22 @@ pub async fn set_policy_status(
         .into_iter()
         .find(|p| p.id == id)
         .ok_or_else(|| ApiError::NotFound("Policy not found".to_owned()))?;
+    // `SEC-83`: a stored policy on a table outside the caller's reach is the
+    // same `404` an unknown id gets, and nothing changes — the rule
+    // `delete_quality_rule` keeps (`GOV-15`). Reach only: the policy is
+    // already stored, so no presence is asked.
+    if let Some(cond) =
+        crate::policy_engine::PolicyCondition::parse_opt(before.conditions.as_deref())
+        && !crate::routes::quality::quality_key_in_reach(
+            &state,
+            principal.as_ref().map(|Extension(p)| p),
+            &headers,
+            &cond.table,
+        )
+        .await?
+    {
+        return Err(ApiError::NotFound("Policy not found".to_owned()).into());
+    }
     let policy = governance::set_policy_status(pool, &id, &body.status)
         .await?
         .ok_or_else(|| ApiError::NotFound("Policy not found".to_owned()))?;
@@ -1884,13 +2054,38 @@ pub async fn set_policy_status(
 ///
 /// # Errors
 ///
-/// `404` when no policy has that id; 503/500 as above.
+/// `404` when no policy has that id, and for a policy on a table outside
+/// the caller's reach (`SEC-83` — the same `404` for both, so the answer
+/// never says which); 503/500 as above.
 pub async fn delete_policy(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<Value>> {
-    let policy = governance::delete_policy(pool(&state)?, &id)
+    let pool = pool(&state)?;
+    // `SEC-83`: read before deleting, so a policy on a table outside the
+    // caller's reach is the same `404` an unknown id gets and is left in
+    // place. Reach only, as `delete_quality_rule` does for a stored rule —
+    // the policy is already stored, so no presence is asked.
+    let before = governance::list_policies(pool)
+        .await?
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| ApiError::NotFound("Policy not found".to_owned()))?;
+    if let Some(cond) =
+        crate::policy_engine::PolicyCondition::parse_opt(before.conditions.as_deref())
+        && !crate::routes::quality::quality_key_in_reach(
+            &state,
+            principal.as_ref().map(|Extension(p)| p),
+            &headers,
+            &cond.table,
+        )
+        .await?
+    {
+        return Err(ApiError::NotFound("Policy not found".to_owned()).into());
+    }
+    let policy = governance::delete_policy(pool, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Policy not found".to_owned()))?;
     audit_policy_change(
@@ -1967,13 +2162,31 @@ fn preview_result_json(affected_rows: Option<i64>, masked_columns: Option<Vec<St
 /// 400 on a malformed body; 503 if no pool is configured (kept consistent
 /// with every other `/api/governance/*` route, even though this route
 /// itself never touches Postgres — `pool(&state)?` is the same
-/// availability gate the rest of this file uses).
+/// availability gate the rest of this file uses); `404`/`503` from the
+/// caller's tenant reach, and an out-of-reach table is answered as one
+/// `system.columns` has never heard of, with no query run (`SEC-83`).
 pub async fn preview_policy(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     pool(&state)?;
     let body: PreviewPolicyBody = parse_body(&body)?;
+    // `SEC-83`: a draft the caller could not save over is not measured. The
+    // answer is `preview_result_json(None, None)` — exactly what a table
+    // `system.columns` has never heard of gets — so the answer never says
+    // which, and no `ClickHouse` query runs for it.
+    if !crate::routes::quality::quality_key_in_reach(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        &headers,
+        body.table.trim(),
+    )
+    .await?
+    {
+        return Ok(ApiJson(preview_result_json(None, None)));
+    }
     Ok(ApiJson(preview_policy_impl(&state, &body).await))
 }
 

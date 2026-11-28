@@ -46,7 +46,7 @@ function findPageFiles(dir: string): string[] {
   return pages
 }
 
-const PUBLIC_PREFIXES = ["/login", "/public", "/embed", "/landing", "/render"]
+const PUBLIC_PREFIXES = ["/login", "/public", "/embed", "/render"]
 
 function isPublicRoute(pattern: string): boolean {
   return PUBLIC_PREFIXES.some((p) => pattern === p || pattern.startsWith(`${p}/`))

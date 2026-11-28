@@ -170,9 +170,13 @@ fn size(text: &str) -> (usize, usize) {
 ///
 /// `OPS-36` scoped the data-map cache to each `AppState`, so a total is the
 /// same when this file runs alone and when the whole suite runs (`AI-32`).
-const ADMIN_BUILD_CEILING: usize = 76_407;
-const ADMIN_ASK_CEILING: usize = 19_724;
-const VIEWER_BUILD_CEILING: usize = 29_699;
+///
+/// Raised for `AI-11`'s three sharing tools (owner, 2026-11-26, via the
+/// Auditor): the schemas and the prompt's sharing rule moved the measured
+/// totals to 78,143 / 20,214 / 31,627, deltas +1,736 / +490 / +1,928.
+const ADMIN_BUILD_CEILING: usize = 78_143;
+const ADMIN_ASK_CEILING: usize = 20_214;
+const VIEWER_BUILD_CEILING: usize = 31_627;
 
 #[tokio::test]
 async fn the_chat_prompt_and_its_tools_stay_under_the_owner_target() {

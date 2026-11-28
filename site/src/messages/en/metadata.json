@@ -1,0 +1,14 @@
+{
+  "home": {
+    "title": "RantAI Lakehouse — your data has a home",
+    "description": "One lakehouse with dashboards built in. Bring every source in, keep it in open tables, and ask for answers in plain language."
+  },
+  "contact": {
+    "title": "Contact — RantAI Lakehouse",
+    "description": "Ask about installing RantAI Lakehouse on your servers, a walkthrough, or connecting your sources. Common questions are answered here.",
+    "ogHeadline": "Tell us about your data."
+  },
+  "og": {
+    "headline": "Your data has a home now."
+  }
+}

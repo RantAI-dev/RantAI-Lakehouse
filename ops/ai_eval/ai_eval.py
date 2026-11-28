@@ -1039,12 +1039,25 @@ def expect_state_problems(
     return []
 
 
-def approval_problems(trace: list[dict[str, Any]], tool: str) -> list[str]:
-    """`expect_approval`: the tool's step must hold `needs_approval: true`."""
+def approval_problems(
+    trace: list[dict[str, Any]], tool: str, args_contains: dict[str, Any] | None = None
+) -> list[str]:
+    """`expect_approval`: the tool's step must hold `needs_approval: true`.
+
+    `AI-11`: with `args_contains`, the step's arguments (the call
+    the approval would run as approved, since the decide route replays the
+    stored arguments) must carry every wanted key too, the same match
+    `expect_tool.args_contains` uses."""
+    want = args_contains or {}
+    asked = False
     for step in trace:
         result = step.get("result") or {}
         if step.get("tool") == tool and isinstance(result, dict) and result.get("needs_approval") is True:
-            return []
+            asked = True
+            if tool_args_match(step.get("args", {}), want):
+                return []
+    if asked:
+        return [f"approval: {tool} asked for approval with other arguments than {want}"]
     return [f"approval: {tool} did not ask for approval"]
 
 
@@ -1189,7 +1202,13 @@ def run_case(cfg: Config, session: requests.Session, case: dict[str, Any]) -> di
             except requests.RequestException as err:
                 scored["problems"].append(f"state check failed: {type(err).__name__}")
         if "expect_approval" in case:
-            scored["problems"].extend(approval_problems(trace, case["expect_approval"]))
+            expected = case["expect_approval"]
+            if isinstance(expected, dict):
+                scored["problems"].extend(
+                    approval_problems(trace, expected["tool"], expected.get("args_contains"))
+                )
+            else:
+                scored["problems"].extend(approval_problems(trace, expected))
         if "expect_no_tool" in case:
             scored["problems"].extend(no_tool_problems(trace, case["expect_no_tool"]))
         if "forbid_unless_tool" in case:

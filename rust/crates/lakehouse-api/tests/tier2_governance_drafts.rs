@@ -291,6 +291,51 @@ async fn draft_policy_with_structured_conditions_ignores_activate() {
     assert_eq!(status, "draft");
 }
 
+/// `SEC-83` (`SEC-80`'s rule for policies): the tool writes the policy as
+/// the person behind the chat, through the console's own handler, so a table
+/// outside that person's reach is refused exactly as the form refuses it,
+/// and nothing is stored. The `serving.` table is present as far as the
+/// stand-in can tell (one column for every name), so only the reach refuses.
+#[tokio::test]
+async fn a_drafted_policy_for_a_table_outside_the_callers_reach_is_refused_and_stores_nothing() {
+    let (router, pool, _ch) = app().await;
+    // The person holds exactly what the tool needs (the route's
+    // `assistant:use`, the gate's and the route's `policy:write`) and
+    // belongs to no tenant of a multi-tenant deployment: a reach that
+    // covers nothing, so the shared `serving.` table is outside it.
+    let caller = common::create_assistant_principal(&pool, "policy:write").await;
+    let cookie = common::session_cookie_for_user(&pool, caller).await;
+    let mut args = policy_args("copilot_drafted_out_of_reach");
+    args["conditions"] = json!({
+        "roles": ["analyst"],
+        "table": "serving.mart_customer_segment",
+        "mask": ["email"],
+    });
+    args["confirmed"] = json!(true);
+    let resp = post(
+        &router,
+        "/api/ai/tool",
+        &cookie,
+        json!({ "tool": "draft_policy", "args": args, "mode": "build" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["outcome"], "failed", "{body}");
+    assert_eq!(
+        body["result"]["error"],
+        json!(
+            "\"serving.mart_customer_segment\" is not a table you can read. Pick the table as silver.<table>, serving.<table>, bronze.<table> or gold.<table>."
+        ),
+        "{body}"
+    );
+    assert_eq!(
+        policy_rows(&pool, "copilot_drafted_out_of_reach").await,
+        0,
+        "a refused draft stores nothing"
+    );
+}
+
 /// `draft_classification_rule` always lands `review_status = "needs-review"`
 /// — the only value `create_classification_rule` ever inserts.
 #[tokio::test]

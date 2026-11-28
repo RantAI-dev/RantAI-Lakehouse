@@ -79,6 +79,11 @@ nothing recorded that it had.
 14. Be told honestly when the assistant may not do what was asked: the tool
     step says which permission is missing, or that Ask mode cannot change
     anything.
+15. Point the chat at a table with `@`: the composer searches the catalog
+    tables you may read, a picked table becomes a chip in the message, and
+    the answer names that table and its columns. At most five chips fit in
+    one message. On a table's own page the chat already knows the table, so
+    "describe this dataset's columns" names it without a chip (`AI-26`).
 
 A conversation is private to the person who had it. Another user cannot
 list it, open it or delete it; the address of someone else's conversation
@@ -90,10 +95,11 @@ answers 404 (not found).
   (ADR 0012) and in the "Tools" menu of the composer, in the capability
   names rather than the tool names.
 - Attaching a file to a chat.
-- The assistant making a dashboard public or embeddable, changing who can
-  see one, or emailing anyone outside the company. There is no tool for it
-  today; it is `AI-11`, which is planned and blocked by `BI-19`, `BI-26`
-  and `DEC-8`.
+- Changing who can see a dashboard, or emailing anyone outside the
+  company. Making a dashboard public or embeddable is offered through the
+  assistant now (`AI-11`): the public link waits for a person's approval,
+  ending one is a confirm in the chat, and the assistant never grants
+  permissions.
 - Grounding the assistant in documents. There is no vector store in the
   product; the assistant is a tool-calling agent over its registry.
 - Scheduled or headless runs for the ordinary user. The digital employees
@@ -121,6 +127,7 @@ and a change it may not make is refused with the permission it lacks.
 | 6 | Everything is written to the audit | One immutable row per gate decision and per executed tool call, with secrets in the arguments replaced by `[redacted]` | ADR 0012 decision 4 |
 | 7 | The requester cannot decide their own approval | A person who asked for a high-risk action cannot approve it: the API refuses the decision with 403 and the request waits for somebody else. A catalog access request obeys the same rule | `SEC-57`, product owner 2026-11-02 |
 | 8 | One name: AI Copilot | Every screen that names the assistant says "AI Copilot" — never "Copilot" alone and never "the assistant" — and the reserved employee row (`emp-copilot`) carries the same name | `AI-23`, product owner 2026-11-02 |
+| 9 | A table mention is page context, not a new tool or prompt text | The chat body carries `mentions: [{ kind: "table", key }]`. The server checks each key with the catalog's own reach helpers, drops one the caller may not read without a trace, and adds the survivors' name and described columns to the page context inside its 6,000-character cap, cut last-first if over. At most five per message | Owner, 2026-11-27 (`AI-26`) |
 
 ## Limits to tell a customer
 
@@ -134,6 +141,10 @@ and a change it may not make is refused with the permission it lacks.
   permission.
 - Its SQL runs inside the person's own permissions, with the same masking
   and row filters as Query Studio (`SEC-9`).
+- The `@` picker lists catalog tables, so it needs `catalog:read`. A person
+  whose only grant is a per-table `query:read` gets no picker. The server
+  still checks every mention a message carries, and a table they may not
+  read adds nothing to the answer, whatever the client sent (`AI-26`).
 - Ask mode cannot change anything. A tool that changes something is refused
   with "refused: Ask mode cannot run a tool that changes anything; switch to
   Build mode".

@@ -1,0 +1,3667 @@
+/*
+ * The Lakehouse site's styles (WEB-5). Tailwind, the few console rules the
+ * landing page was drawn against, and the landing's own CSS (moved from
+ * `src/features/landing/landing.css`): custom properties, keyframes and the
+ * text-stroke numerals.
+ *
+ * Palette is sampled from the logo; `lib/palette.ts` holds the same values
+ * for the 3D scene. The accents (bronze, silver, gold) belong to the three
+ * depths only (WEB-1 plan §2.3).
+ *
+ * Motion that loops forever lives here as CSS, and every one of those loops is
+ * switched off under `prefers-reduced-motion: reduce` at the bottom of this
+ * file (plan §2.8: "no autoplay loops"). Scroll-driven motion is done in the
+ * components with `motion`, which checks the same media query itself.
+ */
+
+@import "tailwindcss";
+
+/*
+ * Hover applies whenever the element is actually hovered: the console's
+ * rule, kept so the page behaves as it did. Tailwind v4 otherwise wraps
+ * every `hover:` in `@media (hover: hover)`.
+ */
+@custom-variant hover (&:hover);
+/* WEB-5 review fix R12: a phone screen too short for the hero's creature
+   and its full-size copy: up to 832 px tall, so 360×800 and 375×812 are,
+   and 390×844, where nothing may change, is not. */
+@custom-variant short (@media (max-width: 47.99rem) and (max-height: 52rem));
+
+/*
+ * WEB-5 D6 (the design stays): the landing was drawn inside the console, so
+ * it inherited the console design system's radius scale and base type
+ * rules. They are restated here, with the console's values, so the moved
+ * page measures the same: `rounded-3xl` is 2.2 x 0.45rem there, not
+ * Tailwind's 1.5rem.
+ */
+@theme {
+  --radius-sm: calc(0.45rem * 0.6);
+  --radius-md: calc(0.45rem * 0.8);
+  --radius-lg: 0.45rem;
+  --radius-xl: calc(0.45rem * 1.4);
+  --radius-2xl: calc(0.45rem * 1.8);
+  --radius-3xl: calc(0.45rem * 2.2);
+  --radius-4xl: calc(0.45rem * 2.6);
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+  body {
+    background: #020514;
+    color: #e8f4ff;
+  }
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  summary,
+  label[for] {
+    cursor: pointer;
+  }
+  h1 {
+    font-family: var(--font-sans);
+    font-weight: 700;
+    font-size: 48px;
+    line-height: 48px;
+    letter-spacing: -0.02em;
+  }
+  h2 {
+    font-family: var(--font-sans);
+    font-weight: 600;
+    font-size: 30px;
+    line-height: 36px;
+    letter-spacing: -0.01em;
+  }
+  h3 {
+    font-family: var(--font-sans);
+    font-weight: 600;
+    font-size: 24px;
+    line-height: 32px;
+  }
+  p,
+  li {
+    font-size: 16px;
+    line-height: 24px;
+  }
+  th {
+    font-weight: 500;
+    font-size: 14px;
+    line-height: 24px;
+  }
+  td {
+    font-size: 14px;
+    line-height: 24px;
+  }
+  /* WEB-5 review fix R7 (owner): monospace only for code. The one code
+     identifier on the page (the pipeline name in the approval card) uses
+     the system's monospace stack, as the RantAI site's `.code-frame pre
+     code` does; every label, pill and caption is the sans face. */
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    font-size: 14px;
+    line-height: 20px;
+  }
+}
+
+/* ---- The landing ------------------------------------------------------ */
+
+/* WEB-5 owner QA O25: the primary (filled) button's colours, one token for
+   every filled call to action. White text needs a deeper lake blue than the
+   accent (#44A6FA is 2.6:1 with white): the fill is 5.12:1 with white, the
+   hover one step lighter at 4.84:1, the press one step deeper at 5.79:1. On
+   :root, because the language offer renders outside `.lk-root`. */
+:root {
+  /* Task A neutral base (owner, 2026-11-07: "jangan biru semuanya"): the content
+     sections between the two seas are near-black and grey, as rantai.dev's dark
+     mode, now (Task C) a dark muted deep-sea blue, not black. Bright blue stays on the primary button,
+     links, data and small accents. Panels and cards are flat steps of this grey. */
+  --lk-n-bg: #061224;
+  --lk-n-surface: #0b1a2d;
+  --lk-n-raised: #112238;
+  --lk-n-hair: rgba(170, 200, 235, 0.12);
+  --lk-n-text: #f1f3f4;
+  --lk-n-muted: #9fb0c4;
+  --lk-primary: #1d6ccf;
+  --lk-primary-hover: #2370d4;
+  --lk-primary-press: #1a63c4;
+}
+
+/* WEB-5 owner QA O26, O33: the rubber band past either end of the page
+   (macOS and iOS) shows the root's canvas. Since O33 every page ends on the
+   abyss, #020514 (the home page's water, the contact page and the 404 all
+   darken down to it), which is also the hero's night at the top, so the
+   canvas is that one colour above and below. The body keeps the abyss
+   behind the content. The bounce itself is left alone. */
+:root:has(.lk-root) {
+  background: #020514;
+}
+
+.lk-root {
+  --lk-abyss: #020514;
+  --lk-navy: #050a30;
+  --lk-dusk: #0b1a4a;
+  --lk-lake: #44a6fa;
+  --lk-foam: #e8f4ff;
+  --lk-bronze: #c8834a;
+  --lk-silver: #b9c6d3;
+  --lk-gold: #f2c14e;
+  color-scheme: dark;
+  background: var(--lk-abyss);
+  color: var(--lk-foam);
+  font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* The overscroll area and the area behind a rubber-banding page match the
+   page instead of flashing a light background. */
+html:has(.lk-root) {
+  background: #020514;
+  scroll-behavior: smooth;
+}
+
+.lk-display {
+  font-family: var(--font-display), var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+  font-style: normal;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+}
+
+
+/* WEB-5 D5: content is visible without JavaScript. Every reveal starts
+   hidden through inline styles (opacity, travel, blur) that the server HTML
+   already carries. Until motion's animation features have loaded and
+   `motion-features.tsx` has put `motion-ready` on <html>, those starting
+   states are overridden, so a visitor without JavaScript, or whose features
+   chunk failed, reads the page in full (WEB-5 review fix R1). This replaces
+   the `<noscript>` patch. */
+html:not(.motion-ready) [data-reveal] {
+  opacity: 1 !important;
+  transform: none !important;
+  filter: none !important;
+}
+
+/* WEB-5 D14 S1, the slow dive: while the live lake runs the hero is 220 vh
+   (DIVE.heroVh in lib/scroll-timeline.ts), so the camera has room to linger
+   at the waterline. The DOM hero (no fast WebGL, reduced motion, no JS)
+   keeps its 150 vh, because a long pinned screen without the dive would
+   only be a pause. The mode is set after the page is usable, below the
+   fold, so the change shifts nothing on screen. */
+html[data-scene="full"] #hero {
+  height: 220vh;
+}
+
+/* WEB-5 D14 S2: the page-wide water (components/home/depth-backdrop.tsx).
+   Its two colours are written by the page as it scrolls; the defaults are
+   the deepest water, where the assistant starts. Once the page has
+   hydrated (`data-scene` is set), the sections from the assistant to the
+   final call drop their own backgrounds and sit in it. Without
+   JavaScript the attribute never appears, and they keep them. */
+.lk-water {
+  --lk-water-top: #081a2e;
+  --lk-water-bottom: #071626;
+  background: linear-gradient(180deg, var(--lk-water-top), var(--lk-water-bottom));
+}
+html[data-scene] .lk-fallback-bg {
+  background: none;
+}
+/* WEB-5 O33: the ascent's caustics and bubbles (`.lk-water-caustics`,
+   `.lk-bubbles`, `.lk-bubble`, `--lk-ascent`, `--lk-caustic`) are gone with
+   the ascent: the page is one descent now. */
+
+/* WEB-5 D14 S3: the depth gauge (components/home/depth-gauge.tsx). The page
+   writes --lk-gauge-f, the depth as a fraction of the deepest point. The
+   desktop marker moves down the scale and the phone hairline fills with it.
+   The desktop scale hides inside the depths section, whose own gauge
+   stands there. Without JavaScript the marker never moves, so no gauge. */
+.lk-gauge {
+  --lk-gauge-f: 0;
+}
+.lk-gauge-marker {
+  top: calc(var(--lk-gauge-f) * 100%);
+}
+.lk-gauge-fill {
+  transform: scaleX(var(--lk-gauge-f));
+}
+.lk-gauge-scale {
+  transition: opacity 0.4s ease;
+}
+.lk-gauge[data-in-depths] .lk-gauge-scale {
+  opacity: 0;
+}
+html:not([data-scene]) .lk-gauge {
+  display: none;
+}
+
+/* Visible focus ring on the dark page (plan §2.8, keyboard). */
+.lk-root :focus-visible {
+  outline: 2px solid var(--lk-lake);
+  outline-offset: 3px;
+}
+.lk-root #main:focus {
+  outline: none;
+}
+
+.lk-root ::selection {
+  background: rgba(68, 166, 250, 0.35);
+  color: #fff;
+}
+
+/* Outlined numerals for the "Yours to keep" cards. */
+.lk-outline-text {
+  color: transparent;
+  -webkit-text-stroke: 1px rgba(255, 255, 255, 0.38);
+}
+
+/* Film grain: a 160px tile of fractal noise, very faint. It breaks up the
+   banding that long dark gradients show on 8-bit displays. */
+.lk-grain::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.07;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.9 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  /* WEB-5 D14 S2/S5: the grain fades in over the final's first quarter, so
+     it does not draw an edge on the page-wide water where the section starts. */
+  mask-image: linear-gradient(to bottom, transparent, #000 25%);
+}
+
+/* ---- Keyframes -------------------------------------------------------- */
+
+@keyframes lk-bob {
+  0%,
+  100% {
+    transform: translateY(0) rotate(-0.6deg);
+  }
+  50% {
+    transform: translateY(-2.2%) rotate(0.6deg);
+  }
+}
+
+@keyframes lk-drop {
+  0% {
+    transform: translateY(-6px);
+    opacity: 0;
+  }
+  15% {
+    opacity: 1;
+  }
+  80% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(40px);
+    opacity: 0;
+  }
+}
+
+@keyframes lk-caustic-a {
+  0% {
+    transform: translate3d(-6%, -4%, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(6%, 5%, 0) scale(1.15);
+  }
+  100% {
+    transform: translate3d(-6%, -4%, 0) scale(1);
+  }
+}
+
+@keyframes lk-caustic-b {
+  0% {
+    transform: translate3d(7%, 3%, 0) scale(1.1);
+  }
+  50% {
+    transform: translate3d(-5%, -6%, 0) scale(0.95);
+  }
+  100% {
+    transform: translate3d(7%, 3%, 0) scale(1.1);
+  }
+}
+
+@keyframes lk-wave {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+@keyframes lk-ring {
+  0% {
+    transform: translate(-50%, -50%) scale(0.5);
+    opacity: 0.55;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(2.1);
+    opacity: 0;
+  }
+}
+
+@keyframes lk-shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+@keyframes lk-twinkle {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 0.95;
+  }
+}
+
+@keyframes lk-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(68, 166, 250, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 0 7px rgba(68, 166, 250, 0);
+  }
+}
+
+.lk-bob {
+  animation: lk-bob 4s ease-in-out infinite;
+}
+.lk-drop {
+  animation: lk-drop 2.4s cubic-bezier(0.5, 0, 0.5, 1) infinite;
+}
+.lk-caustic-a {
+  animation: lk-caustic-a 22s ease-in-out infinite;
+}
+.lk-caustic-b {
+  animation: lk-caustic-b 28s ease-in-out infinite;
+}
+.lk-wave-slow {
+  animation: lk-wave 18s linear infinite;
+}
+.lk-wave-fast {
+  animation: lk-wave 11s linear infinite;
+}
+.lk-ring {
+  animation: lk-ring 4s ease-out infinite;
+}
+.lk-twinkle {
+  animation: lk-twinkle 3.2s ease-in-out infinite;
+}
+.lk-pulse {
+  animation: lk-pulse 2s ease-in-out infinite;
+}
+.lk-shimmer {
+  background-size: 200% 100%;
+  animation: lk-shimmer 1.6s linear infinite;
+}
+
+/* WEB-5 P4 micro-details (DESIGN.md §3). A state that appears (the form's
+   "Nothing opened?" line, a copy button's feedback) eases in instead of
+   popping. */
+@keyframes lk-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+.lk-fade-in {
+  animation: lk-fade-in 220ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* The FAQ's answers open and close smoothly where the browser can animate
+   a <details> (`::details-content` with `interpolate-size`); elsewhere they
+   open at once, which is the same disclosure without the ease. */
+.lk-faq {
+  interpolate-size: allow-keywords;
+}
+.lk-faq details::details-content {
+  block-size: 0;
+  overflow: clip;
+  opacity: 0;
+  transition:
+    block-size 260ms cubic-bezier(0.16, 1, 0.3, 1),
+    opacity 200ms ease-out,
+    content-visibility 260ms allow-discrete;
+}
+.lk-faq details[open]::details-content {
+  block-size: auto;
+  opacity: 1;
+}
+
+/* WEB-5 O6: the phone menu, a modal <dialog>, slides in from the right over
+   a dimmed page and back out when it closes (`display` and `overlay` are
+   kept through the exit, so the slide-out is seen). */
+.lk-sheet {
+  translate: 100% 0;
+  transition:
+    translate 320ms cubic-bezier(0.16, 1, 0.3, 1),
+    overlay 320ms allow-discrete,
+    display 320ms allow-discrete;
+}
+.lk-sheet[open] {
+  display: flex;
+  translate: 0 0;
+}
+@starting-style {
+  .lk-sheet[open] {
+    translate: 100% 0;
+  }
+}
+.lk-sheet::backdrop {
+  opacity: 0;
+  transition:
+    opacity 260ms ease-out,
+    overlay 320ms allow-discrete,
+    display 320ms allow-discrete;
+}
+.lk-sheet[open]::backdrop {
+  opacity: 1;
+}
+@starting-style {
+  .lk-sheet[open]::backdrop {
+    opacity: 0;
+  }
+}
+
+/* WEB-5 owner QA O9: a side column that stays with a longer list beside it
+   sits at the vertical centre of the screen below the top bar, not pinned
+   under it. The column is a wrapper as tall as the visible area (or as its
+   grid row, if that is shorter) with its content centred in it, so:
+   - beside a short list it is simply centred against the list;
+   - beside a long one it rises into the centre as the section arrives,
+     stays there, and leaves with the last item, inside its own section;
+   - when its content is taller than the screen, `safe` falls back to the
+     top instead of cutting it.
+   The percentage height resolves against the grid area. Applied from the
+   breakpoint where the layout has two columns (`lk-sticky-center-md` /
+   `-lg`); on phones nothing is sticky. */
+@media (min-width: 48rem) {
+  .lk-sticky-center-md {
+    position: sticky;
+    top: 4rem;
+    display: flex;
+    flex-direction: column;
+    justify-content: safe center;
+    align-self: start;
+    height: min(100%, calc(100svh - 4rem));
+  }
+}
+@media (min-width: 64rem) {
+  .lk-sticky-center-lg {
+    position: sticky;
+    top: 4rem;
+    display: flex;
+    flex-direction: column;
+    justify-content: safe center;
+    align-self: start;
+    height: min(100%, calc(100svh - 4rem));
+  }
+}
+
+/* ---- The living tiles (WEB-5 owner QA O10) ------------------------------
+   The dashboards' tiles move like a live dashboard, in CSS only.
+   `components/home/live-tile.tsx` sets `data-shown` once a tile comes into
+   view (the entrance) and `data-live` while it is on screen (the idle loop,
+   paused off screen). Without JavaScript neither is set and every tile is
+   its final picture; the hidden start states apply only once motion is
+   ready (`html.motion-ready`). Under reduced motion none of it runs (the
+   block at the end of this file). */
+.lk-tile {
+  --lk-ease: cubic-bezier(0.16, 1, 0.3, 1);
+}
+.lk-tile .lk-draw {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 0;
+}
+html.motion-ready .lk-tile:not([data-shown]) .lk-draw {
+  stroke-dashoffset: 1;
+}
+html.motion-ready .lk-tile:not([data-shown]) :is(.lk-fade, .lk-land, .lk-flow) {
+  opacity: 0;
+}
+.lk-tile[data-shown] .lk-draw {
+  animation: lk-draw 1.4s var(--lk-ease) backwards;
+}
+.lk-tile[data-shown] .lk-fade {
+  animation: lk-tile-fade 0.9s ease-out backwards;
+}
+.lk-tile .lk-land,
+.lk-tile .lk-breathe,
+.lk-tile .lk-nudge,
+.lk-tile .lk-tick {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+.lk-tile[data-shown] .lk-land {
+  animation: lk-land 0.5s var(--lk-ease) 1.25s backwards;
+}
+@keyframes lk-draw {
+  from {
+    stroke-dashoffset: 1;
+  }
+}
+@keyframes lk-tile-fade {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes lk-land {
+  from {
+    opacity: 0;
+    transform: translateY(-10px) scale(0.4);
+  }
+}
+
+/* Idle loops: defined once shown, running only while on screen (the pause
+   rules follow at the end of this block, after the shorthands they adjust). */
+.lk-tile[data-shown] .lk-breathe {
+  animation: lk-breathe 3.2s ease-in-out 1.8s infinite;
+}
+@keyframes lk-breathe {
+  50% {
+    transform: scale(1.45);
+    opacity: 0.35;
+  }
+}
+/* The newest point nudges up every few seconds, as if a value came in. */
+.lk-tile[data-shown] .lk-nudge {
+  animation: lk-nudge 6s ease-in-out 3s infinite;
+}
+@keyframes lk-nudge {
+  0%,
+  78%,
+  100% {
+    transform: translateY(0);
+  }
+  86% {
+    transform: translateY(-5px);
+  }
+}
+/* Sankey: a short light travels along each band. */
+.lk-tile .lk-flow {
+  stroke-dasharray: 0.08 0.92;
+  stroke-dashoffset: 1;
+}
+.lk-tile[data-shown] .lk-flow {
+  animation: lk-flow 7.5s linear infinite;
+}
+@keyframes lk-flow {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+/* KPI: the digits roll up into place, then the last one ticks now and then. */
+.lk-tile .lk-roll {
+  transform: translateY(calc(var(--lk-d) * -1em));
+}
+.lk-tile[data-shown] .lk-roll {
+  animation: lk-roll 1.2s var(--lk-ease) 0.15s backwards;
+}
+.lk-tile[data-shown] .lk-roll.lk-tick {
+  animation:
+    lk-roll 1.2s var(--lk-ease) 0.15s backwards,
+    lk-tick 9s var(--lk-ease) 4s infinite;
+}
+@keyframes lk-roll {
+  from {
+    transform: translateY(0);
+  }
+}
+@keyframes lk-tick {
+  0%,
+  70%,
+  100% {
+    transform: translateY(calc(var(--lk-d) * -1em));
+  }
+  76%,
+  94% {
+    transform: translateY(calc((var(--lk-d) + 1) * -1em));
+  }
+}
+/* The map: the dots light up in a wave across the shape. */
+.lk-tile[data-shown] .lk-map img {
+  mask-image: linear-gradient(90deg, #000 0 40%, transparent 60% 100%);
+  mask-size: 250% 100%;
+  mask-position: 0% 0;
+  animation: lk-wave 1.6s var(--lk-ease) backwards;
+}
+html.motion-ready .lk-tile:not([data-shown]) .lk-map img {
+  opacity: 0.15;
+}
+@keyframes lk-wave {
+  from {
+    mask-position: 100% 0;
+  }
+}
+/* The highlighted region settles, and a light sweeps over the dots now and then. */
+.lk-map-glow,
+.lk-map-sweep {
+  mask: url(/tiles/dot-map.svg) center / 100% 100% no-repeat;
+  pointer-events: none;
+}
+/* Audit #23: the highlighted island is Java, the busiest. */
+.lk-map-glow {
+  background: radial-gradient(16% 14% at 33% 75%, rgba(255, 255, 255, 0.55), transparent 70%);
+  opacity: 0.6;
+}
+html.motion-ready .lk-tile:not([data-shown]) .lk-map-glow {
+  opacity: 0;
+}
+.lk-tile[data-shown] .lk-map-glow {
+  animation: lk-tile-fade 1s ease-out 1.2s backwards;
+}
+.lk-map-sweep {
+  background: linear-gradient(100deg, transparent 35%, rgba(255, 255, 255, 0.7) 50%, transparent 65%) no-repeat;
+  background-size: 300% 100%;
+  background-position: 120% 0;
+}
+.lk-tile[data-shown] .lk-map-sweep {
+  animation: lk-sweep 8s ease-in-out 3s infinite;
+}
+@keyframes lk-sweep {
+  0% {
+    background-position: 120% 0;
+  }
+  35%,
+  100% {
+    background-position: -20% 0;
+  }
+}
+/* The calendar: the cells fill in a diagonal ripple; one day glows now and then. */
+.lk-tile[data-shown] .lk-cal img {
+  mask-image: linear-gradient(135deg, #000 0 40%, transparent 60% 100%);
+  mask-size: 250% 250%;
+  mask-position: 0% 0%;
+  animation: lk-ripple 1.8s var(--lk-ease) backwards;
+}
+html.motion-ready .lk-tile:not([data-shown]) .lk-cal img {
+  opacity: 0.15;
+}
+@keyframes lk-ripple {
+  from {
+    mask-position: 100% 100%;
+  }
+}
+.lk-cal-glow {
+  mask: url(/tiles/calendar-heatmap.svg) center / 100% 100% no-repeat;
+  pointer-events: none;
+}
+.lk-cal-glow::before,
+.lk-cal-glow::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+}
+.lk-cal-glow::before {
+  background: radial-gradient(4.5% 9% at 33.5% 36%, #e8f4ff, transparent 100%);
+}
+.lk-cal-glow::after {
+  background: radial-gradient(4.5% 9% at 76% 60%, #e8f4ff, transparent 100%);
+}
+.lk-tile[data-shown] .lk-cal-glow::before {
+  animation: lk-cell 7s ease-in-out 2.5s infinite;
+}
+.lk-tile[data-shown] .lk-cal-glow::after {
+  animation: lk-cell 7s ease-in-out 6s infinite;
+}
+@keyframes lk-cell {
+  0%,
+  60%,
+  100% {
+    opacity: 0;
+  }
+  70%,
+  80% {
+    opacity: 0.9;
+  }
+}
+/* Paused off screen. After every `animation` shorthand above, which would
+   otherwise set the state back to running. The entrance on .lk-roll.lk-tick
+   is a finished, one-off animation, so pausing both is harmless. */
+.lk-tile:not([data-live]) :is(.lk-breathe, .lk-nudge, .lk-flow, .lk-tick, .lk-map-sweep),
+.lk-tile:not([data-live]) .lk-cal-glow::before,
+.lk-tile:not([data-live]) .lk-cal-glow::after,
+.lk-tile:not([data-live]) .lk-roll.lk-tick {
+  animation-play-state: paused;
+}
+
+
+/* ---- Tile hover (WEB-5 owner QA O18) ------------------------------------
+   Every tile answers the pointer. Hover zones and their layers are in the
+   tiles' markup; these rules show them. Tooltips appear under reduced
+   motion too, only without the easing (the block at the end). */
+.lk-hov-show,
+.lk-hov-tip,
+.lk-flowtip,
+.lk-nodetip {
+  opacity: 0;
+  transition: opacity 180ms ease-out;
+  pointer-events: none;
+}
+.lk-hov-zone:hover .lk-hov-show,
+.lk-tile:focus-visible .lk-hov-zone[data-last] .lk-hov-show {
+  opacity: 1;
+}
+.lk-hov-show .lk-hov-tip,
+.lk-flowtip .lk-hov-tip,
+.lk-nodetip .lk-hov-tip {
+  /* Shown and hidden by their parent group. */
+  opacity: 1;
+}
+.lk-hov-grow {
+  transform-box: fill-box;
+  transform-origin: center;
+  scale: 0.5;
+  transition: scale 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.lk-hov-zone:hover .lk-hov-grow,
+.lk-tile:focus-visible .lk-hov-zone[data-last] .lk-hov-grow {
+  scale: 1;
+}
+/* The KPI follows the hovered day: the idle tick stops, the digits roll there. */
+.lk-tile .lk-kpi .lk-roll {
+  transition: transform 220ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.lk-kpi:has(.lk-kz:hover) .lk-roll {
+  animation: none;
+}
+/* Sankey: the hovered band, or a node's bands, stay lit; the rest dim. */
+.lk-sankey .lk-flowgrp {
+  transition: opacity 200ms ease-out;
+}
+.lk-sankey:has(.lk-flowgrp:hover) .lk-flowgrp:not(:hover) {
+  opacity: 0.18;
+}
+/* Map: the region under the pointer shows its dots lit, the rest dim. */
+.lk-zone::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: url(/tiles/dot-map.svg) no-repeat;
+  background-size: 400% 300%;
+  background-position: inherit;
+  filter: brightness(1.8) drop-shadow(0 0 6px rgba(68, 166, 250, 0.6));
+}
+.lk-zone::before,
+.lk-zone .lk-tip {
+  opacity: 0;
+  transition: opacity 180ms ease-out;
+}
+.lk-zone:hover::before,
+.lk-zone:hover .lk-tip {
+  opacity: 1;
+}
+.lk-map img {
+  transition: opacity 200ms ease-out;
+}
+.lk-map:has(.lk-zone:hover) img {
+  opacity: 0.35;
+}
+/* The HTML tooltips (map, calendar): the site's glass, tabular. */
+.lk-tip {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 6px);
+  translate: -50% 0;
+  white-space: nowrap;
+  border-radius: 10px;
+  background: rgba(4, 12, 24, 0.94);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.22);
+  padding: 4px 9px;
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: #e8f4ff;
+  pointer-events: none;
+  filter: none;
+}
+/* Calendar (calendar-hover.tsx writes --c, --r and data-on). The grid is
+   the drawing's: columns of 17 and rows of 23 from (12, 14), cells 13 x 17,
+   in a 360 x 190 tile. */
+.lk-calhov > span {
+  position: absolute;
+  opacity: 0;
+  transition: opacity 150ms ease-out;
+}
+.lk-calhov[data-on] > span {
+  opacity: 1;
+}
+.lk-calhov-row {
+  left: 2.5%;
+  right: 2.5%;
+  top: calc((14 + var(--r, 0) * 23) / 190 * 100%);
+  height: calc(17 / 190 * 100%);
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 6px;
+}
+.lk-calhov-col {
+  top: 5%;
+  bottom: 3%;
+  left: calc((12 + var(--c, 0) * 17) / 360 * 100%);
+  width: calc(13 / 360 * 100%);
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 6px;
+}
+.lk-calhov-cell {
+  left: calc((12 + var(--c, 0) * 17) / 360 * 100%);
+  top: calc((14 + var(--r, 0) * 23) / 190 * 100%);
+  width: calc(13 / 360 * 100%);
+  height: calc(17 / 190 * 100%);
+  border-radius: 4px;
+  box-shadow: 0 0 0 2px #e8f4ff, 0 0 14px 2px rgba(68, 166, 250, 0.6);
+  scale: 1.35;
+  transition:
+    left 120ms ease-out,
+    top 120ms ease-out,
+    opacity 150ms ease-out;
+}
+.lk-calhov .lk-calhov-tip {
+  left: calc((18.5 + var(--c, 0) * 17) / 360 * 100%);
+  top: calc((14 + var(--r, 0) * 23) / 190 * 100% - 30px);
+  bottom: auto;
+}
+.lk-calhov .lk-calhov-tip[data-flip] {
+  translate: -100% 0;
+}
+
+/* ---- Governance (WEB-5 owner QA O16 + O17; O36: masking is masked text
+   that keeps its shape, with a lock, never a grey bar or a blur) ---------- */
+/* The bento's illustrations: hidden start states only once motion is ready. */
+html.motion-ready .lk-tile:not([data-shown]) :is(.lk-gv-node, .lk-gv-row, .lk-gv-result, .lk-gv-badge) {
+  opacity: 0;
+}
+.lk-tile[data-shown] .lk-gv-node,
+.lk-tile[data-shown] .lk-gv-row,
+.lk-tile[data-shown] .lk-gv-result,
+.lk-tile[data-shown] .lk-gv-badge {
+  animation: lk-gv-in 520ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+@keyframes lk-gv-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+/* Proof: the address masks and unmasks; the check stays. */
+.lk-gv-mask {
+  opacity: 0;
+}
+.lk-tile[data-shown] .lk-gv-plain {
+  animation: lk-gv-plain 6s ease-in-out 1.2s infinite;
+}
+.lk-tile[data-shown] .lk-gv-mask {
+  animation: lk-gv-mask 6s ease-in-out 1.2s infinite;
+}
+/* O36: one gives way before the other comes, so the two never overlap. */
+@keyframes lk-gv-plain {
+  0%,
+  35%,
+  100% {
+    opacity: 1;
+  }
+  41%,
+  92% {
+    opacity: 0;
+  }
+}
+@keyframes lk-gv-mask {
+  0%,
+  43%,
+  90%,
+  100% {
+    opacity: 0;
+  }
+  48%,
+  84% {
+    opacity: 1;
+  }
+}
+/* Audit: the risky row waits, then is approved, now and then. */
+.lk-gv-ok {
+  opacity: 0;
+}
+.lk-tile[data-shown] .lk-gv-wait {
+  animation: lk-gv-wait 7s ease-in-out 1.5s infinite;
+}
+.lk-tile[data-shown] .lk-gv-ok {
+  animation: lk-gv-ok 7s ease-in-out 1.5s infinite;
+}
+/* One status at a time: the old one is fully gone before the new one starts to show
+   (the two pills have different widths and share one cell). */
+@keyframes lk-gv-wait {
+  0%,
+  44% {
+    opacity: 1;
+  }
+  47%,
+  96% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+@keyframes lk-gv-ok {
+  0%,
+  50% {
+    opacity: 0;
+    transform: scale(0.94);
+  }
+  53%,
+  92% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  95%,
+  100% {
+    opacity: 0;
+    transform: scale(0.94);
+  }
+}
+/* Catalog: the query types itself, one character at a time, with a caret. */
+.lk-gv-type {
+  width: calc(var(--lk-n) * 1ch);
+}
+.lk-tile[data-shown] .lk-gv-type {
+  animation: lk-gv-type 1.1s steps(var(--lk-n)) 0.3s backwards;
+}
+@keyframes lk-gv-type {
+  from {
+    width: 0;
+  }
+}
+.lk-tile[data-shown] .lk-gv-caret {
+  animation: lk-gv-caret 1s steps(1) infinite;
+}
+@keyframes lk-gv-caret {
+  50% {
+    opacity: 0;
+  }
+}
+.lk-tile[data-shown] .lk-gv-result {
+  animation-delay: 1.3s;
+}
+/* Access: the lock follows the table's "View as" (the section's data-role). */
+.lk-gv-open {
+  opacity: 0;
+}
+.lk-gv-open,
+.lk-gv-closed {
+  transition:
+    opacity 220ms ease-out,
+    transform 220ms ease-out;
+}
+section[data-role="admin"] .lk-gv-open {
+  opacity: 1;
+}
+section[data-role="admin"] .lk-gv-closed {
+  opacity: 0;
+  transform: translateY(-3px);
+}
+/* Paused off screen, like the dashboards' tiles. */
+.lk-tile:not([data-live]) :is(.lk-gv-plain, .lk-gv-mask, .lk-gv-wait, .lk-gv-ok, .lk-gv-caret) {
+  animation-play-state: paused;
+}
+
+/* ---- Column lineage (`components/home/lineage-trace.tsx`) ---------------
+   A bead of light along the traced path, Bronze → Silver, then Silver →
+   Gold (the second edge waits 1.1 s). In at the start, out at the end, then
+   it waits; it rests just off either end (0.2 / -1.02), so its round caps
+   never leave a dot. Reduced motion: the block at the end of this file stops
+   every animation in a tile, and the bead rests out of sight. ------------ */
+.lk-lt-pulse {
+  stroke-dasharray: 0.18 1.4;
+  stroke-dashoffset: 0.2;
+}
+.lk-tile[data-shown] .lk-lt-pulse {
+  animation: lk-lt-run 2.2s cubic-bezier(0.45, 0, 0.55, 1) backwards infinite;
+}
+@keyframes lk-lt-run {
+  0% {
+    stroke-dashoffset: 0.2;
+  }
+  50%,
+  100% {
+    stroke-dashoffset: -1.02;
+  }
+}
+.lk-tile:not([data-live]) .lk-lt-pulse {
+  animation-play-state: paused;
+}
+
+/* ---- The footer card's flow (WEB-5 owner QA O14, compact in O46) --------
+   Keyed on the picked source, so every pick replays it: the nodes fade in
+   and one light travels the thin line, segment after segment (each
+   segment's delay is `--lk-sf-d`), while the card is on screen
+   (`data-live`). Across on wider screens, down on phones. */
+.lk-sf-line {
+  position: relative;
+  display: block;
+  flex: 1 1 0;
+  min-width: 14px;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.16);
+  overflow: hidden;
+}
+@media (max-width: 47.99rem) {
+  .lk-sf-line {
+    flex: none;
+    width: 1px;
+    min-width: 0;
+    height: 18px;
+    margin-left: 18px;
+  }
+}
+.lk-sf-line::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, #8fcbff, transparent);
+  transform: translateX(-100%);
+  animation: lk-sf-run 1.8s linear infinite;
+  animation-delay: var(--lk-sf-d, 0s);
+  animation-play-state: paused;
+}
+@media (max-width: 47.99rem) {
+  .lk-sf-line::after {
+    background: linear-gradient(180deg, transparent, #8fcbff, transparent);
+    animation-name: lk-sf-run-down;
+  }
+}
+.lk-sf[data-live] .lk-sf-line::after {
+  animation-play-state: running;
+}
+/* A quarter of the cycle crossing its segment, then dark while the light
+   crosses the next ones (four segments, 0.45 s apart). */
+@keyframes lk-sf-run {
+  0% {
+    transform: translateX(-100%);
+  }
+  25%,
+  100% {
+    transform: translateX(100%);
+  }
+}
+@keyframes lk-sf-run-down {
+  0% {
+    transform: translateY(-100%);
+  }
+  25%,
+  100% {
+    transform: translateY(100%);
+  }
+}
+.lk-sf-node {
+  animation: lk-sf-in 360ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+@keyframes lk-sf-in {
+  from {
+    opacity: 0;
+  }
+}
+
+/* ---- Governance bento pointer effects (WEB-5 owner QA O37) --------------
+   Written here, not taken from a library. `bento-fx.tsx` writes the pointer
+   into `--mx`/`--my` on the grid and `--x`/`--y` on every tile, once a frame.
+   - The spotlight: one soft light over the whole grid.
+   - The border glow: each tile's hairline lights up near the pointer, a
+     radial light masked to the 1px ring; it fades with distance, so a
+     neighbour catches a little of it.
+   - Foam dots drift inside the hovered tile; a ring spreads from a press.
+   Pointer effects only while `data-fx` is set (a mouse is over the grid). */
+.lk-mb-spot {
+  opacity: 0;
+  background: radial-gradient(260px circle at calc(var(--mx, -999px) + 40px) calc(var(--my, -999px) + 40px), rgba(68, 166, 250, 0.09), transparent 70%);
+  transition: opacity 300ms ease-out;
+}
+.lk-mb-tile::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  border-radius: inherit;
+  padding: 1px;
+  pointer-events: none;
+  background: radial-gradient(320px circle at var(--x, -999px) var(--y, -999px), rgba(143, 203, 255, 0.75), rgba(68, 166, 250, 0.25) 40%, transparent 70%);
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box exclude,
+    linear-gradient(#000 0 0);
+  opacity: 0;
+  transition: opacity 300ms ease-out;
+}
+.lk-mb[data-fx] .lk-mb-spot,
+.lk-mb[data-fx] .lk-mb-tile::before {
+  opacity: 1;
+}
+.lk-mb-dots {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+}
+.lk-mb-dot {
+  position: absolute;
+  width: 3px;
+  height: 3px;
+  border-radius: 9999px;
+  background: rgba(190, 225, 255, 0.7);
+  box-shadow: 0 0 6px rgba(143, 203, 255, 0.6);
+  opacity: 0;
+  animation: lk-mb-dot 2.4s ease-in-out infinite;
+}
+@keyframes lk-mb-dot {
+  0% {
+    opacity: 0;
+    transform: translate(0, 0);
+  }
+  30% {
+    opacity: 0.8;
+  }
+  100% {
+    opacity: 0;
+    transform: translate(var(--dx), var(--dy));
+  }
+}
+.lk-mb-ripple {
+  position: absolute;
+  z-index: 2;
+  width: 24px;
+  height: 24px;
+  margin: -12px 0 0 -12px;
+  border-radius: 9999px;
+  border: 1px solid rgba(143, 203, 255, 0.7);
+  background: rgba(68, 166, 250, 0.12);
+  pointer-events: none;
+  animation: lk-mb-ripple 650ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+@keyframes lk-mb-ripple {
+  to {
+    opacity: 0;
+    transform: scale(14);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .lk-mb-spot,
+  .lk-mb-tile::before,
+  .lk-mb-dots,
+  .lk-mb-ripple {
+    display: none;
+  }
+}
+
+/* ---- Reduced motion --------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  /* O14: still and lit. */
+  .lk-sf-node,
+  .lk-sf-line,
+  .lk-sf-line::after {
+    animation: none !important;
+  }
+  .lk-sf-line {
+    background: rgba(143, 203, 255, 0.4);
+  }
+  /* O16/O17: still. */
+  .lk-gv-open,
+  .lk-gv-closed {
+    transition: none;
+  }
+  html.motion-ready .lk-tile:not([data-shown]) :is(.lk-gv-node, .lk-gv-row, .lk-gv-result, .lk-gv-badge) {
+    opacity: 1;
+  }
+  /* O18: tooltips and highlights still appear, at once. */
+  .lk-hov-show,
+  .lk-hov-grow,
+  .lk-flowtip,
+  .lk-nodetip,
+  .lk-zone::before,
+  .lk-zone .lk-tip,
+  .lk-calhov > span,
+  .lk-sankey .lk-flowgrp {
+    transition: none !important;
+  }
+  /* O10: the tiles are their final pictures, with no entrance and no loop. */
+  .lk-tile *,
+  .lk-tile *::before,
+  .lk-tile *::after {
+    animation: none !important;
+  }
+  html.motion-ready .lk-tile:not([data-shown]) :is(.lk-fade, .lk-land, .lk-map-glow),
+  html.motion-ready .lk-tile:not([data-shown]) :is(.lk-map, .lk-cal) img {
+    opacity: 1;
+  }
+  html.motion-ready .lk-tile:not([data-shown]) .lk-draw {
+    stroke-dashoffset: 0;
+  }
+  .lk-tile .lk-flow {
+    opacity: 0;
+  }
+  .lk-faq details::details-content,
+  .lk-sheet,
+  .lk-sheet::backdrop {
+    transition: none;
+  }
+  html:has(.lk-root) {
+    scroll-behavior: auto;
+  }
+  .lk-root .lk-fade-in,
+  .lk-root .lk-bob,
+  .lk-root .lk-drop,
+  .lk-root .lk-caustic-a,
+  .lk-root .lk-caustic-b,
+  .lk-root .lk-wave-slow,
+  .lk-root .lk-wave-fast,
+  .lk-root .lk-ring,
+  .lk-root .lk-twinkle,
+  .lk-root .lk-pulse,
+  .lk-root .lk-shimmer {
+    animation: none;
+  }
+}
+
+/* ---- WEB-5 O21: the depths' data card (components/home/depth-data-card.tsx) ----
+   One table that changes with the depth: `data-stage` on the card says
+   which, and every move below is a transition between two of its states,
+   so scrolling back up plays them in reverse. The accent is a registered
+   property so it eases from bronze to silver to gold with the rows. */
+@property --lk-depth-accent {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #c8834a;
+}
+.lk-depth-card {
+  --lk-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --lk-depth-row: 32px;
+  --lk-depth-group: 44px;
+  --lk-depth-ok: #7ee2b0;
+  --lk-depth-bad: #ff9b8e;
+  container: lk-depth / inline-size;
+  position: relative;
+  overflow: hidden;
+  border-radius: var(--radius-3xl);
+  /* Borderless (owner): one flat surface a step lighter than the water and a soft shadow so it
+     still stands off the 3D sea. No coloured top edge (owner, 2026-11-24). */
+  background: var(--lk-n-surface);
+  box-shadow:
+    0 28px 60px -28px rgba(0, 0, 0, 0.7);
+  color: #e8f4ff;
+  font-size: 12px;
+  line-height: 16px;
+  transition: --lk-depth-accent 0.7s ease;
+}
+.lk-depth-dot {
+  background: var(--lk-depth-accent);
+  animation: lk-depth-breathe 3.2s ease-in-out infinite;
+}
+@keyframes lk-depth-breathe {
+  50% {
+    opacity: 0.55;
+  }
+}
+.lk-depth-body {
+  height: calc(28px + 5 * var(--lk-depth-row) + 6px);
+}
+
+/* Columns: the source's name and the order number only where they fit. */
+.lk-depth-grid {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) 70px 58px;
+  column-gap: 8px;
+  align-items: center;
+  padding: 0 14px;
+}
+.lk-depth-ord {
+  display: none;
+}
+@container lk-depth (min-width: 330px) {
+  .lk-depth-grid {
+    grid-template-columns: 14px 50px minmax(0, 1fr) 72px 60px;
+  }
+  .lk-depth-ord {
+    display: block;
+  }
+}
+@container lk-depth (min-width: 400px) {
+  .lk-depth-grid {
+    grid-template-columns: 16px 62px minmax(0, 1fr) 78px 66px;
+    column-gap: 10px;
+  }
+}
+/* O31: the source glyph names its file on hover. */
+.lk-depth-tip {
+  position: absolute;
+  left: -4px;
+  bottom: calc(100% + 4px);
+  z-index: 2;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--lk-n-raised);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.16);
+  color: #e8f4ff;
+  font-size: 10.5px;
+  line-height: 16px;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease;
+}
+.lk-depth-row:hover .lk-depth-tip {
+  opacity: 1;
+}
+.lk-depth-grid-gold {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 44px minmax(0, 1.5fr);
+  column-gap: 24px;
+  align-items: center;
+  padding: 0 14px;
+}
+.lk-depth-head {
+  height: 28px;
+  font-size: 10.5px;
+  color: rgba(255, 255, 255, 0.6);
+  white-space: nowrap;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  transition: opacity 0.4s ease;
+}
+
+.lk-depth-row {
+  position: absolute;
+  inset-inline: 0;
+  top: 28px;
+  height: var(--lk-depth-row);
+  border-radius: 8px;
+  transform: translateY(calc(var(--slot) * var(--lk-depth-row)));
+  transition:
+    transform 0.75s var(--lk-ease) calc(0.12s + var(--i) * 45ms),
+    opacity 0.45s ease calc(var(--i) * 45ms),
+    background-color 0.4s ease;
+}
+.lk-depth-row:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+}
+.lk-depth-row + .lk-depth-row::before {
+  content: "";
+  position: absolute;
+  inset-inline: 14px;
+  top: 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* Bronze: the mess shows. The second copy of an order is tinted and
+   marked, the spellings Silver will change are underlined, a trailing
+   space is drawn, and the missing amount is a dashed gap. */
+.lk-depth-twice {
+  display: none;
+  background: rgba(200, 131, 74, 0.22);
+  color: #f3c49c;
+}
+[data-stage="bronze"] .lk-depth-row[data-dup] {
+  background-color: rgba(200, 131, 74, 0.1);
+}
+[data-stage="bronze"] .lk-depth-twice {
+  display: inline;
+}
+[data-stage="bronze"] .lk-depth-word[data-fix] [data-word] {
+  text-decoration: underline wavy rgba(226, 158, 102, 0.85);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+.lk-depth-space {
+  display: none;
+  margin-left: 1px;
+  color: #e29e66;
+}
+[data-stage="bronze"] .lk-depth-space {
+  display: inline;
+}
+/* Owner QA, "badges don't need a border": a muted slate fill, distinct from the amber
+   "×2" (Bronze) and from the red "empty" Silver turns it into. */
+.lk-depth-empty {
+  background-color: rgba(159, 176, 196, 0.16);
+  color: #b9c6d3;
+  transition:
+    background-color 0.4s ease,
+    color 0.4s ease;
+}
+.lk-depth-empty-x {
+  display: none;
+}
+
+/* Silver: the duplicate slides out, the rows under it close the gap, each
+   rewritten value flashes once, and the checks mark their columns. */
+[data-stage="silver"] .lk-depth-row[data-dup],
+[data-stage="gold"] .lk-depth-row[data-dup] {
+  opacity: 0;
+  transform: translate(28px, calc(var(--slot) * var(--lk-depth-row)));
+  transition-delay: 0s;
+}
+[data-stage="silver"] .lk-depth-word[data-fix] {
+  animation: lk-depth-fix 1.1s ease-out 0.2s;
+  border-radius: 5px;
+}
+@keyframes lk-depth-fix {
+  0%,
+  35% {
+    background-color: rgba(185, 198, 211, 0.24);
+    box-shadow: 0 0 0 3px rgba(185, 198, 211, 0.24);
+  }
+  100% {
+    background-color: transparent;
+    box-shadow: 0 0 0 3px transparent;
+  }
+}
+[data-stage="silver"] .lk-depth-empty {
+  background-color: rgba(255, 110, 95, 0.12);
+  color: var(--lk-depth-bad);
+}
+[data-stage="silver"] .lk-depth-empty-x {
+  display: block;
+}
+.lk-depth-mark {
+  opacity: 0;
+  transform: scale(0.4);
+  color: var(--lk-depth-ok);
+  background: rgba(126, 226, 176, 0.14);
+  transition:
+    opacity 0.3s ease,
+    transform 0.45s var(--lk-ease);
+}
+.lk-depth-mark:not([data-ok]) {
+  color: var(--lk-depth-bad);
+  background: rgba(255, 110, 95, 0.16);
+}
+[data-stage="silver"] .lk-depth-mark {
+  opacity: 1;
+  transform: none;
+  transition-delay: 0.6s;
+}
+.lk-depth-badge {
+  color: var(--lk-depth-ok);
+  background: rgba(126, 226, 176, 0.1);
+}
+.lk-depth-badge:not([data-ok]) {
+  color: var(--lk-depth-bad);
+  background: rgba(255, 110, 95, 0.1);
+}
+
+/* Gold: every row travels to its city's group and fades into it while
+   the group's bar grows and the revenue counts up. */
+[data-stage="gold"] .lk-depth-row {
+  opacity: 0;
+  transform: translateY(calc(var(--slot) * var(--lk-depth-group))) scaleY(0.7);
+}
+[data-stage="gold"] .lk-depth-body > .lk-depth-head {
+  opacity: 0;
+}
+.lk-depth-gold {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.35s ease;
+}
+[data-stage="gold"] .lk-depth-gold {
+  opacity: 1;
+  pointer-events: auto;
+  transition: opacity 0.5s ease 0.3s;
+}
+.lk-depth-group {
+  position: absolute;
+  inset-inline: 0;
+  top: 28px;
+  height: var(--lk-depth-group);
+  border-radius: 8px;
+  transform: translateY(calc(var(--slot) * var(--lk-depth-group) + 8px));
+  transition:
+    transform 0.7s var(--lk-ease) 0.3s,
+    background-color 0.3s ease;
+}
+[data-stage="gold"] .lk-depth-group {
+  transform: translateY(calc(var(--slot) * var(--lk-depth-group)));
+}
+.lk-depth-group:hover {
+  background-color: rgba(242, 193, 78, 0.07);
+}
+.lk-depth-track {
+  background: rgba(255, 255, 255, 0.07);
+}
+.lk-depth-bar {
+  background: #f2c14e;
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 0.5s var(--lk-ease);
+}
+[data-stage="gold"] .lk-depth-bar {
+  transform: none;
+  transition: transform 1s var(--lk-ease) calc(0.45s + var(--i) * 0.14s);
+}
+.lk-depth-group:hover .lk-depth-bar {
+  filter: brightness(1.15);
+}
+.lk-depth-kpi {
+  color: #f2c14e;
+}
+.lk-depth-lag {
+  color: #f6d27f;
+  background: rgba(242, 193, 78, 0.1);
+}
+[data-stage="gold"] .lk-depth-spin {
+  animation: lk-depth-spin 6s linear infinite;
+}
+@keyframes lk-depth-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+[data-stage="gold"] .lk-depth-hint {
+  animation: lk-depth-hint 2.4s ease-in-out infinite;
+}
+@keyframes lk-depth-hint {
+  50% {
+    transform: translate(2px, 2px);
+  }
+}
+
+/* The header's table name and the footer's line: one per depth, crossfaded. */
+.lk-depth-swap {
+  opacity: 0;
+  transform: translateY(5px);
+  pointer-events: none;
+  transition:
+    opacity 0.3s ease,
+    transform 0.45s var(--lk-ease);
+}
+[data-stage="bronze"] .lk-depth-swap[data-for="bronze"],
+[data-stage="silver"] .lk-depth-swap[data-for="silver"],
+[data-stage="gold"] .lk-depth-swap[data-for="gold"] {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+  transition-delay: 0.2s;
+}
+[data-stage="silver"] .lk-depth-swap[data-for="silver"] .lk-depth-badge {
+  animation: lk-fade-in 0.4s var(--lk-ease) backwards;
+}
+[data-stage="silver"] .lk-depth-swap[data-for="silver"] .lk-depth-badge:nth-child(2) {
+  animation-delay: 0.12s;
+}
+[data-stage="silver"] .lk-depth-swap[data-for="silver"] .lk-depth-badge:nth-child(3) {
+  animation-delay: 0.24s;
+}
+
+/* O40: the Bronze footer's key to the mess the rows show. */
+.lk-depth-legend-wavy {
+  text-decoration: underline wavy rgba(226, 158, 102, 0.85);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+.lk-depth-legend-empty {
+  background-color: rgba(159, 176, 196, 0.16);
+}
+[data-stage="bronze"] .lk-depth-swap[data-for="bronze"] .lk-depth-twice {
+  display: inline;
+}
+
+/* Still: the reduced-motion list and the no-JS page show each depth's
+   final card without a transition or a loop. */
+.lk-depth-still,
+.lk-depth-still * {
+  transition: none !important;
+  animation: none !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  .lk-depth-card,
+  .lk-depth-card *,
+  .lk-depth-slab-top {
+    transition: none !important;
+  }
+}
+/* O21: without a canvas, the CSS slabs stand in only where the cell beside
+   the chapter has room for them (a short phone gives it to the card). */
+.lk-depth-stack-cell {
+  container-type: size;
+}
+@container (max-height: 200px) {
+  .lk-depth-stack-cell > * {
+    display: none;
+  }
+}
+/* O21: a narrow card (phones, the reduced-motion list) keeps every badge and
+   the table's name whole: smaller badges, no row count, and the Gold hint
+   on two short lines. */
+@container lk-depth (max-width: 329px) {
+  .lk-depth-count {
+    display: none;
+  }
+  .lk-depth-badge {
+    gap: 3px;
+    padding-inline: 6px;
+    font-size: 10px;
+  }
+  .lk-depth-badge svg {
+    width: 10px;
+    height: 10px;
+  }
+  .lk-depth-feeds {
+    font-size: 10.5px;
+    line-height: 13px;
+  }
+}
+.lk-depth-word {
+  line-height: 20px;
+}
+@container lk-depth (max-width: 329px) {
+  .lk-depth-checks {
+    gap: 4px;
+    padding-inline: 8px;
+  }
+}
+.lk-depth-foot {
+  height: 40px;
+}
+@container lk-depth (max-width: 329px) {
+  .lk-depth-foot {
+    height: 54px;
+  }
+  .lk-depth-checks {
+    flex-wrap: wrap;
+    align-content: center;
+    row-gap: 4px;
+  }
+}
+
+/* ---- WEB-5 O19: the assistant panel (components/home/assistant-chat.tsx) ----
+   One attribute draws the whole conversation: `data-s` on `.lk-ast` lists
+   the steps reached (assistant-steps.ts). The server renders every step,
+   which is the finished chat; the deferred script adds them one by one.
+   `.lk-ast-still` (no JavaScript, reduced motion, already on screen)
+   shows any state without a transition.
+   O35 (owner: minimal, clean, professional): one flat surface and one
+   hairline; every part inside is told apart by a step of fill and by
+   spacing (12 / 16 / 24), never by a border, a gradient or a glow. The
+   surface steps: panel var(--lk-n-surface), fields and bubbles var(--lk-n-raised), the card
+   var(--lk-n-raised). Type: 14 px body, 13 px meta, 12 px chart labels. */
+.lk-ast {
+  --lk-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --lk-ast-surface: var(--lk-n-surface);
+  --lk-ast-raised: var(--lk-n-raised);
+  --lk-ast-ok: #7ee2b0;
+  --lk-ast-wait: #f5c46a;
+  container: lk-ast / inline-size;
+  display: flex;
+  flex-direction: column;
+  /* O41: a fixed height, like a real chat window. WEB-5 M1 (phone pass): on a phone it was
+     about a screen tall (560 px) and empty while the first question typed; it is now sized to
+     hold one exchange (question, answer and chart), and the first exchange shows at once
+     (assistant-play.tsx). */
+  height: min(420px, 64svh);
+  overflow: hidden;
+  border-radius: var(--radius-3xl);
+  background: var(--lk-ast-surface);
+  box-shadow: 0 28px 60px -30px rgba(0, 0, 0, 0.6);
+}
+@media (min-width: 48rem) {
+  .lk-ast {
+    height: min(640px, 78svh);
+  }
+}
+/* The oldest messages fade out under the header as newer ones push them up. */
+.lk-ast-log {
+  mask-image: linear-gradient(to bottom, transparent, #000 20px);
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 20px);
+}
+
+/* A user bubble that settled half out of the top is let go whole (assistant-play.tsx). */
+.lk-ast-user {
+  transition: opacity 0.2s ease;
+}
+.lk-ast-user[data-clipped] {
+  opacity: 0;
+}
+
+/* A message opens its height from zero, so the panel grows under it. */
+.lk-ast-grow {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transform: translateY(8px);
+  transition:
+    grid-template-rows 0.5s var(--lk-ease),
+    opacity 0.35s ease,
+    transform 0.5s var(--lk-ease);
+}
+.lk-ast-grow > div {
+  overflow: hidden;
+}
+.lk-ast-log > .lk-ast-grow > div > * {
+  margin-top: 16px;
+}
+.lk-ast[data-s~="2"] .lk-ast-grow[data-from="2"],
+.lk-ast[data-s~="3"] .lk-ast-grow[data-from="3"],
+.lk-ast[data-s~="4"] .lk-ast-grow[data-from="4"],
+.lk-ast[data-s~="5"] .lk-ast-grow[data-from="5"],
+.lk-ast[data-s~="8"] .lk-ast-grow[data-from="8"],
+.lk-ast[data-s~="9"] .lk-ast-grow[data-from="9"],
+.lk-ast[data-s~="10"] .lk-ast-grow[data-from="10"] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transform: none;
+}
+.lk-ast[data-s~="5"] .lk-ast-grow[data-until="5"],
+.lk-ast[data-s~="10"] .lk-ast-grow[data-until="10"] {
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transform: none;
+}
+
+.lk-ast-user {
+  background: var(--lk-ast-raised);
+}
+.lk-ast-summary {
+  color: rgba(255, 255, 255, 0.55);
+}
+.lk-ast-summary svg {
+  color: var(--lk-ast-ok);
+}
+
+/* The assistant's steps: a small spinner and a breathing label while each runs, a check once done. */
+.lk-ast-step-label {
+  color: rgba(255, 255, 255, 0.8);
+  animation: lk-ast-breathe 1.4s ease-in-out infinite;
+}
+.lk-ast-step-icon {
+  border: 1.5px solid rgba(143, 203, 255, 0.25);
+  border-top-color: #8fcbff;
+  animation: lk-ast-spin 0.8s linear infinite;
+}
+.lk-ast-step-check {
+  opacity: 0;
+}
+.lk-ast[data-s~="4"] .lk-ast-step[data-done-at="4"],
+.lk-ast[data-s~="5"] .lk-ast-step[data-done-at="5"],
+.lk-ast[data-s~="10"] .lk-ast-step[data-done-at="10"] {
+  & .lk-ast-step-icon {
+    border-color: transparent;
+    animation: none;
+  }
+  & .lk-ast-step-check {
+    opacity: 1;
+    color: var(--lk-ast-ok);
+  }
+  & .lk-ast-step-label {
+    color: rgba(255, 255, 255, 0.55);
+    animation: none;
+  }
+}
+@keyframes lk-ast-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes lk-ast-breathe {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+/* The answer streams in word by word. */
+.lk-ast[data-s~="5"] .lk-ast-word {
+  animation: lk-ast-word 0.4s ease-out backwards;
+}
+@keyframes lk-ast-word {
+  from {
+    opacity: 0;
+    filter: blur(3px);
+  }
+}
+
+/* The chart: flat bars on a thin baseline, vertical where the panel is
+   wide and horizontal on a phone. The leader is the solid accent. */
+.lk-ast-bars {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  column-gap: 12px;
+  padding-top: 20px;
+}
+.lk-ast-bars::after {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  bottom: 24px;
+  border-top: 1px solid rgba(255, 255, 255, 0.14);
+}
+.lk-ast-bar-item {
+  display: grid;
+  grid-template-rows: 76px 24px;
+  transition: opacity 0.2s ease;
+}
+.lk-ast-bar-item .lk-ast-bar-label {
+  grid-row: 2;
+  align-self: end;
+  text-align: center;
+  font-size: 12px;
+  line-height: 16px;
+  color: rgba(255, 255, 255, 0.55);
+}
+.lk-ast-bar-item[data-lead] .lk-ast-bar-label {
+  color: #e8f4ff;
+}
+.lk-ast-bar-track {
+  grid-row: 1;
+  position: relative;
+}
+.lk-ast-bar {
+  position: absolute;
+  inset-inline: 0;
+  bottom: 0;
+  height: calc(var(--v) * 100%);
+  border-radius: 4px 4px 0 0;
+  background: rgba(255, 255, 255, 0.14);
+  transform: scaleY(0);
+  transform-origin: bottom;
+  transition:
+    transform 0.4s var(--lk-ease),
+    background-color 0.2s ease;
+}
+.lk-ast-bar-item[data-lead] .lk-ast-bar {
+  background: #44a6fa;
+}
+.lk-ast-bar-value,
+.lk-ast-tip {
+  position: absolute;
+  left: 50%;
+  bottom: calc(var(--v) * 100% + 4px);
+  translate: -50% 0;
+  white-space: nowrap;
+  font-size: 12px;
+  line-height: 16px;
+  transition: opacity 0.2s ease;
+}
+.lk-ast-bar-value {
+  color: rgba(255, 255, 255, 0.6);
+  opacity: 0;
+}
+.lk-ast-bar-item[data-lead] .lk-ast-bar-value {
+  color: #e8f4ff;
+  font-weight: 500;
+}
+.lk-ast-tip {
+  z-index: 1;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--lk-ast-raised);
+  color: #e8f4ff;
+  opacity: 0;
+  pointer-events: none;
+}
+.lk-ast[data-s~="5"] .lk-ast-bar {
+  transform: none;
+  transition:
+    transform 0.8s var(--lk-ease) calc(0.45s + var(--i) * 0.14s),
+    background-color 0.2s ease;
+}
+.lk-ast[data-s~="5"] .lk-ast-bar-value {
+  opacity: 1;
+  transition: opacity 0.3s ease calc(0.85s + var(--i) * 0.14s);
+}
+.lk-ast-bars:hover .lk-ast-bar-item:not(:hover) {
+  opacity: 0.5;
+}
+.lk-ast-bar-item:not([data-lead]):hover .lk-ast-bar {
+  background: rgba(255, 255, 255, 0.24);
+}
+.lk-ast-bar-item:hover .lk-ast-bar-value {
+  opacity: 0 !important;
+  transition-delay: 0s !important;
+}
+.lk-ast-bar-item:hover .lk-ast-tip {
+  opacity: 1;
+}
+@container lk-ast (max-width: 419px) {
+  .lk-ast-bars {
+    grid-template-columns: none;
+    row-gap: 6px;
+    padding-top: 0;
+  }
+  .lk-ast-bars::after {
+    inset-inline: auto;
+    left: 56px;
+    top: 0;
+    bottom: 0;
+    border-top: 0;
+    border-left: 1px solid rgba(255, 255, 255, 0.14);
+  }
+  .lk-ast-bar-item {
+    grid-template-rows: none;
+    grid-template-columns: 48px minmax(0, 1fr);
+    column-gap: 8px;
+    align-items: center;
+  }
+  .lk-ast-bar-item .lk-ast-bar-label {
+    grid-row: 1;
+    grid-column: 1;
+    align-self: center;
+    text-align: right;
+  }
+  .lk-ast-bar-track {
+    grid-column: 2;
+    height: 16px;
+  }
+  .lk-ast-bar {
+    inset-inline: auto;
+    inset-block: 1px;
+    left: 0;
+    height: auto;
+    width: calc(var(--v) * (100% - 48px));
+    border-radius: 0 4px 4px 0;
+    transform: scaleX(0);
+    transform-origin: left;
+  }
+  .lk-ast-bar-value {
+    left: calc(var(--v) * (100% - 48px) + 6px);
+    bottom: 0;
+    translate: none;
+  }
+  .lk-ast-tip {
+    left: auto;
+    right: 0;
+    bottom: -2px;
+    translate: none;
+  }
+}
+
+/* The approval card: one step of fill, no border. Its status is a small
+   text pill, amber while it waits and green once an admin approves. */
+.lk-ast-card {
+  background: var(--lk-n-raised);
+}
+.lk-ast-card-icon {
+  color: var(--lk-ast-wait);
+  background: rgba(245, 185, 74, 0.12);
+  transition:
+    color 0.5s ease,
+    background-color 0.5s ease;
+}
+.lk-ast-pill {
+  color: var(--lk-ast-wait);
+  background: rgba(245, 185, 74, 0.12);
+  transition:
+    color 0.4s ease,
+    background-color 0.4s ease;
+}
+.lk-ast-pill-dot {
+  background: var(--lk-ast-wait);
+  animation: lk-ast-wait 1.8s ease-out infinite;
+}
+@keyframes lk-ast-wait {
+  0% {
+    box-shadow: 0 0 0 0 rgba(245, 196, 106, 0.55);
+  }
+  100% {
+    box-shadow: 0 0 0 6px rgba(245, 196, 106, 0);
+  }
+}
+.lk-ast-pill-wait,
+.lk-ast-pill-ok,
+.lk-ast-decide,
+.lk-ast-done {
+  transition:
+    opacity 0.3s ease,
+    transform 0.45s var(--lk-ease);
+}
+/* The pill is as wide as the state it shows: the hidden one is taken out of the flow. */
+.lk-ast-pill-ok {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transform: scale(0.8);
+}
+.lk-ast-admin {
+  background: #4a5a6a;
+}
+.lk-ast-btn {
+  transition:
+    background-color 0.18s ease,
+    transform 0.18s ease,
+    box-shadow 0.18s ease;
+}
+.lk-ast-decline {
+  color: #e8f4ff;
+  background: rgba(255, 255, 255, 0.08);
+}
+.lk-ast-decline:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+.lk-ast-approve {
+  background: var(--lk-primary);
+}
+.lk-ast-approve:hover {
+  background: var(--lk-primary-hover);
+}
+.lk-ast[data-s~="11"]:not([data-s~="12"]) .lk-ast-approve {
+  background: var(--lk-primary-press);
+  transform: scale(0.95);
+  box-shadow: 0 0 0 3px rgba(68, 166, 250, 0.3);
+}
+.lk-ast-done {
+  color: #c6f5dc;
+  opacity: 0;
+  transform: translateY(6px);
+  pointer-events: none;
+}
+.lk-ast-done svg {
+  color: var(--lk-ast-ok);
+}
+.lk-ast[data-s~="12"] {
+  & .lk-ast-card-icon {
+    color: var(--lk-ast-ok);
+    background: rgba(126, 226, 176, 0.12);
+  }
+  & .lk-ast-pill {
+    color: var(--lk-ast-ok);
+    background: rgba(126, 226, 176, 0.12);
+  }
+  & .lk-ast-pill-wait,
+  & .lk-ast-decide {
+    opacity: 0;
+    transform: translateY(-4px);
+    pointer-events: none;
+  }
+  & .lk-ast-pill-ok {
+    position: static;
+    opacity: 1;
+    transform: none;
+  }
+  & .lk-ast-pill-wait {
+    position: absolute;
+    inset: 0;
+    padding-inline: 10px;
+  }
+  & .lk-ast-done {
+    opacity: 1;
+    transform: none;
+    transition-delay: 0.15s;
+  }
+}
+.lk-ast-reviewer-short {
+  display: none;
+}
+@container lk-ast (max-width: 419px) {
+  .lk-ast-reviewer {
+    display: none;
+  }
+  .lk-ast-reviewer-short {
+    display: inline;
+  }
+}
+
+/* The composer: a flat field one step lighter than the panel. It shows
+   typing during steps 1 and 7; the send button is muted when empty, the
+   primary blue with a white arrow while there is text, and presses when
+   the message goes. */
+.lk-ast-composer {
+  background: var(--lk-ast-raised);
+}
+.lk-ast-caret {
+  display: none;
+}
+.lk-ast-send {
+  color: rgba(255, 255, 255, 0.4);
+  background: rgba(255, 255, 255, 0.06);
+  transition:
+    background-color 0.2s ease,
+    color 0.2s ease;
+}
+.lk-ast:is([data-s~="1"]:not([data-s~="2"]), [data-s~="7"]:not([data-s~="8"])) {
+  & .lk-ast-placeholder {
+    opacity: 0;
+  }
+  & .lk-ast-caret {
+    display: inline-block;
+    animation: lk-twinkle 0.9s steps(2, jump-none) infinite;
+  }
+  & .lk-ast-send {
+    color: #fff;
+    background: var(--lk-primary);
+  }
+}
+.lk-ast:is([data-s~="2"]:not([data-s~="3"]), [data-s~="8"]:not([data-s~="9"])) .lk-ast-send {
+  animation: lk-ast-press 0.35s ease-out;
+}
+@keyframes lk-ast-press {
+  0% {
+    color: #fff;
+    background: var(--lk-primary-press);
+    transform: scale(0.88);
+  }
+  60% {
+    color: #fff;
+    background: var(--lk-primary);
+    transform: scale(1.04);
+  }
+}
+.lk-ast-mode {
+  color: rgba(255, 255, 255, 0.47);
+  transition: color 0.3s ease;
+}
+.lk-ast-mode[data-mode="ask"],
+.lk-ast[data-s~="6"] .lk-ast-mode[data-mode="build"] {
+  color: rgba(255, 255, 255, 0.9);
+}
+.lk-ast[data-s~="6"] .lk-ast-mode[data-mode="ask"] {
+  color: rgba(255, 255, 255, 0.47);
+}
+.lk-ast-mode-thumb {
+  background: rgba(255, 255, 255, 0.07);
+  transition: transform 0.4s var(--lk-ease);
+}
+.lk-ast[data-s~="6"] .lk-ast-mode-thumb {
+  transform: translateX(100%);
+}
+
+.lk-ast-still,
+.lk-ast-still * {
+  transition: none !important;
+  animation: none !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  .lk-ast,
+  .lk-ast * {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+
+/* ---- WEB-5 O23: "Get started" comes alive (components/home/get-started-*.tsx) ----
+   The line fills and the numbers light as the steps pass the middle of the
+   screen, on CSS scroll timelines; without them the line is full and the
+   numbers lit, which is also the reduced-motion picture. The terminals
+   type through `data-term` (idle → typing → done), set by the deferred
+   typing script; the server's `data-term=""` is the finished terminal. */
+.lk-gs-num {
+  color: #8fcbff;
+  box-shadow: 0 0 0 1px rgba(68, 166, 250, 0.7);
+}
+.lk-gs-fill {
+  transform-origin: top;
+}
+@supports (animation-timeline: view()) {
+  .lk-gs-steps {
+    view-timeline: --lk-gs block;
+  }
+  .lk-gs-fill {
+    animation: lk-gs-fill linear both;
+    animation-timeline: --lk-gs;
+    animation-range: cover 50vh cover calc(100% - 50vh);
+  }
+}
+@keyframes lk-gs-fill {
+  from {
+    transform: scaleY(0);
+  }
+}
+/* A step's number lights when its block reaches the middle of the screen
+   (get-started-play.tsx); settled without JavaScript or under reduced motion. */
+.lk-gs-num {
+  transition:
+    color 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+    box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+    scale 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+[data-js] .lk-gs-steps > li:not([data-lit]) .lk-gs-num {
+  color: rgba(255, 255, 255, 0.5);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.2);
+  scale: 0.88;
+}
+
+/* O35 follow-up: a flat terminal, one step lighter than the water, with a
+   hairline. */
+.lk-gs-term {
+  box-shadow: none;
+}
+
+/* The copy button: the icon morphs between copy, check and select, and a
+   ring answers a successful copy. */
+.lk-copy {
+  position: relative;
+}
+.lk-copy-icon {
+  position: relative;
+  width: 14px;
+  height: 14px;
+}
+.lk-copy-icon > svg {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transform: scale(0.5) rotate(-30deg);
+  transition:
+    opacity 0.18s ease,
+    transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+.lk-copy[data-state="idle"] .lk-copy-idle,
+.lk-copy[data-state="copied"] .lk-copy-copied,
+.lk-copy[data-state="failed"] .lk-copy-failed {
+  opacity: 1;
+  transform: none;
+}
+.lk-copy[data-state="copied"]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  animation: lk-copy-ring 0.6s ease-out;
+}
+@keyframes lk-copy-ring {
+  from {
+    box-shadow: 0 0 0 0 rgba(123, 224, 176, 0.5);
+  }
+  to {
+    box-shadow: 0 0 0 8px rgba(123, 224, 176, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lk-gs-fill,
+  .lk-gs-num,
+  .lk-gs-term *,
+  .lk-copy,
+  .lk-copy::after,
+  .lk-copy-icon > svg {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+/* O31: from two columns on, the chapter column starts just right of the
+   depth gauge (which reaches 176 px from the screen's edge), wherever the
+   1120 px container sits, so the card keeps clear of the 3D slabs that the
+   scene centres right of the middle. */
+@media (min-width: 48rem) {
+  .lk-depth-grid-stage {
+    padding-left: max(0px, calc(12rem - (100vw - 70rem) / 2 - 1.5rem));
+  }
+}
+@media (min-width: 48rem) and (max-width: 70rem) {
+  .lk-depth-grid-stage {
+    padding-left: 10.5rem;
+  }
+}
+
+/* ---- WEB-5 O22 / O38: "Yours to keep" as a sticky showcase (components/home/open-*.tsx) ----
+   O38 (owner: one bento on the page is enough; governance keeps it): a
+   list of the four promises on the left and one large panel on the right,
+   held at the middle of the screen, that swaps between their pictures as
+   the list scrolls by. `data-active` on `.lk-show` (set by
+   open-showcase.tsx) says which. Flat and solid (O35): one surface a step
+   lighter than the water, one hairline, no gradient, no glow.
+   On phones, without JavaScript and under reduced motion, nothing is
+   sticky or hidden where it matters: phones read title, line, picture,
+   four times; no JS reads the same (a <noscript> style); reduced motion
+   swaps without a fade. Every loop pauses while its picture is hidden. */
+.lk-show {
+  --lk-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  row-gap: 16px;
+}
+/* Phones, no JS and short windows: the two boxes dissolve into the grid and
+   items and pictures interleave by order. */
+.lk-show-mark {
+  display: none;
+}
+.lk-show-pin,
+.lk-show-cols,
+.lk-show-list,
+.lk-show-stage {
+  display: contents;
+}
+.lk-show-head {
+  order: -1;
+  margin-bottom: 32px;
+}
+.lk-show-item[data-i="0"] {
+  order: 0;
+}
+.lk-show-visual[data-i="0"] {
+  order: 1;
+}
+.lk-show-item[data-i="1"] {
+  order: 2;
+}
+.lk-show-visual[data-i="1"] {
+  order: 3;
+}
+.lk-show-item[data-i="2"] {
+  order: 4;
+}
+.lk-show-visual[data-i="2"] {
+  order: 5;
+}
+.lk-show-item[data-i="3"] {
+  order: 6;
+}
+.lk-show-visual[data-i="3"] {
+  order: 7;
+}
+.lk-show-item {
+  padding-left: 20px;
+  border-left: 2px solid rgba(255, 255, 255, 0.1);
+}
+.lk-show-item a {
+  pointer-events: none;
+}
+.lk-show-visual {
+  position: relative;
+  /* Phones: as tall as the picture needs; from 1024 px one fixed panel. */
+  min-height: 260px;
+  max-width: 40rem;
+  overflow: hidden;
+  border-radius: var(--radius-3xl);
+  background: var(--lk-n-surface);
+  margin-bottom: 32px;
+}
+/* From 1024 px, and only where the window is tall enough to hold the list
+   and the panel under the top bar: four invisible markers, one screen of
+   scroll each, drive the showcase. The list is one sticky box held at the
+   middle of the screen, its items one under another; the pictures are one
+   sticky box, stacked, one shown. Both release together after the last
+   marker. */
+@media (min-width: 64rem) and (min-height: 44rem) {
+  .lk-show {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: repeat(4, auto);
+    row-gap: 0;
+  }
+  .lk-show-mark {
+    display: block;
+    grid-column: 1;
+    height: 75vh;
+    scroll-margin-top: 12.5vh;
+  }
+  .lk-show-mark[data-i="0"] {
+    grid-row: 1;
+  }
+  .lk-show-mark[data-i="1"] {
+    grid-row: 2;
+  }
+  .lk-show-mark[data-i="2"] {
+    grid-row: 3;
+  }
+  .lk-show-mark[data-i="3"] {
+    grid-row: 4;
+  }
+  /* Owner QA: the heading, the list and the panel are one unit, held at the middle of the screen
+     (the unit is about 600 px tall; 44 rem is the shortest window that holds it under the top bar). */
+  .lk-show-pin {
+    grid-column: 1;
+    grid-row: 1 / -1;
+    align-self: start;
+    position: -webkit-sticky;
+    position: sticky;
+    top: 4rem;
+    height: calc(100svh - 4rem);
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 48px;
+  }
+  .lk-show-head {
+    margin-bottom: 0;
+  }
+  .lk-show-head > h2 {
+    font-size: clamp(2.5rem, 9svh, 4.5rem);
+  }
+  .lk-show-cols {
+    display: grid;
+    grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+    column-gap: 64px;
+    align-items: start;
+  }
+  .lk-show-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .lk-show-stage {
+    display: grid;
+    align-content: start;
+  }
+  .lk-show-item {
+    border-left-color: rgba(255, 255, 255, 0.1);
+    padding-block: 14px;
+    transition: border-color 0.3s ease;
+  }
+  .lk-show-item a {
+    pointer-events: auto;
+  }
+  .lk-show-item .lk-show-title,
+  .lk-show-item .lk-show-line {
+    transition: color 0.3s ease;
+  }
+  .lk-show-item:not([data-on]) .lk-show-title {
+    color: rgba(255, 255, 255, 0.45);
+  }
+  .lk-show-item:not([data-on]) .lk-show-line {
+    color: rgba(255, 255, 255, 0.35);
+  }
+  .lk-show-item[data-on] {
+    border-left-color: #44a6fa;
+  }
+  .lk-show-item:not([data-on]):hover .lk-show-title {
+    color: rgba(255, 255, 255, 0.8);
+  }
+  /* The four pictures share one cell of the stage. */
+  .lk-show-visual {
+    grid-area: 1 / 1;
+    height: min(440px, calc(100svh - 4rem - 11.5rem));
+    max-width: none;
+    margin: 0;
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(12px);
+    transition:
+      opacity 0.45s ease,
+      transform 0.6s var(--lk-ease),
+      visibility 0s linear 0.45s;
+  }
+  .lk-show-visual[data-on] {
+    opacity: 1;
+    visibility: visible;
+    transform: none;
+    transition:
+      opacity 0.45s ease,
+      transform 0.6s var(--lk-ease),
+      visibility 0s;
+  }
+  .lk-show-visual:not([data-on]) *,
+  .lk-show-visual:not([data-on]) *::after {
+    animation-play-state: paused !important;
+  }
+}
+@media (min-width: 64rem) and (min-height: 44rem) and (prefers-reduced-motion: reduce) {
+  .lk-show-visual,
+  .lk-show-visual[data-on] {
+    transition: none;
+    transform: none;
+  }
+}
+
+/* Open source: the code, highlighted, with a band walking down it. */
+.lk-open-pre {
+  /* The long string line fades out at the panel's edge instead of being cut. */
+  mask-image: linear-gradient(90deg, #000 86%, transparent);
+}
+.lk-tok-kw {
+  color: #8fcbff;
+}
+.lk-tok-ty {
+  color: #f2c14e;
+}
+.lk-tok-str {
+  color: #9fe3bf;
+}
+.lk-tok-mac {
+  color: #d7a6ff;
+}
+.lk-open-license {
+  color: #9fe3bf;
+  background: rgba(126, 226, 176, 0.1);
+}
+/* The line numbers are generated from `data-n`, not text in the DOM: they are a
+   decorative gutter (the block is aria-hidden), so they are not selected,
+   copied or read, and the contrast audit has no text to measure there. */
+.lk-open-ln::before {
+  content: attr(data-n);
+}
+.lk-open-band {
+  background: rgba(68, 166, 250, 0.1);
+  box-shadow: inset 2px 0 0 #44a6fa;
+  animation: lk-open-band 9s steps(1, end) infinite;
+}
+/* The band steps down the function and rests on the line that refuses. */
+@keyframes lk-open-band {
+  0% {
+    transform: translateY(0);
+  }
+  12% {
+    transform: translateY(calc(2 * 19px));
+  }
+  24% {
+    transform: translateY(calc(3 * 19px));
+  }
+  36% {
+    transform: translateY(calc(4 * 19px));
+  }
+  48% {
+    transform: translateY(calc(5 * 19px));
+  }
+  88% {
+    transform: translateY(calc(6 * 19px));
+  }
+}
+.lk-open-fold {
+  color: rgba(255, 255, 255, 0.5);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* Your servers or ours: two radio buttons drive the picture. */
+.lk-open-seg {
+  background: var(--lk-n-raised);
+}
+.lk-open-seg-thumb {
+  background: rgba(68, 166, 250, 0.22);
+  transition: transform 0.45s var(--lk-ease);
+}
+.lk-open-seg-opt {
+  color: rgba(255, 255, 255, 0.65);
+  transition: color 0.2s ease;
+}
+.lk-open-seg-opt:hover,
+.lk-open-seg-opt:has(:checked) {
+  color: #e8f4ff;
+}
+.lk-open-seg-opt:has(:focus-visible) {
+  outline: 2px solid #8fcbff;
+  outline-offset: 1px;
+}
+/* The console's home (home/open-visuals.tsx, console-script.ts): the settled console is the
+   markup; the script drives it through attributes. */
+.lk-con {
+  --lk-ease: cubic-bezier(0.16, 1, 0.3, 1);
+}
+.lk-con-box {
+  background: var(--lk-n-raised);
+}
+.lk-con-caret {
+  animation: lk-twinkle 1s steps(2, jump-none) infinite;
+}
+.lk-con-tab {
+  transition: transform 0.12s ease, background-color 0.12s ease, box-shadow 0.12s ease;
+}
+.lk-con-tab[data-pressed] {
+  transform: translateY(1px) scale(0.94);
+  background: rgba(232, 244, 255, 0.2);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+  color: #e8f4ff;
+}
+.lk-con-thumb {
+  transition: transform 0.25s cubic-bezier(0.34, 1.4, 0.5, 1);
+}
+.lk-con[data-mode="build"] .lk-con-thumb {
+  transform: translateX(100%);
+}
+.lk-con-opt {
+  color: rgba(232, 244, 255, 0.6);
+  transition: color 0.2s ease;
+}
+.lk-con[data-mode="ask"] .lk-con-opt[data-m="ask"],
+.lk-con[data-mode="build"] .lk-con-opt[data-m="build"] {
+  color: #e8f4ff;
+}
+.lk-con-short {
+  background: var(--lk-n-raised);
+  transition:
+    transform 0.2s var(--lk-ease),
+    box-shadow 0.2s ease;
+}
+.lk-con-short:hover,
+.lk-con-short[data-hover] {
+  transform: translateY(-2px);
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.5);
+}
+.lk-con-short:hover .lk-con-short-icon,
+.lk-con-short[data-hover] .lk-con-short-icon {
+  color: #8fcbff;
+}
+.lk-con-short:active,
+.lk-con-short[data-press] {
+  transform: scale(0.98);
+  transition-duration: 0.12s;
+}
+.lk-con-ripple {
+  background: radial-gradient(circle at var(--rx, 50%) var(--ry, 50%), rgba(143, 203, 255, 0.35), transparent 60%);
+  opacity: 0;
+}
+.lk-con-short[data-press] .lk-con-ripple {
+  animation: lk-con-ripple 0.5s ease-out;
+}
+@keyframes lk-con-ripple {
+  from {
+    opacity: 1;
+    transform: scale(0.3);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.2);
+  }
+}
+.lk-con-pointer {
+  transition:
+    transform 0.7s cubic-bezier(0.4, 0, 0.2, 1),
+    opacity 0.25s ease;
+}
+.lk-con-main {
+  transition: opacity 0.2s ease, transform 0.25s var(--lk-ease);
+}
+.lk-con-stage[data-result] .lk-con-main {
+  opacity: 0;
+  transform: scale(0.985);
+  pointer-events: none;
+}
+.lk-con-result {
+  background: var(--lk-n-raised);
+  opacity: 0;
+  visibility: hidden;
+  transform-origin: 0 0;
+}
+.lk-con-stage[data-result] .lk-con-result {
+  opacity: 1;
+  visibility: visible;
+}
+.lk-cv {
+  display: none;
+}
+.lk-con-result[data-kind="dash"] .lk-cv-dash,
+.lk-con-result[data-kind="src"] .lk-cv-src {
+  display: flex;
+}
+/* The result assembles piece by piece (only once the script marks it shown). */
+.lk-con-result[data-show] .lk-cv-tile {
+  animation: lk-cv-in 0.35s var(--lk-ease) backwards;
+  animation-delay: calc(0.15s + var(--i) * 0.28s);
+}
+.lk-con-result[data-show] .lk-cv-line {
+  stroke-dasharray: 1;
+  animation: lk-cv-draw 0.9s ease-out backwards;
+  animation-delay: 0.45s;
+}
+.lk-con-result[data-show] .lk-cv-bar {
+  transform-origin: bottom;
+  animation: lk-cv-grow 0.5s var(--lk-ease) backwards;
+  animation-delay: calc(0.75s + var(--k) * 0.08s);
+}
+.lk-cv-chip .lk-cv-ok {
+  display: inline-flex;
+}
+.lk-cv-chip .lk-cv-wait {
+  display: none;
+}
+.lk-cv-chip[data-state="connecting"] .lk-cv-ok {
+  display: none;
+}
+.lk-cv-chip[data-state="connecting"] .lk-cv-wait {
+  display: inline;
+}
+.lk-con-result[data-show] .lk-cv-chip {
+  animation: lk-cv-in 0.35s var(--lk-ease) backwards;
+  animation-delay: calc(0.1s + var(--i) * 0.2s);
+}
+@keyframes lk-cv-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+@keyframes lk-cv-draw {
+  from {
+    stroke-dashoffset: 1;
+  }
+}
+@keyframes lk-cv-grow {
+  from {
+    transform: scaleY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lk-open-band,
+  .lk-con-caret,
+  .lk-con-short,
+  .lk-con-thumb,
+  .lk-con-tab,
+  .lk-con-main {
+    animation: none !important;
+    transition: none !important;
+  }
+  .lk-con-short:hover {
+    transform: none;
+  }
+  .lk-open-band {
+    transform: translateY(calc(5 * 19px));
+  }
+}
+
+/* ---- WEB-5 O40: the depths card rests on its layer's slab ----
+   The card sits in the right column; below it a strip of
+   `--lk-depths-card-lift` is left free, where the slab's top face shows,
+   then the slab's front edge. With the canvas the 3D slab is drawn under the
+   card's box (`[data-depths-card]`, lake-engine.ts), so the 3D side reads
+   the same lift; without one, `.lk-depth-slab` below is the slab. A soft
+   contact shadow under the card makes it rest rather than float. */
+@property --lk-slab {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #c8834a;
+}
+.lk-depth-pair {
+  --lk-depths-card-lift: 36px;
+  --lk-depths-slab-edge: 14px;
+  padding-bottom: calc(var(--lk-depths-card-lift) + var(--lk-depths-slab-edge));
+}
+.lk-depth-on-slab .lk-depth-card {
+  box-shadow: 0 18px 22px -14px rgba(0, 0, 0, 0.75);
+}
+.lk-depth-slab {
+  position: absolute;
+  left: -6%;
+  right: -6%;
+  bottom: 0;
+  height: calc(var(--lk-depths-card-lift) + var(--lk-depths-slab-edge) + 48px);
+  transition: --lk-slab 0.7s ease;
+}
+.lk-depth-slab-top {
+  position: absolute;
+  inset: 0 0 var(--lk-depths-slab-edge) 0;
+  clip-path: polygon(5.5% 0, 94.5% 0, 100% 100%, 0 100%);
+  background: color-mix(in srgb, var(--lk-slab) 24%, var(--lk-n-surface));
+}
+.lk-depth-slab-front {
+  position: absolute;
+  inset: auto 0 0 0;
+  height: var(--lk-depths-slab-edge);
+  border-radius: 0 0 10px 10px;
+  background: color-mix(in srgb, var(--lk-slab) 48%, var(--lk-n-surface));
+  box-shadow: inset 0 1px 0 0 color-mix(in srgb, var(--lk-slab) 80%, #fff 0%);
+}
+@media (prefers-reduced-motion: reduce) {
+  .lk-depth-slab {
+    transition: none;
+  }
+}
+/* O40: on a narrow card the mess key stays on one line. */
+@container lk-depth (max-width: 329px) {
+  .lk-depth-legend {
+    gap: 8px;
+    padding-inline: 10px;
+    font-size: 10px;
+  }
+}
+
+/* Owner QA: the chat keeps its fixed height, so older messages scroll out under the header;
+   they fade out there over 40 px instead of being cut through. */
+.lk-ast-log {
+  -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 40px);
+  mask-image: linear-gradient(180deg, transparent 0, #000 40px);
+}
+
+/* ---- Your servers or ours, the real stack (home/hosting-stack.tsx) --------------------------- */
+.lk-hs {
+  --lk-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  background: var(--lk-n-surface);
+}
+.lk-hs-thumb {
+  background: rgba(68, 166, 250, 0.22);
+  transition: transform 0.22s var(--lk-ease);
+}
+.lk-hs:has(input[value="ours"]:checked) .lk-hs-thumb {
+  transform: translateX(calc(100% + 0px));
+}
+.lk-hs-box {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+  transition: box-shadow 0.22s ease;
+}
+.lk-hs-head {
+  color: rgba(232, 244, 255, 0.75);
+  transition: color 0.22s ease;
+}
+.lk-hs-name-ours,
+.lk-hs-sources {
+  opacity: 0;
+}
+.lk-hs-name-yours,
+.lk-hs-name-ours,
+.lk-hs-sources,
+.lk-hs-term,
+.lk-hs-talk {
+  transition: opacity 0.22s ease, transform 0.22s var(--lk-ease);
+}
+.lk-hs-talk {
+  opacity: 0;
+  pointer-events: none;
+}
+.lk-hs:has(input[value="ours"]:checked) .lk-hs-box {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.5);
+}
+.lk-hs:has(input[value="ours"]:checked) .lk-hs-head {
+  color: #8fcbff;
+}
+.lk-hs:has(input[value="ours"]:checked) .lk-hs-name-yours,
+.lk-hs:has(input[value="ours"]:checked) .lk-hs-term {
+  opacity: 0;
+}
+.lk-hs:has(input[value="ours"]:checked) .lk-hs-name-ours,
+.lk-hs:has(input[value="ours"]:checked) .lk-hs-sources {
+  opacity: 1;
+}
+.lk-hs:has(input[value="ours"]:checked) .lk-hs-talk {
+  opacity: 1;
+  pointer-events: auto;
+}
+.lk-hs-card {
+  border-radius: 10px;
+  padding: 8px 9px;
+  background: var(--lk-n-raised);
+  transition: box-shadow 0.2s ease, transform 0.2s var(--lk-ease);
+}
+.lk-hs-card:hover {
+  transform: translateY(-2px);
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.5);
+}
+/* Hovering a card lights the cards it talks to. */
+.lk-hs:has(.lk-hs-card[data-id="console"]:hover) .lk-hs-card[data-rel~="console"] {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.3);
+  background: #16293f;
+}
+.lk-hs:has(.lk-hs-card[data-id="api"]:hover) .lk-hs-card[data-rel~="api"] {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.3);
+  background: #16293f;
+}
+.lk-hs:has(.lk-hs-card[data-id="postgres"]:hover) .lk-hs-card[data-rel~="postgres"] {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.3);
+  background: #16293f;
+}
+.lk-hs:has(.lk-hs-card[data-id="clickhouse"]:hover) .lk-hs-card[data-rel~="clickhouse"] {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.3);
+  background: #16293f;
+}
+.lk-hs:has(.lk-hs-card[data-id="lakekeeper"]:hover) .lk-hs-card[data-rel~="lakekeeper"] {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.3);
+  background: #16293f;
+}
+.lk-hs:has(.lk-hs-card[data-id="rustfs"]:hover) .lk-hs-card[data-rel~="rustfs"] {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.3);
+  background: #16293f;
+}
+.lk-hs:has(.lk-hs-card[data-id="openfga"]:hover) .lk-hs-card[data-rel~="openfga"] {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.3);
+  background: #16293f;
+}
+.lk-hs:has(.lk-hs-card[data-id="dagster"]:hover) .lk-hs-card[data-rel~="dagster"] {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.3);
+  background: #16293f;
+}
+/* Booting like `compose up`: each card goes from Starting to Started, one after another. */
+.lk-hs-st-a {
+  opacity: 0;
+}
+.lk-show-visual[data-on] .lk-hs-st-a {
+  opacity: 1;
+  animation: lk-hs-out 0.2s ease forwards;
+  animation-delay: calc(0.5s + var(--i) * 0.4s);
+}
+.lk-show-visual[data-on] .lk-hs-st-b {
+  opacity: 0;
+  animation: lk-hs-in 0.2s ease forwards;
+  animation-delay: calc(0.5s + var(--i) * 0.4s);
+}
+.lk-show-visual[data-on] .lk-hs-done {
+  opacity: 0;
+  animation: lk-hs-in 0.25s ease forwards;
+  animation-delay: 3.8s;
+}
+@keyframes lk-hs-out {
+  to {
+    opacity: 0;
+  }
+}
+@keyframes lk-hs-in {
+  to {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .lk-hs * {
+    animation: none !important;
+  }
+  .lk-hs-thumb,
+  .lk-hs-box,
+  .lk-hs-name-yours,
+  .lk-hs-name-ours,
+  .lk-hs-sources,
+  .lk-hs-term,
+  .lk-hs-talk,
+  .lk-hs-card {
+    transition: none !important;
+  }
+}
+
+/* ==========================================================================
+   Day and night on the surface scenes (lib/tod.ts). `html[data-tod]` is set
+   before first paint. Night is the base; day only changes the hero, the
+   final call and the top bar while it sits over their sky (`data-over-sky`,
+   components/home/tod-toggle.tsx). Everything under water is untouched.
+   Layers marked `.lk-tn` are night-only and `.lk-td` day-only; they
+   cross-fade in --lk-tod-ms (the same 600 ms as the 3D scene, TOD_FADE_MS).
+   ========================================================================== */
+html {
+  --lk-tod-ms: 600ms;
+  --lk-ink: #08183a;
+}
+.lk-td {
+  opacity: 0;
+}
+.lk-td,
+.lk-tn {
+  transition: opacity var(--lk-tod-ms) ease;
+}
+html[data-tod="day"] .lk-td {
+  opacity: 1;
+}
+html[data-tod="day"] .lk-tn {
+  opacity: 0;
+}
+/* The sun's glitter on the water. */
+.lk-glitter {
+  background: repeating-linear-gradient(180deg, rgba(255, 252, 240, 0.7) 0 2px, transparent 2px 9px);
+  background-size: 100% 18px;
+  -webkit-mask-image: radial-gradient(ellipse 48% 100% at 50% 0%, #000 0%, transparent 78%);
+  mask-image: radial-gradient(ellipse 48% 100% at 50% 0%, #000 0%, transparent 78%);
+  animation: lk-glitter 3.2s linear infinite;
+}
+@keyframes lk-glitter {
+  to {
+    background-position: 0 18px;
+  }
+}
+.lk-waterline path {
+  transition: stroke var(--lk-tod-ms) ease;
+}
+html[data-tod="day"] .lk-waterline path {
+  stroke: #fff;
+  stroke-opacity: 0.6;
+}
+
+/* The hero's words: dark ink by day (>= 4.5:1 on the pale wash). */
+#hero [data-intro-copy] h1,
+#hero [data-intro-copy] p,
+#hero [data-intro-copy] ul,
+#hero [data-intro-copy] a,
+#hero [data-intro-copy] > :first-child {
+  transition: color var(--lk-tod-ms) ease, border-color var(--lk-tod-ms) ease, background-color 200ms ease;
+}
+html[data-tod="day"] #hero [data-intro-copy] h1 {
+  color: var(--lk-ink);
+  /* WEB-5 day-mode LCP: Chrome counts a text's shadow in its painted area. The reassurance line below carries a
+     26px halo (see `ul` below), which makes its area larger than the headline's; when the intro reveals it at
+     about 2.2 s it took over as the largest paint (LCP 4.7 s simulated instead of 1.7 s). A fully transparent
+     shadow of the same kind on the headline makes the headline's area the larger one again. Nothing is drawn. */
+  text-shadow: 0 0 64px transparent;
+}
+html[data-tod="day"] #hero [data-intro-copy] > :first-child {
+  color: #083f82;
+  text-shadow: none;
+}
+html[data-tod="day"] #hero [data-intro-copy] p {
+  color: rgb(8 24 58 / 0.88);
+}
+html[data-tod="day"] #hero [data-intro-copy] ul {
+  color: rgb(8 24 58 / 0.9);
+  /* The same soft pale wash the copy sits on, so the line stays readable over bright reflections. */
+  text-shadow: 0 0 6px rgb(238 246 253 / 0.95), 0 0 14px rgb(238 246 253 / 0.9), 0 0 26px rgb(238 246 253 / 0.8);
+}
+html[data-tod="day"] #hero [data-intro-copy] li::before {
+  color: #1d6ccf;
+}
+html[data-tod="day"] #hero [data-intro-copy] a:not([class*="lk-primary"]) {
+  color: var(--lk-ink);
+  border-color: rgb(8 24 58 / 0.42);
+}
+html[data-tod="day"] #hero [data-intro-copy] a:not([class*="lk-primary"]):hover {
+  border-color: rgb(8 24 58 / 0.75);
+  background-color: rgb(8 24 58 / 0.08);
+}
+/* The creature's own little pool is a night shade; on the day water it is a hint. */
+#hero svg g[aria-hidden="true"] {
+  transition: opacity var(--lk-tod-ms) ease;
+}
+html[data-tod="day"] #hero svg g[aria-hidden="true"] {
+  opacity: 0.35;
+}
+/* The button and the cue, over the day sky and water. */
+html[data-tod="day"] #hero .lk-tod-btn {
+  border-color: rgb(8 24 58 / 0.3);
+  background-color: rgb(255 255 255 / 0.55);
+  color: var(--lk-ink);
+}
+html[data-tod="day"] #hero .lk-tod-btn:hover {
+  border-color: rgb(8 24 58 / 0.55);
+  background-color: rgb(255 255 255 / 0.8);
+}
+
+/* The final call: a day sky under the same words, in ink. The night picture stays
+   under it, so the cross-fade has nothing to jump between. */
+#final::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -30;
+  opacity: 0;
+  background: linear-gradient(180deg, #020514 0%, #5f97d6 12%, #86b6e8 36%, #cfe3f4 66%, #6fa6d6 100%);
+  transition: opacity var(--lk-tod-ms) ease;
+  pointer-events: none;
+}
+html[data-tod="day"] #final::before {
+  opacity: 1;
+}
+/* Over the live lake the section's top is dark where the descent meets it; by day only a short band. */
+#final .lk-final-top {
+  transition: opacity 400ms, height var(--lk-tod-ms) ease;
+}
+html[data-tod="day"] #final .lk-final-top {
+  height: 11%;
+}
+#final h2 {
+  transition: color var(--lk-tod-ms) ease;
+}
+html[data-tod="day"] #final h2 {
+  color: var(--lk-ink);
+}
+#final [class*="lk-twinkle"] {
+  transition: opacity var(--lk-tod-ms) ease;
+}
+html[data-tod="day"] #final [class*="lk-twinkle"] {
+  opacity: 0;
+  animation: none;
+}
+
+/* The top bar's light variant, only while it is over a day sky. */
+header {
+  transition: color var(--lk-tod-ms) ease, background-color 500ms, border-color 500ms, backdrop-filter 500ms;
+}
+html[data-tod="day"][data-over-sky="1"] header {
+  color: var(--lk-ink);
+}
+html[data-tod="day"][data-over-sky="1"] header[data-scrolled] {
+  background-color: rgb(238 246 253 / 0.6);
+  border-color: rgb(8 24 58 / 0.1);
+}
+html[data-tod="day"][data-over-sky="1"] header :where([class*="text-[#E8F4FF]"]):not(dialog *) {
+  color: rgb(8 24 58 / 0.78);
+}
+html[data-tod="day"][data-over-sky="1"] header a[href$="#hero"],
+html[data-tod="day"][data-over-sky="1"] header :where([class*="text-[#E8F4FF]"]):not(dialog *):hover,
+html[data-tod="day"][data-over-sky="1"] header [aria-current]:not(dialog *) {
+  color: var(--lk-ink);
+}
+html[data-tod="day"][data-over-sky="1"] header :where([class*="text-[#E8F4FF]"]):not(dialog *):hover,
+html[data-tod="day"][data-over-sky="1"] header [aria-current]:not(dialog *) {
+  background-color: rgb(8 24 58 / 0.08);
+}
+html[data-tod="day"][data-over-sky="1"] header svg path[fill="white"] {
+  fill: #0a1250;
+}
+html[data-tod="day"][data-over-sky="1"] header a[class*="bg-[var(--lk-primary)]"] {
+  color: #fff;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    --lk-tod-ms: 0ms;
+  }
+  .lk-glitter {
+    animation: none;
+  }
+}
+
+/* ---- By day: the way up from the deep water to the day sky (home/surface-rise.tsx) ---- */
+.lk-surf {
+  display: none;
+  height: 115vh;
+}
+html[data-tod="day"] .lk-surf {
+  display: block;
+  margin-bottom: -2px; /* overlaps the final call's first rows, so no sub-pixel line can show between them */
+}
+/* The night feather into the night sea is replaced, by day, by the rise. */
+html[data-tod="day"] .lk-feather {
+  display: none;
+}
+.lk-surf-water {
+  background: linear-gradient(
+    180deg,
+    rgba(8, 70, 110, 0) 0%,
+    rgba(8, 70, 110, 0.04) 10%,
+    rgba(10, 84, 128, 0.16) 22%,
+    rgba(14, 104, 150, 0.38) 36%,
+    rgba(26, 134, 170, 0.6) 50%,
+    rgba(54, 168, 196, 0.78) 63%,
+    rgba(108, 200, 220, 0.92) 76%,
+    rgba(176, 225, 238, 1) 88%,
+    #c9e6f2 100%
+  );
+}
+/* Marine snow, thinning out upward in the page (downward here) and gone by the middle. */
+.lk-surf-snow {
+  background-image:
+    radial-gradient(circle, rgba(220, 240, 255, 0.55) 1px, transparent 1.6px),
+    radial-gradient(circle, rgba(220, 240, 255, 0.4) 1px, transparent 1.4px),
+    radial-gradient(circle, rgba(220, 240, 255, 0.5) 1.2px, transparent 2px),
+    radial-gradient(circle, rgba(220, 240, 255, 0.3) 0.8px, transparent 1.3px);
+  background-size: 131px 97px, 83px 141px, 227px 179px, 61px 223px;
+  background-position: 0 0, 40px 60px, 90px 20px, 13px 110px;
+  -webkit-mask-image: linear-gradient(180deg, #000 0%, rgba(0, 0, 0, 0.5) 22%, transparent 52%);
+  mask-image: linear-gradient(180deg, #000 0%, rgba(0, 0, 0, 0.5) 22%, transparent 52%);
+  animation: lk-snow 60s linear infinite;
+}
+@keyframes lk-snow {
+  to {
+    background-position: 0 -194px, 40px -222px, 90px -338px, 13px -336px;
+  }
+}
+/* Sun shafts: soft slanted beams, stronger the nearer the surface. */
+.lk-surf-shafts {
+  -webkit-mask-image: linear-gradient(180deg, transparent 6%, rgba(0, 0, 0, 0.55) 40%, #000 82%, transparent 100%);
+  mask-image: linear-gradient(180deg, transparent 6%, rgba(0, 0, 0, 0.55) 40%, #000 82%, transparent 100%);
+}
+.lk-shaft {
+  top: -12%;
+  height: 130%;
+  transform-origin: 50% 0;
+  background: linear-gradient(180deg, rgba(214, 244, 252, 0) 0%, rgba(214, 244, 252, 0.34) 55%, rgba(214, 244, 252, 0.1) 100%);
+  filter: blur(20px);
+  transform: rotate(13deg);
+  animation: lk-shaft 10s ease-in-out infinite alternate;
+}
+@keyframes lk-shaft {
+  from {
+    transform: rotate(11deg);
+  }
+  to {
+    transform: rotate(15.5deg);
+  }
+}
+.lk-wave {
+  animation: lk-wave 9s ease-in-out infinite alternate;
+}
+.lk-wave-b {
+  animation-duration: 11s;
+  animation-direction: alternate-reverse;
+}
+@keyframes lk-wave {
+  from {
+    transform: translateX(-3%);
+  }
+  to {
+    transform: translateX(3%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .lk-surf-snow,
+  .lk-shaft,
+  .lk-wave {
+    animation: none;
+  }
+}
+/* The final call's top, by day: the surface's own pale haze, easing into the sky. */
+html[data-tod="day"] #final .lk-final-top {
+  height: 20%;
+  opacity: 1 !important;
+  background: linear-gradient(
+    180deg,
+    #c9e6f2 0%,
+    rgba(201, 230, 242, 0.82) 22%,
+    rgba(201, 230, 242, 0.5) 48%,
+    rgba(201, 230, 242, 0.2) 74%,
+    rgba(201, 230, 242, 0) 100%
+  );
+}
+html[data-tod="day"] #final::before {
+  background: linear-gradient(180deg, #c9e6f2 0%, #86b6e8 22%, #86b6e8 36%, #cfe3f4 66%, #6fa6d6 100%);
+}
+#final .lk-final-bottom {
+  transition: opacity var(--lk-tod-ms) ease;
+}
+html[data-tod="day"] #final .lk-final-bottom {
+  z-index: 5; /* over the sea, so the water itself melts into the footer */
+  height: 34%;
+  background: linear-gradient(
+    0deg,
+    #f4f7fb 0%,
+    rgba(244, 247, 251, 0.85) 25%,
+    rgba(244, 247, 251, 0.5) 52%,
+    rgba(244, 247, 251, 0.18) 78%,
+    rgba(244, 247, 251, 0) 100%
+  );
+}
+
+/* ---- By day: a light, solid footer (map colours only; the markup is rantai.dev's) ---- */
+footer {
+  transition: background-color var(--lk-tod-ms) ease;
+}
+html[data-tod="day"] footer {
+  background-color: #f4f7fb;
+  color: rgb(8 24 58 / 0.62);
+}
+/* A soft run-in above it, where the page above is dark (the contact page); the home
+   page's final call fades into it itself. */
+footer::before {
+  content: "";
+  position: absolute;
+  inset: auto 0 100% 0;
+  height: 280px;
+  pointer-events: none;
+  opacity: 0;
+  background: linear-gradient(
+    180deg,
+    rgba(244, 247, 251, 0) 0%,
+    rgba(60, 110, 170, 0.05) 14%,
+    rgba(70, 120, 180, 0.16) 30%,
+    rgba(120, 165, 215, 0.34) 48%,
+    rgba(190, 212, 238, 0.62) 68%,
+    rgba(232, 240, 249, 0.88) 86%,
+    #f4f7fb 100%
+  );
+  transition: opacity var(--lk-tod-ms) ease;
+}
+html[data-tod="day"] footer::before {
+  opacity: 1;
+}
+html[data-tod="day"] main:has(#final) + footer::before {
+  display: none;
+}
+/* Text: solid ink, muted ink, and the hover back to ink. The terminal keeps its own colours. */
+html[data-tod="day"] footer :is([class*=" text-[#E8F4FF] "], [class$=" text-[#E8F4FF]"]):not(.lk-term *, .lk-wm *) {
+  color: var(--lk-ink);
+}
+html[data-tod="day"] footer [class*="text-[#E8F4FF]/"]:not(.lk-term *, .lk-wm *) {
+  color: rgb(8 24 58 / 0.62);
+}
+html[data-tod="day"] footer [class*="hover:text-[#E8F4FF]"]:hover:not(.lk-term *) {
+  color: var(--lk-ink);
+}
+html[data-tod="day"] footer [class*="border-[#E8F4FF]/"]:not(.lk-term *) {
+  border-color: rgb(8 24 58 / 0.08);
+}
+html[data-tod="day"] footer a[class*="border-[#E8F4FF]/35"]:not(.lk-term *) {
+  border-color: rgb(8 24 58 / 0.4);
+}
+html[data-tod="day"] footer a[class*="border-[#E8F4FF]/35"]:not(.lk-term *):hover {
+  border-color: rgb(8 24 58 / 0.75);
+  background-color: rgb(8 24 58 / 0.06);
+}
+html[data-tod="day"] footer [class*="hover:bg-[#E8F4FF]/5"]:hover {
+  background-color: rgb(8 24 58 / 0.06);
+}
+html[data-tod="day"] footer .group:hover [class*="group-hover:bg-[#E8F4FF]"] {
+  background-color: var(--lk-ink);
+  border-color: var(--lk-ink);
+  color: #fff;
+}
+html[data-tod="day"] footer .group:hover [class*="group-hover:border-[#E8F4FF]"] {
+  border-color: var(--lk-ink);
+}
+html[data-tod="day"] footer [class*="text-[#8fcbff]"]:not(.lk-term *) {
+  color: #0b5ec2;
+}
+html[data-tod="day"] footer a[class*="text-[#8fcbff]"]:hover {
+  color: var(--lk-ink);
+}
+html[data-tod="day"] footer [class*="bg-[#44A6FA]/15"] {
+  background-color: rgb(29 108 207 / 0.12);
+}
+html[data-tod="day"] footer code:not(.lk-term code) {
+  background-color: rgb(8 24 58 / 0.07);
+  color: var(--lk-ink);
+}
+/* The clone-command block: a light surface by day. The scroll edge-fade is a transparency
+   mask, so it fades to this surface by itself. */
+html[data-tod="day"] footer .lk-term {
+  background-color: #e9eef5;
+  box-shadow: inset 0 0 0 1px rgb(8 24 58 / 0.08);
+}
+html[data-tod="day"] footer .lk-term > span[aria-hidden] {
+  color: #546782;
+}
+html[data-tod="day"] footer .lk-term code {
+  color: #0b1a33;
+}
+html[data-tod="day"] footer .lk-term button {
+  background-color: rgb(8 24 58 / 0.08);
+  color: #0b1a33;
+}
+html[data-tod="day"] footer .lk-term button:hover {
+  background-color: rgb(8 24 58 / 0.15);
+  color: #0b1a33;
+}
+html[data-tod="day"] footer .lk-term button[data-state="copied"] {
+  background-color: rgb(14 128 76 / 0.16);
+  color: #0a5e37;
+}
+html[data-tod="day"] footer .lk-term button[data-state="failed"] {
+  background-color: rgb(179 38 30 / 0.12);
+  color: #a3211a;
+}
+/* Logos: the mark's white becomes ink; the product logos (light on dark) are inverted. */
+html[data-tod="day"] footer svg path[fill="white"] {
+  fill: #0a1250;
+}
+html[data-tod="day"] footer img {
+  filter: invert(1) hue-rotate(180deg);
+}
+html[data-tod="day"] footer img[class*="invert"] {
+  filter: brightness(0);
+}
+/* The big wordmark: pale grey on light, as it is dark-on-dark at night. */
+html[data-tod="day"] footer .lk-wm [class*="from-[#E8F4FF]/[0.08]"] {
+  --tw-gradient-from: rgb(8 24 58 / 0.09);
+}
+html[data-tod="day"] footer .lk-wm [class*="from-[#E8F4FF]/[0.42]"] {
+  --tw-gradient-from: rgb(8 24 58 / 0.3);
+  --tw-gradient-to: rgb(8 24 58 / 0.05);
+}
+html[data-tod="day"] footer .lk-wm [class*="text-[#E8F4FF]/[0.12]"] {
+  color: rgb(8 24 58 / 0.1);
+}
+
+/* WEB-5 T3b: sections far below the fold are not styled or laid out until they near the screen
+   (`content-visibility: auto`). The intrinsic heights are the measured content heights of each
+   section (without its padding), so the page is as tall as before at 390, 768 and 1190 px wide, in
+   both languages (WEB-5 phone pass: governance re-measured at 390, 375 and 360 px for its compact
+   phone stack, owner QA 2026-11-25, and at 768 px; get-started at 390 and 768 px after its step 2
+   got a phone note, M8). `auto` keeps the real height once the section has been seen; the pinned and
+   sticky sections (depths, dashboards, open) and the vh-sized ones (assistant, final) are left out. */
+[data-home] #governance,
+[data-home] #get-started,
+[data-home] #faq {
+  content-visibility: auto;
+}
+[data-home] #governance { contain-intrinsic-block-size: auto 1618.02px; }
+:lang(id) [data-home] #governance { contain-intrinsic-block-size: auto 1638.27px; }
+[data-home] #get-started { contain-intrinsic-block-size: auto 848.56px; }
+[data-home] #faq { contain-intrinsic-block-size: auto 635px; }
+:lang(id) [data-home] #get-started { contain-intrinsic-block-size: auto 813.63px; }
+:lang(id) [data-home] #faq { contain-intrinsic-block-size: auto 688.88px; }
+/* Narrower phones: the English governance section and the Indonesian Get started are taller
+   (measured at 375 and 360). */
+@media (max-width: 389.98px) {
+  [data-home] #governance { contain-intrinsic-block-size: auto 1638.27px; }
+  :lang(id) [data-home] #get-started { contain-intrinsic-block-size: auto 848.56px; }
+}
+@media (max-width: 374.98px) {
+  [data-home] #governance { contain-intrinsic-block-size: auto 1684.66px; }
+}
+@media (min-width: 768px) {
+  [data-home] #governance,
+  :lang(id) [data-home] #governance { contain-intrinsic-block-size: auto 899.23px; }
+  [data-home] #get-started,
+  :lang(id) [data-home] #get-started { contain-intrinsic-block-size: auto 511px; }
+  [data-home] #faq,
+  :lang(id) [data-home] #faq { contain-intrinsic-block-size: auto 645.88px; }
+}
+@media (min-width: 1024px) {
+  [data-home] #governance,
+  :lang(id) [data-home] #governance { contain-intrinsic-block-size: auto 880.92px; }
+  [data-home] #get-started,
+  :lang(id) [data-home] #get-started { contain-intrinsic-block-size: auto 467px; }
+  [data-home] #faq,
+  :lang(id) [data-home] #faq { contain-intrinsic-block-size: auto 432px; }
+}
+
+/* ---- WEB-5 phone pass (plan §12, M1–M11): rules for below 1024 px only ----
+   Desktop (1024 px and up) does not change; every rule here is inside a max-width query or
+   styles an element that only renders below 1024 px. */
+
+/* M2: the dashboards rail's position dots. `--lk-f` is the rail's position in tiles (set by
+   dashboards-scroller.tsx); a dot grows from 6 to 20 px and lights as its tile comes in. */
+.lk-dash-dots > li {
+  --lk-near: max(0, 1 - max(var(--lk-f, 0) - var(--i), var(--i) - var(--lk-f, 0)));
+  height: 6px;
+  width: calc(6px + 14px * var(--lk-near));
+  border-radius: 9999px;
+  background: rgb(232 244 255 / calc(0.22 + 0.6 * var(--lk-near)));
+}
+
+/* M4: every line of the open-source excerpt fits the phone's panel (open-visuals.tsx), so the
+   right-edge fade that hid the long line goes; that line ends in an ellipsis instead. */
+@media (max-width: 1023.98px) {
+  .lk-open-pre {
+    mask-image: none;
+  }
+}
+
+/* M10: readable text inside the mocks is at least 12 px below 1024 px. The depths cards'
+   labels (they carried 10-11 px, and 10 px on a narrow card), and the KPI tile's delta
+   (14 of 360 drawing units, ~11.5 px on a phone's tile). The sankey has a phone drawing of its
+   own (dashboard-tiles.tsx). */
+@media (max-width: 1023.98px) {
+  .lk-depth-head,
+  .lk-depth-count,
+  .lk-depth-legend,
+  .lk-depth-badge,
+  .lk-depth-lag,
+  .lk-depth-feeds,
+  .lk-depth-total > span:first-child,
+  .lk-depth-tip,
+  .lk-depth-empty,
+  .lk-depth-twice {
+    font-size: 12px;
+  }
+  .lk-kpi svg text {
+    font-size: 15.5px;
+  }
+}
+
+/* Owner QA 2026-11-25 ("terkesan banyak banget datanya"): the depths card on a phone shows three
+   rows, one per problem (depth-records.ts, `PHONE_ROW_IDS`), and three columns, Order, City and
+   Amount: the source glyph and the date go. Rows are a little shorter, the Gold groups too, and
+   each row takes its phone place (`--pslot`). Gold is built from all five rows, as on desktop. */
+@media (max-width: 1023.98px) {
+  .lk-depth-card {
+    --lk-depth-row: 34px;
+    --lk-depth-group: 36px;
+  }
+  .lk-depth-body {
+    height: calc(28px + 3 * var(--lk-depth-row) + 16px);
+  }
+  .lk-depth-row {
+    --slot: var(--pslot) !important;
+  }
+  .lk-depth-row[data-phone-hide],
+  .lk-depth-src,
+  .lk-depth-date {
+    display: none;
+  }
+  .lk-depth-ord {
+    display: block;
+  }
+  .lk-depth-grid {
+    grid-template-columns: 58px minmax(0, 1fr) 84px;
+    column-gap: 10px;
+  }
+}
+
+/* Owner QA 2026-11-25 ("aku pengen dia muncul satu satu pas di scroll ... sama kek section Answer
+   become dashboards"): "Yours to keep" on a phone is the desktop showcase's mechanism fitted to a
+   phone: one sticky stage under the top bar with the heading, the current promise (title and line)
+   and its picture, and four position dots; vertical scroll steps through the four markers
+   (open-showcase.tsx lights the one at the middle of the screen) and each promise holds still for
+   45svh of scroll. The marker heights put the three switches and the release 45svh apart once the
+   stage is pinned: the first and last also cover the half screen before the middle line. Only with
+   JavaScript (`html[data-scene]`) and motion; otherwise the four stack, everything visible. */
+.lk-show-dots {
+  display: none;
+}
+@media (max-width: 63.98rem) and (prefers-reduced-motion: no-preference) {
+  html[data-scene] .lk-show {
+    grid-template-rows: repeat(4, auto);
+    row-gap: 0;
+  }
+  html[data-scene] .lk-show-mark {
+    display: block;
+    grid-column: 1;
+    height: 45svh;
+  }
+  html[data-scene] .lk-show-mark[data-i="0"] {
+    grid-row: 1;
+    height: calc(95svh - 4rem);
+  }
+  html[data-scene] .lk-show-mark[data-i="1"] {
+    grid-row: 2;
+  }
+  html[data-scene] .lk-show-mark[data-i="2"] {
+    grid-row: 3;
+  }
+  html[data-scene] .lk-show-mark[data-i="3"] {
+    grid-row: 4;
+    height: 95svh;
+  }
+  html[data-scene] .lk-show-pin {
+    grid-column: 1;
+    grid-row: 1 / -1;
+    align-self: start;
+    position: -webkit-sticky;
+    position: sticky;
+    top: 4rem;
+    height: calc(100svh - 4rem);
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding-block: 12px 14px;
+  }
+  html[data-scene] .lk-show-head {
+    margin-bottom: 0;
+  }
+  html[data-scene] .lk-show-head > h2 {
+    font-size: clamp(2rem, 9vw, 2.6rem);
+  }
+  html[data-scene] .lk-show-cols {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    flex-direction: column;
+    gap: 12px;
+  }
+  html[data-scene] .lk-show-list,
+  html[data-scene] .lk-show-stage {
+    display: grid;
+  }
+  html[data-scene] .lk-show-stage {
+    flex: 1;
+    min-height: 0;
+    align-content: start;
+  }
+  /* The promises and the pictures each share one cell; the current one shows. */
+  html[data-scene] .lk-show-item,
+  html[data-scene] .lk-show-visual {
+    grid-area: 1 / 1;
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(10px);
+    transition:
+      opacity 0.4s ease,
+      transform 0.55s var(--lk-ease),
+      visibility 0s linear 0.4s;
+  }
+  html[data-scene] .lk-show-item[data-on],
+  html[data-scene] .lk-show-visual[data-on] {
+    opacity: 1;
+    visibility: visible;
+    transform: none;
+    transition:
+      opacity 0.4s ease 0.08s,
+      transform 0.55s var(--lk-ease) 0.08s,
+      visibility 0s;
+  }
+  html[data-scene] .lk-show-item {
+    border-left-color: #44a6fa;
+  }
+  html[data-scene] .lk-show-item .lk-show-title {
+    font-size: 20px;
+    line-height: 28px;
+  }
+  html[data-scene] .lk-show-item .lk-show-line {
+    margin-top: 2px;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  html[data-scene] .lk-show-visual {
+    align-self: start;
+    min-height: 0;
+    max-height: 100%;
+    max-width: none;
+    margin: 0;
+  }
+  /* The dots sit with the words, between the promise and its picture, and the pictures hang from
+     the top of the stage, so what is left of the screen is under the picture, not between parts. */
+  html[data-scene] .lk-show-dots {
+    order: 1;
+    display: flex;
+    justify-content: flex-start;
+    gap: 6px;
+    padding-left: 22px;
+  }
+  html[data-scene] .lk-show-stage {
+    order: 2;
+  }
+  /* The pin's own empty foot is the gap to Get started at the release. */
+  html[data-scene] #open {
+    padding-bottom: 8px;
+  }
+  html[data-scene] .lk-show-dots > li {
+    --lk-near: 0;
+    transition:
+      width 0.3s var(--lk-ease),
+      background-color 0.3s ease;
+  }
+  html[data-scene] .lk-show[data-active="0"] .lk-show-dots > li[data-i="0"],
+  html[data-scene] .lk-show[data-active="1"] .lk-show-dots > li[data-i="1"],
+  html[data-scene] .lk-show[data-active="2"] .lk-show-dots > li[data-i="2"],
+  html[data-scene] .lk-show[data-active="3"] .lk-show-dots > li[data-i="3"] {
+    --lk-near: 1;
+  }
+  /* The tallest pictures, compacted to fit the stage at 360x740: the tables' storage list goes
+     (the files are what the "Apache Iceberg underneath" line says), and the stack's cards and
+     gaps are tighter. */
+  html[data-scene] .lk-show-visual .lk-otr-a-store {
+    display: none;
+  }
+  html[data-scene] .lk-show-visual .lk-hs-card {
+    padding-block: 6px;
+  }
+}
+/* Short phones (iPhone SE, 375x667): the stage is about 420 px, so the pin's gaps and the stack's
+   cards are tighter still, and every picture fits without being cut. */
+@media (max-width: 63.98rem) and (max-height: 700px) and (prefers-reduced-motion: no-preference) {
+  html[data-scene] .lk-show-pin {
+    gap: 8px;
+    padding-block: 6px 8px;
+  }
+  html[data-scene] .lk-show-cols {
+    gap: 8px;
+  }
+  html[data-scene] .lk-show-head > h2 {
+    font-size: 1.9rem;
+  }
+  html[data-scene] .lk-show-visual .lk-hs {
+    gap: 6px;
+  }
+  html[data-scene] .lk-show-visual .lk-hs-card {
+    padding-block: 3px;
+  }
+}

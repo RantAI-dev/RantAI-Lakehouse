@@ -16,7 +16,7 @@ import {
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatCompactNumber, formatDateTime } from "@/lib/format"
 import { consumerState, consumerTooltip } from "@/lib/gold-consumers"
-import { publicationLabel } from "@/lib/gold-freshness"
+import { publicationLabel, syncModeLabel } from "@/lib/gold-freshness"
 import { fmtMeasured } from "@/lib/measured"
 import { goldService } from "@/services"
 import type {
@@ -27,17 +27,42 @@ import type {
   GoldReadBack,
 } from "@/services/contracts/gold"
 
+/**
+ * The "Enabled" and "Sync" cells of one row, from ONE publication read
+ * (`DATA-66` D2: the same three labels the card shows). The sync mode
+ * here is read-only — the card is where it changes — so a reader who
+ * cannot edit still sees how the table follows ClickHouse.
+ */
 function MartPublication({ mart, reloadKey }: { mart: { name: string }; reloadKey: number }) {
   const state = useService<GoldPublication>(
     (signal) => goldService.getPublication(mart.name, signal),
     [mart.name, reloadKey]
   )
-  if (state.status === "loading") return <span className="text-muted-foreground">…</span>
-  if (state.status === "error") return <span className="text-destructive">—</span>
+  if (state.status === "loading") {
+    return (
+      <>
+        <TableCell className="text-muted-foreground">…</TableCell>
+        <TableCell className="text-muted-foreground">…</TableCell>
+      </>
+    )
+  }
+  if (state.status === "error") {
+    return (
+      <>
+        <TableCell className="text-destructive">—</TableCell>
+        <TableCell className="text-destructive">—</TableCell>
+      </>
+    )
+  }
   return (
-    <span className={state.data.canEdit ? "" : "text-muted-foreground"}>
-      {publicationLabel(state.data)}
-    </span>
+    <>
+      <TableCell className={state.data.canEdit ? "" : "text-muted-foreground"}>
+        {publicationLabel(state.data)}
+      </TableCell>
+      <TableCell className="text-muted-foreground">
+        {state.data.enabled ? syncModeLabel(state.data.syncMode) : "—"}
+      </TableCell>
+    </>
   )
 }
 
@@ -108,9 +133,7 @@ function MartRow({ mart }: { mart: GoldMart }) {
     <TableRow>
       <TableCell className="font-medium">{mart.name}</TableCell>
       <TableCell>{formatCompactNumber(mart.rows)}</TableCell>
-      <TableCell>
-        <MartPublication mart={mart} reloadKey={publicationKey} />
-      </TableCell>
+      <MartPublication mart={mart} reloadKey={publicationKey} />
       <TableCell>
         {lastExport.status === "loading" ? (
           <span className="text-muted-foreground">…</span>
@@ -203,6 +226,7 @@ export function GoldExportsPage() {
               <TableHead>Mart</TableHead>
               <TableHead>Rows</TableHead>
               <TableHead>Enabled</TableHead>
+              <TableHead>Sync</TableHead>
               <TableHead>Last export</TableHead>
               <TableHead>Snapshot</TableHead>
               <TableHead>History (runs)</TableHead>

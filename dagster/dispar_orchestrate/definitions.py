@@ -26,11 +26,14 @@ from dispar_orchestrate.cdc_apply import cdc_apply_job, cdc_apply_sensor
 from dispar_orchestrate.discover import discover_job
 from dispar_orchestrate.file_ingest import file_ingest_job
 from dispar_orchestrate.gold_export import (
-    gold_export_after_authored_sensor,
     gold_export_job,
     gold_export_schedule,
 )
 from dispar_orchestrate.gold_latest_copy import gold_latest_copy_job
+from dispar_orchestrate.iceberg_sync import (
+    iceberg_sync_job,
+    iceberg_sync_sensor,
+)
 from dispar_orchestrate.ingest_factory import ingest_job, ingest_schedule_sensor
 from dispar_orchestrate.maintenance import (
     bronze_maintenance_job,
@@ -105,6 +108,13 @@ from dispar_orchestrate.storage_snapshot import (
 # has no schedule and no sensor: there is no such thing as "the" uploaded
 # file to run it on.
 #
+# `iceberg_sync_job` (DATA-66) exports and trims ONE publication, given
+# by its run config; the API's after-write route and the
+# `iceberg_sync_sensor` launch it. It is deliberately NOT on
+# `SERIAL_JOB_NAMES`: `dagster.yaml` limits `lakehouse/iceberg-sync-target`
+# to one run per unique value, so two tables sync in parallel and two
+# syncs of one table queue. See `iceberg_sync.py`'s module doc.
+#
 # `discover_job` (SRC-13, docs/superpowers/plans/2026-10-15-src-13-table-discovery.md)
 # lists what a MongoDB, Kafka, SFTP or Oracle source holds, and previews the
 # columns of one object (also a REST endpoint), for the console's table picker. It
@@ -120,6 +130,9 @@ defs = Definitions(
         # publish's run config — no schedule, no sensor, same reason as
         # `file_ingest_job` above.
         gold_latest_copy_job,
+        # DATA-66 (D6): one publication per run; launched by the API and
+        # by `iceberg_sync_sensor`, never scheduled directly.
+        iceberg_sync_job,
         agent_run_job,
         alerts_run_job,
         capacity_snapshot_job,
@@ -150,7 +163,8 @@ defs = Definitions(
         cdc_apply_sensor,
         pipeline_run_failed_sensor,
         pipeline_run_finished_sensor,
-        gold_export_after_authored_sensor,
+        # DATA-66 D8: the per-table watcher, every 15 seconds.
+        iceberg_sync_sensor,
         # R3 plan 2a: one `run_status_sensor` per authored pipeline with
         # non-empty `depends_on`, named `authored__<safe_id>_after` (the
         # same name the API layer fetches ticks for via

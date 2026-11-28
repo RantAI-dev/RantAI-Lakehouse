@@ -54,7 +54,7 @@
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use lakehouse_auth::Principal;
 use lakehouse_auth::PrincipalId;
 use lakehouse_auth::Secret;
@@ -1205,7 +1205,11 @@ pub struct UpdateRoleBody {
 /// and then nothing is written. Rules are matched against a principal's
 /// role NAMES, so a rename would silently stop every mask and row filter
 /// those rules carry from reaching the people who hold this role: data the
-/// role must not see would become visible (`WEB-3` review R2).
+/// role must not see would become visible (`WEB-3` review R2). The 409's
+/// sentence counts every rule that names the role, but names only the
+/// rules whose tables the caller's reach covers (`SEC-83` follow-up): the
+/// block survives a rule the caller cannot see, and the sentence says
+/// nothing about it.
 ///
 /// # Security
 ///
@@ -1221,6 +1225,7 @@ pub async fn update_role(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
     Path(id): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Role>> {
     let body: UpdateRoleBody = parse_body(&body)?;
@@ -1242,7 +1247,23 @@ pub async fn update_role(
     if input.name != before.name {
         let naming = policies_naming_role(pool, &before.name).await?;
         if !naming.is_empty() {
-            return Err(ApiError::Conflict(named_by_rules_sentence(&naming)).into());
+            // `SEC-83` follow-up: the count is read from
+            // every rule that names the role — the rename must stay
+            // blocked while any rule anywhere names it, because a rename
+            // that passed over an unseen rule would break it — but the
+            // names come only from the rules whose tables the caller's
+            // reach covers, so the answer says nothing about another
+            // tenant's rules. A rule that binds no table counts as in
+            // reach, the same reading every policy list keeps.
+            let total = naming.len();
+            let in_reach = crate::routes::governance::retain_policies_in_reach(
+                &state,
+                Some(&principal),
+                &headers,
+                naming,
+            )
+            .await?;
+            return Err(ApiError::Conflict(named_by_rules_sentence(total, &in_reach)).into());
         }
     }
     let role = identity::update_role(pool, &id, &input).await?;
@@ -1478,20 +1499,28 @@ async fn policies_naming_role(
 }
 
 /// The 409 sentence for a rename an access rule still names (`WEB-3`
-/// review R2, fixed by the plan): how many rules name the role, and the
-/// first three by name — read from the stored rows, never from an
-/// upstream error's own text (principle 4).
-fn named_by_rules_sentence(rules: &[governance::Policy]) -> String {
+/// review R2, fixed by the plan): how many rules name the role IN FULL —
+/// the count is read before the reach filter, so the block survives a
+/// rule the caller cannot see — and up to three names, taken only from
+/// the rules in the caller's reach (`SEC-83` follow-up):
+/// a caller outside a rule's reach learns nothing about it, not even its
+/// name. With no in-reach rule the names part is empty. Read from the
+/// stored rows, never from an upstream error's own text (principle 4).
+fn named_by_rules_sentence(total: usize, rules: &[governance::Policy]) -> String {
     let first_three = rules
         .iter()
         .take(3)
         .map(|rule| rule.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
+    let names = if first_three.is_empty() {
+        String::new()
+    } else {
+        format!(" ({first_three}…)")
+    };
     format!(
-        "This role is named by {} access rules ({first_three}…). Change those rules first, or \
-         keep the role's name.",
-        rules.len()
+        "This role is named by {total} access rules{names}. Change those rules first, or \
+         keep the role's name."
     )
 }
 

@@ -87,12 +87,9 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
-    // The published landing page's build artifacts (`bun run build:landing`):
-    // the static export at the root and the export project's own Next output.
-    // Their source lives in `ops/landing-pages` and `src/`, which stay linted.
-    "out-landing/**",
-    "ops/landing-pages/.next/**",
-    "ops/landing-pages/out/**",
+    // WEB-5 D11: the Lakehouse site is its own package with its own lint
+    // run (`cd site && bun run lint`); the console's run never reads it.
+    "site/**",
   ]),
 ]);
 

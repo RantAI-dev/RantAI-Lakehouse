@@ -18,12 +18,15 @@ use crate::common;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use lakehouse_store::uploads::claim_table;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use common::{TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up};
+use common::{
+    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up, spin_up_with_env,
+};
 
 mod identity {
     use super::*;
@@ -409,9 +412,20 @@ mod identity {
         //! refusals say what stands in the way.
 
         use super::*;
+        use std::collections::HashMap;
+
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         /// The seeded `Analyst` role, which people hold (`0002_seed_identity.sql`).
         const SEEDED_ANALYST: &str = "22222222-2222-4222-8222-000000000001";
+
+        /// The upload table Meridian Group — the tenant that owns the shared
+        /// catalog — holds once an upload claims it.
+        const GROUP_TABLE: &str = "group_orders";
+
+        /// The upload table Meridian Retail holds once an upload claims it.
+        const RETAIL_TABLE: &str = "retail_orders";
 
         /// `POST /api/identity/roles` and return the new role's id.
         async fn create_role(app: &TestApp, cookie: &str, name: &str) -> String {
@@ -482,6 +496,133 @@ mod identity {
             .await;
             assert_eq!(status, StatusCode::CREATED, "{body}");
             body["id"].as_str().expect("the new rule's id").to_owned()
+        }
+
+        /// The app's deployment with a `ClickHouse` stand-in for the one
+        /// lookup a rule-writing request makes: `SEC-83` has `POST
+        /// /api/governance/policies` check the bound table before it stores
+        /// (`SEC-80`'s presence check, asked through `system.columns` for a
+        /// `serving.` table). These tests never test absence, so the
+        /// stand-in answers only that one table, present, and mounts
+        /// nothing else: wiremock's 404 keeps any other query loud.
+        async fn spin_up_with_the_rule_table_present() -> TestApp {
+            let ch = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("system.columns"))
+                .and(body_string_contains("database = 'serving'"))
+                .and(body_string_contains("table = 'mart_customer_segment'"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [
+                        {"name": "name", "type": "String"},
+                        {"name": "type", "type": "String"}
+                    ],
+                    "data": [{"name": "email", "type": "String"}],
+                    "rows": 1,
+                })))
+                .mount(&ch)
+                .await;
+            let mut env = HashMap::new();
+            env.insert("CH_URL".to_owned(), ch.uri());
+            spin_up_with_env(&env).await
+        }
+
+        /// Both tenants claim their upload table, the way an upload does.
+        async fn claim_the_uploads(pool: &PgPool) {
+            for (tenant, table) in [
+                (MERIDIAN_GROUP, GROUP_TABLE),
+                (MERIDIAN_RETAIL, RETAIL_TABLE),
+            ] {
+                let claimed = claim_table(
+                    pool,
+                    tenant.parse::<Uuid>().expect("a seeded tenant id"),
+                    table,
+                    &format!("upload-{table}"),
+                )
+                .await
+                .expect("claim the upload table");
+                assert!(claimed, "the tenant must hold the claim on {table}");
+            }
+        }
+
+        /// A principal that holds exactly `permissions` and belongs to
+        /// exactly `tenant`, as a session cookie.
+        async fn cookie_in_tenant(pool: &PgPool, permissions: &str, tenant: &str) -> String {
+            let user = create_principal_with_permissions(pool, permissions).await;
+            sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+                .bind(user)
+                .bind(tenant.parse::<Uuid>().expect("a seeded tenant id"))
+                .execute(pool)
+                .await
+                .expect("add the membership");
+            session_cookie_for_user(pool, user).await
+        }
+
+        /// `POST /api/governance/policies` — an access rule whose structured
+        /// `conditions` name `role` and bind an upload table, enforced. The
+        /// caller must hold `policy:write`, belong to the tenant whose
+        /// reach covers `table`, and the table must be present, or the
+        /// route refuses (`SEC-83`). Returns the rule's id.
+        async fn create_rule_naming_table(
+            app: &TestApp,
+            cookie: &str,
+            name: &str,
+            role: &str,
+            table: &str,
+        ) -> String {
+            let (status, body) = request(
+                app,
+                "POST",
+                "/api/governance/policies",
+                Some(cookie),
+                Some(json!({
+                    "name": name,
+                    "kind": "Masking",
+                    "subjects": format!("Everyone who holds {role}"),
+                    "resources": "tenant-scoped tables",
+                    "effect": "Permit with obligation",
+                    "conditions": json!({
+                        "roles": [role],
+                        "table": table,
+                        "mask": ["email"],
+                    })
+                    .to_string(),
+                    "activate": true,
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            body["id"].as_str().expect("the new rule's id").to_owned()
+        }
+
+        /// The deployment of the reach tests: the catalog's tenant named,
+        /// an Iceberg query database, and a `ClickHouse` stand-in answering
+        /// the `DESCRIBE` of both claimed upload tables present — the
+        /// presence check `POST /api/governance/policies` makes for a
+        /// `bronze.` table (`SEC-80`'s model). Any other `DESCRIBE` finds
+        /// no mock, so wiremock's 404 keeps it loud.
+        async fn spin_up_with_the_upload_tables_present() -> TestApp {
+            let ch = MockServer::start().await;
+            for table in [GROUP_TABLE, RETAIL_TABLE] {
+                Mock::given(method("POST"))
+                    .and(body_string_contains("DESCRIBE TABLE"))
+                    .and(body_string_contains(format!("bronze.{table}")))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "meta": [
+                            {"name": "name", "type": "String"},
+                            {"name": "type", "type": "String"}
+                        ],
+                        "data": [{"name": "email", "type": "String"}],
+                        "rows": 1,
+                    })))
+                    .with_priority(1)
+                    .mount(&ch)
+                    .await;
+            }
+            let mut env = HashMap::new();
+            env.insert("CH_URL".to_owned(), ch.uri());
+            env.insert("CATALOG_TENANT_ID".to_owned(), MERIDIAN_GROUP.to_owned());
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
+            spin_up_with_env(&env).await
         }
 
         /// The stored name and conditions of an access rule.
@@ -585,10 +726,11 @@ mod identity {
         /// silently, and for data the role must not see. While any rule
         /// names the old name the rename is refused with 409, and neither
         /// the role nor the rule is written. A draft counts too: it is
-        /// enforced the moment someone makes it ready.
+        /// enforced the moment someone makes it ready. The holder here is
+        /// an operator, so both rules sit in reach and both are named.
         #[tokio::test]
         async fn a_rename_is_refused_while_an_access_rule_names_the_role() {
-            let app = spin_up().await;
+            let app = spin_up_with_the_rule_table_present().await;
             let admin = create_principal_with_permissions(&app.pool, "*:*").await;
             let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
             let id = create_role(&app, &admin_cookie, "Reviewers").await;
@@ -603,16 +745,20 @@ mod identity {
             let sentence = body["error"]
                 .as_str()
                 .expect("the refusal is a fixed sentence");
+            // The sentence counts every rule that names the role and names
+            // up to three of them, newest first (`SEC-83` follow-up). The store's
+            // order is `created_at DESC, name`, and the two requests may
+            // land on the same timestamp, so either order is the sentence.
+            let live_first = "This role is named by 2 access rules (Live row filter, \
+                              Draft masking…). Change those rules first, or keep the \
+                              role's name.";
+            let draft_first = "This role is named by 2 access rules (Draft masking, \
+                               Live row filter…). Change those rules first, or keep \
+                               the role's name.";
             assert!(
-                sentence.starts_with("This role is named by 2 access rules ("),
+                sentence == live_first || sentence == draft_first,
                 "{sentence}"
             );
-            assert!(
-                sentence.ends_with("). Change those rules first, or keep the role's name."),
-                "{sentence}"
-            );
-            assert!(sentence.contains("Draft masking"), "{sentence}");
-            assert!(sentence.contains("Live row filter"), "{sentence}");
 
             assert_eq!(
                 stored_role(&app.pool, &id).await,
@@ -641,12 +787,130 @@ mod identity {
             assert_eq!(audits, 0, "nothing was written, so nothing is audited");
         }
 
+        /// `SEC-83` follow-up: the refusal names only the
+        /// rules whose tables the caller's reach covers. Meridian Group's
+        /// `identity:write` holder renames a role that both tenants' rules
+        /// name — Group's on its own upload table, Retail's on its own — and
+        /// the 409 still counts both rules, but names only Group's: the
+        /// other tenant's rule's name, and its table, stay out of the
+        /// answer, and nothing is written.
+        #[tokio::test]
+        async fn a_rename_refusal_names_only_the_rules_of_tables_the_caller_can_reach() {
+            let app = spin_up_with_the_upload_tables_present().await;
+            claim_the_uploads(&app.pool).await;
+            let group_writer = cookie_in_tenant(&app.pool, "policy:write", MERIDIAN_GROUP).await;
+            let retail_writer = cookie_in_tenant(&app.pool, "policy:write", MERIDIAN_RETAIL).await;
+            let admin = cookie_in_tenant(&app.pool, "identity:write", MERIDIAN_GROUP).await;
+            let id = create_role(&app, &admin, "Reviewers").await;
+            create_rule_naming_table(
+                &app,
+                &group_writer,
+                "Group reviewers mask",
+                "Reviewers",
+                &format!("bronze.{GROUP_TABLE}"),
+            )
+            .await;
+            create_rule_naming_table(
+                &app,
+                &retail_writer,
+                "Retail reviewers mask",
+                "Reviewers",
+                &format!("bronze.{RETAIL_TABLE}"),
+            )
+            .await;
+
+            let (status, body) =
+                update_role(&app, &admin, &id, "Senior Reviewers", "query:read").await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            let body_text = body.to_string();
+            assert!(
+                !body_text.contains("Retail reviewers mask"),
+                "the other tenant's rule is not named: {body}"
+            );
+            assert!(
+                !body_text.contains(RETAIL_TABLE),
+                "the answer carries no trace of the other tenant's table: {body}"
+            );
+            let sentence = body["error"]
+                .as_str()
+                .expect("the refusal is a fixed sentence");
+            assert_eq!(
+                sentence,
+                "This role is named by 2 access rules (Group reviewers mask…). \
+                 Change those rules first, or keep the role's name.",
+                "{sentence}"
+            );
+
+            assert_eq!(
+                stored_role(&app.pool, &id).await,
+                Some((
+                    "Reviewers".to_owned(),
+                    "query:read".to_owned(),
+                    "first".to_owned()
+                )),
+                "the refused rename leaves the role alone"
+            );
+        }
+
+        /// A rule the caller cannot reach still blocks the rename — the
+        /// count is read from every rule that names the role, so the block
+        /// survives (`SEC-83` follow-up) — but the answer names nothing: the one
+        /// rule that names the role is Retail's, on a table outside Group's
+        /// reach, so the names part is empty.
+        #[tokio::test]
+        async fn a_rule_outside_the_callers_reach_still_blocks_the_rename_without_being_named() {
+            let app = spin_up_with_the_upload_tables_present().await;
+            claim_the_uploads(&app.pool).await;
+            let retail_writer = cookie_in_tenant(&app.pool, "policy:write", MERIDIAN_RETAIL).await;
+            let admin = cookie_in_tenant(&app.pool, "identity:write", MERIDIAN_GROUP).await;
+            let id = create_role(&app, &admin, "Reviewers").await;
+            create_rule_naming_table(
+                &app,
+                &retail_writer,
+                "Retail reviewers mask",
+                "Reviewers",
+                &format!("bronze.{RETAIL_TABLE}"),
+            )
+            .await;
+
+            let (status, body) =
+                update_role(&app, &admin, &id, "Senior Reviewers", "query:read").await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            let sentence = body["error"]
+                .as_str()
+                .expect("the refusal is a fixed sentence");
+            assert_eq!(
+                sentence,
+                "This role is named by 1 access rules. Change those rules first, or \
+                 keep the role's name.",
+                "{sentence}"
+            );
+            let body_text = body.to_string();
+            assert!(
+                !body_text.contains("Retail reviewers mask"),
+                "the other tenant's rule is not named: {body}"
+            );
+            assert!(
+                !body_text.contains(RETAIL_TABLE),
+                "the answer carries no trace of the other tenant's table: {body}"
+            );
+            assert_eq!(
+                stored_role(&app.pool, &id).await,
+                Some((
+                    "Reviewers".to_owned(),
+                    "query:read".to_owned(),
+                    "first".to_owned()
+                )),
+                "the refused rename leaves the role alone"
+            );
+        }
+
         /// `WEB-3` review R2, the other side: nothing names the role, so the
         /// rename goes through — a rule that names someone else does not
         /// stand in its way.
         #[tokio::test]
         async fn a_rename_is_allowed_when_no_access_rule_names_the_role() {
-            let app = spin_up().await;
+            let app = spin_up_with_the_rule_table_present().await;
             let admin = create_principal_with_permissions(&app.pool, "*:*").await;
             let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
             let id = create_role(&app, &admin_cookie, "Reviewers").await;
@@ -673,7 +937,7 @@ mod identity {
         /// people it applied to before.
         #[tokio::test]
         async fn a_description_only_edit_is_allowed_while_an_access_rule_names_the_role() {
-            let app = spin_up().await;
+            let app = spin_up_with_the_rule_table_present().await;
             let admin = create_principal_with_permissions(&app.pool, "*:*").await;
             let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
             let id = create_role(&app, &admin_cookie, "Reviewers").await;

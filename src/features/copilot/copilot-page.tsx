@@ -149,7 +149,7 @@ export function CopilotPage() {
 
           <div className="shrink-0">
             <ChatComposer onStop={c.stop} solid
-              mode={c.mode} setMode={c.setMode} onSend={c.send} busy={c.busy}
+              mode={c.mode} setMode={c.setMode} onSend={(t, mentions) => c.send(t, undefined, { mentions })} busy={c.busy}
               enabledCaps={c.enabledCaps} toggleCap={c.toggleCap}
               placeholder={c.mode === "build" ? "Tell AI Copilot what to build or change…" : "Ask anything about your lakehouse data…"}
             />

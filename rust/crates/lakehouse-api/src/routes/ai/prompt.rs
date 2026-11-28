@@ -145,6 +145,14 @@ COUNTS IN A GROUPED TABLE
 - If there is no such detail table, give the figure per row of the grain and say that a total cannot be read from this table.
 - Say in one clause which table the count came from.";
 
+/// The lineage rule for a Build turn (`AI-13` decision 4).
+/// Appended only when `get_lineage` is in the offered tool list, so a Build
+/// turn that cannot call the tool keeps its prompt. Ask carries the same
+/// question in [`SYSTEM_ASK_SUFFIX`], and its text is not changed here.
+pub(super) const LINEAGE_RULE: &str = "
+
+For \"where does this number come from?\" on a chart: call get_lineage with its id from the page context; name the source tables, connector and refresh times, \"not recorded\" where the path stops.";
+
 /// Most remembered words carried in one prompt: the newest ones. A person
 /// may keep more (`lakehouse_store::chat_term::MAX_TERMS_PER_OWNER`), but a
 /// small model's context is better spent on the question.
@@ -452,10 +460,13 @@ macro_rules! named_metrics_first {
     };
 }
 
-/// Appended in ask mode.
+/// Appended in ask mode. The last sentence is the lineage rule (`AI-13`
+/// decision 4): the acceptance question is asked in ask mode, and the viewer
+/// Build prompt has no room for it after the schema change — the size test
+/// (`ai_prompt_size.rs`) holds the ceiling that decides that.
 pub(super) const SYSTEM_ASK_SUFFIX: &str = concat!("
 
-MODE: ASK (read-only). You can read and analyse anything, but you cannot change anything: no creating or deleting charts, pipelines, connectors or rules. You can still change the page's view filters with set_board_view_filters, since it changes only this person's view. If the user asks for a change, tell them to switch to Build mode. A name describe_mart does not list may be a calculated field: to explain one, or before saying a field does not exist, call list_calculated_fields for that mart or SQL source, which explains the formula in plain words, and run no SQL for it.", limits_and_freshness!(), " ", named_metrics_first!(". If a metric matches, use query_metric"));
+MODE: ASK (read-only). You can read and analyse anything, but you cannot change anything: no creating or deleting charts, pipelines, connectors or rules. You can still change the page's view filters with set_board_view_filters, since it changes only this person's view. If the user asks for a change, tell them to switch to Build mode. A name describe_mart does not list may be a calculated field: to explain one, or before saying a field does not exist, call list_calculated_fields for that mart or SQL source, which explains the formula in plain words, and run no SQL for it.", limits_and_freshness!(), " ", named_metrics_first!(". If a metric matches, use query_metric"), " For \"where does this number come from?\" on a chart: call get_lineage with its id from the page context; name the source tables, connector and refresh times, \"not recorded\" where the path stops.");
 
 /// What the model is told when the person cannot change dashboards (`BI-18`
 /// part C review fix (SHOULD-FIX) R30). The tools that write are then not in
@@ -569,8 +580,9 @@ MODE: BUILD. Besides answering, you can operate the lakehouse:
 - Iceberg tables: list_iceberg_tables, describe_iceberg_table, get_table_maintenance, set_table_maintenance. Storage: get_capacity. Saved queries: save_query, list_saved_queries, run_saved_query. Gold export: export_gold_mart appends a mart to its Iceberg table; get_gold_export reads it back.
 - Governance: draft_policy, draft_classification_rule and draft_quality_rule always save a draft; activating it stays a human action in the console.
 - Embedding: get_embed_snippet describes the address template and the locked filters; enable_embed and set_embed_filter_modes wait for human approval; withdraw_embed_tokens needs a confirm in this chat. You never sign a token and never show one: the customer's own server signs it, so never write a token or a signing command in your answer.
+- Sharing: list_dashboard_access says who can see a dashboard. create_public_link waits for approval; a live link keeps its address, so never say a new address was made unless the tool says so. revoke_public_link needs a confirm. You never give, change or remove access: say so, point to Share > People, and call no tool.
 - Reports and templates: create_report takes title, optional folderId and blocks in order: heading, paragraph, list, quote {text}, divider {}, chart {id from list_charts, width: text or wide}. Marks: **bold**, *italic* and [words](address), a link inside a sentence; \\ escapes a mark; never HTML. A report holds at most 30 charts. list_reports, update_report (`blocks` replaces all, `append` adds blocks, `chart` adds one chart at the end) and delete_report needs approval. list_templates shows templates; create_dashboard_from_template starts an independent dashboard from one. Say its link is below; never write the address.
-- These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_tab, delete_board, delete_calculated_field, delete_metric, run_bronze_maintenance, kill_query, enable_embed, set_embed_filter_modes, delete_report, delete_template. Call the tool; the server then creates the approval. Only when a tool result says needs_approval, tell the user the request is waiting in Approvals (/agents/approvals). Never say a request is waiting if you did not call the tool, or if its result did not say needs_approval.
+- These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_tab, delete_board, delete_calculated_field, delete_metric, run_bronze_maintenance, kill_query, enable_embed, set_embed_filter_modes, create_public_link, delete_report, delete_template. Call the tool; the server then creates the approval. Only when a tool result says needs_approval, tell the user the request is waiting in Approvals (/agents/approvals). Never say a request is waiting if you did not call the tool, or if its result did not say needs_approval.
 - needs_confirmation and needs_approval are different. needs_confirmation: the user confirms in this chat, with the Confirm button under your reply; never mention Approvals for it. needs_approval: a human must approve it in Approvals (/agents/approvals).
 - When a tool result says needs_confirmation, call no other tool that needs the drafted object: reply with ONE short sentence that names the draft (a chart, a board, a tab or a calculated field). The sentence must stay true after the person confirms: say what the draft makes (for example \"A bar chart of visitors by month.\") and never that it is waiting, that it needs confirming or where to confirm it. Write a last line `NEXT: <the remaining steps, in one sentence>` only when the request needs another object after the draft, or another change to the drafted object (its cache rule, its format, its tab); never for confirming, saving or publishing the draft itself, and never when the draft is the whole request. Do not repeat the arguments and do not ask the user to type a confirmation. A user message that starts with `Confirmed and saved:` lists the objects that now exist: never draft them again; do only the step after `Continue:`; when nothing is left, answer in one sentence and call no tool.
 - A chart draft, and a created or updated chart, has `definition`: describe the chart only by what it lists, because a top N, a bin or a filter it does not list was not made. When a tool refused a call, say so in your first sentence, in plain words, and never present a workaround as what the person asked for. When a refusal says bins are for numbers and names the number columns, call ask_user with those columns as the options; when it says the source has no number column to bin, say that and ask nothing. \"Top N of X by Y\" is dimension X, breakdown Y, sort descending on the measure, limit N.
@@ -929,6 +941,31 @@ const DOMAINS: &[Domain] = &[
             "set_embed_filter_modes",
             "withdraw_embed_tokens",
             "get_embed_snippet",
+            "list_boards",
+        ],
+    },
+    // AI-11: sharing a dashboard with the world, or saying who can see it.
+    // The link write is dropped from an ask turn by the gate; `list_boards`
+    // names the dashboard the request is about.
+    Domain {
+        // `AI-11`: "who has access" and "siapa yang bisa" ask who
+        // can see a dashboard, which is `list_dashboard_access`.
+        words: &[
+            "share",
+            "bagikan",
+            "public",
+            "publik",
+            "link",
+            "tautan",
+            "access",
+            "akses",
+            "who can see",
+            "siapa yang bisa",
+        ],
+        tools: &[
+            "create_public_link",
+            "revoke_public_link",
+            "list_dashboard_access",
             "list_boards",
         ],
     },
@@ -1360,6 +1397,20 @@ mod tests {
         assert!(!tools.contains("kill_query"));
         let tools = select_tools(&["Kenapa pipeline gold gagal?"], false);
         assert!(tools.contains("list_pipeline_runs"));
+    }
+
+    #[test]
+    fn who_has_access_brings_in_the_access_tool_in_english_and_indonesian() {
+        // `AI-11`: the words a person uses for "who can see this
+        // dashboard" reach `list_dashboard_access`.
+        for question in [
+            "Who has access to this dashboard?",
+            "Siapa yang bisa melihat dashboard ini?",
+            "Who can see this dashboard?",
+        ] {
+            let tools = select_tools(&[question], false);
+            assert!(tools.contains("list_dashboard_access"), "{question}");
+        }
     }
 
     #[test]

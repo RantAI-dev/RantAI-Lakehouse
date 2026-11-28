@@ -88,7 +88,10 @@ const LOCK_FAILURES: u32 = 5;
 const LOCK_MINUTES: i64 = 15;
 
 const NEEDS_DATABASE: &str = "Public links need the database.";
-const SWITCHED_OFF: &str = "Public links are switched off by an administrator.";
+/// `pub(crate)` so the assistant's sharing tool (`AI-11`) refuses with the
+/// route's one sentence before it writes an approval row, instead of a
+/// second copy of the sentence that could drift from this one.
+pub(crate) const SWITCHED_OFF: &str = "Public links are switched off by an administrator.";
 const EXPIRY_REFUSED: &str = "The expiry must be between 1 hour and 365 days from now.";
 const PASSWORD_REFUSED: &str = "A password needs 8 to 128 characters.";
 const BODY_SHAPE: &str = "body must be {\"board\": string, \"expiresAt\": \"<RFC 3339 time>\", \"password\"?: string | null, \"newLink\"?: boolean}";

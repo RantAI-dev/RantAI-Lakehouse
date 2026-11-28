@@ -27,6 +27,10 @@ use serde_json::{Map, Value, json};
 use super::{api_result_to_value, arg_str};
 use crate::state::AppState;
 
+/// `AI-11`: the refusal when nobody other than the requester could
+/// approve and run an embed write, so no approval row is written.
+pub(super) const NO_OTHER_APPROVER: &str = "Only another manager of this dashboard can approve this, and it has none; make the change yourself in Share > Embed.";
+
 /// The placeholder in the address template, the same words the console's Share
 /// dialog uses (`embed-settings-panel.tsx`).
 const TOKEN_PLACEHOLDER: &str = "<TOKEN FROM YOUR SERVER>";

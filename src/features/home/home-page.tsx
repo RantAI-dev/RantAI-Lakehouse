@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button"
 import { canOpen } from "@/components/app-shell/nav-config"
 import { useAuth } from "@/features/auth/auth-provider"
 import { ChatComposer, type ChatComposerHandle } from "@/features/copilot/chat-composer"
-import { useCopilot, type Mode } from "@/features/copilot/use-copilot"
+import { useCopilot, type Mode, type TableMention } from "@/features/copilot/use-copilot"
 import { readLastBoard } from "@/features/dashboards/last-board"
 import { useService } from "@/hooks/use-service"
 import { cardRead } from "@/lib/home-cards"
@@ -122,6 +122,7 @@ export function HomePage() {
   const [pending, setPending] = React.useState<{
     text: string
     mode: Mode
+    mentions?: TableMention[]
   } | null>(null)
 
   // ADM-13 review round 1, B3 (D10.3): Home widgets whose page the person cannot open
@@ -140,7 +141,7 @@ export function HomePage() {
   React.useEffect(() => {
     if (!pending || mode !== pending.mode) return
     setPending(null)
-    void send(pending.text, [])
+    void send(pending.text, [], { mentions: pending.mentions })
     // Navigate only now. `send` has put the question and `busy` in place
     // (both before its first await), and the conversation page sends an
     // empty conversation straight back here.
@@ -148,12 +149,12 @@ export function HomePage() {
   }, [pending, mode, send, router])
 
   const ask = React.useCallback(
-    (text: string, wanted: Mode = "ask") => {
+    (text: string, wanted: Mode = "ask", mentions?: TableMention[]) => {
       const q = text.trim()
       if (!q) return
       copilot.newChat()
       copilot.setMode(wanted)
-      setPending({ text: q, mode: wanted })
+      setPending({ text: q, mode: wanted, mentions })
     },
     [copilot],
   )
@@ -449,7 +450,7 @@ export function HomePage() {
               rows={1}
               mode={copilot.mode}
               setMode={copilot.setMode}
-              onSend={(text) => ask(text, copilot.mode)}
+              onSend={(text, mentions) => ask(text, copilot.mode, mentions)}
               busy={false}
               enabledCaps={copilot.enabledCaps}
               toggleCap={copilot.toggleCap}

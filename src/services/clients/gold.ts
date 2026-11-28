@@ -101,7 +101,15 @@ export const goldService: GoldService = {
   async getPublication(mart, signal, zone) {
     return getJson<GoldPublication>(withZone(`/api/gold/export/${encodeURIComponent(mart)}/publication`, zone), { signal })
   },
-  async setPublication(mart, enabled, signal, zone) {
-    return putJson<GoldPublication>(withZone(`/api/gold/export/${encodeURIComponent(mart)}/publication`, zone), { enabled }, signal)
+  async setPublication(mart, enabled, signal, zone, sync) {
+    // DATA-66: the mode and its schedule travel with the switch in one
+    // PUT; absent (`sync === undefined`) leaves the stored setting alone.
+    const body: Record<string, unknown> = { enabled }
+    if (sync) {
+      body.syncMode = sync.syncMode
+      if (sync.schedule) body.schedule = sync.schedule
+      if (sync.timeZone) body.timeZone = sync.timeZone
+    }
+    return putJson<GoldPublication>(withZone(`/api/gold/export/${encodeURIComponent(mart)}/publication`, zone), body, signal)
   },
 }

@@ -1,0 +1,367 @@
+{
+  "hero": {
+    "eyebrow": "For data teams who run their own stack",
+    "headline": "Your data has a home now.",
+    "sub": "One lakehouse with dashboards built in. Open tables, answers in plain words.",
+    "subPhone": "One lakehouse with dashboards built in. Open tables, answers in plain words.",
+    "reassurance": [
+      "Free & open source (AGPL-3.0)",
+      "Runs on your servers"
+    ],
+    "reassurancePhone": ["Free", "Open source", "Runs on your servers"],
+    "scrollCue": "Scroll to dive",
+    "tod": { "day": "Day", "night": "Night", "label": "Day mode" }
+  },
+  "sources": {
+    "headline": "Everything flows in.",
+    "sub": "Databases, files, streams, APIs and business apps, all in one place.",
+    "items": [
+      "PostgreSQL",
+      "MySQL",
+      "SQL Server",
+      "MongoDB",
+      "REST APIs",
+      "Kafka",
+      "CSV and TSV files",
+      "Excel workbooks",
+      "Parquet files",
+      "Salesforce",
+      "ServiceNow",
+      "Google Analytics 4",
+      "HubSpot",
+      "Zendesk",
+      "Confluence",
+      "Dynamics 365",
+      "SharePoint",
+      "JSON, JSON Lines and Avro",
+      "gzip and zip archives"
+    ],
+    "caption": "Live change capture for PostgreSQL. Dedupe or keep history on load.",
+    "more": "+{count} more"
+  },
+  "depths": {
+    "eyebrow": "Three depths",
+    "headline": "Three depths.",
+    "key": {
+      "bronze": "raw",
+      "silver": "clean",
+      "gold": "ready"
+    },
+    "layers": {
+      "bronze": {
+        "title": "As it came.",
+        "body": "Kept as sent, in open Apache Iceberg tables."
+      },
+      "silver": {
+        "title": "Cleaned and checked.",
+        "body": "Pipelines fix it. Quality checks flag the rest."
+      },
+      "gold": {
+        "title": "Ready for answers.",
+        "body": "Refreshes itself within the lag you set."
+      }
+    },
+    "card": {
+      "numberLocale": "en-US",
+      "rows": "rows",
+      "cities": "cities",
+      "ofCount": "{shown} of {total} {unit}",
+      "columns": {
+        "order": "Order",
+        "city": "City",
+        "date": "Date",
+        "amount": "Amount",
+        "orders": "Orders",
+        "revenue": "Revenue"
+      },
+      "empty": "empty",
+      "legend": {
+        "spelling": "Spelling varies",
+        "twice": "Arrived twice",
+        "empty": "Missing"
+      },
+      "checks": {
+        "duplicates": "No duplicates",
+        "city": "City valid",
+        "amount": "1 empty amount"
+      },
+      "total": "Total revenue",
+      "lag": "Within target lag",
+      "feeds": "Feeds dashboards and the assistant",
+      "sr": {
+        "bronze": "Five example order rows from an orders file and a CRM export, stored as they came. One order arrives twice, Jakarta is spelt three ways, the dates use three formats and one amount is missing.",
+        "silver": "The same rows in one Silver table. The duplicate is gone, every city reads Jakarta or Bandung, every date has one format, and a quality check flags the one empty amount.",
+        "gold": "A Gold table of revenue by city built from those rows, Jakarta first, then Bandung, within its target lag, ready for dashboards and the assistant."
+      }
+    }
+  },
+  "assistant": {
+    "headline": "Ask, don't dig.",
+    "sub": "Ask in plain words. Anything risky waits for a person.",
+    "features": [
+      "Charts and dashboards",
+      "Runs pipelines",
+      "Query Studio: autocomplete, tabs, history"
+    ],
+    "name": "Assistant",
+    "placeholder": "Ask anything about your lakehouse…",
+    "modes": {
+      "ask": "Ask",
+      "build": "Build"
+    },
+    "send": "Send",
+    "userOne": "Which region had the most visitors last quarter?",
+    "steps": {
+      "read": "Reading",
+      "group": "Grouping by region",
+      "check": "Checking pipeline",
+      "done": "2 steps"
+    },
+    "answerOne": "Region North had the most visitors last quarter.",
+    "regions": {
+      "north": "North",
+      "south": "South",
+      "east": "East",
+      "west": "West"
+    },
+    "unit": "visits",
+    "numberLocale": "en-US",
+    "userTwo": "Pause the nightly sales pipeline.",
+    "approvalAction": "Pause pipeline",
+    "impact": "Stops tonight's 02:00 run",
+    "approvalLabel": "Waiting for approval",
+    "reviewer": "Admin reviews",
+    "approve": "Approve",
+    "decline": "Decline",
+    "approvedLabel": "Approved",
+    "approvedBy": "Approved by Admin · just now",
+    "srDescription": "An illustration of the assistant. A person asks which region had the most visitors last quarter; the assistant reads a Gold table, groups it by region and answers with a bar chart where North leads. The person then asks to pause the nightly sales pipeline. The assistant does not do it on its own: it shows a request that waits for approval, and an admin approves it. The region names and numbers are illustrative."
+  },
+  "dashboards": {
+    "headline": "Answers become dashboards.",
+    "sub": "About two dozen chart types, maps on your own boundaries included.",
+    "tiles": {
+      "line": {
+        "title": "Visits over time",
+        "kind": "Line chart",
+        "aria": "Illustrative line chart",
+        "points": [
+          "Jan",
+          "Feb",
+          "Mar",
+          "Apr",
+          "May"
+        ]
+      },
+      "map": {
+        "title": "Visits by region",
+        "kind": "Map",
+        "aria": "Illustrative dot map of Indonesia",
+        "islands": [
+          "Sumatra",
+          "Java",
+          "Kalimantan",
+          "Sulawesi",
+          "Bali & Nusa Tenggara",
+          "Maluku",
+          "Papua"
+        ]
+      },
+      "sankey": {
+        "title": "Where visits come from",
+        "kind": "Sankey",
+        "aria": "Illustrative Sankey diagram",
+        "from": [
+          "Search",
+          "Social",
+          "Direct"
+        ],
+        "to": [
+          "Home",
+          "Docs",
+          "Blog"
+        ],
+        "total": "total"
+      },
+      "kpi": {
+        "title": "Visits this week",
+        "kind": "KPI",
+        "aria": "Illustrative KPI tile",
+        "delta": "+8.4% vs last week"
+      },
+      "calendar": {
+        "title": "Busy days",
+        "kind": "Calendar heatmap",
+        "aria": "Illustrative calendar heatmap",
+        "days": [
+          "Mon",
+          "Tue",
+          "Wed",
+          "Thu",
+          "Fri",
+          "Sat",
+          "Sun"
+        ],
+        "week": "Week",
+        "unit": "visits"
+      }
+    }
+  },
+  "governance": {
+    "headline": "Guarded by default.",
+    "sub": "Roles decide who sees what, down to the column.",
+    "viewAs": "View as",
+    "roles": {
+      "analyst": "Analyst",
+      "admin": "Admin"
+    },
+    "columns": {
+      "name": "Name",
+      "email": "Email",
+      "city": "City",
+      "amount": "Amount"
+    },
+    "tableCaption": "Five fictional customers. As an analyst the name and email columns are masked; as an admin they are shown in full.",
+    "status": {
+      "analyst": "Showing as Analyst: names and emails masked",
+      "admin": "Showing as Admin: every column in full"
+    },
+    "policy": {
+      "analyst": "PII masked for Analyst",
+      "admin": "Admin · full access"
+    },
+    "pii": "PII",
+    "piiTip": "Personal data, masked for roles without access",
+    "bento": {
+      "lineage": {
+        "title": "Column-level lineage",
+        "line": "See where every column comes from, raw to curated."
+      },
+      "proof": {
+        "title": "Masking, tested",
+        "line": "Checked end to end by an automated test.",
+        "badge": "Tested end to end"
+      },
+      "audit": {
+        "title": "Every action, logged",
+        "line": "Risky assistant actions wait for a person.",
+        "rows": [
+          "Built chart “Visits by region”",
+          "Refreshed revenue_by_city",
+          "Pause pipeline sales_nightly"
+        ],
+        "awaiting": "Awaiting approval",
+        "approved": "Approved"
+      },
+      "catalog": {
+        "title": "A catalog you can trust",
+        "line": "See what is certified or deprecated.",
+        "query": "revenue",
+        "certified": "Certified",
+        "deprecated": "Deprecated",
+        "tag": "finance"
+      },
+      "access": {
+        "title": "Access per folder",
+        "line": "Permissions per dashboard and per folder.",
+        "folders": [
+          "Sales",
+          "Finance"
+        ],
+        "dashboard": "Revenue",
+        "open": "Open to Admin",
+        "closed": "Closed to Analyst"
+      }
+    },
+    "maskedTip": "Masked by policy for Analyst"
+  },
+  "open": {
+    "headline": "Yours to keep.",
+    "cards": [
+      {
+        "title": "Open source.",
+        "body": "AGPL-3.0. Read every line, run it yourself."
+      },
+      {
+        "title": "Open tables.",
+        "body": "Apache Iceberg underneath, so any engine that reads Iceberg can read it."
+      },
+      {
+        "title": "Your servers or ours.",
+        "body": "Install it on your own infrastructure, or talk to us about running it for you."
+      }
+    ],
+    "code": {
+      "license": "AGPL-3.0",
+      "sr": "A few lines of the Lakehouse's own source code: the function that holds a risky assistant action for a person to approve, and refuses it when there is nowhere to keep the approval."
+    },
+    "tables": {
+      "table": "orders",
+      "format": "Apache Iceberg",
+      "builtIn": "built in",
+      "sr": "An Apache Iceberg table in the middle, read by ClickHouse, which the Lakehouse runs, and by any other engine or notebook that reads Iceberg.",
+      "storage": "Your object storage",
+      "sameAnswer": "Same table, same answer"
+    },
+    "hosting": {
+      "label": "Where it runs",
+      "yours": "Your servers",
+      "ours": "Run for you",
+      "yourNetwork": "Your network",
+      "inside": "Your data stays inside",
+      "ranBy": "Run by RantAI for you",
+      "insideOurs": "Your sources connect in",
+      "starting": "Starting",
+      "started": "Started",
+      "allStarted": "8 services started",
+      "talk": "Talk to us about running it for you",
+      "sourcesLabel": "Your sources",
+      "roles": {
+        "console": "the app you use",
+        "api": "Rust, checks every request",
+        "postgres": "settings and history",
+        "clickhouse": "fast queries",
+        "lakekeeper": "Iceberg catalog",
+        "rustfs": "your files",
+        "openfga": "who sees what",
+        "dagster": "runs pipelines"
+      }
+    },
+    "console": {
+      "window": "Home",
+      "label": "The console's home, recreated",
+      "caption": "Ask in plain words, or start from a shortcut.",
+      "alt": "The RantAI Lakehouse console's home, recreated: a box to ask the assistant, with Ask, Build and Tools, and three shortcuts: Connect a source, Create a pipeline and Build a dashboard."
+    }
+  },
+  "getStarted": {
+    "eyebrow": "Get started",
+    "headline": "Up and running in three steps.",
+    "sub": "All it needs is Docker.",
+    "steps": [
+      {
+        "title": "Clone it",
+        "note": "The public repository, with everything the stack needs."
+      },
+      {
+        "title": "Configure it",
+        "note": "Writes `.env` with generated secrets. Set `AUTH_BOOTSTRAP_EMAIL` and `AUTH_BOOTSTRAP_PASSWORD` there for your first account.",
+        "notePhone": "Writes `.env` with secrets. Set the first admin's email and password there."
+      },
+      {
+        "title": "Start it",
+        "note": "Then open `http://localhost:3000`."
+      }
+    ],
+    "copy": "Copy",
+    "copied": "Copied",
+    "copyFailed": "Selected: press Ctrl+C or ⌘C",
+    "more": "Full Quickstart guide"
+  },
+  "faq": {
+    "all": "All questions"
+  },
+  "final": {
+    "headline": "Come on in. The data's fine."
+  }
+}

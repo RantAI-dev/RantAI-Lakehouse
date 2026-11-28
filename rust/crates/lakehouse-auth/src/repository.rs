@@ -339,6 +339,23 @@ pub async fn permissions_for_role_names(
     ))
 }
 
+/// The ids of every active account, in no particular order.
+///
+/// `AI-11` counts the people who could decide an approval: each
+/// id is loaded with [`load_principal_for_user`], which applies the same
+/// active-account and permission rules a sign-in does. A deleted or
+/// deactivated account is absent here, so it is never counted.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Database`] on any storage failure.
+pub async fn active_user_ids(pool: &PgPool) -> Result<Vec<Uuid>, AuthError> {
+    let rows: Vec<(Uuid,)> = sqlx::query_as("SELECT id FROM app_user WHERE status = 'active'")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
