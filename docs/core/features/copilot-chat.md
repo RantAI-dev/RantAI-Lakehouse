@@ -145,6 +145,8 @@ and a change it may not make is refused with the permission it lacks.
   whose only grant is a per-table `query:read` gets no picker. The server
   still checks every mention a message carries, and a table they may not
   read adds nothing to the answer, whatever the client sent (`AI-26`).
+- A mention covers Silver and Gold tables; Bronze tables are not in the data
+  map, so the picker does not offer them.
 - Ask mode cannot change anything. A tool that changes something is refused
   with "refused: Ask mode cannot run a tool that changes anything; switch to
   Build mode".
