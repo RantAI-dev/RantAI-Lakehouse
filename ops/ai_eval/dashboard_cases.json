@@ -1235,8 +1235,18 @@
     "id": "ai16_connect_postgres_and_load_orders",
     "mode": "build",
     "confirm": true,
-    "note": "AI-16 decision 1: measure the whole discover -> spec -> run flow from one prompt. Setup creates the connector so the harness can fill {connector}; pg-src.test is a reserved test hostname, not a real host, and no secret value is in the prompt.",
+    "note": "AI-16: setup first joins the throwaway admin to the seed tenant (the eval admin has *:* but no tenant, so a connector POST with tenantId would 404), then creates the connector so the harness can fill {connector}. pg-src.test is a reserved test hostname, not a real host, and no secret value is in the prompt.",
     "setup": [
+      {
+        "name": "me",
+        "method": "GET",
+        "path": "/api/auth/me",
+        "id_at": "id"
+      },
+      {
+        "method": "PUT",
+        "path": "/api/identity/users/{me}/tenants/11111111-1111-4111-8111-000000000001"
+      },
       {
         "name": "connector",
         "method": "POST",
@@ -1258,22 +1268,44 @@
       "Connect the Postgres at pg-src.test and load table orders into connector {connector}."
     ],
     "expect_tool": {
-      "name": "run_ingest",
-      "args_contains": {"id": "{connector}"}
+      "name": "set_ingest_spec",
+      "args_contains": {"id": "{connector}", "sourceObjects": "orders"}
     },
     "facts": [
-      {"label": "bronze table", "kind": "text", "values": ["orders"]}
+      {"label": "bronze table", "kind": "text", "values": ["orders"]},
+      {"label": "dial refusal reported", "kind": "text", "values": ["could not connect"],
+       "aliases": {"could not connect": ["could not reach", "could not be reached", "could not resolve",
+                                         "cannot connect", "cannot reach", "unable to connect",
+                                         "unable to reach", "not reachable", "failed to connect",
+                                         "connection failed", "connection refused", "did not resolve",
+                                         "does not resolve", "dial failed"]}}
     ],
     "expect_state": [
       {"path": "/api/connectors/{connector}/ingest-spec", "list": "sourceObjects", "where": {"target": "orders"}, "count": 1, "scope": "all"}
+    ],
+    "forbid": [
+      "(?<!not )(?<!never )(?<!no )\\b(successfully|already|just)\\s+(loaded|ingested|ran)\\b",
+      "\\b(load|ingest|job)\\s+(ran|completed|finished)\\s+successfully\\b",
+      "\\b(loaded|ingested)\\s+(the\\s+)?orders\\b",
+      "\\b(bronze|orders)\\s+(table\\s+)?(now\\s+)?(holds|has|contains)\\s+(rows|data)\\b"
     ]
   },
   {
     "id": "ai16_add_customers_table_to_connector",
     "mode": "build",
     "confirm": true,
-    "note": "AI-16 decision 1: set_ingest_spec on an existing connector. Setup creates the connector so the harness can fill {connector}; no credential value is sent.",
+    "note": "AI-16: setup first joins the throwaway admin to the seed tenant, then creates the connector so the harness can fill {connector}; no credential value is sent.",
     "setup": [
+      {
+        "name": "me",
+        "method": "GET",
+        "path": "/api/auth/me",
+        "id_at": "id"
+      },
+      {
+        "method": "PUT",
+        "path": "/api/identity/users/{me}/tenants/11111111-1111-4111-8111-000000000001"
+      },
       {
         "name": "connector",
         "method": "POST",
@@ -1308,8 +1340,18 @@
   {
     "id": "ai16_why_did_the_last_load_fail",
     "mode": "ask",
-    "note": "AI-16 decision 1: a read/explanation case. The assistant must look at the connector's recent ingest runs, not invent a reason; setup creates the connector so the harness can fill {connector}.",
+    "note": "AI-16: a read/explanation case. Setup first joins the throwaway admin to the seed tenant and creates a connector with no ingest run, then the harness fills {connector}; the answer must say there is no failed load to explain, not invent a reason.",
     "setup": [
+      {
+        "name": "me",
+        "method": "GET",
+        "path": "/api/auth/me",
+        "id_at": "id"
+      },
+      {
+        "method": "PUT",
+        "path": "/api/identity/users/{me}/tenants/11111111-1111-4111-8111-000000000001"
+      },
       {
         "name": "connector",
         "method": "POST",
@@ -1333,6 +1375,18 @@
     "expect_tool": {
       "name": "list_ingest_runs",
       "args_contains": {"id": "{connector}"}
-    }
+    },
+    "facts": [
+      {"label": "no failed load", "kind": "text", "values": ["no failed load"],
+       "aliases": {"no failed load": ["no failed runs", "no ingest runs", "no load runs", "no runs found",
+                                      "there are no runs", "there were no runs", "no runs to show",
+                                      "no runs yet", "no load has run", "has not run", "never run",
+                                      "no failures", "nothing failed", "no failed ingests", "no recent runs"]}}
+    ],
+    "forbid": [
+      "\\b(last|recent)\\s+(load|ingest|run)\\s+failed\\s+(because|due to)\\b",
+      "\\bit\\s+failed\\s+(because|due to)\\b",
+      "\\bfailed\\s+because\\s+(the|of|a|an)\\b"
+    ]
   }
 ]

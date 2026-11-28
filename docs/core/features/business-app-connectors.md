@@ -80,10 +80,26 @@ Checked against the vendors and dlt on 2026-10-19 (sources in the plan):
 
 ## Asking the assistant
 
-Not part of the dashboards assistant. AI work for the Data module is handed
-to the AI team in `AI-16`. The assistant's connector tools list adapters; the
-new one is added there and `tests/fixtures/tool_schemas.json` regenerated, as
-for any adapter.
+The Build chat can build a connector from start to end. In order, it calls
+`create_connector`, sets the ingest spec with `sourceObjects`, calls
+`discover_source` to check that the tables exist, calls `get_ingest_spec` and
+then calls `run_ingest`.
+
+`create_connector` returns the credential reference names once. The person
+enters the values in the console, and no secret value is ever sent in the
+chat (SEC-14).
+
+`set_ingest_spec` replaces the source list rather than adding to it. To add
+a table, the assistant reads `get_ingest_spec` first and sends the objects
+already there with the new one, keeping each object's `loadMode`,
+`primaryKey` and `excludedColumns` unchanged from what `get_ingest_spec`
+returned.
+
+On the eval stack the flow stops before a load. The reserved test host
+`pg-src.test` does not resolve, so `discover_source` reports a dial refusal.
+There is no Dagster there either, so `run_ingest` cannot launch. The eval
+checks the saved spec and that the answer says what happened, not that a
+load finished or that a table holds rows.
 
 ## Decisions
 

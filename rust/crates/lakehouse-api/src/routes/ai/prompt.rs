@@ -153,6 +153,15 @@ pub(super) const LINEAGE_RULE: &str = "
 
 For \"where does this number come from?\" on a chart: call get_lineage with its id from the page context; name the source tables, connector and refresh times, \"not recorded\" where the path stops.";
 
+/// The connector-building rule (`AI-16` decision 2). Appended only when
+/// `create_connector` or `set_ingest_spec` is offered, so a chat without those
+/// tools keeps its prompt byte for byte. `create_connector` returns the derived
+/// secret reference names once; the person fills the values in the console and
+/// no secret ever passes through the chat (`SEC-14`).
+pub(super) const CONNECTOR_FLOW_RULE: &str = "
+
+To build a connector: create_connector, then set_ingest_spec with sourceObjects, then discover_source to check the tables, then get_ingest_spec, then run_ingest. create_connector returns the secret reference names once; the person fills the values in the console and no secret passes through the chat. set_ingest_spec replaces sourceObjects, so to add a table call get_ingest_spec first and resend the existing objects plus the new one.";
+
 /// Most remembered words carried in one prompt: the newest ones. A person
 /// may keep more (`lakehouse_store::chat_term::MAX_TERMS_PER_OWNER`), but a
 /// small model's context is better spent on the question.

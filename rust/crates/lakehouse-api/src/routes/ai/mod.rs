@@ -688,6 +688,8 @@ struct OfferedRules {
     sql_help: bool,
     /// `get_lineage` is offered: the lineage rule, in Build.
     lineage: bool,
+    /// `create_connector` or `set_ingest_spec` is offered: the connector flow rule.
+    connector_flow: bool,
 }
 
 /// The system prompt: the rules for the mode, the rules for asking (when
@@ -825,6 +827,7 @@ async fn system_prompt_with_mentions(
         asking,
         sql_help,
         lineage,
+        connector_flow,
     } = offered;
     let latest_user = user_messages.last().copied().unwrap_or_default();
     // `BI-44` slice 3: a `bi-only` install has no lakehouse DATA MAP, and
@@ -906,6 +909,11 @@ async fn system_prompt_with_mentions(
     // is offered, so a viewer without `lineage:read` gets the prompt it had.
     if is_build && lineage {
         rules.push_str(prompt::LINEAGE_RULE);
+    }
+    // `AI-16`: the connector flow rule follows the tools that can build one.
+    // Write tools are filtered out of Ask, so `offered` is already false there.
+    if connector_flow {
+        rules.push_str(prompt::CONNECTOR_FLOW_RULE);
     }
     let words = prompt::user_words_section(&terms);
     let mentioned = match (&pieces, principal) {
@@ -1033,6 +1041,7 @@ fn offered_rules(tools: &[Value]) -> OfferedRules {
         asking: offers(registry::ASK_USER),
         sql_help: offers(registry::PROPOSE_SQL),
         lineage: offers("get_lineage"),
+        connector_flow: offers("create_connector") || offers("set_ingest_spec"),
     }
 }
 
@@ -3412,6 +3421,7 @@ mod tests {
         asking: false,
         sql_help: false,
         lineage: false,
+        connector_flow: false,
     };
 
     /// A state over the test database, with the semantic-layer switch set.
@@ -3666,6 +3676,7 @@ mod tests {
                     asking,
                     sql_help: false,
                     lineage: false,
+                    connector_flow: false,
                 },
             )
             .await;
@@ -3688,6 +3699,7 @@ mod tests {
                     asking,
                     sql_help: false,
                     lineage: false,
+                    connector_flow: false,
                 },
             )
             .await;
@@ -3717,6 +3729,7 @@ mod tests {
                 asking: true,
                 sql_help: false,
                 lineage: false,
+                connector_flow: false,
             },
         )
         .await;
@@ -3755,6 +3768,7 @@ mod tests {
                     asking: true,
                     sql_help: false,
                     lineage: false,
+                    connector_flow: false,
                 },
             )
             .await;
@@ -3777,6 +3791,7 @@ mod tests {
                     asking: true,
                     sql_help: false,
                     lineage: false,
+                    connector_flow: false,
                 },
             )
             .await;
@@ -3890,6 +3905,7 @@ mod tests {
                 asking: true,
                 sql_help: false,
                 lineage: false,
+                connector_flow: false,
             },
         )
         .await;
@@ -3923,6 +3939,7 @@ mod tests {
                 asking: false,
                 sql_help: false,
                 lineage: true,
+                connector_flow: false,
             },
         )
         .await;
@@ -3942,6 +3959,66 @@ mod tests {
             "{without}"
         );
         assert_eq!(with.replacen(prompt::LINEAGE_RULE, "", 1), without);
+    }
+
+    #[tokio::test]
+    async fn the_connector_flow_rule_reaches_a_chat_that_offers_a_connector_tool() {
+        // `AI-16` decision 2: the rule travels with `create_connector` or
+        // `set_ingest_spec`. A chat that offers neither keeps its prompt. The
+        // rule carries no secret: the console is where values are entered
+        // (`SEC-14`).
+        let state = state_with_ask_back_and_layer("false", "false");
+        let headers = axum::http::HeaderMap::new();
+        let with = system_prompt(
+            &state,
+            None,
+            &headers,
+            true,
+            "",
+            &[FIXED_QUESTION],
+            OfferedRules {
+                asking: false,
+                sql_help: false,
+                lineage: false,
+                connector_flow: true,
+            },
+        )
+        .await;
+        let without = system_prompt(
+            &state,
+            None,
+            &headers,
+            true,
+            "",
+            &[FIXED_QUESTION],
+            NO_RULES,
+        )
+        .await;
+        assert!(
+            with.contains(prompt::CONNECTOR_FLOW_RULE.trim_start()),
+            "{with}"
+        );
+        assert!(
+            !without.contains("To build a connector: create_connector"),
+            "{without}"
+        );
+        assert_eq!(with.replacen(prompt::CONNECTOR_FLOW_RULE, "", 1), without);
+    }
+
+    #[test]
+    fn a_connector_building_tool_in_the_list_turns_on_the_connector_flow_rule() {
+        // A real chat reaches the rule through `offered_rules`, which reads
+        // tool names. Calling `system_prompt` with a hand-built `OfferedRules`
+        // would stay green even if that wiring were deleted, so exercise the
+        // seam a chat actually uses here.
+        let create = vec![json!({ "function": { "name": "create_connector" } })];
+        let ingest = vec![json!({ "function": { "name": "set_ingest_spec" } })];
+        let read_only = vec![json!({ "function": { "name": "list_connectors" } })];
+
+        assert!(offered_rules(&create).connector_flow);
+        assert!(offered_rules(&ingest).connector_flow);
+        assert!(!offered_rules(&read_only).connector_flow);
+        assert!(!offered_rules(&[]).connector_flow);
     }
 
     #[tokio::test]
@@ -4358,6 +4435,7 @@ mod tests {
                 asking: true,
                 sql_help: false,
                 lineage: false,
+                connector_flow: false,
             },
         )
         .await;
@@ -4376,6 +4454,7 @@ mod tests {
                 asking: true,
                 sql_help: false,
                 lineage: false,
+                connector_flow: false,
             },
         )
         .await;
@@ -4392,6 +4471,7 @@ mod tests {
                 asking: true,
                 sql_help: false,
                 lineage: false,
+                connector_flow: false,
             },
         )
         .await;
@@ -4416,6 +4496,7 @@ mod tests {
                 asking: true,
                 sql_help: false,
                 lineage: false,
+                connector_flow: false,
             },
         )
         .await;
@@ -4441,6 +4522,7 @@ mod tests {
                 asking: true,
                 sql_help: false,
                 lineage: false,
+                connector_flow: false,
             },
         )
         .await;
@@ -4472,6 +4554,7 @@ mod tests {
                 asking: true,
                 sql_help: false,
                 lineage: false,
+                connector_flow: false,
             },
         )
         .await;
@@ -4528,6 +4611,7 @@ mod tests {
                 asking: true,
                 sql_help: false,
                 lineage: false,
+                connector_flow: false,
             },
         )
         .await;

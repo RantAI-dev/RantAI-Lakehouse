@@ -598,15 +598,24 @@ DELETE_ROUTES = {
     # in the path (`DELETE /api/dashboard/reports/{id}`), see `PATH_ID_KINDS`.
     "report": "/api/dashboard/reports",
     "template": "/api/dashboard/templates",
+    # AI-16: the connector cases create a connector in setup. It must be
+    # collected as a cleanup object or every eval run leaves one behind.
+    "connector": "/api/connectors",
 }
-# The kinds whose delete names the id in the path, not in `?id=`.
-PATH_ID_KINDS = frozenset({"report", "template"})
+# The kinds whose delete names the id in the path, not in `?id=`: a report,
+# a template (`DELETE /api/dashboard/reports/{id}`) and a connector
+# (`DELETE /api/connectors/{id}`). A connector does not take `?id=`.
+PATH_ID_KINDS = frozenset({"report", "template", "connector"})
 # Newest first: a chart may use a field, a field a source, and a board holds
 # charts, so the dependants go before what they depend on. An alert watches a
 # chart, so it goes before the charts.
 # A report places charts by reference, so it goes first too; a template copies
-# a board's definition and depends on nothing, so it goes last.
-CLEANUP_ORDER = ("alert", "report", "chart", "metric", "field", "source", "board", "template")
+# a board's definition and depends on nothing, so it goes last. A connector
+# goes last as well: the cases use it from the objects above, so deleting it
+# first would leave their cleanup with nothing to act on.
+CLEANUP_ORDER = (
+    "alert", "report", "chart", "metric", "field", "source", "board", "template", "connector"
+)
 
 
 def kind_of_path(path: str) -> str | None:

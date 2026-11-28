@@ -47,6 +47,18 @@ def make_cfg() -> m.Config:
     )
 
 
+AI16_IDS = (
+    "ai16_connect_postgres_and_load_orders",
+    "ai16_add_customers_table_to_connector",
+    "ai16_why_did_the_last_load_fail",
+)
+
+
+def ai16_case(case_id: str) -> dict[str, Any]:
+    cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+    return cases[case_id]
+
+
 class FakeResponse:
     def __init__(self, status: int = 200, body: Any = None) -> None:
         self.status_code = status
@@ -549,6 +561,33 @@ class CleanupPlanTests(unittest.TestCase):
             ],
         )
 
+    def test_a_connector_is_deleted_by_the_id_in_the_path_after_the_resources_that_use_it(self) -> None:
+        # AI-16: the ai16 setup creates a connector, so it must become a
+        # cleanup object. `DELETE /api/connectors/{id}` names the id in the
+        # path, like a report, and goes after the charts and other objects a
+        # case may have made on it.
+        cfg = make_cfg()
+        self.assertEqual(m.kind_of_path("/api/connectors"), "connector")
+        session = FakeSession({
+            ("GET", "/api/auth/me"): {"id": "admin-1"},
+            ("PUT", "/api/identity/users/admin-1/tenants/11111111-1111-4111-8111-000000000001"): {"ok": True},
+            ("POST", "/api/connectors"): {"id": "cn-1"},
+        })
+        setup = ai16_case("ai16_connect_postgres_and_load_orders")["setup"]
+        _, created = m.run_setup(cfg, session, setup)
+        self.assertEqual(created, [{"kind": "connector", "id": "cn-1"}])
+
+        session.calls.clear()
+        created.append({"kind": "chart", "id": "c1"})
+        self.assertEqual(m.run_cleanup(cfg, session, created), [])
+        self.assertEqual(
+            [url for _, url, _ in session.calls],
+            [
+                "http://api.test/api/dashboard/specs?id=c1",
+                "http://api.test/api/connectors/cn-1",
+            ],
+        )
+
     def test_the_report_and_the_board_a_template_made_are_collected_for_the_cleanup(self) -> None:
         traces = [[
             {"tool": "create_report", "result": {"ok": True, "report": {"id": "r1", "title": "X"}}},
@@ -989,6 +1028,69 @@ class SetupTests(unittest.TestCase):
         setup = [{"method": "PUT", "path": "/api/dashboard/boards", "body": {"id": "b-1"}}]
         with self.assertRaises(m.SetupError):
             m.run_setup(cfg, session, setup)
+
+    def test_every_ai16_case_joins_the_tenant_before_it_creates_a_connector(self) -> None:
+        # AI-16: the eval admin has `*:*` but no tenant, so a connector
+        # POST with a tenantId is refused before the model is ever asked. Each
+        # case must first read the admin's id, add it to the seed tenant with
+        # the existing identity route, and only then create the connector.
+        cfg = make_cfg()
+        for case_id in AI16_IDS:
+            setup = ai16_case(case_id)["setup"]
+            self.assertEqual(
+                [(s["method"], s["path"]) for s in setup[:2]],
+                [
+                    ("GET", "/api/auth/me"),
+                    ("PUT", "/api/identity/users/{me}/tenants/11111111-1111-4111-8111-000000000001"),
+                ],
+                case_id,
+            )
+            self.assertEqual(setup[0]["id_at"], "id", case_id)
+            self.assertNotIn("id_at", setup[1], case_id)
+            self.assertNotIn("body", setup[1], case_id)
+            self.assertEqual(setup[2]["path"], "/api/connectors", case_id)
+            self.assertEqual(
+                setup[2]["body"]["tenantId"],
+                "11111111-1111-4111-8111-000000000001",
+                case_id,
+            )
+
+            session = FakeSession({
+                ("GET", "/api/auth/me"): {"id": "admin-1", "name": "Eval admin"},
+                ("PUT", "/api/identity/users/admin-1/tenants/11111111-1111-4111-8111-000000000001"): {"ok": True},
+                ("POST", "/api/connectors"): {"id": "cn-1"},
+            })
+            names, created = m.run_setup(cfg, session, setup)
+            self.assertEqual(names, {"me": "admin-1", "connector": "cn-1"}, case_id)
+            self.assertEqual(created, [{"kind": "connector", "id": "cn-1"}], case_id)
+            self.assertEqual(
+                [(method, url, body) for method, url, body in session.calls],
+                [
+                    ("GET", "http://api.test/api/auth/me", None),
+                    ("PUT", "http://api.test/api/identity/users/admin-1/tenants/11111111-1111-4111-8111-000000000001", None),
+                    ("POST", "http://api.test/api/connectors", ai16_case(case_id)["setup"][2]["body"]),
+                ],
+                case_id,
+            )
+
+    def test_a_refused_tenant_membership_fails_an_ai16_setup_before_the_connector_post(self) -> None:
+        # Fail closed: a membership a tenant admin could not add must stop the
+        # run as a SetupError. Otherwise the connector POST would 404 and the
+        # result would be a scored failure instead of a setup error.
+        cfg = make_cfg()
+        setup = ai16_case("ai16_connect_postgres_and_load_orders")["setup"]
+        session = FakeSession({
+            ("GET", "/api/auth/me"): {"id": "admin-1"},
+            ("PUT", "/api/identity/users/admin-1/tenants/11111111-1111-4111-8111-000000000001"): FakeResponse(403, {"error": "forbidden"}),
+            ("POST", "/api/connectors"): {"id": "cn-1"},
+        })
+        with self.assertRaises(m.SetupError) as caught:
+            m.run_setup(cfg, session, setup)
+        self.assertIn("HTTP 403", str(caught.exception))
+        self.assertEqual([url for _, url, _ in session.calls], [
+            "http://api.test/api/auth/me",
+            "http://api.test/api/identity/users/admin-1/tenants/11111111-1111-4111-8111-000000000001",
+        ])
 
 
 # ── expect_state ──────────────────────────────────────────────────────────
@@ -2247,6 +2349,79 @@ class DashboardCasesTests(unittest.TestCase):
         cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
         case = cases["save_filters_only_when_asked"]
         self.assertIn("{board}", case.get("context", ""))
+
+    def test_the_load_orders_case_expects_a_spec_naming_orders_and_no_false_load_claim(self) -> None:
+        # The eval stack has no resolvable source host and no Dagster: the
+        # model can save a spec, but it cannot run an ingest. Expect the spec
+        # and check that the answer neither claims a load nor hides the dial
+        # refusal. `args_contains` reads nested list values as their JSON
+        # text, which is the strongest `orders` check the harness supports.
+        case = ai16_case("ai16_connect_postgres_and_load_orders")
+        self.assertEqual(case["expect_tool"]["name"], "set_ingest_spec")
+        want = case["expect_tool"]["args_contains"]
+        self.assertEqual(want["id"], "{connector}")
+        self.assertEqual(want["sourceObjects"], "orders")
+        filled = m.fill_value(want, {"connector": "cn-1"})
+        self.assertTrue(m.tool_args_match(
+            {"id": "cn-1", "sourceObjects": [{"name": "public.orders", "target": "orders"}]}, filled
+        ))
+        self.assertFalse(m.tool_args_match(
+            {"id": "cn-1", "sourceObjects": [{"name": "public.customers", "target": "customers"}]}, filled
+        ))
+        self.assertEqual(case["expect_state"][0]["path"], "/api/connectors/{connector}/ingest-spec")
+        fact = next(f for f in case["facts"] if f.get("label") == "dial refusal reported")
+        self.assertEqual(fact["values"], ["could not connect"])
+        self.assertIn("could not be reached", fact["aliases"]["could not connect"])
+
+        trace = [{"tool": "set_ingest_spec", "args": {
+            "id": "cn-1", "sourceObjects": [{"name": "public.orders", "target": "orders"}]
+        }}]
+
+        def verdict(answer: str) -> dict[str, Any]:
+            return m.score_case(
+                make_cfg(), None, case, [ScoreCaseTests.body(answer, trace)], names={"connector": "cn-1"}
+            )
+
+        truthful = (
+            "I saved the ingest spec for orders. The source host pg-src.test could not be reached, "
+            "so discover_source reported a connection failure. No load ran and the Bronze table has "
+            "no rows yet."
+        )
+        self.assertEqual(verdict(truthful)["missing"], [])
+        self.assertEqual(verdict(truthful)["problems"], [])
+        claimed = verdict("Done. I loaded orders into the Bronze table and it now holds rows.")
+        self.assertTrue(any(p.startswith("forbidden:") for p in claimed["problems"]), claimed)
+        self.assertTrue(any(p.startswith("forbidden:") for p in
+                            verdict("The load ran successfully and the Bronze table now holds rows.")["problems"]))
+        hidden = verdict("Done. The ingest spec for orders is saved and the load is ready to run.")
+        self.assertTrue(any("dial refusal reported" in p for p in hidden["missing"]), hidden)
+
+    def test_the_failed_load_case_expects_no_run_answer_and_no_invented_reason(self) -> None:
+        # Setup seeds no ingest run, so the only honest answer is that there
+        # is no failed load to explain. The fact wording has aliases because
+        # the harness scores text by substring, and `forbid` catches a made-up
+        # cause.
+        case = ai16_case("ai16_why_did_the_last_load_fail")
+        self.assertEqual(case["expect_tool"]["name"], "list_ingest_runs")
+        fact = next(f for f in case["facts"] if f.get("label") == "no failed load")
+        self.assertEqual(fact["values"], ["no failed load"])
+        trace = [{"tool": "list_ingest_runs", "args": {"id": "cn-1"}}]
+
+        def verdict(answer: str) -> dict[str, Any]:
+            return m.score_case(
+                make_cfg(), None, case, [ScoreCaseTests.body(answer, trace)], names={"connector": "cn-1"}
+            )
+
+        truthful = (
+            "There are no ingest runs for that connector, so there is no failed load to explain "
+            "and I cannot give a reason."
+        )
+        self.assertEqual(verdict(truthful)["missing"], [])
+        self.assertEqual(verdict(truthful)["problems"], [])
+        invented = verdict("The last load failed because the password was rotated yesterday.")
+        self.assertTrue(any(p.startswith("forbidden:") for p in invented["problems"]), invented)
+        hidden = verdict("I checked the connector and the last load failed.")
+        self.assertTrue(any("no failed load" in p for p in hidden["missing"]), hidden)
 
 
 class CommentCasesFixtureTests(unittest.TestCase):
