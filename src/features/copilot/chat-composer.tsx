@@ -42,7 +42,7 @@ function MentionResults({
       </p>
     );
   }
-  const tables = search.data.assets.filter((a) => a.type === "table" || a.type === "iceberg-table");
+  const tables = search.data.assets.filter((a) => (a.type === "table" || a.type === "iceberg-table") && (a.layer === "silver" || a.layer === "gold"));
   if (!tables.length) return <p className="px-1 text-xs text-muted-foreground">No tables matched “{term}”.</p>;
   return (
     <div className="flex flex-col gap-0.5">

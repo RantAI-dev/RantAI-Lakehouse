@@ -56,6 +56,7 @@ const TABLES = Array.from({ length: 6 }, (_, i) => ({
   id: `t${i + 1}`,
   name: `Table ${i + 1}`,
   type: "table",
+  layer: "gold",
   tableKey: `serving.table_${i + 1}`,
 }))
 
@@ -100,6 +101,53 @@ describe("ChatComposer table mentions (AI-26)", () => {
       kind: "table",
       key: t.tableKey,
     })))
+  })
+
+  it("does not offer a Bronze asset in the catalog response", async () => {
+    const bronze = {
+      id: "bronze.raw_orders",
+      name: "Bronze raw orders",
+      type: "iceberg-table",
+      layer: "bronze",
+      tableKey: "bronze.raw_orders",
+    }
+    stubCatalog({ assets: [bronze], namespaces: [] })
+    render(<ChatComposer {...base} />)
+    const picker = await openPicker()
+    fireEvent.change(within(picker).getByLabelText("Search tables"), { target: { value: "raw_orders" } })
+
+    expect(await within(picker).findByText(/No tables matched/)).toBeTruthy()
+    expect(within(picker).queryByRole("button", { name: /^Mention / })).toBeNull()
+  })
+
+  it("offers a Silver and a Gold asset and sends the picked key unchanged", async () => {
+    const silver = {
+      id: "silver.orders",
+      name: "Silver orders",
+      type: "iceberg-table",
+      layer: "silver",
+    }
+    const gold = {
+      id: "gold.daily",
+      name: "Gold daily",
+      type: "table",
+      layer: "gold",
+    }
+    stubCatalog({ assets: [silver, gold], namespaces: [] })
+    const onSend = mock()
+    render(<ChatComposer {...base} onSend={onSend} />)
+    const picker = await openPicker()
+    fireEvent.change(within(picker).getByLabelText("Search tables"), { target: { value: "orders" } })
+
+    // Neither asset carries a tableKey, so the sent key is the id itself.
+    fireEvent.click(await within(picker).findByRole("button", { name: "Mention Silver orders" }))
+    fireEvent.click(await within(picker).findByRole("button", { name: "Mention Gold daily" }))
+    fireEvent.change(screen.getByLabelText("Message AI Copilot"), { target: { value: "What columns do they have?" } })
+    fireEvent.click(screen.getByRole("button", { name: "Send" }))
+    expect(onSend).toHaveBeenCalledWith("What columns do they have?", [
+      { kind: "table", key: "silver.orders" },
+      { kind: "table", key: "gold.daily" },
+    ])
   })
 
   it("says so and offers no tables when the catalog search is refused", async () => {
