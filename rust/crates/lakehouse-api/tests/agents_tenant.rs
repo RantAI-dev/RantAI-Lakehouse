@@ -1125,3 +1125,108 @@ async fn a_copilot_approval_is_decided_and_replayed_as_before_on_a_two_organisat
     assert_eq!(approval_status(&app.pool, &approval).await, "approved");
     assert!(!connector_exists(&app.pool, RETAIL_CONNECTOR).await);
 }
+
+/// The app with Retail as the catalog's organisation, so a Retail member passes
+/// the catalog gate of the run-detail route (as the run-detail tests do).
+async fn spin_up_with_retail_as_catalog() -> TestApp {
+    spin_up_with_env(&HashMap::from([(
+        "CATALOG_TENANT_ID".to_owned(),
+        RETAIL.to_owned(),
+    )]))
+    .await
+}
+
+/// SEC-76 copilot exemption (planner decision, PR #746): on a two-organisation
+/// install the copilot has no organisation, so its approvals and runs stay
+/// visible as they are on main. An approver who may decide in Retail (not
+/// unrestricted) sees the copilot's approval in the list and opens its run.
+#[tokio::test]
+async fn a_copilot_approval_and_its_run_stay_visible_to_an_approver_in_one_organisation() {
+    let app = spin_up_with_retail_as_catalog().await;
+    seed_connector(&app.pool, RETAIL_CONNECTOR, RETAIL).await;
+    let approval = copilot_delete_waiting(&app.pool, RETAIL_CONNECTOR).await;
+    let run: String = sqlx::query_scalar("SELECT run_id FROM approval_item WHERE id = $1")
+        .bind(&approval)
+        .fetch_one(&app.pool)
+        .await
+        .expect("the copilot's approval has its run");
+    // `connector:manage` is the permission the approved delete needs (the
+    // approver's own permission, checked at decision time).
+    let cookie = principal_in(
+        &app.pool,
+        "agent:approve, agent:read, connector:manage",
+        &[RETAIL],
+    )
+    .await;
+
+    let resp = get_with(
+        &app.router,
+        "/api/agents/approvals",
+        &[("cookie", cookie.as_str())],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ids = listed_ids(&json_body(resp).await);
+    assert!(
+        ids.contains(&approval),
+        "the copilot's approval is listed: {ids:?}"
+    );
+
+    let resp = get_with(
+        &app.router,
+        &format!("/api/agents/runs/{run}"),
+        &[("cookie", cookie.as_str())],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "the copilot's run opens");
+    let body = json_body(resp).await;
+    assert_eq!(body["id"], json!(run), "{body}");
+
+    // The same approver decides the copilot's approval: 200, decided, and the
+    // approved call executes as it did before SEC-76 (not 409, not 404).
+    let resp = decide(&app.router, &approval, &cookie, "approved").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the copilot's approval is decided"
+    );
+    let body = json_body(resp).await;
+    assert_eq!(body["executed"], json!(true), "{body}");
+    assert_eq!(approval_status(&app.pool, &approval).await, "approved");
+    assert!(!connector_exists(&app.pool, RETAIL_CONNECTOR).await);
+}
+
+/// SEC-76 copilot exemption, the other side: the exemption covers the copilot
+/// only. The same approver sees a Retail agent's approval (a positive control)
+/// but not the approval of a non-copilot agent with no organisation, and that
+/// agent's run is 404.
+#[tokio::test]
+async fn a_non_copilot_agent_with_no_organisation_stays_hidden_from_an_approver_in_one_organisation()
+ {
+    let app = spin_up_with_retail_as_catalog().await;
+    insert_connector_agent(&app.pool, RETAIL_AGENT, Some(RETAIL)).await;
+    insert_connector_agent(&app.pool, UNASSIGNED_AGENT, None).await;
+    let (retail, _) = pending_delete_for(&app.pool, RETAIL_AGENT, RETAIL_CONNECTOR).await;
+    let (unassigned, unassigned_run) =
+        pending_delete_for(&app.pool, UNASSIGNED_AGENT, LOGISTICS_CONNECTOR).await;
+    let cookie = principal_in(&app.pool, "agent:approve, agent:read", &[RETAIL]).await;
+
+    let resp = get_with(
+        &app.router,
+        "/api/agents/approvals",
+        &[("cookie", cookie.as_str())],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ids = listed_ids(&json_body(resp).await);
+    assert!(ids.contains(&retail), "{ids:?}");
+    assert!(!ids.contains(&unassigned), "{ids:?}");
+
+    let resp = get_with(
+        &app.router,
+        &format!("/api/agents/runs/{unassigned_run}"),
+        &[("cookie", cookie.as_str())],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

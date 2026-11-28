@@ -976,7 +976,8 @@ pub async fn get_run(pool: &PgPool, id: &str) -> Result<Option<AgentRun>, StoreE
 
 /// [`get_run`] for a run whose agent is in `tenants` (`SEC-76`, decision 4):
 /// `None` finds any run, `Some` finds the run only if the agent that ran it is
-/// in the list. The filter runs in SQL, in the same query as the lookup.
+/// in the list, or is the copilot's own run. The filter runs in SQL, in the same
+/// query as the lookup.
 ///
 /// # Errors
 ///
@@ -986,8 +987,12 @@ pub async fn get_run_in(
     id: &str,
     tenants: Option<&[Uuid]>,
 ) -> Result<Option<AgentRun>, StoreError> {
+    // The copilot (`emp-copilot`) serves every organisation and has none of its
+    // own (NULL), so its runs are found as before (SEC-76, decisions 1 and 4:
+    // the copilot exemption). Every other run needs its agent's organisation.
     let sql = format!(
-        "SELECT {RUN_COLUMNS} FROM agent_run WHERE id = $1 AND ($2::uuid[] IS NULL OR EXISTS (\
+        "SELECT {RUN_COLUMNS} FROM agent_run WHERE id = $1 AND ($2::uuid[] IS NULL OR \
+         agent_run.employee_id = $3 OR EXISTS (\
          SELECT 1 FROM agent_employee e WHERE e.id = agent_run.employee_id \
          AND e.tenant_id = ANY($2)))"
     );
@@ -995,6 +1000,7 @@ pub async fn get_run_in(
     let row: Option<RunRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(tenants.map(<[Uuid]>::to_vec))
+        .bind(COPILOT_EMPLOYEE_ID)
         .fetch_optional(pool)
         .await?;
     match row {
@@ -1197,7 +1203,8 @@ pub async fn list_approvals(
 
 /// [`list_approvals`] narrowed to the agents in `tenants` (`SEC-76`, decision
 /// 4). A `tool_call` approval is listed only when its agent is in `tenants`;
-/// an `access` approval has no agent and is listed as before. `None` applies no
+/// an `access` approval has no agent and is listed as before, and so is the
+/// copilot's own approval. `None` applies no
 /// narrowing. The filter runs in SQL.
 ///
 /// # Errors
@@ -1208,17 +1215,22 @@ pub async fn list_approvals_in(
     employee_id: Option<&str>,
     tenants: Option<&[Uuid]>,
 ) -> Result<Vec<ApprovalItem>, StoreError> {
+    // The copilot (`emp-copilot`) serves every organisation and has none of its
+    // own (NULL), so its approvals are shown as before (SEC-76, decisions 1 and
+    // 4: the copilot exemption). Every other tool-call approval needs its
+    // agent's organisation.
     let sql = format!(
         "SELECT {APPROVAL_COLUMNS_QUALIFIED} {APPROVAL_AUDIT_JOIN} WHERE ($1::text IS NULL OR \
-         a.employee_id = $1) AND ($2::uuid[] IS NULL OR a.kind <> 'tool_call' OR EXISTS (\
-         SELECT 1 FROM agent_employee e WHERE e.id = a.employee_id AND e.tenant_id = ANY($2))) \
-         ORDER BY a.requested_at DESC"
+         a.employee_id = $1) AND ($2::uuid[] IS NULL OR a.kind <> 'tool_call' OR a.employee_id = $3 \
+         OR EXISTS (SELECT 1 FROM agent_employee e WHERE e.id = a.employee_id \
+         AND e.tenant_id = ANY($2))) ORDER BY a.requested_at DESC"
     );
     // safe: only the constants `APPROVAL_COLUMNS_QUALIFIED`, `APPROVAL_AUDIT_JOIN` are formatted
     // in; values are bound.
     let rows: Vec<ApprovalRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(employee_id)
         .bind(tenants.map(<[Uuid]>::to_vec))
+        .bind(COPILOT_EMPLOYEE_ID)
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(ApprovalItem::from).collect())
