@@ -131,7 +131,8 @@ connector's run loads nothing and ends `paused` (D13, `SRC-18`).
 A source object's `excludedColumns` is applied inside the before-load gate
 (`_leave_out_columns`), AFTER the API has been shown the whole table, so a
 column left out is never reported as removed at the source (D9). Only the
-batch SQL path has such a gate.
+batch SQL path has such a gate. The same names go to the sink as `drop_columns`
+(`SRC-48`), which removes them from a table that is replaced on every load.
 
 # Secrets
 
@@ -715,6 +716,17 @@ def _leave_out_columns(
 _WAITING_MESSAGE = "waiting for a decision on a schema change at the source"
 
 
+def _columns_to_drop(adapter_name: str, obj: dict) -> list[str]:
+    """`SRC-48` (decision 10, `QA TC-1706`): the Bronze names of a source object's
+    `excludedColumns`, for `load_via_sink(drop_columns=...)`. Only the batch SQL path has
+    excluded columns (this module's doc); the sink decides which tables lose them (those
+    replaced on every load) and which names are kept (system, key and cursor columns)."""
+    if adapter_name != "sql":
+        return []
+    names = [n for n in (obj.get("excludedColumns") or []) if isinstance(n, str)]
+    return sink_adapter.bronze_column_names(names)
+
+
 def _make_gate(connector: dict, obj: dict, run_id: str | None):
     """The `before_load` observation for one source object (SRC-8, D4): what
     `dlt` reflected goes to the API and its decision comes back."""
@@ -899,6 +911,10 @@ def _run_one_object(
         )
         plan = _load_plan(adapter_name, column_obj, refresh=_REFRESH_OF_ACTION.get(action or ""))
         gate = _make_gate(connector, column_obj, run_id)
+        # SRC-48: only passed when there are some, so a load with no exclusions calls the
+        # sink exactly as before.
+        drop = _columns_to_drop(adapter_name, column_obj)
+        drop_kwargs: dict[str, Any] = {"drop_columns": drop} if drop else {}
 
         if adapter_name == "sql" and dial.get("driver") in _POSTGRES_DRIVERS:
             # See this module's docstring, "Postgres routing" -- pinned
@@ -913,6 +929,7 @@ def _run_one_object(
                 # append or incremental, and it records the run's label like the
                 # Clear, Oracle and generic paths below do.
                 author=_run_author(connector_id, run_id),
+                **drop_kwargs,
             )
             if outcome.get("waiting"):
                 _record(rows=None, status="waiting", error=_WAITING_MESSAGE)
@@ -949,6 +966,7 @@ def _run_one_object(
                     dlt_pipeline.BronzeIngestConfig.from_env(), author=_run_author(connector_id, run_id)
                 ),
                 plan,
+                **drop_kwargs,
             )
             _record(rows=outcome.rows, status="succeeded")
             _register_in_catalog(connector_id, obj)
@@ -1026,7 +1044,7 @@ def _run_one_object(
             sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(
                 dlt_pipeline.BronzeIngestConfig.from_env(), author=_run_author(connector_id, run_id)
             )
-            return sink_adapter.load_via_sink(source, obj["target"], sink_config, plan)
+            return sink_adapter.load_via_sink(source, obj["target"], sink_config, plan, **drop_kwargs)
 
         host = _host_of(dial)
         if resolved is not None and host is not None:
