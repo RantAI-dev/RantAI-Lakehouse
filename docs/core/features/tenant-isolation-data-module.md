@@ -82,6 +82,9 @@ Signed by the product owner on 2026-10-15: the defaults below, as built.
 - Annotations already stored for assets that do not exist stay in the
   database; they are no longer readable or writable through these routes.
 - An agent works in one organisation. A scheduled run acts as the agent in that organisation, a manual run uses it too, and an agent with no organisation does not run (409). See `table-access-per-role.md`.
+- Who sees which agent: a caller sees an agent when the caller belongs to its organisation or is unrestricted (`*:*`, which also sees an agent with no organisation). This covers the employee list and detail, the approval list, and the run detail. An agent the caller may not see answers 404. The scheduler sends `x-run-token` and sees every agent. Its bearer alone is filtered like any other service principal.
+- Approvals replay in the agent's organisation. The approver must belong to that organisation or be unrestricted. Otherwise the request answers 404 and the approval stays pending. An agent with no organisation answers 409. The interactive copilot (`emp-copilot`) is exempt and replays as before.
+- Copilot approvals and copilot runs (`emp-copilot`) keep their visibility as on main: every `agent:approve` caller sees a copilot approval, and every caller who may read runs sees a copilot run, because the copilot serves every organisation and has none of its own. The requester-organisation rule for copilot approvals is still open.
 
 ## Acceptance checklist
 

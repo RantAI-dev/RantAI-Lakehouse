@@ -3511,6 +3511,14 @@ async fn the_agent_run_detail_is_read_by_the_catalog_owner_and_by_nobody_else() 
     mount_empty_clickhouse(&ch).await;
     let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
     let run_id = seed_an_agent_run(&pool).await;
+    // The catalog owner reads a run only through its agent's organisation
+    // (SEC-76, decision 4), so the agent is placed in the catalog's organisation
+    // for the owner to read the run.
+    sqlx::query("UPDATE agent_employee SET tenant_id = $1::uuid WHERE id = 'emp-inventory'")
+        .bind(CATALOG_TENANT)
+        .execute(&pool)
+        .await
+        .expect("place the run's agent in the catalog's organisation");
     let owner = cookie_in_tenant(&pool, AGENTS_READER, CATALOG_TENANT).await;
     let other = cookie_in_tenant(&pool, AGENTS_READER, OTHER_TENANT).await;
     let operator = operator_cookie(&pool).await;
@@ -3533,6 +3541,43 @@ async fn the_agent_run_detail_is_read_by_the_catalog_owner_and_by_nobody_else() 
     assert_eq!(body["id"], json!(run_id), "{body}");
 
     // An operator reaches it too.
+    let (status, body) = get(
+        &router,
+        &format!("/api/agents/runs/{run_id}"),
+        &operator,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], json!(run_id), "{body}");
+}
+
+/// SEC-76, decision 4 (revision item 3): a run of an agent with no organisation
+/// is read by an unrestricted caller only. The catalog owner, who reads the runs
+/// of agents in its own organisation, gets the unknown-run 404.
+#[tokio::test]
+async fn the_run_of_an_agent_with_no_organisation_is_read_by_an_unrestricted_caller_only() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_empty_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    let run_id = seed_an_agent_run(&pool).await;
+    sqlx::query("UPDATE agent_employee SET tenant_id = NULL WHERE id = 'emp-inventory'")
+        .execute(&pool)
+        .await
+        .expect("remove the run's agent from every organisation");
+    let owner = cookie_in_tenant(&pool, AGENTS_READER, CATALOG_TENANT).await;
+    let operator = operator_cookie(&pool).await;
+
+    let (status, body) = get(&router, &format!("/api/agents/runs/{run_id}"), &owner, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        body["error"],
+        json!(format!("Run {run_id} not found")),
+        "{body}"
+    );
+
     let (status, body) = get(
         &router,
         &format!("/api/agents/runs/{run_id}"),

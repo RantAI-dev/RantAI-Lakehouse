@@ -106,30 +106,77 @@ fn stored_tool_detail(shown: &Value) -> String {
 
 // ── Employees ──────────────────────────────────────────────────────────
 
-/// `GET /api/agents/employees`.
+/// Whether `presented` is the configured agent run token. `None` on either
+/// side never matches, so with no token configured nothing matches (fail
+/// closed). Shared by [`check_employee_run_auth`] and
+/// [`visible_agent_tenants`], so the run route and the agent reads compare the
+/// token the same way.
+fn run_token_matches(configured: Option<&str>, presented: Option<&str>) -> bool {
+    matches!((configured, presented), (Some(need), Some(got)) if need == got)
+}
+
+/// The organisations whose agents the caller may see (`SEC-76`, decision 1).
+///
+/// `None` means every agent, one with no organisation included. That is the
+/// answer for an unrestricted caller (`*:*`) and for the scheduler, which
+/// presents the run token in `x-run-token` (decision 2). Every other caller
+/// gets `Some` of its own organisations, so an agent with no organisation is
+/// seen by none of them. The narrowing runs in SQL, in the store call that
+/// takes the result.
+fn visible_agent_tenants(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+) -> Option<Vec<Uuid>> {
+    let presented = headers
+        .get("x-run-token")
+        .and_then(|value| value.to_str().ok());
+    let scheduler = run_token_matches(state.config.agent_run_token.as_deref(), presented);
+    if scheduler || crate::routes::catalog::is_unrestricted(principal) {
+        None
+    } else {
+        Some(principal.tenant_ids.clone())
+    }
+}
+
+/// `GET /api/agents/employees`, narrowed to the caller's organisations
+/// (`SEC-76`, decision 1). See [`visible_agent_tenants`].
 ///
 /// # Errors
 ///
 /// 503 if no pool is configured; 500 on a database failure.
 pub async fn list_employees(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
 ) -> ApiResult<ApiJson<Vec<DigitalEmployee>>> {
-    Ok(ApiJson(agents::list_employees(pool(&state)?).await?))
+    let tenants = visible_agent_tenants(&state, &principal, &headers);
+    Ok(ApiJson(
+        agents::list_employees_in(pool(&state)?, tenants.as_deref()).await?,
+    ))
 }
 
 /// `GET /api/agents/employees/{id}`. Uses
-/// [`agents::get_employee_with_metrics`] (WS7 item G3), not the lighter
+/// [`agents::get_employee_with_metrics_in`] (WS7 item G3, narrowed by `SEC-76`
+/// decision 1), not the lighter
 /// [`agents::get_employee`] `list_employees` uses — a single-row DETAIL
 /// read can afford the four real metric columns `list_employees` skips.
 ///
+/// An agent the caller may not see (`SEC-76`, decision 1) is `404`, the same
+/// answer as an unknown id, never `403`, so the answer does not reveal that
+/// the agent exists.
+///
 /// # Errors
 ///
-/// 404 if `id` is unknown; 503/500 as above.
+/// 404 if `id` is unknown or not visible to the caller; 503/500 as above.
 pub async fn get_employee(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<DigitalEmployee>> {
-    let employee = agents::get_employee_with_metrics(pool(&state)?, &id)
+    let tenants = visible_agent_tenants(&state, &principal, &headers);
+    let employee = agents::get_employee_with_metrics_in(pool(&state)?, &id, tenants.as_deref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Employee {id} not found")))?;
     Ok(ApiJson(employee))
@@ -509,7 +556,11 @@ pub async fn get_run(
     {
         return Err(ApiError::NotFound(format!("Run {id} not found")).into());
     }
-    let run = agents::get_run(pool(&state)?, &id)
+    // SEC-76, decision 4: a run is found only through its agent's organisation.
+    // A valid x-run-token (the scheduler) finds every run, as it sees every
+    // agent: the token already authorises running any agent.
+    let tenants = visible_agent_tenants(&state, &principal, &headers);
+    let run = agents::get_run_in(pool(&state)?, &id, tenants.as_deref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Run {id} not found")))?;
     Ok(ApiJson(run))
@@ -524,10 +575,22 @@ pub async fn get_run(
 /// 503 if no pool is configured; 500 on a database failure.
 pub async fn list_approvals(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Query(query): Query<EmployeeQuery>,
 ) -> ApiResult<ApiJson<Vec<ApprovalItem>>> {
+    // SEC-76, decision 4: a tool call's approval is listed only to a caller who
+    // may see its agent, so the list shows nothing the caller could not decide.
+    // A valid x-run-token (the scheduler) lists every approval, as it sees every
+    // agent: the token already authorises running any agent.
+    let tenants = visible_agent_tenants(&state, &principal, &headers);
     Ok(ApiJson(
-        agents::list_approvals(pool(&state)?, query.employee_id.as_deref()).await?,
+        agents::list_approvals_in(
+            pool(&state)?,
+            query.employee_id.as_deref(),
+            tenants.as_deref(),
+        )
+        .await?,
     ))
 }
 
@@ -687,6 +750,32 @@ fn decide_approval_audit_event(
     )
 }
 
+/// Writes the one `refused` audit row a refused decision leaves (`AI-28`,
+/// `LH-AI-18-10`): the approval's own action, naming why the decision was
+/// refused. Nothing is decided when this runs.
+async fn audit_refused_decision(
+    state: &AppState,
+    principal: &Principal,
+    approval: &ApprovalItem,
+    id: &str,
+    comment: Option<&str>,
+    reason: &str,
+) {
+    audit_coverage::record_best_effort(
+        state,
+        decide_approval_audit_event(
+            principal,
+            &approval.action,
+            id,
+            comment,
+            "refused",
+            approval.run_id.as_deref(),
+            Some(reason),
+        ),
+    )
+    .await;
+}
+
 /// The name `crate::audit_coverage::AUDIT_TABLE` gives `POST
 /// /api/agents/approvals/{id}/decide`, and the action of the `refused` row
 /// `auth_gate` writes when it turns the call away (`GOV-1`). The row a
@@ -750,20 +839,36 @@ pub async fn decide_approval(
         Err(err) => return Err(ApiError::from(err).into()),
     };
 
+    // SEC-76, decision 3: the approval's agent sets the organisation its call
+    // runs in, so the approver must belong to it. Checked before the requester
+    // rule and before the store call, so a refusal decides nothing.
+    //
+    // The copilot (`emp-copilot`) is exempt (SEC-76, decision 3 exemption). It
+    // is interactive, serves every organisation, and has no organisation of its
+    // own (NULL), so the agent rule does not apply to it: its replay runs as it
+    // did before this plan, with the approver's principal and no tenant change.
+    // Copilot approvals replaying in the requester's organisation is parked with
+    // the Auditor.
+    let is_copilot = existing
+        .as_ref()
+        .is_some_and(|existing| existing.employee_id == agents::COPILOT_EMPLOYEE_ID);
+    let agent_tenant = match existing.as_ref() {
+        Some(existing) if !is_copilot => {
+            Some(approval_agent(&state, &principal, existing, &id, body.comment.as_deref()).await?)
+        }
+        _ => None,
+    };
+
     if let Some(existing) = existing.as_ref()
         && let Err(err) = refuse_own_request(existing, &principal)
     {
-        audit_coverage::record_best_effort(
+        audit_refused_decision(
             &state,
-            decide_approval_audit_event(
-                &principal,
-                &existing.action,
-                &id,
-                body.comment.as_deref(),
-                "refused",
-                existing.run_id.as_deref(),
-                Some("the requester may not decide their own request"),
-            ),
+            &principal,
+            existing,
+            &id,
+            body.comment.as_deref(),
+            "the requester may not decide their own request",
         )
         .await;
         return Err(err.into());
@@ -779,17 +884,13 @@ pub async fn decide_approval(
             // lost the pending→decided race writes one `refused` audit row
             // naming why, instead of silently returning.
             if let Some(existing) = existing.as_ref() {
-                audit_coverage::record_best_effort(
+                audit_refused_decision(
                     &state,
-                    decide_approval_audit_event(
-                        &principal,
-                        &existing.action,
-                        &id,
-                        body.comment.as_deref(),
-                        "refused",
-                        existing.run_id.as_deref(),
-                        Some("already decided"),
-                    ),
+                    &principal,
+                    existing,
+                    &id,
+                    body.comment.as_deref(),
+                    "already decided",
                 )
                 .await;
             }
@@ -919,7 +1020,21 @@ pub async fn decide_approval(
             "notExecuted": { "reason": "permission", "required": spec.permission },
         })));
     }
-    let result = ai_tools::run_tool(&state, Some(&principal), &pending.tool, &args).await;
+    // SEC-76, decision 3: the call runs in the agent's own organisation, as the
+    // approver's principal narrowed to that organisation. The audit below still
+    // names the approver. The copilot's call runs as before (decision 3
+    // exemption).
+    let replay = match agent_tenant {
+        Some(tenant_id) => approval_replay_principal(&principal, tenant_id),
+        None if is_copilot => principal.clone(),
+        None => {
+            return Err(ApiError::Internal(format!(
+                "approval {id} has no agent to run its call for"
+            ))
+            .into());
+        }
+    };
+    let result = ai_tools::run_tool(&state, Some(&replay), &pending.tool, &args).await;
     // LH-QS-2-08 (owner 2026-11-12): this run's outcome is read by a browser,
     // and so is this route's answer, so both carry the browser's copy of an
     // engine failure. No model reads the result here.
@@ -1098,6 +1213,70 @@ fn build_run_principal(
     }
 }
 
+/// The [`Principal`] an approved tool call runs as (`SEC-76`, decision 3, as
+/// revised 2026-11-27).
+///
+/// The approver's id, name, permissions and roles stay, so the call runs with
+/// the rights the approver holds and the audit names the person who decided.
+/// Only the organisation narrows: the call sees `tenant_id`, the agent's
+/// organisation, and none of the approver's other organisations. The approver's
+/// broad roles are not narrowed to the agent's grant, so the approver's own deny
+/// and visibility checks (for example `may_download`) still apply to the call.
+fn approval_replay_principal(approver: &Principal, tenant_id: Uuid) -> Principal {
+    let mut replay = approver.clone();
+    replay.tenant_ids = vec![tenant_id];
+    replay
+}
+
+/// The organisation of the agent a pending approval acts for, when `principal`
+/// may decide it (`SEC-76`, decision 3).
+///
+/// An agent with no organisation is a `409` with [`NO_ORGANISATION_SENTENCE`]
+/// for every approver, an unrestricted one included. An approver who is neither
+/// in the agent's organisation nor unrestricted gets the approval's own
+/// not-found answer, so the answer does not reveal the agent. Each refusal
+/// writes its one `refused` audit row and decides nothing, so the approval
+/// stays `pending`.
+///
+/// # Errors
+///
+/// `409` for an agent with no organisation; `404` for an approver outside the
+/// agent's organisation and for an agent that no longer exists; `503`/`500` on a
+/// database failure.
+async fn approval_agent(
+    state: &AppState,
+    principal: &Principal,
+    approval: &ApprovalItem,
+    id: &str,
+    comment: Option<&str>,
+) -> ApiResult<Uuid> {
+    let agent = agents::get_employee_run_config(pool(state)?, &approval.employee_id).await?;
+    let (error, reason) = match agent {
+        Some(agent) => match agent.tenant_id {
+            Some(tenant)
+                if principal.in_tenant(tenant)
+                    || crate::routes::catalog::is_unrestricted(principal) =>
+            {
+                return Ok(tenant);
+            }
+            Some(_) => (
+                ApiError::NotFound(format!("Approval {id} not found")),
+                "the approver is outside the agent's organisation",
+            ),
+            None => (
+                ApiError::Conflict(NO_ORGANISATION_SENTENCE.to_owned()),
+                "the agent has no organisation",
+            ),
+        },
+        None => (
+            ApiError::NotFound(format!("Approval {id} not found")),
+            "the agent of this approval no longer exists",
+        ),
+    };
+    audit_refused_decision(state, principal, approval, id, comment, reason).await;
+    Err(error.into())
+}
+
 /// The `(trigger, principal_id, principal_kind, actor)` tuple
 /// [`run_employee`] passes to [`agents::create_run`] and every
 /// [`write_headless_audit`] call for this run — a pure, unit-tested
@@ -1149,9 +1328,7 @@ fn check_employee_run_auth(
     query_token: Option<&str>,
     principal: Option<&Principal>,
 ) -> Result<RunAuth, ApiError> {
-    if let Some(need) = configured
-        && header_token.or(query_token) == Some(need)
-    {
+    if run_token_matches(configured, header_token.or(query_token)) {
         return Ok(RunAuth::Token);
     }
     match principal {
@@ -2239,6 +2416,52 @@ mod tests {
         );
     }
 
+    /// SEC-76 decision 3 (as revised 2026-11-27): an approved call runs in the
+    /// agent's organisation, and the approver's id, name, permissions and roles
+    /// stay. Only `tenant_ids` changes, so the audit names the approver.
+    #[test]
+    fn an_approved_call_replays_in_the_agents_organisation_keeping_the_approvers_roles() {
+        let tenant_b = Uuid::from_u128(0xb);
+        let tenant_a = Uuid::from_u128(0xa);
+        let mut approver = fixture_user_principal();
+        approver.tenant_ids = vec![tenant_a, tenant_b];
+        approver.role_names = vec!["Finance".to_owned(), "Analyst".to_owned()];
+
+        let replay = approval_replay_principal(&approver, tenant_b);
+
+        assert_eq!(replay.tenant_ids, vec![tenant_b]);
+        assert_eq!(
+            replay.role_names,
+            vec!["Finance".to_owned(), "Analyst".to_owned()],
+            "the approver's roles are not narrowed to the agent's grant"
+        );
+        assert_eq!(
+            replay.id, approver.id,
+            "the audit identity stays the approver"
+        );
+        assert_eq!(replay.display_name, approver.display_name);
+        assert_eq!(replay.permissions, approver.permissions);
+        let mut expected = approver;
+        expected.tenant_ids = vec![tenant_b];
+        assert_eq!(replay, expected, "only the organisation changes");
+    }
+
+    /// An approver who holds none of the agent's roles keeps their own roles on
+    /// replay: the replay never adds a grant the approver does not hold, and it
+    /// never narrows the approver's own roles to the agent's grant.
+    #[test]
+    fn an_approver_holding_none_of_the_agents_roles_replays_with_their_own_roles() {
+        let tenant_b = Uuid::from_u128(0xb);
+        let mut approver = fixture_user_principal();
+        approver.tenant_ids = vec![tenant_b];
+        approver.role_names = vec!["Finance".to_owned()];
+
+        let replay = approval_replay_principal(&approver, tenant_b);
+
+        assert_eq!(replay.role_names, vec!["Finance".to_owned()]);
+        assert_eq!(replay.tenant_ids, vec![tenant_b]);
+    }
+
     /// SEC-68 D2: a scheduled run uses strictly its own grant; an empty grant
     /// fails closed even when the trigger is a restricted human.
     #[test]
@@ -2767,6 +2990,16 @@ mod tests {
         assert!(matches!(err, ApiError::Unauthorized(_)));
         let err = check_employee_run_auth(None, None, None, None).unwrap_err();
         assert!(matches!(err, ApiError::Unauthorized(_)));
+    }
+
+    /// SEC-76: with no run token configured, no presented token matches, so the
+    /// run-token check fails closed (the scheduler sees every agent only when
+    /// the token is configured and presented).
+    #[test]
+    fn run_token_matches_fails_closed_when_no_token_is_configured() {
+        assert!(!run_token_matches(None, Some("x")));
+        assert!(!run_token_matches(None, None));
+        assert!(run_token_matches(Some("x"), Some("x")));
     }
 
     /// Wrong/absent token AND a principal that lacks `agent:manage` is a
